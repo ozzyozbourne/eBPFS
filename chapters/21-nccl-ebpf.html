@@ -1,0 +1,1219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · NCCLbpf: eBPF policies inside NCCL · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="21">
+<meta name="chapter-part" content="Part V · eBPF for GPUs and accelerators">
+<meta name="chapter-summary" content="How NCCLbpf runs verified eBPF policies inside NCCL's tuner, profiler and net plugins through bpftime, how a policy picks algorithm, protocol and channels for each collective, and why a load-time check must stop policies that let ranks disagree.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/nccl-eBPF">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part V · eBPF for GPUs and accelerators › 21 · NCCLbpf</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 21</div>
+      <h1>NCCLbpf: verified eBPF policies inside NCCL</h1>
+      <p class="lede">NVIDIA's collective communication library chooses an algorithm, a protocol and a
+      channel count for every AllReduce. You can change that choice with a plugin, but the plugin
+      is native code that can crash the training job. NCCLbpf replaces the native plugin logic with eBPF
+      programs run by bpftime. This chapter covers the NCCL background you need, how the plugin calls a policy,
+      and a problem kernel eBPF never had: every rank must make the same decision, or the
+      collective hangs.</p>
+      <div class="meta"><span>Prerequisites: <a href="03-verifier.html">03</a>, <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="14-bpftime-architecture.html">14</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/nccl-eBPF">eunomia-bpf/nccl-eBPF</a> at <code>9a6006e2</code></span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Large-model training spends much of its time moving data between GPUs. Data-parallel training
+    sums gradients across all GPUs after every step. Tensor-parallel inference sums partial activations
+    inside every layer. Both of these are <em>collective operations</em>, and on NVIDIA hardware almost
+    every framework (PyTorch, Megatron-LM, DeepSpeed, inference engines) runs them through
+    <a href="https://github.com/NVIDIA/nccl">NCCL</a>, the NVIDIA Collective Communication Library.</p>
+
+    <p>Each NCCL call has to answer three questions: which <strong>algorithm</strong> moves the data
+    (ring, tree, NVLink SHARP, …), which <strong>protocol</strong> signals that data has arrived (LL, LL128,
+    Simple), and how many <strong>channels</strong> (roughly, how many GPU thread blocks and parallel
+    connections) to use. NCCL answers them with a built-in cost model. The model is good, but it does not
+    know your workload, your other jobs, or the quirks of a new machine. NCCL therefore lets you load a
+    <em>tuner plugin</em>: a shared library whose function is called for every collective and can change
+    the answer.</p>
+
+    <p>That plugin is ordinary native code inside the training process. A null pointer dereference in it
+    kills a job that may have been running on thousands of GPUs for days. Changing its logic means
+    restarting the job. This is the same situation the Linux kernel was in before eBPF: an extension point
+    that only accepts trusted native modules. NCCLbpf, a research prototype from eunomia-bpf (presented at the
+    eBPF '26 workshop), applies the eBPF answer. Policies are small restricted-C programs that are verified
+    when loaded, JIT-compiled, and run through NCCL's existing plugin interfaces. It uses
+    <a href="14-bpftime-architecture.html">bpftime</a> as the userspace runtime, without changing NCCL itself.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>A kernel verifier checks one program
+    running on one machine. A collective runs the same program on many ranks, and every rank must reach
+    the same decision. NCCLbpf therefore adds a second check at load time. It is an information-flow analysis
+    that rejects any policy whose collective-wide action can depend on rank-local data such as this GPU's
+    measured latency, a timer, or an ordinary map.</p></div>
+
+    <h2>NCCL background a programmer needs</h2>
+
+    <h3>Ranks, communicators and collectives</h3>
+    <p>A <strong>rank</strong> is one participant, usually one GPU driven by one process or thread. A
+    <strong>communicator</strong> is a group of ranks created together (for example with
+    <code>ncclCommInitRank</code>). Every rank in the communicator calls the same collective with buffers
+    of the same size. NVIDIA's documentation defines the main operations
+    (<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html">Collective Operations</a>):</p>
+    <ul>
+      <li><strong>AllReduce</strong>: every rank provides N values and receives the element-wise reduction
+      (sum, max, …) over all ranks: <code>out[i] = in0[i] + in1[i] + … + in(k-1)[i]</code>.</li>
+      <li><strong>AllGather</strong>: every rank provides N values, and every rank receives all k·N values
+      ordered by rank.</li>
+      <li><strong>ReduceScatter</strong>: the reduction is computed, and rank j keeps only the j-th block. The docs
+      note that ReduceScatter followed by AllGather is equivalent to AllReduce.</li>
+      <li><strong>Broadcast</strong> and <strong>Reduce</strong> have a root rank: one sends, or one receives.</li>
+    </ul>
+    <p>The <code>nccl-tests</code> benchmarks report two bandwidths. <em>algbw</em> is bytes divided by time.
+    <em>busbw</em> scales it by the amount of data each link must carry, so that numbers can be compared across rank
+    counts. For AllReduce the factor is <code>2(n-1)/n</code>, for AllGather and ReduceScatter
+    <code>(n-1)/n</code> (<a href="https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md">nccl-tests PERFORMANCE.md</a>).
+    The evaluation numbers later in this chapter are busbw.</p>
+
+    <h3>Algorithms: ring and tree (and friends)</h3>
+    <p>A <strong>ring</strong> arranges the ranks in a cycle. AllReduce on a ring is a ReduceScatter phase
+    followed by an AllGather phase. The buffer is cut into n chunks. In each of n−1 steps every rank sends one
+    chunk to its right neighbour and adds the chunk it received from the left. After those steps, every rank owns
+    one fully reduced chunk. Another n−1 steps circulate the finished chunks. Each rank sends about
+    2(n−1)/n of the buffer, which is optimal for bandwidth. The latency, however, grows linearly with n, because
+    a chunk must travel around the whole ring.</p>
+    <p>A <strong>tree</strong> reduces up to a root and broadcasts back down, so the latency is logarithmic in n.
+    In a single binary tree the leaves only send and the root only receives, which wastes half the link bandwidth. NCCL 2.4
+    introduced <em>double binary trees</em>: two complementary trees in which each rank is an inner node in at
+    most one of them, each tree carrying half of the data. The result is "full bandwidth and a logarithmic latency"
+    (<a href="https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4">Jeaugey, NCCL 2.4 blog</a>).
+    Newer NCCL versions add more algorithms. The pinned header lists seven: Tree, Ring, CollNetDirect, CollNetChain,
+    NVLS, NVLSTree and PAT. NVLS and NVLSTree use NVLink SHARP, in which the NVLink switch performs the reduction
+    with hardware multicast (<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">NCCL_ALGO docs</a>).</p>
+
+    <figure>
+      <svg viewBox="0 0 820 330" role="img" aria-label="Four GPUs connected in a ring with chunks moving clockwise, and eight ranks in two complementary binary trees">
+        <defs><marker id="ah211" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent2)"/></marker>
+        <marker id="ah212" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent)"/></marker></defs>
+        <text x="190" y="24" text-anchor="middle" style="fill:var(--fg);font-size:15px;font-weight:600">Ring (4 ranks)</text>
+        <g style="font-size:13px">
+          <rect x="140" y="50" width="100" height="44" rx="8" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="190" y="77" text-anchor="middle" style="fill:var(--fg)">GPU 0</text>
+          <rect x="280" y="150" width="100" height="44" rx="8" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="330" y="177" text-anchor="middle" style="fill:var(--fg)">GPU 1</text>
+          <rect x="140" y="250" width="100" height="44" rx="8" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="190" y="277" text-anchor="middle" style="fill:var(--fg)">GPU 2</text>
+          <rect x="0" y="150" width="100" height="44" rx="8" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="50" y="177" text-anchor="middle" style="fill:var(--fg)">GPU 3</text>
+          <path d="M240,80 Q300,100 320,148" style="fill:none;stroke:var(--accent2);stroke-width:2" marker-end="url(#ah211)"/>
+          <path d="M320,196 Q300,250 242,268" style="fill:none;stroke:var(--accent2);stroke-width:2" marker-end="url(#ah211)"/>
+          <path d="M140,268 Q80,250 60,196" style="fill:none;stroke:var(--accent2);stroke-width:2" marker-end="url(#ah211)"/>
+          <path d="M60,148 Q80,100 138,80" style="fill:none;stroke:var(--accent2);stroke-width:2" marker-end="url(#ah211)"/>
+          <text x="190" y="166" text-anchor="middle" style="fill:var(--muted);font-size:12px">2(n−1) steps,</text>
+          <text x="190" y="182" text-anchor="middle" style="fill:var(--muted);font-size:12px">one chunk per hop</text>
+        </g>
+        <line x1="410" y1="20" x2="410" y2="310" style="stroke:var(--border)"/>
+        <text x="615" y="24" text-anchor="middle" style="fill:var(--fg);font-size:15px;font-weight:600">Double binary tree (8 ranks)</text>
+        <g style="font-size:12px">
+          <!-- tree A (accent2): root 4 -> 2,6 -> leaves 1,3,5,7 ; tree B (accent): root 3 -> 1,5 -> leaves 0,2,4,6 -->
+          <circle cx="615" cy="62" r="15" style="fill:var(--bg3);stroke:var(--accent2);stroke-width:2"/><text x="615" y="66" text-anchor="middle" style="fill:var(--fg)">4</text>
+          <circle cx="530" cy="125" r="15" style="fill:var(--bg3);stroke:var(--accent2);stroke-width:2"/><text x="530" y="129" text-anchor="middle" style="fill:var(--fg)">2</text>
+          <circle cx="700" cy="125" r="15" style="fill:var(--bg3);stroke:var(--accent2);stroke-width:2"/><text x="700" y="129" text-anchor="middle" style="fill:var(--fg)">6</text>
+          <line x1="602" y1="72" x2="542" y2="114" style="stroke:var(--accent2);stroke-width:2"/>
+          <line x1="628" y1="72" x2="688" y2="114" style="stroke:var(--accent2);stroke-width:2"/>
+          <line x1="522" y1="139" x2="490" y2="172" style="stroke:var(--accent2);stroke-width:2"/>
+          <line x1="538" y1="139" x2="570" y2="172" style="stroke:var(--accent2);stroke-width:2"/>
+          <line x1="692" y1="139" x2="660" y2="172" style="stroke:var(--accent2);stroke-width:2"/>
+          <line x1="708" y1="139" x2="740" y2="172" style="stroke:var(--accent2);stroke-width:2"/>
+          <text x="490" y="186" text-anchor="middle" style="fill:var(--muted)">1</text>
+          <text x="570" y="186" text-anchor="middle" style="fill:var(--muted)">3</text>
+          <text x="660" y="186" text-anchor="middle" style="fill:var(--muted)">5</text>
+          <text x="740" y="186" text-anchor="middle" style="fill:var(--muted)">7</text>
+          <circle cx="615" cy="214" r="15" style="fill:var(--bg3);stroke:var(--accent);stroke-width:2"/><text x="615" y="218" text-anchor="middle" style="fill:var(--fg)">3</text>
+          <circle cx="530" cy="262" r="15" style="fill:var(--bg3);stroke:var(--accent);stroke-width:2"/><text x="530" y="266" text-anchor="middle" style="fill:var(--fg)">1</text>
+          <circle cx="700" cy="262" r="15" style="fill:var(--bg3);stroke:var(--accent);stroke-width:2"/><text x="700" y="266" text-anchor="middle" style="fill:var(--fg)">5</text>
+          <line x1="602" y1="222" x2="542" y2="252" style="stroke:var(--accent);stroke-width:2"/>
+          <line x1="628" y1="222" x2="688" y2="252" style="stroke:var(--accent);stroke-width:2"/>
+          <line x1="522" y1="276" x2="490" y2="296" style="stroke:var(--accent);stroke-width:2"/>
+          <line x1="538" y1="276" x2="570" y2="296" style="stroke:var(--accent);stroke-width:2"/>
+          <line x1="692" y1="276" x2="660" y2="296" style="stroke:var(--accent);stroke-width:2"/>
+          <line x1="708" y1="276" x2="740" y2="296" style="stroke:var(--accent);stroke-width:2"/>
+          <text x="490" y="310" text-anchor="middle" style="fill:var(--muted)">0</text>
+          <text x="570" y="310" text-anchor="middle" style="fill:var(--muted)">2</text>
+          <text x="660" y="310" text-anchor="middle" style="fill:var(--muted)">4</text>
+          <text x="740" y="310" text-anchor="middle" style="fill:var(--muted)">6</text>
+          <text x="790" y="130" style="fill:var(--accent2)">tree A</text>
+          <text x="790" y="266" style="fill:var(--accent)">tree B</text>
+        </g>
+      </svg>
+      <figcaption>Figure 21.1 — Left: a ring AllReduce sends one chunk per hop to the neighbour, for
+      2(n−1) steps. Right: the double-binary-tree idea (schematic, not NCCL's exact rank layout). Ranks that are inner nodes of
+      tree A are leaves of tree B and vice versa, and each tree carries half of the data. The two patterns
+      send different data to different peers, so every rank must run the same one.</figcaption>
+    </figure>
+
+    <h3>Protocols: LL, LL128, Simple</h3>
+    <p>Moving bytes is half the job. The receiver must also learn that the bytes have arrived. NCCL has three ways
+    to do this, and the Hu et al. analysis describes their trade-offs in detail
+    (<a href="https://arxiv.org/abs/2507.04786">Demystifying NCCL</a>):</p>
+    <ul>
+      <li><strong>LL</strong> (low latency): every 8-byte store carries 4 bytes of data and a 4-byte flag. The
+      pinned <code>device.h</code> defines <code>union ncclLLFifoLine</code> as <code>data1, flag1, data2,
+      flag2</code>. The receiver spins on the flag and needs no separate synchronisation, so latency is very low,
+      but half of the bandwidth goes to flags.</li>
+      <li><strong>LL128</strong>: the same idea on 128-byte lines with one 8-byte flag per line
+      (<code>NCCL_LL128_LINESIZE 128</code>, <code>NCCL_LL128_DATAELEMS = LINEELEMS-1</code>). It is much more
+      efficient, but it depends on the hardware writing 128-byte lines atomically. NVIDIA warns that "enabling LL128 on
+      platforms that don't support it can lead to data corruption"
+      (<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">NCCL_PROTO</a>).</li>
+      <li><strong>Simple</strong>: large chunks followed by a memory fence and a flag. It reaches the highest
+      bandwidth, at the cost of higher per-step latency.</li>
+    </ul>
+    <p>So the right protocol depends on message size and topology. Small messages want LL. Large ones want
+    Simple, and LL128 sits in between where the hardware supports it.</p>
+
+    <h3>Channels</h3>
+    <p>A <strong>channel</strong> is one parallel lane of a collective. Each channel has its own ring or tree
+    connections and its own CUDA block on each GPU, and the buffer is split across channels. More channels use
+    more links and SMs at the same time. Fewer channels leave more SMs for compute. <code>NCCL_MIN_NCHANNELS</code> and
+    <code>NCCL_MAX_NCHANNELS</code> bound the count. Their doc entry notes that fewer channels also means fewer CUDA
+    blocks used for communication. Because the channel count decides how each rank <em>partitions</em> the buffer,
+    it is collective-wide state, just like the algorithm.</p>
+
+    <h3>How NCCL picks, and where a tuner plugs in</h3>
+    <p>Inside <code>ncclGetAlgoInfo</code> in <code>src/enqueue.cc</code>, NCCL builds a small 2-D table
+    <code>collCostTable[algorithm][protocol]</code> of predicted times. It lets the tuner edit the table and
+    then takes the cheapest entry:</p>
+    <pre data-file="nccl/src/enqueue.cc"><code class="language-c">  float collCostTable[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
+  initCollCostTable((float **)collCostTable);
+  NCCLCHECK(updateCollCostTable(comm, info, nBytes, collNetSupport, nvlsSupport, numPipeOps, (float **)collCostTable));
+  if (comm-&gt;tuner != NULL) {
+    /* ... compute regBuff from buffer registration ... */
+    NCCLCHECK(comm-&gt;tuner-&gt;getCollInfo(
+          comm-&gt;tunerContext, info-&gt;func, nBytes,
+          numPipeOps, (float **)collCostTable, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
+          regBuff, &amp;nMaxChannels));
+    NCCLCHECK(topoGetAlgoInfo(comm, info, nBytes, (float **)collCostTable, simInfo));
+  } else {
+    /* ... */
+  }
+
+  info-&gt;nMaxChannels = nMaxChannels == 0 ? info-&gt;nMaxChannels : nMaxChannels;</code></pre>
+    <p><code>updateCollCostTable</code> fills only the cells this communicator can actually run. For example, it skips NVLS
+    without NVLS support and CollNet without CollNet support, and a one-rank communicator gets only Ring/Simple. All
+    other cells stay at −1. <code>topoGetAlgoInfo</code> then scans for the smallest non-negative cell:</p>
+    <pre data-file="nccl/src/enqueue.cc"><code class="language-c">  for (int a=0; a&lt;NCCL_NUM_ALGORITHMS; a++) {
+    for (int p=0; p&lt;NCCL_NUM_PROTOCOLS; p++) {
+      if (table[a][p] == NCCL_ALGO_PROTO_IGNORE) continue;
+      if (table[a][p] &gt;= 0.0 &amp;&amp; table[a][p] &lt; minTime) {
+        algorithm = a;
+        protocol = p;
+        minTime = table[a][p];
+      }
+    }
+  }</code></pre>
+    <p>A tuner steers the choice by lowering a cell's cost, usually to 0. It caps channels by writing
+    <code>*nChannels</code>, where 0 means "keep NCCL's choice". The plugin ABI at the pinned NCCL 2.29.7 is
+    tuner v5:</p>
+    <pre data-file="nccl/src/include/plugin/tuner/tuner_v5.h"><code class="language-c">typedef struct {
+  const char* name;
+  ncclResult_t (*init)(void** ctx, uint64_t commId, size_t nRanks, size_t nNodes, ncclDebugLogger_t logFunction,
+                      ncclNvlDomainInfo_v5_t* nvlDomainInfo, ncclTunerConstants_v5_t* constants);
+  /* ...
+  //   - collCostTable: collective cost table, generated by NCCL core, containing algo|proto|time entries for collType.
+  //                    NCCL core sets ignored algo/proto cost table entries to -1.0 (NCCL_ALGO_PROTO_IGNORE).
+  //
+  // If getCollInfo() does not return ncclSuccess, NCCL will fall back to the
+  // default tuning for the given collective.
+  // Also, the plugin is allowed to not set any output, or set only the
+  // algorithm and protocol, but not only the algorithm or only the protocol.
+  ... */
+  ncclResult_t (*getCollInfo)(void* context, ncclFunc_t collType, size_t nBytes,
+                              int numPipeOps, float** collCostTable, int numAlgo, int numProto,
+                              int regBuff, int* nChannels);
+  ncclResult_t (*finalize)(void* context);
+} ncclTuner_v5_t;</code></pre>
+    <p>NCCL finds the plugin library through <code>NCCL_TUNER_PLUGIN</code> and looks up the symbol
+    <code>ncclTunerPlugin_v5</code> with <code>dlsym</code> (<code>src/plugin/tuner/tuner_v5.cc</code>). Two
+    details of this interface matter later. First, <code>init</code> receives the communicator id, rank and node
+    counts, and NVL-domain info, but <em>not this process's rank number</em>. Second, every rank loads its own copy of
+    the plugin and decides on its own. Nothing in the ABI makes the ranks agree.</p>
+
+    <h3>The other plugin types</h3>
+    <p>NCCL also loads <strong>net</strong> plugins (<code>NCCL_NET_PLUGIN</code>, symbol
+    <code>ncclNetPlugin_v11</code> in the pinned tree). These implement the transport with
+    <code>listen/connect/accept/isend/irecv/test</code> and let vendors ship network code separately from NCCL
+    (<a href="https://github.com/NVIDIA/nccl/tree/361915904b456d397e6e1578f8f65ea1a45bdd28/plugins/net">plugins/net</a>).
+    <strong>Profiler</strong> plugins (<code>NCCL_PROFILER_PLUGIN</code>) receive start/stop events for
+    collectives and lower-level operations. NCCLbpf uses all three: tuner v5, profiler v6 and net v11.</p>
+
+    <h2>What NCCLbpf is</h2>
+    <p>NCCLbpf's README describes it as bringing "verified eBPF policy execution to NCCL". Concretely, the repo
+    contains:</p>
+    <div class="grid">
+      <div class="card"><h4>Tuner + profiler plugin</h4><p><code>libnccl-policy.so</code> exports
+      <code>ncclTunerPlugin_v5</code> ("eBPFPolicy") and <code>ncclProfiler_v6</code>. On each
+      <code>getCollInfo</code> it runs an eBPF policy and applies the returned action.</p></div>
+      <div class="card"><h4>Net plugin</h4><p><code>libnccl-net-ebpf.so</code> wraps NCCL's Socket transport
+      and runs an eBPF program on transport events. Currently it only traces.</p></div>
+      <div class="card"><h4>Policy library</h4><p><code>src/ebpf-policies/</code>: size-aware, NVLink-aware and
+      telemetry policies, plus intentionally unsafe <code>bad_*</code> programs for verifier tests.</p></div>
+      <div class="card"><h4>Rank-agreement checker</h4><p>A load-time bytecode analysis that rejects policies whose
+      action could differ across ranks, plus an experimental "agreed map".</p></div>
+    </div>
+    <p>The paper is Y. Zheng, "NCCLbpf: Verified, Composable Policy Execution for GPU Collective Communication",
+    eBPF '26 (arXiv 2603.11438). The README is careful to call the code "a research prototype". The
+    <a href="#limitations">limitations section</a> lists what that means in practice.</p>
+
+    <h2>The architecture at a glance</h2>
+    <figure>
+      <svg viewBox="0 0 860 400" role="img" aria-label="NCCL core calls the tuner, profiler and net plugins; the plugins run eBPF programs in bpftime, which share maps; policy objects enter through verifier, rank-agreement check and LLVM JIT">
+        <defs><marker id="ah213" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <g style="font-size:13px">
+          <rect x="15" y="40" width="200" height="320" rx="10" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="115" y="64" text-anchor="middle" style="fill:var(--fg);font-weight:600">NCCL core (unmodified)</text>
+          <text x="115" y="100" text-anchor="middle" style="fill:var(--muted)">ncclAllReduce(...)</text>
+          <text x="115" y="140" text-anchor="middle" style="fill:var(--fg)">ncclGetAlgoInfo</text>
+          <text x="115" y="158" text-anchor="middle" style="fill:var(--muted)">cost table</text>
+          <text x="115" y="226" text-anchor="middle" style="fill:var(--fg)">profiler events</text>
+          <text x="115" y="306" text-anchor="middle" style="fill:var(--fg)">transport (net)</text>
+
+          <rect x="270" y="110" width="180" height="62" rx="8" style="fill:var(--bg2);stroke:var(--accent2);stroke-width:2"/>
+          <text x="360" y="136" text-anchor="middle" style="fill:var(--fg)">Tuner v5 adapter</text>
+          <text x="360" y="155" text-anchor="middle" style="fill:var(--muted);font-size:11px">pluginGetCollInfoImpl</text>
+          <rect x="270" y="195" width="180" height="62" rx="8" style="fill:var(--bg2);stroke:var(--accent2);stroke-width:2"/>
+          <text x="360" y="221" text-anchor="middle" style="fill:var(--fg)">Profiler v6 adapter</text>
+          <text x="360" y="240" text-anchor="middle" style="fill:var(--muted);font-size:11px">start/stopEvent</text>
+          <text x="360" y="96" text-anchor="middle" style="fill:var(--muted);font-size:11px">libnccl-policy.so</text>
+          <rect x="270" y="280" width="180" height="62" rx="8" style="fill:var(--bg2);stroke:var(--accent2);stroke-width:2"/>
+          <text x="360" y="306" text-anchor="middle" style="fill:var(--fg)">Net v11 wrapper</text>
+          <text x="360" y="325" text-anchor="middle" style="fill:var(--muted);font-size:11px">libnccl-net-ebpf.so</text>
+
+          <line x1="215" y1="145" x2="268" y2="145" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="215" y1="226" x2="268" y2="226" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="215" y1="311" x2="268" y2="311" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+
+          <rect x="500" y="90" width="200" height="270" rx="10" style="fill:var(--bg3);stroke:var(--accent);stroke-width:2"/>
+          <text x="600" y="112" text-anchor="middle" style="fill:var(--fg);font-weight:600">bpftime (in process)</text>
+          <rect x="520" y="125" width="160" height="40" rx="6" style="fill:var(--bg2);stroke:var(--border)"/>
+          <text x="600" y="150" text-anchor="middle" style="fill:var(--fg)">SEC("uprobe") policy</text>
+          <rect x="520" y="205" width="160" height="40" rx="6" style="fill:var(--bg2);stroke:var(--border)"/>
+          <text x="600" y="230" text-anchor="middle" style="fill:var(--fg)">SEC("profiler") prog</text>
+          <rect x="520" y="290" width="160" height="40" rx="6" style="fill:var(--bg2);stroke:var(--border)"/>
+          <text x="600" y="315" text-anchor="middle" style="fill:var(--fg)">net_trace prog</text>
+          <line x1="450" y1="145" x2="518" y2="145" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="450" y1="226" x2="518" y2="226" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="450" y1="311" x2="518" y2="311" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <rect x="560" y="172" width="80" height="26" rx="5" style="fill:var(--bg);stroke:var(--accent)"/>
+          <text x="600" y="190" text-anchor="middle" style="fill:var(--accent);font-size:11px">telemetry_map</text>
+
+          <rect x="740" y="40" width="105" height="320" rx="10" style="fill:var(--bg2);stroke:var(--border);stroke-dasharray:5 4"/>
+          <text x="792" y="64" text-anchor="middle" style="fill:var(--fg);font-weight:600">load time</text>
+          <text x="792" y="100" text-anchor="middle" style="fill:var(--muted)">.bpf.o</text>
+          <text x="792" y="140" text-anchor="middle" style="fill:var(--fg)">PREVAIL</text>
+          <text x="792" y="156" text-anchor="middle" style="fill:var(--fg)">verifier</text>
+          <text x="792" y="196" text-anchor="middle" style="fill:var(--fg)">rank</text>
+          <text x="792" y="212" text-anchor="middle" style="fill:var(--fg)">agreement</text>
+          <text x="792" y="252" text-anchor="middle" style="fill:var(--fg)">LLVM JIT</text>
+          <line x1="792" y1="106" x2="792" y2="126" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="792" y1="162" x2="792" y2="182" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="792" y1="218" x2="792" y2="238" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <line x1="740" y1="250" x2="702" y2="250" style="stroke:var(--fg)" marker-end="url(#ah213)"/>
+          <text x="440" y="390" text-anchor="middle" style="fill:var(--muted);font-size:12px">action (u64) flows back: tuner adapter zeroes one cost-table cell and/or sets nChannels</text>
+        </g>
+      </svg>
+      <figcaption>Figure 21.2 — NCCLbpf's structure. NCCL calls the three plugin adapters through its ordinary
+      ABIs. Each adapter fills a context struct and runs a JIT-compiled eBPF program inside bpftime. The profiler program
+      writes latency into <code>telemetry_map</code>, which the tuner adapter reads when building its next context.
+      A policy object becomes executable only after passing the verifier, then (for tuner programs) the
+      rank-agreement check, then the LLVM JIT.</figcaption>
+    </figure>
+    <p>NCCLbpf uses bpftime as a library. It does not use bpftime's <code>LD_PRELOAD</code> syscall server or its
+    binary-rewriting uprobes from <a href="14-bpftime-architecture.html">Chapter 14</a>. The plugin itself plays the role of
+    the attach point: it creates bpftime maps from the ELF object, runs bpftime's verifier, builds a
+    <code>bpftime_prog</code> with the <code>llvm</code> VM (the <a href="16-llvmbpf.html">llvmbpf</a> JIT), and calls
+    <code>bpftime_prog_exec(&amp;ctx, sizeof ctx, &amp;ret)</code> directly. Policies are tagged
+    <code>SEC("uprobe")</code> because that is a section bpftime's verifier already knows. The context is plain memory
+    that the plugin passes in.</p>
+
+    <h2>How the code is organised</h2>
+    <pre><code class="language-plaintext">nccl-eBPF/                          (commit 9a6006e2, 2026-09-29)
+├── README.md                       architecture, env vars, build/run commands
+├── Makefile                        build / test / artifact-check / artifact-arxiv / install
+├── src/
+│   ├── nccl-policy-plugin/         tuner v5 + profiler v6 plugin (C++)
+│   │   ├── plugin.cpp              ~2.8k lines: load, verify, JIT, getCollInfo, profiler, hot reload
+│   │   ├── rank_agreement_verifier.h   cross-rank information-flow check for tuner bytecode
+│   │   ├── rank_merge_verifier.h       check for SEC("dist_merge") programs
+│   │   ├── distributed_map.{h,cpp}     experimental Unix-socket / TCP slot exchange
+│   │   ├── native_baseline.{h,cpp}     same logic in C++ for overhead comparison
+│   │   ├── CMakeLists.txt          also compiles every ../ebpf-policies/*.bpf.c with clang -target bpf
+│   │   └── test/                   CTest: verifier matrix, hot reload, native crash, distributed maps
+│   ├── nccl-net-ebpf-plugin/       net v11 wrapper over NCCL's Socket transport
+│   │   ├── plugin.cpp, net_ebpf_ctx.h, net_trace.bpf.c
+│   ├── ebpf-policies/              policy_context.h, policy_action.h, policy_maps.h, bpf_compat.h,
+│   │                               size_aware*, nvlink_ring_mid*, nvl72_size_aware, spark_tp4_*,
+│   │                               adaptive_channels*, slo_enforcer, profiler_latency, cpu_aware,
+│   │                               distributed_max_latency, noop, lookup_*, bad_* (7 unsafe programs)
+│   └── kernel_observer/            kernel eBPF program feeding a pinned map (used by cpu_aware)
+├── scripts/                        nccl_bench.sh (benchmark arms), test_nccl_bench.sh, paper packaging
+├── docs/
+│   ├── artifact/README.md          paper artifact entry point + evidence index
+│   ├── cross-rank-agreement.md     design notes and NCCL source analysis for agreement
+│   ├── paper/                      frozen paper.tex / paper.pdf / source zip
+│   └── tmp/                        ~90 working notes and experiment summaries
+├── nccl/  bpftime/  libbpf/  bpftool/   submodules (NCCL 2.29.7 at 36191590)
+└── vmlinux/                        kernel headers for CO-RE (kernel_observer)</code></pre>
+    <p>The repo root also tracks four large ELF executables (<code>check</code>, <code>tests</code>,
+    <code>run_yaml</code>, <code>conformance_check</code>, 42–75 MB each). They were added in a commit titled
+    "a", and no document explains them. Treat them as stray build output, not as part of the design.</p>
+
+    <h2>The policy ABI: context in, action out</h2>
+    <h3>The context struct</h3>
+    <p>A policy is a function that takes a pointer to <code>struct nccl_policy_ctx</code> and returns a
+    <code>uint64_t</code>. The struct is versioned by appending fields. Static asserts pin the offsets, and the
+    <code>reserved</code> field holds the struct size, so a policy can tell an old 72-byte host from the current
+    88-byte one:</p>
+    <pre data-file="src/ebpf-policies/policy_context.h"><code class="language-c">#define NCCL_POLICY_CTX_ABI_V1_SIZE 72U
+#define NCCL_POLICY_CTX_ABI_V2_SIZE 88U
+
+enum nccl_policy_coll_type {
+  NCCL_POLICY_COLL_BROADCAST = 0,
+  NCCL_POLICY_COLL_REDUCE = 1,
+  NCCL_POLICY_COLL_ALLGATHER = 2,
+  NCCL_POLICY_COLL_REDUCESCATTER = 3,
+  NCCL_POLICY_COLL_ALLREDUCE = 4,
+};
+
+struct nccl_policy_ctx {
+  uint64_t n_bytes;
+  /* Populated from profiler-fed telemetry_map snapshots when available. */
+  uint64_t last_latency_ns;
+  uint64_t avg_latency_ns;
+  uint64_t rolling_p99_ns;
+  uint64_t call_count;
+  uint32_t coll_type;
+  uint32_t num_pipe_ops;
+  uint32_t reg_buff;
+  uint32_t n_ranks;
+  uint32_t n_nodes;
+  uint32_t current_channels;
+  /* Total context size in bytes; zero when populated by a v1 host. */
+  uint32_t reserved;
+  /* NVL topology supplied by the NCCL tuner v5 initialization ABI. ... */
+  uint32_t n_nvl_domains;
+  uint32_t min_ranks_per_nvl_domain;
+  uint32_t max_ranks_per_nvl_domain;
+  uint32_t reserved2;
+};</code></pre>
+    <p>The fields fall into two groups, and the rest of the chapter depends on this split.
+    <code>n_bytes</code>, <code>coll_type</code>, <code>num_pipe_ops</code>, <code>n_ranks</code>,
+    <code>n_nodes</code> and the NVL-domain fields come from <code>getCollInfo</code> arguments or from
+    communicator-wide values, so they are the same on every rank. The latency fields, <code>call_count</code>,
+    <code>reg_buff</code> and <code>current_channels</code> are measured or computed by this process alone.</p>
+
+    <h3>The packed action</h3>
+    <p>The return value packs five bytes. The flags say which fields the host should apply, so returning 0
+    means "do nothing, keep NCCL's choice":</p>
+    <pre data-file="src/ebpf-policies/policy_action.h"><code class="language-c">enum nccl_policy_action_flags {
+  NCCL_POLICY_ACTION_SET_ALGO = 1u &lt;&lt; 0,
+  NCCL_POLICY_ACTION_SET_PROTO = 1u &lt;&lt; 1,
+  NCCL_POLICY_ACTION_SET_CHANNELS = 1u &lt;&lt; 2,
+  NCCL_POLICY_ACTION_SET_AGGRESSIVENESS = 1u &lt;&lt; 3,
+};
+
+static inline uint64_t nccl_policy_pack_action(uint8_t algo, uint8_t proto,
+                                               uint8_t n_channels,
+                                               uint8_t aggressiveness,
+                                               uint8_t flags)
+{
+  return (uint64_t)algo |
+         ((uint64_t)proto &lt;&lt; 8) |
+         ((uint64_t)n_channels &lt;&lt; 16) |
+         ((uint64_t)aggressiveness &lt;&lt; 24) |
+         ((uint64_t)flags &lt;&lt; 32);
+}</code></pre>
+    <p>The algorithm and protocol enums in the same header mirror NCCL's numbering (Tree 0, Ring 1, …, PAT 6;
+    LL 0, LL128 1, Simple 2), so the host can use them directly as indices into the cost table.</p>
+
+    <div class="callout warn"><span class="label">Paper vs. repo</span><p>Listing 1 in the paper shows a
+    <code>SEC("tuner")</code> program that assigns <code>ctx-&gt;algorithm</code> and
+    <code>ctx-&gt;n_channels</code>. The code in the repo does not work that way. Every policy returns the packed
+    <code>u64</code>, and the rank-agreement checker rejects any store to the context ("write to policy context").
+    Read the paper's listing as illustrative and the repo headers as the real ABI.</p></div>
+
+    <h3>A real policy</h3>
+    <p>This is the policy behind the paper's main GPU result, tuned for one 8×B300 NVLink node:</p>
+    <pre data-file="src/ebpf-policies/nvlink_ring_mid_v2.bpf.c"><code class="language-c">/* nvlink_ring_mid_v2.bpf.c -- Refined NVLink-aware policy for B300 8-GPU
+ *
+ * v1 finding: Ring/Simple only beats NVLS at 64M-128M. At 4M-32M,
+ * Ring/Simple is worse than NVLS because NCCL's auto-protocol for Ring
+ * would choose LL128, not Simple.
+ *
+ * v2 strategy:
+ *   4M-32M:   Ring/LL128 (matches what NCCL_ALGO=Ring auto-selects)
+ *   64M-192M: Ring/Simple (proven +5-10% over NVLS)
+ *   else:     no override (NCCL uses NVLS)
+ */
+#include "bpf_compat.h"
+#include "policy_action.h"
+#include "policy_context.h"
+
+SEC("uprobe")
+uint64_t nvlink_ring_mid_v2_policy(struct nccl_policy_ctx *ctx) {
+  if (!ctx)
+    return 0;
+
+  /* 4M-32M: Ring with LL128 protocol */
+  if (ctx-&gt;n_bytes &gt;= (4ULL &lt;&lt; 20) &amp;&amp; ctx-&gt;n_bytes &lt;= (32ULL &lt;&lt; 20)) {
+    return nccl_policy_pack_action(
+        NCCL_POLICY_ALGO_RING, NCCL_POLICY_PROTO_LL128, 0, 0,
+        NCCL_POLICY_ACTION_SET_ALGO | NCCL_POLICY_ACTION_SET_PROTO);
+  }
+
+  /* 64M-192M: Ring with Simple protocol */
+  if (ctx-&gt;n_bytes &gt;= (64ULL &lt;&lt; 20) &amp;&amp; ctx-&gt;n_bytes &lt;= (192ULL &lt;&lt; 20)) {
+    return nccl_policy_pack_action(
+        NCCL_POLICY_ALGO_RING, NCCL_POLICY_PROTO_SIMPLE, 0, 0,
+        NCCL_POLICY_ACTION_SET_ALGO | NCCL_POLICY_ACTION_SET_PROTO);
+  }
+
+  return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+    <p>The policy reads only <code>n_bytes</code> and never sets a channel count. Note that 32–64 MiB and anything
+    above 192 MiB are left to NCCL. The repo has no <code>libbpf</code> headers here: <code>bpf_compat.h</code>
+    defines <code>SEC</code>, <code>__uint</code>/<code>__type</code> and the three map helpers (ids 1–3) by hand. When
+    compiled with <code>clang -target bpf -O2</code> (I used clang 14), the whole function is 15 instructions. The two
+    actions become 64-bit immediates (my disassembly, not repo text):</p>
+    <pre><code class="language-plaintext">; llvm-objdump -d nvlink_ring_mid_v2.bpf.o   (built locally from the repo source)
+       0:	r0 = 0
+       1:	if r1 == 0 goto +12 &lt;LBB0_4&gt;
+       2:	r0 = 12884902145 ll          ; 0x3_00_00_01_01: flags=ALGO|PROTO, proto=LL128(1), algo=RING(1)
+       4:	r1 = *(u64 *)(r1 + 0)        ; ctx-&gt;n_bytes
+       5:	r2 = r1
+       6:	r2 += -4194304
+       7:	r3 = 29360129
+       8:	if r3 &gt; r2 goto +5 &lt;LBB0_4&gt;
+       9:	r1 += -67108864
+      10:	r0 = 0
+      11:	if r1 &gt; 134217728 goto +2 &lt;LBB0_4&gt;
+      12:	r0 = 12884902401 ll          ; 0x3_00_00_02_01: proto=SIMPLE(2), algo=RING(1)
+      14:	exit</code></pre>
+
+    <h2>Inside the tuner adapter</h2>
+    <h3>Loading a policy</h3>
+    <p>On tuner <code>init</code>, <code>pluginInitImpl</code> starts the bpftime runtime and creates a
+    per-communicator shared state. It then loads the object named by <code>NCCL_POLICY_BPF_PATH</code>. If that
+    variable is unset, it uses a built-in noop. If it is set and loading fails, <code>init</code> returns an error. The pipeline
+    in <code>load_program_from_object</code>, trimmed:</p>
+    <pre data-file="src/nccl-policy-plugin/plugin.cpp"><code class="language-cpp">  std::unique_ptr&lt;struct bpf_object, decltype(&amp;bpf_object__close)&gt; obj(
+      bpf_object__open_file(path, nullptr), &amp;bpf_object__close);
+  /* ... */
+  if (!extract_program_spec(shared, obj.get(), &amp;spec)) { /* ... */ return false; }
+  if (!create_bpftime_maps(shared, policy_state, obj.get()))
+    return false;
+  /* ... distributed-map opt-in checks (NCCL_POLICY_EXPERIMENTAL_DIST_MAP) ... */
+  attach_kernel_maps(shared, policy_state);
+  if (!relocate_program_maps(shared, path, policy_state, &amp;spec))
+    return false;
+  if (!verify_program(shared, policy_state, spec))
+    return false;
+  if (spec.section_name.rfind("profiler", 0) != 0) {
+    std::unordered_set&lt;int&gt; agreed_fds;
+    auto agreed = policy_state-&gt;map_fds.find("agreed_map");
+    if (agreed != policy_state-&gt;map_fds.end())
+      agreed_fds.insert(agreed-&gt;second);
+    std::string agreement_error;
+    if (!rank_agreement::check(spec.insns, agreed_fds, &amp;agreement_error)) {
+      log_plugin_message(shared ? shared-&gt;log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "cross-rank agreement rejected %s: %s",
+                         path, agreement_error.c_str());
+      return false;
+    }
+  }
+
+  config.set_vm_name("llvm");
+  policy_state-&gt;prog = std::make_unique&lt;bpftime::bpftime_prog&gt;(
+      spec.insns.data(), spec.insns.size(), spec.name.c_str(),
+      std::move(config));
+  /* ... register_helpers(): kernel-utils + shm-maps helper groups ... */
+  if (policy_state-&gt;prog-&gt;bpftime_prog_load(true) &lt; 0) { /* "failed to JIT-load policy" */ return false; }</code></pre>
+    <p><code>verify_program</code> calls <code>bpftime::verifier::verify_ebpf_program</code>, bpftime's wrapper
+    around the PREVAIL verifier (<a href="03-verifier.html">Chapter 03</a>). It passes the map descriptors and the
+    exact list of allowed helper ids. Its strictness comes from <code>NCCL_POLICY_VERIFY_MODE</code>: <code>strict</code>
+    (the default) rejects, <code>warning</code> logs and loads anyway, and <code>none</code> skips verification. Sections
+    the verifier does not know are checked with <code>uprobe</code> rules. Note the order. Memory safety is proven first, then
+    cross-rank agreement, and only then does any machine code exist.</p>
+
+    <h3>Running it on every collective</h3>
+    <p><code>pluginGetCollInfoImpl</code> is the hot path. Trimmed to its core:</p>
+    <pre data-file="src/nccl-policy-plugin/plugin.cpp"><code class="language-cpp">  policy_state = load_active_policy(ctx-&gt;shared.get());
+  /* ... experimental distributed-map bookkeeping ... */
+  {
+    std::lock_guard&lt;std::mutex&gt; lock(ctx-&gt;stats_mu);
+    call_count_snapshot = ctx-&gt;call_count;
+    current_channels = ctx-&gt;last_channels;
+    synthetic = ctx-&gt;synthetic_telemetry;
+  }
+  *n_channels = current_channels;
+
+  policy_ctx.n_bytes = n_bytes;
+  /* ... latency fields from synthetic telemetry or the telemetry_map snapshot ... */
+  policy_ctx.call_count = call_count_snapshot;
+  policy_ctx.coll_type = policy_coll_type;
+  policy_ctx.num_pipe_ops = static_cast&lt;uint32_t&gt;(num_pipe_ops);
+  policy_ctx.reg_buff = static_cast&lt;uint32_t&gt;(reg_buff);
+  /* ... n_ranks, n_nodes from the communicator state ... */
+  policy_ctx.current_channels = static_cast&lt;uint32_t&gt;(current_channels);
+  policy_ctx.reserved = sizeof(policy_ctx);
+  policy_ctx.n_nvl_domains = ctx-&gt;n_nvl_domains;
+  /* ... */
+      err = policy_state-&gt;prog-&gt;bpftime_prog_exec(
+          &amp;policy_ctx, sizeof(policy_ctx), &amp;action);
+  /* ... */
+  apply_policy_action(action, coll_cost_table, num_algo, num_proto, n_channels);</code></pre>
+    <p>The host, not the policy, then writes into NCCL's memory. This is where the paper's "verification
+    boundaries" are enforced. The table's dimensions and which cells are available are only known at call time, so they
+    are checked here:</p>
+    <pre data-file="src/nccl-policy-plugin/plugin.cpp"><code class="language-cpp">void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
+                         int num_proto, int *n_channels) {
+  const uint8_t flags = nccl_policy_action_flags_get(action);
+  const int algo = nccl_policy_action_algo(action);
+  const int proto = nccl_policy_action_proto(action);
+  const int channels = nccl_policy_action_channels(action);
+
+  if ((flags &amp; NCCL_POLICY_ACTION_SET_CHANNELS) &amp;&amp; channels &gt; 0)
+    *n_channels = channels;
+
+  if (!coll_cost_table)
+    return;
+
+  /* NCCL passes collCostTable as float (*)[NCCL_NUM_PROTOCOLS] cast to float**.
+   * It is a contiguous 2D array, NOT an array of float* pointers. ... */
+  if ((flags &amp; NCCL_POLICY_ACTION_SET_ALGO) &amp;&amp;
+      (flags &amp; NCCL_POLICY_ACTION_SET_PROTO) &amp;&amp; algo &gt;= 0 &amp;&amp; proto &gt;= 0 &amp;&amp;
+      algo &lt; num_algo &amp;&amp; proto &lt; num_proto &amp;&amp; algo &lt; NCCL_NUM_ALGORITHMS &amp;&amp;
+      proto &lt; NCCL_NUM_PROTOCOLS) {
+    float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])coll_cost_table;
+    if (table[algo][proto] != NCCL_ALGO_PROTO_IGNORE) {
+      /* Set this algo/proto to cost 0.0 so NCCL selects it as best */
+      table[algo][proto] = 0.0f;
+    }
+  }
+}</code></pre>
+    <p>Three rules are visible here. Algorithm and protocol apply only as a pair, which follows the v5 contract.
+    Indices are bounds-checked. An unavailable cell (−1) is never overwritten, so a policy cannot make NCCL run a
+    combination it did not build. The comment about <code>float**</code> records a real pitfall. The
+    <code>size_aware_v5.bpf.c</code> header mentions an earlier crash: asking for Tree in a configuration where Tree's
+    entry was unavailable caused a null-pointer dereference in the plugin. The IGNORE check exists to prevent exactly that.</p>
+    <div class="callout tip"><span class="label">Channels, by default</span><p><code>last_channels</code> starts at 0
+    and is written back after each call, so a policy that never sets channels always reports 0 to NCCL. NCCL then keeps
+    its own channel count (<code>nMaxChannels == 0 ? info-&gt;nMaxChannels : nMaxChannels</code>). The design notes point out
+    that NCCL does <em>not</em> clamp a non-zero tuner channel value in some paths, such as CollNet and allgatherv. The
+    plugin cannot see <code>comm-&gt;nChannels</code>, so a bounded channel request remains an open item.</p></div>
+
+    <h2>Walkthrough: one AllReduce decision</h2>
+    <p>Follow one 16 MiB AllReduce on the paper's 8×B300 node with <code>nvlink_ring_mid_v2</code> loaded on all eight
+    ranks.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. The application calls NCCL</h4><p>Each of the 8 ranks calls
+      <code>ncclAllReduce</code> on a 16 MiB buffer. NCCL computes <code>nBytes = 16777216</code> inside
+      <code>ncclGetAlgoInfo</code> (<code>enqueue.cc</code>). The size is the same on every rank because the collective
+      contract requires matching counts.</p></div>
+      <div class="step"><h4>2. NCCL builds its cost table</h4><p><code>initCollCostTable</code> sets all 7×3 cells to
+      −1.0. <code>updateCollCostTable</code> asks <code>ncclTopoGetAlgoTime</code> for every supported algorithm/protocol
+      pair. On this node NVLS is available, and per the repo's sweep it is NCCL's default at every size. Its predicted time
+      is the minimum.</p></div>
+      <div class="step"><h4>3. NCCL calls the tuner</h4><p>Because a tuner is loaded, NCCL calls
+      <code>comm-&gt;tuner-&gt;getCollInfo(ctx, ncclFuncAllReduce, 16777216, numPipeOps, table, 7, 3, regBuff,
+      &amp;nMaxChannels)</code> with <code>nMaxChannels = 0</code>. This lands in
+      <code>pluginGetCollInfoImpl</code>.</p></div>
+      <div class="step"><h4>4. The plugin builds the context</h4><p>It fills <code>n_bytes=16777216</code>,
+      <code>coll_type=4</code> (AllReduce), <code>n_ranks=8</code>, <code>n_nodes=1</code>, the NVL-domain counts, any
+      telemetry snapshot, <code>current_channels=0</code> and <code>reserved=88</code>. All of this is ordinary stack memory
+      in the plugin.</p></div>
+      <div class="step"><h4>5. bpftime runs the JIT'd policy</h4><p><code>bpftime_prog_exec</code> jumps into the
+      LLVM-compiled code with <code>r1 = &amp;ctx</code>. 16 MiB is within [4 MiB, 32 MiB], so the policy returns
+      <code>0x300000101</code>: algo=Ring(1), proto=LL128(1), channels=0, flags=SET_ALGO|SET_PROTO. The paper reports the
+      dispatch itself at 33 ns.</p></div>
+      <div class="step"><h4>6. The host applies the action</h4><p><code>apply_policy_action</code> sees both flags,
+      checks bounds, checks that <code>table[RING][LL128]</code> is not −1, and writes 0.0 there. No channel flag is set, so
+      <code>*nChannels</code> stays 0.</p></div>
+      <div class="step"><h4>7. NCCL picks the cheapest cell</h4><p>Back in <code>ncclGetAlgoInfo</code>,
+      <code>topoGetAlgoInfo</code> scans for the smallest non-negative cost and finds Ring/LL128 at 0.0. NCCL then sizes threads
+      and keeps its own channel count, because the tuner returned 0.</p></div>
+      <div class="step"><h4>8. All ranks agree, so the kernels match</h4><p>The policy read only <code>n_bytes</code>,
+      which is identical on all 8 ranks. Every rank therefore launches the Ring/LL128 kernel with the same peers and chunking,
+      and the ring completes. If one rank had chosen NVLS, it would wait on a different exchange and the collective would never
+      finish. The next section is about preventing that.</p></div>
+    </div>
+
+    <h2>The cross-rank problem</h2>
+    <h3>Why divergent choices deadlock</h3>
+    <p>The repo's design notes put it plainly: "Every rank of a communicator must pick the same algorithm and protocol,
+    and the same channel count, for the same collective call. Each algorithm fixes who sends what to whom; if rank 0
+    runs Ring and rank 1 runs Tree, each waits for data that never comes."
+    (<code>docs/cross-rank-agreement.md</code>). The three outputs matter for different reasons:</p>
+    <ul>
+      <li><strong>Algorithm</strong>: selects the kernel and peer pattern. A new algorithm can even trigger transport
+      connection setup inside <code>ncclGroupEnd</code>.</li>
+      <li><strong>Protocol</strong>: selects the buffer format. An LL receiver spinning on 4-byte flags will never see them
+      if the sender writes Simple chunks.</li>
+      <li><strong>Channels</strong>: decide how the buffer is partitioned (<code>enqueue.cc</code> per the notes). Peers that
+      split the same buffer differently disagree on which bytes travel on which channel.</li>
+    </ul>
+    <p>NCCL keeps itself consistent by aligning inputs once, at communicator init. It runs an AllGather of per-rank graph info
+    and takes minimums and maximums, with the comment "Make sure we align all ranks so that the tuning is consistent across
+    ranks". Its per-call choice is then a deterministic function of those aligned values. A tuner plugin breaks this
+    model. Each rank's copy decides alone, and the v5 ABI does not even give it the rank id. As soon as a policy reads
+    something local, such as its own measured latency or a clock, ranks can diverge. The notes record an internal two-rank run
+    in which the ranks logged 10 and 9 channels for the same call. Whether that run hung, corrupted data or was clamped is
+    listed as an open experiment, so do not read it as a demonstrated deadlock.</p>
+
+    <figure>
+      <svg viewBox="0 0 820 230" role="img" aria-label="Two ranks with the same shared input reach the same action; with a rank-local latency input they can reach different actions and wait forever">
+        <defs><marker id="ah214" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <g style="font-size:13px">
+          <text x="200" y="22" text-anchor="middle" style="fill:var(--fg);font-weight:600">Shared input only (accepted)</text>
+          <rect x="20" y="40" width="160" height="40" rx="6" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="100" y="65" text-anchor="middle" style="fill:var(--fg)">rank 0: n_bytes=16M</text>
+          <rect x="20" y="130" width="160" height="40" rx="6" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="100" y="155" text-anchor="middle" style="fill:var(--fg)">rank 1: n_bytes=16M</text>
+          <rect x="240" y="40" width="130" height="40" rx="6" style="fill:var(--bg2);stroke:var(--accent2);stroke-width:2"/>
+          <text x="305" y="65" text-anchor="middle" style="fill:var(--fg)">Ring/LL128</text>
+          <rect x="240" y="130" width="130" height="40" rx="6" style="fill:var(--bg2);stroke:var(--accent2);stroke-width:2"/>
+          <text x="305" y="155" text-anchor="middle" style="fill:var(--fg)">Ring/LL128</text>
+          <line x1="180" y1="60" x2="238" y2="60" style="stroke:var(--fg)" marker-end="url(#ah214)"/>
+          <line x1="180" y1="150" x2="238" y2="150" style="stroke:var(--fg)" marker-end="url(#ah214)"/>
+          <line x1="305" y1="82" x2="305" y2="128" style="stroke:var(--accent2);stroke-width:2"/>
+          <text x="315" y="110" style="fill:var(--accent2)">ring completes</text>
+          <line x1="410" y1="10" x2="410" y2="220" style="stroke:var(--border)"/>
+          <text x="615" y="22" text-anchor="middle" style="fill:var(--fg);font-weight:600">Rank-local input (rejected)</text>
+          <rect x="430" y="40" width="170" height="40" rx="6" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="515" y="65" text-anchor="middle" style="fill:var(--fg)">rank 0: my p99=0.9 ms</text>
+          <rect x="430" y="130" width="170" height="40" rx="6" style="fill:var(--bg3);stroke:var(--border)"/>
+          <text x="515" y="155" text-anchor="middle" style="fill:var(--fg)">rank 1: my p99=1.4 ms</text>
+          <rect x="660" y="40" width="140" height="40" rx="6" style="fill:var(--bg2);stroke:var(--accent);stroke-width:2"/>
+          <text x="730" y="65" text-anchor="middle" style="fill:var(--fg)">12 channels</text>
+          <rect x="660" y="130" width="140" height="40" rx="6" style="fill:var(--bg2);stroke:var(--accent);stroke-width:2"/>
+          <text x="730" y="155" text-anchor="middle" style="fill:var(--fg)">11 channels</text>
+          <line x1="600" y1="60" x2="658" y2="60" style="stroke:var(--fg)" marker-end="url(#ah214)"/>
+          <line x1="600" y1="150" x2="658" y2="150" style="stroke:var(--fg)" marker-end="url(#ah214)"/>
+          <line x1="730" y1="82" x2="730" y2="128" style="stroke:var(--accent);stroke-width:2;stroke-dasharray:4 4"/>
+          <text x="615" y="205" text-anchor="middle" style="fill:var(--accent)">peers partition the buffer differently: hang or corruption</text>
+        </g>
+      </svg>
+      <figcaption>Figure 21.3 — The same verified bytecode, run on two ranks, gives the same action only if its inputs are the
+      same on both. The example values on the right are illustrative.</figcaption>
+    </figure>
+
+    <h3>The load-time rank-agreement check</h3>
+    <p><code>rank_agreement_verifier.h</code> is a header-only analysis of about 260 lines that runs on the relocated
+    bytecode after PREVAIL accepts it. It is a forward abstract interpretation, the same technique the kernel verifier uses
+    (<a href="03-verifier.html">Chapter 03</a>), but the abstract value it tracks is "where did this come from", not "what
+    range is this in". Every register and each of the 512 stack bytes carries a label: <code>shared</code>,
+    <code>local</code>, <code>context</code>, <code>stack</code>, <code>agreed_map</code>, <code>local_map</code>,
+    <code>agreed_value</code> or <code>local_value</code>. At entry <code>r1</code> is <code>context</code> and
+    <code>r10</code> is <code>stack</code>. Loads from the context are shared only for specific byte ranges:</p>
+    <pre data-file="src/nccl-policy-plugin/rank_agreement_verifier.h"><code class="language-cpp">inline bool shared_context_access(int offset, int size) {
+  // Collective arguments and communicator-wide values, including the NCCL
+  // NVL-domain profile provided at communicator initialization. Timing, call
+  // count, registration and previous channels remain rank-local.
+  constexpr int ranges[][2] = {
+      {0, 8}, {40, 48}, {52, 60}, {64, 80}};
+  for (auto &amp;range : ranges)
+    if (offset &gt;= range[0] &amp;&amp; offset + size &lt;= range[1]) return true;
+  return false;
+}</code></pre>
+    <p>Compare these with the struct offsets. <code>n_bytes</code> is at 0–8, <code>coll_type</code> and
+    <code>num_pipe_ops</code> at 40–48, <code>n_ranks</code> and <code>n_nodes</code> at 52–60, and <code>reserved</code>
+    plus the three NVL fields at 64–80. The latency fields (8–32), <code>call_count</code> (32), <code>reg_buff</code> (48)
+    and <code>current_channels</code> (60) are local. Note that <code>regBuff</code> counts as local even though it is an NCCL
+    argument, because it reflects this rank's buffer registration. Arithmetic on two shared values stays shared; anything
+    touching a local value becomes local. <code>bpf_map_lookup_elem</code> on the host-published <code>agreed_map</code>
+    yields an <code>agreed_value</code>. Every other lookup and every other helper, timers included, yields a local value.
+    A helper that receives a stack pointer marks the whole stack local, since it may have written there. The verdict is
+    decided at <code>exit</code> and at branches:</p>
+    <pre data-file="src/nccl-policy-plugin/rank_agreement_verifier.h"><code class="language-cpp">      if (op == BPF_EXIT) {
+        if (s.reg[0].kind != Kind::shared)
+          return fail(pc, "rank-local action");
+        if (s.local_control &amp;&amp; !s.zero[0])
+          return fail(pc, "rank-local control flow");
+        exiting = true;
+      } else if (op == BPF_CALL) {
+        if (in.src_reg != 0) return fail(pc, "subprogram call is unanalysed");
+        /* ... map_lookup on agreed_map -&gt; agreed_value, else local_value;
+               map_update/delete on agreed_map -&gt; "policy writes agreed snapshot" ... */
+      } else if (op == BPF_JA) {
+        /* ... */
+      } else {
+        Value rhs = BPF_SRC(in.code) == BPF_X ? s.reg[in.src_reg] : scalar();
+        bool local_condition =
+            rank_local(s.reg[in.dst_reg]) || rank_local(rhs);
+        /* ... null checks (JEQ/JNE 0) on ctx or agreed pointers are allowed ... */
+        s.local_control |= local_condition;
+        conditional = true;
+      }</code></pre>
+    <p>Data flow and control flow are both covered. A policy cannot <em>return</em> a local value, and it cannot
+    <em>branch</em> on one and then return a non-zero action. Branching on local data and returning 0 on every path is fine:
+    "local data may be computed, but it cannot affect a nonzero action". Paths are merged at join points until a
+    fixpoint is reached, with a 200,000-step cap. Stores into the context or the agreed snapshot are rejected outright.
+    The analysis is deliberately conservative. For example, <code>current_channels</code> could in principle be treated as
+    shared by induction, since every earlier decision was checked, but today it is treated as local.</p>
+
+    <h3>What it accepts and rejects</h3>
+    <p>The repo's unit test builds tiny instruction sequences: a context load at offset 0 is accepted, offset 8 is
+    "rank-local action", a branch on offset 8 is "control flow", <code>ktime_get_ns</code> is rejected, and so on. I compiled
+    the test and it passes. I then fed the real compiled policies to <code>rank_agreement::check</code> with a small scratch
+    harness. The harness is my own approximation of the plugin's relocation step, not repo tooling:</p>
+    <table>
+      <tr><th>Policy</th><th>Reads</th><th>Result</th></tr>
+      <tr><td><code>noop</code>, <code>size_aware_v5</code>, <code>nvlink_ring_mid_v2</code>, <code>spark_tp4_simple_64k_1m</code></td><td>n_bytes, coll_type, n_ranks, n_nodes</td><td>accept</td></tr>
+      <tr><td><code>nvl72_size_aware</code></td><td>+ NVL-domain fields</td><td>accept</td></tr>
+      <tr><td><code>distributed_max_latency</code> (with <code>agreed_map</code> marked agreed)</td><td>agreed map</td><td>accept</td></tr>
+      <tr><td><code>adaptive_channels</code>, <code>adaptive_channels_v2</code></td><td>ordinary <code>telemetry_map</code></td><td>reject: rank-local control flow</td></tr>
+      <tr><td><code>slo_enforcer</code></td><td>telemetry</td><td>reject: rank-local action</td></tr>
+      <tr><td><code>cpu_aware</code></td><td>kernel-fed map</td><td>reject: rank-local control flow</td></tr>
+    </table>
+    <p>This matches the README, which now calls <code>adaptive_channels</code> and <code>slo_enforcer</code> "historical
+    local-telemetry examples; the cross-rank checker now rejects their tuner actions". It also explains a tension in the
+    paper. Its closed-loop composability experiment used exactly those adaptive policies, and they would no longer load.
+    The tabs below contrast the two telemetry styles.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Rejected: local telemetry"><pre data-file="src/ebpf-policies/adaptive_channels.bpf.c"><code class="language-c">SEC("uprobe")
+uint64_t adaptive_channels_policy(struct nccl_policy_ctx *ctx) {
+  struct nccl_policy_telemetry_key key = {};
+  struct nccl_policy_telemetry_value next = {};
+  struct nccl_policy_telemetry_value *prev;
+  uint32_t channels;
+
+  if (!ctx)
+    return 0;
+
+  key.coll_type = ctx-&gt;coll_type;
+  key.n_nodes = ctx-&gt;n_nodes;
+
+  prev = bpf_map_lookup_elem(&amp;telemetry_map, &amp;key);
+  /* ... */
+  next = *prev;
+  channels = clamp_channels(prev-&gt;recommended_channels);
+  if (prev-&gt;samples &gt; prev-&gt;applied_samples) {
+    if (prev-&gt;last_latency_ns &gt; prev-&gt;avg_latency_ns + 32) {
+      channels = clamp_channels(channels - 1);
+    } else if (ctx-&gt;n_bytes &gt;= (1ULL &lt;&lt; 20) &amp;&amp;
+               prev-&gt;last_latency_ns &lt;= prev-&gt;avg_latency_ns) {
+      channels = clamp_channels(channels + 1);
+    }
+    next.applied_samples = prev-&gt;samples;
+  }
+
+  next.recommended_channels = channels;
+  bpf_map_update_elem(&amp;telemetry_map, &amp;key, &amp;next, BPF_ANY);
+
+  return nccl_policy_pack_action(0, 0, (uint8_t)channels, 0,
+                                 NCCL_POLICY_ACTION_SET_CHANNELS);
+}</code></pre></div>
+      <div class="tab-panel" data-label="Accepted: agreed map"><pre data-file="src/ebpf-policies/distributed_max_latency.bpf.c"><code class="language-c">SEC("uprobe")
+uint64_t distributed_max_latency_policy(struct nccl_policy_ctx *ctx) {
+  uint32_t key = 0;
+  uint64_t *max_latency;
+  if (!ctx)
+    return 0;
+  max_latency = bpf_map_lookup_elem(&amp;agreed_map, &amp;key);
+  if (!max_latency)
+    return 0;
+  /* The same agreed value yields the same action on every rank. */
+  return nccl_policy_pack_action(0, 0, *max_latency &gt; 1000000 ? 4 : 8,
+                                 0, NCCL_POLICY_ACTION_SET_CHANNELS);
+}
+
+SEC("dist_merge")
+uint64_t distributed_max_latency_merge(struct nccl_dist_merge_ctx *ctx) {
+  uint64_t maximum = 0;
+  uint32_t zero = 0;
+  if (!ctx || ctx-&gt;n_ranks == 0 || ctx-&gt;n_ranks &gt; 8)
+    return 1;
+  /* MERGE_RANK(0) ... MERGE_RANK(7): look up rank_slots[i], keep the max */
+  /* ... */
+  bpf_map_update_elem(&amp;agreed_map, &amp;zero, &amp;maximum, BPF_ANY);
+  return 0;
+}</code></pre></div>
+    </div>
+
+    <h3>The experimental agreed map</h3>
+    <p>Rejecting all local telemetry is safe, but it throws away the closed loop. The September 2026 commits add a way to
+    keep the loop: make the telemetry the same on every rank before the tuner reads it. In
+    <code>distributed_max_latency</code>, each rank writes its own latency into <code>local_latency</code>. Every 1024 tuner
+    calls the plugin exchanges these slots asynchronously, over a Unix socket on one host or over TCP to an explicit rank-0
+    endpoint given in <code>NCCL_POLICY_DIST_COORDINATOR</code>. It fills <code>rank_slots</code> identically on every rank,
+    runs the verified <code>SEC("dist_merge")</code> program, and publishes <code>agreed_map</code> at the next 1024-call
+    boundary. A second checker, <code>rank_merge_verifier.h</code>, ensures that the merge reads only the exchanged slots and
+    writes only the agreed result. Agreement then follows from determinism: the same verified program on the same inputs
+    gives the same output on every rank.</p>
+    <p>Before the first action, a round-0 exchange compares a hash of the BPF object and the plugin runtime, and a mismatch
+    fails <code>getCollInfo</code>. Because tuner v5 has no rank id, the rank comes from the profiler v6 plugin, so the same
+    library must be loaded as both. The path is opt-in (<code>NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1</code>), supports 1–8 ranks
+    with one rank per process, may block up to the exchange deadline (30 s by default), and refuses hot reload. The README
+    lists its gaps in detail. NCCL does not call <code>getCollInfo</code> uniformly on every path: CUDA Graph replay skips it,
+    and the symmetric-kernel and allgatherv paths add calls. The TCP COMMIT step is not atomic, so a failure partway through
+    can leave some ranks committed and others failed. Only CPU tests exist so far, with no GPU or multi-host measurement.</p>
+
+    <h2>Telemetry: the profiler adapter</h2>
+    <p>The profiler v6 half of the library times collectives from start/stop events. In the default <code>native</code> mode,
+    C++ code updates <code>telemetry_map</code>. In <code>ebpf</code> mode (<code>NCCL_POLICY_PROFILER_MODE=ebpf</code> plus
+    <code>NCCL_POLICY_PROFILER_BPF_PATH</code>), a separately verified program does the update:</p>
+    <pre data-file="src/ebpf-policies/profiler_latency.bpf.c"><code class="language-c">SEC("profiler")
+uint64_t record_latency(struct nccl_profiler_ctx *ctx) {
+  struct nccl_policy_telemetry_key key = {};
+  struct nccl_policy_telemetry_value next = {};
+  struct nccl_policy_telemetry_value *prev;
+
+  if (!ctx || ctx-&gt;latency_ns == 0)
+    return 0;
+
+  key.coll_type = ctx-&gt;coll_type;
+  key.n_nodes = ctx-&gt;n_nodes;
+  prev = bpf_map_lookup_elem(&amp;telemetry_map, &amp;key);
+  if (prev)
+    next = *prev;
+
+  next.last_latency_ns = ctx-&gt;latency_ns;
+  next.avg_latency_ns =
+      prev ? (next.avg_latency_ns == 0
+                  ? ctx-&gt;latency_ns
+                  : (next.avg_latency_ns * 7 + ctx-&gt;latency_ns) / 8)
+           : ctx-&gt;latency_ns;
+  /* ... p99 estimate, last_n_bytes, observed_channels, samples++ ... */
+  bpf_map_update_elem(&amp;telemetry_map, &amp;key, &amp;next, BPF_ANY);
+  return 0;
+}</code></pre>
+    <p>Profiler programs skip the rank-agreement check (<code>section_name.rfind("profiler", 0) != 0</code>), because
+    recording local measurements is harmless. Only a <em>tuner</em> action that depends on them is dangerous. This is the
+    output-scoped idea from the design notes. Tuner outputs must agree across the communicator. A net plugin's per-connection
+    choice must agree between the two ends. Profiler writes need no agreement at all.</p>
+
+    <h2>The net plugin: tracing the transport</h2>
+    <p>The second library implements <code>ncclNet_v11</code> with <code>.name = "Socket"</code> and forwards every call to
+    NCCL's built-in Socket backend. After each successful <code>init/listen/connect/accept/isend/irecv/finalize</code>, it
+    runs an eBPF program with a small event context:</p>
+    <pre data-file="src/nccl-net-ebpf-plugin/plugin.cpp"><code class="language-cpp">ncclResult_t pluginIsendImpl(void *send_comm, void *data, size_t size, int tag,
+                             void *mhandle, void *phandle, void **request) {
+  auto *ctx = unwrap_ctx(send_comm);
+  ncclNet_t *base =
+      resolve_socket_backend(ctx ? ctx-&gt;log_function : nullptr);
+  ncclResult_t ret;
+  /* ... */
+  ret = base-&gt;isend(unwrap_comm(send_comm), data, size, tag, mhandle, phandle,
+                    request);
+  if (ret == ncclSuccess &amp;&amp; request &amp;&amp; *request)
+    exec_policy_hook(ctx, NCCL_NET_EBPF_HOOK_ISEND, unwrap_dev(send_comm), size,
+                     tag);
+  return ret;
+}</code></pre>
+    <p>The default program only counts:</p>
+    <pre data-file="src/nccl-net-ebpf-plugin/net_trace.bpf.c"><code class="language-c">SEC("uprobe")
+uint64_t net_trace_policy(struct nccl_net_ebpf_ctx *ctx) {
+  uint32_t key;
+  struct nccl_net_ebpf_stat *stat;
+
+  if (!ctx)
+    return 0;
+
+  key = ctx-&gt;hook;
+  if (key &gt;= NCCL_NET_EBPF_HOOK_COUNT)
+    return 0;
+
+  stat = bpf_map_lookup_elem(&amp;stats_map, &amp;key);
+  if (!stat)
+    return 0;
+
+  stat-&gt;calls += 1;
+  stat-&gt;bytes += ctx-&gt;size;
+  stat-&gt;last_comm_id = ctx-&gt;comm_id;
+  stat-&gt;last_tag = ctx-&gt;tag;
+  return 0;
+}</code></pre>
+    <p>The return value is ignored, so this hook cannot rate-limit or reject anything yet. There is also a practical catch.
+    <code>resolve_socket_backend</code> looks up <code>ncclNetSocket</code> with <code>dlsym</code>, trying
+    <code>RTLD_DEFAULT</code>, then <code>dlopen(..., RTLD_NOLOAD)</code> by soname, then the path found in
+    <code>/proc/self/maps</code>. The pinned NCCL builds with hidden symbols and does not export it. The recorded experiment
+    patched one line of NCCL to export the symbol and rebuilt. So, unlike the tuner/profiler plugin, the net wrapper is
+    <strong>not</strong> demonstrated on unmodified NCCL. Check your library with
+    <code>nm -D nccl/build/lib/libnccl.so | grep -w ncclNetSocket</code>.</p>
+
+    <h2>Building and using it</h2>
+    <div class="callout warn"><span class="label">Hardware</span><p>A full build needs CUDA, a source-built NCCL from the
+    submodule, a pre-built bpftime at <code>build-bpftime/</code>, and an NVIDIA GPU. I did not build NCCL, bpftime or the
+    plugins for this chapter. The commands below are copied from the README and the artifact guide. The only parts I ran
+    myself are the policy compilation and the two header-only checker tests.</p></div>
+    <pre><code class="language-bash"># 1. submodules (NCCL 2.29.7, bpftime, libbpf, bpftool)
+git submodule update --init --recursive
+make install                     # Ubuntu: apt deps incl. cmake, clang, llvm-dev (not CUDA)
+
+# 2. NCCL from the pinned submodule
+make -C nccl -j$(nproc) src.build BUILDDIR=$(pwd)/nccl/build
+
+# 3. bpftime: build per its repo; output expected at build-bpftime/
+#    (override with -DBPFTIME_BUILD_DIR=&lt;path&gt;)
+
+# 4. both plugins + all policy objects
+make build                       # = cmake for src/nccl-policy-plugin and src/nccl-net-ebpf-plugin
+#   -&gt; src/nccl-policy-plugin/build/libnccl-policy.so
+#   -&gt; src/nccl-policy-plugin/build/ebpf-policies/*.bpf.o
+make test                        # CTest: verifier matrix, hot reload, rank checks, distributed maps
+
+# nccl-tests is external (paper used v2.18.0)
+git clone --branch v2.18.0 --depth 1 https://github.com/NVIDIA/nccl-tests.git nccl-tests
+make -C nccl-tests -j$(nproc) NCCL_HOME="$PWD/nccl/build"</code></pre>
+    <p>Run any NCCL program with the tuner plugin and a policy:</p>
+    <pre><code class="language-bash">LD_LIBRARY_PATH=nccl/build/lib \
+NCCL_TUNER_PLUGIN=src/nccl-policy-plugin/build/libnccl-policy.so \
+NCCL_POLICY_BPF_PATH=src/nccl-policy-plugin/build/ebpf-policies/size_aware_v5.bpf.o \
+mpirun -np 2 nccl-tests/build/all_reduce_perf_mpi -b 1M -e 128M -g 1</code></pre>
+    <p>The paper's B300 measurements used one process driving eight GPUs, with five independent launches per arm:</p>
+    <pre data-file="docs/artifact/README.md"><code class="language-bash">export LD_LIBRARY_PATH="$PWD/nccl/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TEST_BIN="$PWD/nccl-tests/build/all_reduce_perf"
+export NCCL_TUNER_PLUGIN="$PWD/src/nccl-policy-plugin/build/libnccl-policy.so"
+export NCCL_POLICY_BPF_PATH="$PWD/src/nccl-policy-plugin/build/ebpf-policies/nvlink_ring_mid_v2.bpf.o"
+mkdir -p scripts/results/paper-b300
+
+for rep in 1 2 3 4 5; do
+  env -u NCCL_TUNER_PLUGIN -u NCCL_POLICY_BPF_PATH \
+    "$TEST_BIN" -b 1M -e 8G -f 2 -g 8 -n 50 -w 10 \
+    &gt; "scripts/results/paper-b300/baseline-r${rep}.log" 2&gt;&amp;1
+  "$TEST_BIN" -b 1M -e 8G -f 2 -g 8 -n 50 -w 10 \
+    &gt; "scripts/results/paper-b300/policy-r${rep}.log" 2&gt;&amp;1
+done</code></pre>
+    <p>Useful environment variables: <code>NCCL_POLICY_VERIFY_MODE</code> (<code>strict</code>|<code>warning</code>|<code>none</code>),
+    <code>NCCL_POLICY_PROFILER_MODE</code>, <code>NCCL_PROFILER_PLUGIN</code> (set to the same library for the agreed-map example),
+    <code>NCCL_POLICY_BENCHMARK_READY=1</code> (per-rank READY marker plus size-bucket histograms of tuner calls).
+    For the net plugin: <code>NCCL_NET_PLUGIN</code>, <code>NCCL_NET_EBPF_BPF_PATH</code>,
+    <code>NCCL_NET_EBPF_VERIFY_MODE</code>, usually together with <code>NCCL_NET=Socket NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1</code>
+    to force traffic through the socket path. <code>scripts/nccl_bench.sh selftest</code> prints the command for a benchmark arm
+    without running it, and <code>scripts/test_nccl_bench.sh</code> runs on a machine without CUDA.</p>
+    <p>Compiling a policy needs only clang. The CMake rule is <code>clang -target bpf -O2 -g -I src/ebpf-policies</code>:</p>
+    <pre><code class="language-bash">clang -target bpf -O2 -g -I src/ebpf-policies \
+  -c src/ebpf-policies/nvlink_ring_mid_v2.bpf.c -o nvlink_ring_mid_v2.bpf.o
+llvm-objdump -d --no-show-raw-insn nvlink_ring_mid_v2.bpf.o</code></pre>
+
+    <h3>Hot reload</h3>
+    <p>The active policy is a <code>std::shared_ptr</code> read with <code>std::atomic_load_explicit</code>. Reload goes through the
+    debug export <code>ncclPolicyPluginDebugReloadPolicy</code>. It runs the full load pipeline (verify, rank check, JIT) on the
+    new object and only then calls <code>std::atomic_exchange_explicit</code>. In-flight calls keep their reference to the old
+    program, and a failed load leaves the old policy in place. The paper describes this as a compare-and-swap on a function
+    pointer, which is the same idea. Note the limit the design notes point out. The paper's claim that briefly running
+    different policies is fine "because calls are independent" holds within one process, but not across ranks. Ordinary
+    reload is per process and not coordinated, and distributed-policy reload is refused.</p>
+
+    <h2>Evaluation (numbers from the repo)</h2>
+    <p>All numbers below come from the frozen paper (<code>docs/paper/paper.tex</code>) and the experiment notes it cites
+    (<code>docs/eval-plan-b300.md</code>, <code>docs/tmp/*.md</code>). The testbed was 8× NVIDIA B300 SXM6 with NVLink 5, CUDA 13.0,
+    NCCL 2.29.7, and an AMD EPYC 9575F host for CPU microbenchmarks. The artifact guide says plainly that some raw logs are not
+    tracked: "The table is an evidence index, not a claim that all measurements can be independently recomputed from raw data."</p>
+
+    <h3>Overhead</h3>
+    <table>
+      <tr><th>Policy (1M calls, CPU)</th><th>P50 ns</th><th>P99 ns</th><th>ΔP50 vs native</th></tr>
+      <tr><td>native C++ baseline</td><td>20</td><td>30</td><td>—</td></tr>
+      <tr><td><code>noop</code></td><td>100</td><td>111</td><td>+80</td></tr>
+      <tr><td><code>size_aware</code></td><td>100</td><td>111</td><td>+80</td></tr>
+      <tr><td><code>lookup_only</code></td><td>130</td><td>140</td><td>+110</td></tr>
+      <tr><td><code>lookup_update</code></td><td>140</td><td>151</td><td>+120</td></tr>
+      <tr><td><code>adaptive_channels</code></td><td>140</td><td>151</td><td>+120</td></tr>
+      <tr><td><code>slo_enforcer</code></td><td>150</td><td>160</td><td>+130</td></tr>
+    </table>
+    <p>The paper's rough model is 80 + 30·(lookups) + 10·(updates) ns. Its worst case, 130 ns, is about 0.03% of a 128 MiB
+    8-GPU AllReduce (about 394 µs). On the GPU, the noop plugin adds about 1.3 µs of fixed cost for 8 B–256 KiB messages
+    (about 4% of a 32 µs baseline). The paper attributes this to the plugin framework (shared-memory setup, cost-table writes),
+    not to eBPF dispatch, which it measures at 33 ns. At 4 MiB and above the difference is below noise (&lt;0.1%).</p>
+
+    <h3>Safety and hot reload</h3>
+    <p>The verifier matrix has 14 programs. The 7 safe ones are accepted. The 7 unsafe ones (null dereference after map lookup,
+    out-of-bounds context read, unregistered helper, stack overflow, unbounded loop, context write, possible division by zero)
+    are all rejected at load time. In <code>test_native_crash</code>, a native tuner with the same null-dereference bug dies with
+    SIGSEGV. Reload swaps in 1.07 µs (about 9.4 ms including verification and JIT), with zero lost calls across 400,000
+    invocations.</p>
+
+    <h3>The size-aware policy on B300</h3>
+    <p>NCCL's default on this node was NVLS at every size. An algorithm sweep (busbw, GB/s) showed Ring ahead in the middle
+    range:</p>
+    <table>
+      <tr><th>Size</th><th>Default (NVLS)</th><th>Ring</th><th>Δ</th></tr>
+      <tr><td>4 MiB</td><td>133.5</td><td>148.1</td><td>+10.9%</td></tr>
+      <tr><td>8 MiB</td><td>196.3</td><td>249.7</td><td>+27.2%</td></tr>
+      <tr><td>16 MiB</td><td>278.8</td><td>337.4</td><td>+21.0%</td></tr>
+      <tr><td>32 MiB</td><td>349.3</td><td>402.4</td><td>+15.2%</td></tr>
+      <tr><td>64 MiB</td><td>425.2</td><td>471.8</td><td>+11.0%</td></tr>
+      <tr><td>128 MiB</td><td>596.9</td><td>628.9</td><td>+5.4%</td></tr>
+      <tr><td>256 MiB</td><td>656.5</td><td>632.5</td><td>−3.7%</td></tr>
+      <tr><td>8 GiB</td><td>836.3</td><td>697.6</td><td>−16.6%</td></tr>
+    </table>
+    <p>A global <code>NCCL_ALGO=Ring</code> would lose at 256 MiB and above. <code>nvlink_ring_mid_v2</code> switches only inside
+    the ranges where Ring wins, and the paper reports 5.5–26.5% over default in the targeted range (for example 194.9 → 246.5 GB/s
+    at 8 MiB). That figure is "steady-state" and uses repetitions 4 and 5. The notes record that Ring/LL128 was unstable for the
+    first two or three communicator creations. Two control results are worth keeping in mind. <code>bad_channels</code>, a
+    verified policy that forces one channel, loses 87–95% of throughput. The verifier proves safety, not good decisions.
+    Over 20 runs of 128 MiB AllGather, default and policy are indistinguishable (565.6 ± 0.9 vs 565.5 ± 0.6 GB/s).</p>
+
+    <h3>Composability and the net plugin</h3>
+    <p>With the profiler feeding <code>telemetry_map</code>, <code>adaptive_channels</code> ramped from 2 to 12 channels over
+    100,000 calls, dropped to 2 under injected 10× latency, and recovered to 12. As shown above, the current checker rejects this
+    policy, so treat the experiment as a demonstration of the map mechanism, not of a deployable policy. The net-plugin experiment
+    ran on an RTX 5090 with two ranks sharing one GPU over Socket at 128 MB. The mean was 2.134 GB/s baseline vs 2.094 GB/s wrapped
+    (about 1.87% slower), and the medians were 2.13 vs 2.15, which the notes read as roughly noise-level.</p>
+
+    <h2>Recent development</h2>
+    <p>The clone's HEAD is <code>9a6006e2</code> (2026-09-29). Reading the last ~60 commits:</p>
+    <ul>
+      <li><strong>2026-09-29: cross-rank agreement and the agreed map</strong>. <code>4e74e1a</code> "Verify tuner actions
+      use rank-agreed inputs" added <code>rank_agreement_verifier.h</code>. <code>caf36b8</code> added the merge verifier.
+      <code>c7bb3ce</code> added the same-host Unix-socket exchange and <code>distributed_max_latency</code> (+1,329 lines).
+      <code>b9513d8</code>, <code>9a247a3</code>, <code>3bf2bcc</code> and <code>7374a74</code> added the explicit-address TCP exchange,
+      and several docs commits followed (<code>b88d107</code>, <code>8007ca4</code>, <code>0052f9a</code>, <code>7c4afcf</code>).</li>
+      <li><strong>2026-09-29: Spark TP4 candidates</strong>. <code>18f18f7</code> and <code>9a6006e</code> add four
+      <code>spark_tp4_*</code> A/B policies for a four-node, four-rank AllReduce. <code>e087392</code> adds per-communicator
+      call summaries. The README says a medium window "matched 443 of the first 1000 AllReduce calls in a four-Spark DeepSeek
+      pilot" and that "no Spark inference speedup has been established".</li>
+      <li><strong>2026-09-24: paper artifact</strong>. <code>50dc7b6</code> freezes the paper files with SHA-256 sums and adds
+      <code>make artifact-check</code>/<code>artifact-arxiv</code> and CI. Later commits map every experiment to a reproduction
+      path and state the NCCL compatibility limits.</li>
+      <li><strong>2026-09-06: PR #1, GB300 NVL-domain policy</strong> (<code>d1ed426</code>). This added the v2 context with
+      NVL-domain fields, <code>nvl72_size_aware</code> and <code>scripts/nccl_bench.sh</code>. A separate
+      <a href="https://github.com/datacrunch-research/nccl-eBPF/pull/1">GB300 NVL72 evaluation PR</a> in a fork holds later
+      rack-scale work that is not part of the paper.</li>
+      <li><strong>August–early September 2026</strong>: camera-ready edits and ACM metadata, many with one-word messages.
+      <strong>March 2026</strong>: the B300 evaluation, net plugin, kernel-observer/<code>cpu_aware</code> experiment, and the
+      original paper drafts.</li>
+    </ul>
+
+    <h2 id="limitations">Benefits and limitations</h2>
+    <h3>What you get</h3>
+    <ul>
+      <li><strong>Crash-proof policy code.</strong> Memory-safety and termination bugs are rejected before execution. The
+      native-vs-eBPF null-dereference comparison is the clearest demonstration.</li>
+      <li><strong>No NCCL changes</strong> for the tuner and profiler paths: they use the stock v5/v6 ABIs.</li>
+      <li><strong>Per-call, per-size decisions</strong> that environment variables cannot express, at a cost of tens to a
+      hundred-odd nanoseconds.</li>
+      <li><strong>Verified hot swap</strong> within a process, plus typed maps shared between profiler and tuner.</li>
+      <li><strong>A distributed-consistency check</strong> that is, as far as the paper claims, new for eBPF. The repo's prior-art
+      section compares it to Titanium's <code>single</code> qualifier and PARCOACH-style taint analysis in MPI.</li>
+    </ul>
+    <h3>What it does not do (yet)</h3>
+    <ul>
+      <li>Verification covers safety, not quality: <code>bad_channels</code> passes and loses 87–95% of throughput.</li>
+      <li>The trusted computing base includes the host plugin, bpftime's JIT and the PREVAIL-based verifier. Policies are
+      assumed to come from platform operators, not hostile tenants.</li>
+      <li>The rank check is conservative and has known gaps: host-side availability can still differ per rank (for example a
+      per-process <code>NCCL_ALGO</code>), channel requests are not bounded by <code>comm-&gt;nChannels</code>, and only tuner
+      programs are checked.</li>
+      <li>The agreed map is experimental, limited to 8 ranks, has non-atomic COMMIT, and does not handle CUDA-graph replay or
+      the symmetric-kernel call-count paths.</li>
+      <li>The net plugin only observes, and it needs an NCCL build that exports <code>ncclNetSocket</code>.</li>
+      <li>All GPU results come from one node with 8 GPUs on NVLink. Multi-node InfiniBand runs are future work, as the paper says.</li>
+      <li>Policies can only choose among NCCL's built-in algorithms. They cannot change ring order or tree shape, which NCCL
+      fixes at init.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>Other NCCL tuners.</strong> AutoCCL (NSDI '25) searches NCCL's low-level parameters online, built on a
+      modified NCCL. Per the repo's notes, rank 0 decides and broadcasts versioned schedules, so its agreement is "a leader
+      decides". NCCLbpf's agreed map instead runs the same verified merge on every rank. NVIDIA ships an example CSV-driven
+      tuner in <code>plugins/tuner/</code>.</li>
+      <li><strong>Collective synthesis.</strong> TACCL (NSDI '23) and MSCCL synthesise schedules offline. NCCLbpf only picks
+      among built-in algorithms, and the paper describes the two as complementary.</li>
+      <li><strong>Understanding NCCL.</strong> Hu et al., "Demystifying NCCL" (HOTI 2025 / arXiv 2507.04786), is the best
+      reference for protocols, channels and algorithms.</li>
+      <li><strong>eBPF beyond the CPU.</strong> <a href="20-gpu-ext.html">Chapter 20</a> (gpu_ext) puts eBPF policies in the GPU
+      driver for memory and scheduling. NCCLbpf works one layer up, in the communication library.
+      <a href="22-xpu-perf.html">Chapter 22</a> covers CPU+GPU profiling.</li>
+      <li><strong>The runtime.</strong> <a href="14-bpftime-architecture.html">Chapter 14</a> (bpftime design, verifier options,
+      shared maps) and <a href="16-llvmbpf.html">Chapter 16</a> (the LLVM JIT used here). <a href="15-bpftime-in-practice.html">Chapter 15</a>
+      shows bpftime's own attach modes, which NCCLbpf does not use.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> How does an NCCLbpf policy make NCCL use Ring/LL128 for a given call?</p>
+        <button class="opt">It writes <code>ctx-&gt;algorithm</code> and <code>ctx-&gt;protocol</code> in the context struct</button>
+        <button class="opt" data-right>It returns a packed u64 with algo=Ring, proto=LL128 and both SET flags; the host writes 0.0 into that cost-table cell and NCCL picks the minimum</button>
+        <button class="opt">It calls a helper that patches NCCL's kernel launch</button>
+        <button class="opt">It sets <code>NCCL_ALGO</code> in the environment</button>
+        <div class="why"><code>apply_policy_action</code> zeroes <code>table[algo][proto]</code> if the cell is not −1, and
+        <code>topoGetAlgoInfo</code> selects the lowest non-negative cost. Context writes are rejected by the rank-agreement check.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Why is it dangerous for a tuner policy to choose channels from this rank's measured p99 latency?</p>
+        <button class="opt">Reading the latency field is out of bounds</button>
+        <button class="opt">The verifier cannot prove the loop terminates</button>
+        <button class="opt" data-right>Latency differs per rank, so ranks can pick different channel counts and partition the same buffer differently, leading to a hang or wrong data</button>
+        <button class="opt">Channels can only be set by environment variables</button>
+        <div class="why">Algorithm, protocol and channel count are collective-wide. Each rank's plugin decides on its own, so
+        decisions must depend only on inputs that are the same on every rank.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Which context field is treated as <em>shared</em> by <code>rank_agreement_verifier.h</code>?</p>
+        <button class="opt"><code>call_count</code></button>
+        <button class="opt"><code>reg_buff</code></button>
+        <button class="opt" data-right><code>n_nodes</code></button>
+        <button class="opt"><code>current_channels</code></button>
+        <div class="why">The shared byte ranges are 0–8, 40–48, 52–60 and 64–80. <code>n_nodes</code> is at offset 56.
+        <code>reg_buff</code> reflects local buffer registration, and <code>current_channels</code> and <code>call_count</code>
+        are per-process state.</div></div>
+      <div class="q"><p><strong>Q4.</strong> A policy branches on <code>last_latency_ns</code> but returns 0 on both paths. What does the checker say?</p>
+        <button class="opt" data-right>Accept: local control flow is allowed when every reachable action is provably zero</button>
+        <button class="opt">Reject: rank-local action</button>
+        <button class="opt">Reject: subprogram call is unanalysed</button>
+        <div class="why">At <code>exit</code> it fails only if <code>local_control &amp;&amp; !zero[r0]</code>. The repo test
+        <code>benign_local_branch</code> checks exactly this case.</div></div>
+      <div class="q"><p><strong>Q5.</strong> What can the current net plugin's eBPF program do?</p>
+        <button class="opt">Reject or rate-limit <code>isend</code> calls through its return value</button>
+        <button class="opt" data-right>Observe transport events (count calls, bytes, last tag) in a map; the return value is ignored</button>
+        <button class="opt">Choose between InfiniBand and Socket per connection</button>
+        <div class="why"><code>exec_policy_hook</code> discards the return value, and the README says it "does not enforce
+        transport decisions". The wrapper also needs <code>ncclNetSocket</code> to be exported, which the pinned default NCCL build
+        does not do.</div></div>
+      <div class="q"><p><strong>Q6.</strong> How does the experimental agreed map keep ranks consistent while still using measured latency?</p>
+        <button class="opt">Rank 0 decides and broadcasts the action</button>
+        <button class="opt" data-right>Ranks exchange their latency slots, and every rank runs the same verified <code>dist_merge</code> program on identical slots, publishing the result at an agreed 1024-call boundary</button>
+        <button class="opt">Each rank averages its own last eight samples</button>
+        <div class="why">Agreement follows from determinism: the same program on the same data gives the same value. Round 0
+        also compares object and runtime hashes. The README calls the path experimental, for example because TCP COMMIT is not atomic.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/nccl-eBPF">eunomia-bpf/nccl-eBPF</a> at commit <a href="https://github.com/eunomia-bpf/nccl-eBPF/tree/9a6006e2fd21835ff614e854b8ba858edf595312"><code>9a6006e2</code></a> (2026-09-29): <code>README.md</code>, <code>src/nccl-policy-plugin/</code>, <code>src/nccl-net-ebpf-plugin/</code>, <code>src/ebpf-policies/</code>, <a href="https://github.com/eunomia-bpf/nccl-eBPF/blob/9a6006e2fd21835ff614e854b8ba858edf595312/docs/artifact/README.md"><code>docs/artifact/README.md</code></a>, <code>docs/cross-rank-agreement.md</code>, <code>docs/eval-plan-b300.md</code>, <code>docs/tmp/net-plugin-experiment.md</code>, <code>docs/tmp/phase3-safety-results.md</code>.</li>
+      <li>Y. Zheng, <a href="https://doi.org/10.1145/3837779.3838156">"NCCLbpf: Verified, Composable Policy Execution for GPU Collective Communication"</a>, 4th Workshop on eBPF and Kernel Extensions (eBPF '26), Prague, 2026; preprint <a href="https://arxiv.org/abs/2603.11438">arXiv:2603.11438</a> [cs.DC]. Workshop <a href="https://ebpf.github.io/2026/schedule.html">schedule</a>.</li>
+      <li>NVIDIA NCCL source at the pinned commit <a href="https://github.com/NVIDIA/nccl/tree/361915904b456d397e6e1578f8f65ea1a45bdd28"><code>36191590</code></a> (2.29.7): <a href="https://github.com/NVIDIA/nccl/blob/361915904b456d397e6e1578f8f65ea1a45bdd28/src/include/plugin/tuner/tuner_v5.h"><code>src/include/plugin/tuner/tuner_v5.h</code></a>, <a href="https://github.com/NVIDIA/nccl/blob/361915904b456d397e6e1578f8f65ea1a45bdd28/src/enqueue.cc"><code>src/enqueue.cc</code></a>, <a href="https://github.com/NVIDIA/nccl/blob/361915904b456d397e6e1578f8f65ea1a45bdd28/src/include/device.h"><code>src/include/device.h</code></a>, <a href="https://github.com/NVIDIA/nccl/tree/361915904b456d397e6e1578f8f65ea1a45bdd28/plugins/tuner"><code>plugins/tuner/</code></a>, <a href="https://github.com/NVIDIA/nccl/tree/361915904b456d397e6e1578f8f65ea1a45bdd28/plugins/net"><code>plugins/net/</code></a>.</li>
+      <li>NVIDIA, <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">NCCL Environment Variables</a> (NCCL_ALGO, NCCL_PROTO, NCCL_TUNER_PLUGIN, NCCL_NET_PLUGIN, NCCL_PROFILER_PLUGIN, NCCL_MAX_NCHANNELS) and <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html">Collective Operations</a>, NCCL User Guide.</li>
+      <li>S. Jeaugey, <a href="https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4">"Massively Scale Your Deep Learning Training with NCCL 2.4"</a>, NVIDIA Technical Blog, Feb 2019 (double binary trees).</li>
+      <li>Z. Hu, S. Shen, T. Bonato, S. Jeaugey, C. Alexander, E. Spada, J. Dinan, J. Hammond, T. Hoefler, <a href="https://arxiv.org/abs/2507.04786">"Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms"</a>, IEEE Symposium on High-Performance Interconnects (HOTI) 2025; arXiv:2507.04786.</li>
+      <li>NVIDIA, <a href="https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md">nccl-tests PERFORMANCE.md</a> (algbw and busbw definitions).</li>
+      <li>G. Xu, Z. Le, Y. Chen, Z. Lin, Z. Jin, Y. Miao, C. Li, <a href="https://www.usenix.org/conference/nsdi25/presentation/xu-guanbin">"AutoCCL: Automated Collective Communication Tuning for Accelerating Distributed and Parallel DNN Training"</a>, NSDI '25, 2025, pp. 667–683.</li>
+      <li>A. Shah et al., <a href="https://www.usenix.org/conference/nsdi23/presentation/shah">"TACCL: Guiding Collective Algorithm Synthesis using Communication Sketches"</a>, NSDI '23, 2023.</li>
+      <li>Y. Zheng et al., <a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">"Extending Applications Safely and Efficiently"</a> (bpftime), OSDI '25, 2025.</li>
+      <li><a href="https://arxiv.org/abs/2512.12615">"gpu_ext: Extensible OS Policies for GPUs via eBPF"</a>, arXiv:2512.12615 (see Chapter 20).</li>
+      <li>E. Gershuni et al., <a href="https://doi.org/10.1145/3314221.3314590">"Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions"</a> (PREVAIL), PLDI 2019.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="20-gpu-ext.html"><small>Previous</small>20 · gpu_ext</a>
+      <a class="next" href="22-xpu-perf.html"><small>Next</small>22 · xpu-perf</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

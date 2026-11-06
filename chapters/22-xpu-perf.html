@@ -1,0 +1,1405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · xpu-perf: CPU+GPU profiling with eBPF · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="22">
+<meta name="chapter-part" content="Part V · eBPF for GPUs and accelerators">
+<meta name="chapter-summary" content="Profiling fundamentals (sampling, stack unwinding, symbolization, flame graphs), then how xpu-perf combines perf_event eBPF sampling from a fork of the OpenTelemetry eBPF profiler with a CUPTI injection library and a correlation-ID uprobe to draw CPU stacks and GPU kernel time in one flame graph, plus how it compares with Parca, Pyroscope, iaprof and Nsight.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/xpu-perf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part V · eBPF for GPUs and accelerators › 22 · xpu-perf</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 22</div>
+      <h1>xpu-perf: one flame graph for CPU and GPU</h1>
+      <p class="lede">Your PyTorch job is slow, and <code>nvidia-smi</code> says the GPU is busy
+      only part of the time. Is the CPU starving the GPU, or is one kernel eating the clock? A CPU
+      profiler can't see GPU kernels. A GPU tracer shows kernels but not the Python or C++ code that
+      launched them. This chapter covers the profiling basics you need first: sampling, stack
+      unwinding, symbolization and flame graphs. Then it shows how xpu-perf joins the two views. It
+      samples CPU stacks with a <code>perf_event</code> eBPF program, captures the stack at every
+      CUDA launch with a uprobe, and reads GPU kernel timings from CUPTI. A CUPTI correlation ID
+      links the two, and the result is a single flame graph.</p>
+      <div class="meta"><span>Prerequisites: <a href="05-program-types-and-hooks.html">05</a> (perf_event, uprobes), <a href="04-maps-helpers-kfuncs.html">04</a> (maps, tail calls), <a href="15-bpftime-in-practice.html">15</a> (GPU attach, optional)</span><span>Repo: <a href="https://github.com/eunomia-bpf/xpu-perf">eunomia-bpf/xpu-perf</a> @ <code>b4fcc885</code></span><span>~60 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>A GPU program is really two programs running at the same time. A host thread on the CPU
+    runs ordinary code: a Python interpreter, the PyTorch dispatcher, a tokenizer, data loading.
+    Now and then that code calls <code>cudaLaunchKernel</code>, which puts a kernel in a GPU
+    queue and <em>returns at once</em>. The kernel runs later, on different hardware, possibly
+    for much longer than the call that launched it. The CPU and the GPU each have their own clock,
+    their own idle time and their own bottlenecks.</p>
+    <p>The usual tools look at only one side:</p>
+    <ul>
+      <li>A <strong>CPU profiler</strong> (Linux <code>perf</code>, Parca, the OpenTelemetry eBPF
+      profiler) samples where the CPU's time goes. For a GPU workload it shows a little time in
+      <code>cudaLaunchKernel</code>, and maybe a lot of time spinning in
+      <code>cudaDeviceSynchronize</code>. It can't show which kernel the CPU is waiting for.</li>
+      <li>A <strong>GPU tracer</strong> (CUPTI-based tools, NVIDIA Nsight Systems) records every
+      kernel's start and end time. It shows the kernel by its mangled name, such as
+      <code>_Z13softmaxKernelPKfPfmm</code>, but not the 30 frames of application code that led to
+      the launch.</li>
+    </ul>
+    <p>Engineers end up laying a CPU flame graph next to a GPU timeline and lining up timestamps by
+    eye. xpu-perf, an eunomia-bpf project whose GitHub description is "Continuous profiler for
+    GPU &amp; CPU with eBPF", automates that. Its output is one ordinary
+    folded-stack file. Each GPU kernel appears as a leaf frame
+    <code>[GPU_Kernel]name</code> on top of the exact CPU call stack that launched it, and its width
+    is the kernel's GPU time converted into the same units as CPU samples.</p>
+
+    <div class="callout warn"><span class="label">Project status</span><p>The README says, in its
+    own words, "<strong>WIP， not finished yet!!!</strong>". This chapter studies commit
+    <code>b4fcc885</code> (2026-09-17). Most of the profiler code was written in November 2025.
+    I built and ran the CPU mode in an orb with no GPU; the GPU and merge modes
+    are described from the source code and the sample output committed to the repo. They were not
+    run here. Where the docs and the code disagree, this chapter follows the code and says so.</p></div>
+
+    <div class="callout key"><span class="label">Key idea</span><p>xpu-perf adds very little eBPF
+    of its own. It reuses the OpenTelemetry eBPF profiler for perf_event sampling and stack
+    unwinding, and CUPTI for GPU timing. The new piece is a <em>join key</em>. A tiny
+    <code>noinline</code> function, <code>XpuPerfGetCorrelationId(id)</code>, is called inside a
+    CUPTI callback. A uprobe on that function stores the ID in a per-CPU map and tail-calls the
+    profiler's unwinder, so every captured CPU stack carries the same correlation ID that CUPTI
+    later writes on the kernel's activity record.</p></div>
+
+    <h2>Profiling fundamentals</h2>
+    <p>You need these terms to follow the rest of the chapter. If you already know
+    <code>perf record -g</code> and flame graphs, skim this section.</p>
+
+    <h3>Sampling versus tracing</h3>
+    <p>A <strong>tracing</strong> tool records every event of interest, such as every function
+    entry, every syscall or every kernel launch, usually with timestamps. You get exact counts and
+    exact durations, but the cost grows with the event rate. Trace a function called ten million
+    times a second and you slow the program down and fill your buffers.</p>
+    <p>A <strong>sampling</strong> profiler interrupts the program at a fixed rate, for example 50
+    times per second per CPU, and records what was running at that moment: the instruction pointer
+    and, ideally, the whole call stack. Each sample stands for about 1/50 s of CPU time. Over
+    thousands of samples, the share of samples that land in a function estimates the share of CPU
+    time spent there. The cost depends on the sample rate, not on how busy the program is, which is
+    why sampling profilers can stay on in production. Google-Wide Profiling (Ren et al., IEEE Micro
+    2010) is the classic description of fleet-wide continuous sampling.</p>
+    <p>xpu-perf uses both. It samples CPU stacks on a timer and traces every kernel launch: a
+    uprobe fires on every launch, and CUPTI records every kernel's start and end. The GPU side has
+    to be traced because a kernel is a discrete event with a duration. You can't sample "the
+    current kernel" from the CPU.</p>
+    <p>On Linux, the timer interrupt for sampling comes from <code>perf_event_open(2)</code> with a
+    software clock such as <code>PERF_COUNT_SW_CPU_CLOCK</code>. Since kernel 4.9 an eBPF program of
+    type <code>BPF_PROG_TYPE_PERF_EVENT</code> can be attached to that event and runs at each sample,
+    in the context of the interrupted thread (<a href="05-program-types-and-hooks.html">Chapter 05</a>
+    shows the minimal libbpf version). That program has the interrupted registers, so it knows the
+    instruction pointer, stack pointer and frame pointer of whatever was running.</p>
+
+    <h3>Stack unwinding: frame pointers versus unwind tables</h3>
+    <p>A single instruction pointer only tells you the leaf function. To build a flame graph you
+    need the chain of callers: the <em>call stack</em>. Reconstructing it from a register snapshot
+    and raw stack memory is called <strong>unwinding</strong>, and there are two main ways to do
+    it.</p>
+    <p><strong>Frame pointers.</strong> When code is compiled with frame pointers
+    (<code>-fno-omit-frame-pointer</code>), every function prologue pushes the caller's
+    <code>%rbp</code> and sets <code>%rbp</code> to the current stack position. The saved values
+    form a linked list through the stack. Each frame holds a pointer to the previous frame and,
+    next to it, the return address. An unwinder just follows the list, which is cheap enough to do
+    inside an interrupt or an eBPF program. The catch is that, on x86-64, GCC and Clang drop frame
+    pointers by default when optimizing, which frees <code>%rbp</code> as a general-purpose
+    register. Many distribution libraries were built that way for about twenty years. Brendan
+    Gregg's post "The Return of the Frame Pointers" (2024) describes the broken profiles this
+    causes and the recent decisions by Fedora and Ubuntu to build packages with frame pointers
+    again.</p>
+    <p><strong>Unwind tables (DWARF CFI / <code>.eh_frame</code>).</strong> Almost every ELF binary
+    carries <code>.eh_frame</code>, the call-frame information that C++ exception handling uses.
+    For each range of instruction addresses it says how to compute the <em>canonical frame
+    address</em> (CFA), for example "CFA = RSP + 16", and where the return address is saved. With
+    that table you can unwind code that has no frame pointers. The table is large, though, and
+    interpreting DWARF bytecode inside the kernel isn't practical. <code>perf record --call-graph
+    dwarf</code> sidesteps this by copying a chunk of raw user stack into every sample and
+    unwinding later in user space, which costs a lot of bandwidth.</p>
+    <p>The OpenTelemetry eBPF profiler, which xpu-perf builds on, takes a third approach. User space
+    reads <code>.eh_frame</code> once per binary and converts it into compact <strong>stack
+    deltas</strong>, which the project's <code>doc/internals.md</code> describes as "a mapping
+    from each PC in an executable to instructions describing how to find the caller". These are
+    loaded into eBPF maps. The eBPF unwinder then looks up the delta for each PC and walks the
+    stack in the kernel, with or without frame pointers. Go binaries get their deltas from
+    <code>.gopclntab</code> instead, and separate unwinders handle interpreted frames for Python,
+    the JVM, Ruby, PHP, Node.js and Perl.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 330" role="img" aria-label="Two ways to unwind: on the left a frame pointer chain through stack memory; on the right an unwind table that maps PC ranges to CFA rules.">
+        <style>
+          .u1{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .u2{fill:none;stroke:var(--accent);stroke-width:2}
+          .ut{fill:var(--fg);font:600 13.5px sans-serif}
+          .us{fill:var(--fg);font:12px monospace}
+          .um{fill:var(--muted);font:11.5px sans-serif}
+          .ua{stroke:var(--accent);stroke-width:1.8;fill:none;marker-end:url(#ah22a)}
+          .ub{stroke:var(--accent2);stroke-width:1.8;fill:none;marker-end:url(#ah22b)}
+        </style>
+        <defs>
+          <marker id="ah22a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="ah22b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <text class="ut" x="20" y="24">A · Frame-pointer walk</text>
+        <text class="um" x="20" y="42">follow saved %rbp values; read the return address next to each</text>
+        <!-- stack column -->
+        <rect class="u1" x="60" y="60" width="220" height="250" rx="6"/>
+        <text class="um" x="290" y="74">high addresses</text>
+        <text class="um" x="290" y="304">low addresses (stack grows down)</text>
+        <rect class="u2" x="70" y="70" width="200" height="66" rx="4"/>
+        <text class="us" x="80" y="90">main frame</text>
+        <text class="us" x="80" y="108">saved rbp = 0 (end)</text>
+        <text class="us" x="80" y="126">ret → libc start code</text>
+        <rect class="u2" x="70" y="146" width="200" height="66" rx="4"/>
+        <text class="us" x="80" y="166">work frame</text>
+        <text class="us" x="80" y="184">saved rbp ●</text>
+        <text class="us" x="80" y="202">ret → main+0x9</text>
+        <rect class="u2" x="70" y="222" width="200" height="66" rx="4"/>
+        <text class="us" x="80" y="242">leaf_a frame</text>
+        <text class="us" x="80" y="260">saved rbp ●</text>
+        <text class="us" x="80" y="278">ret → work+0xe</text>
+        <path class="ua" d="M262,256 C305,240 305,200 268,184"/>
+        <path class="ua" d="M262,180 C305,160 305,120 268,106"/>
+        <text class="us" x="4" y="262">%rbp</text>
+        <line class="ua" x1="40" y1="258" x2="66" y2="258"/>
+        <!-- right side -->
+        <text class="ut" x="520" y="24">B · Unwind table (.eh_frame → stack deltas)</text>
+        <text class="um" x="520" y="42">no frame pointer needed; look up a rule for each PC</text>
+        <rect class="u1" x="520" y="60" width="420" height="150" rx="6"/>
+        <text class="us" x="536" y="84">PC range</text><text class="us" x="720" y="84">CFA rule</text><text class="us" x="830" y="84">RA at</text>
+        <line x1="530" y1="92" x2="930" y2="92" stroke="var(--border)"/>
+        <text class="us" x="536" y="112">leaf_a+0x0..+0x4</text><text class="us" x="720" y="112">RSP+8</text><text class="us" x="830" y="112">CFA-8</text>
+        <text class="us" x="536" y="132">leaf_a+0x4..+0x30</text><text class="us" x="720" y="132">RSP+16</text><text class="us" x="830" y="132">CFA-8</text>
+        <text class="us" x="536" y="152">work+0x0..+0x1</text><text class="us" x="720" y="152">RSP+8</text><text class="us" x="830" y="152">CFA-8</text>
+        <text class="us" x="536" y="172">work+0x1..+0x20</text><text class="us" x="720" y="172">RSP+16</text><text class="us" x="830" y="172">CFA-8</text>
+        <text class="um" x="536" y="198">illustrative rows, not taken from a real binary</text>
+        <rect class="u1" x="520" y="230" width="420" height="80" rx="6"/>
+        <text class="us" x="536" y="254">loop: rule = lookup(PC)</text>
+        <text class="us" x="590" y="272">CFA = reg + delta; PC = *(CFA-8)</text>
+        <text class="us" x="590" y="290">SP = CFA; push frame; repeat</text>
+        <path class="ub" d="M730,210 L730,228"/>
+      </svg>
+      <figcaption>Figure 22.1 — Frame-pointer unwinding follows a linked list kept in stack memory.
+      Table-driven unwinding computes each caller from per-PC rules. The OpenTelemetry eBPF
+      profiler turns <code>.eh_frame</code> into "stack deltas" held in eBPF maps, so it can unwind
+      binaries built without frame pointers.</figcaption>
+    </figure>
+
+    <h3>Symbolization</h3>
+    <p>The unwinder produces addresses, not names. <strong>Symbolization</strong> turns
+    <code>(binary, address)</code> into <code>function+offset</code>. For a
+    position-independent executable or a shared library, the runtime address first has to be
+    converted to an offset inside the file. Then it is looked up in the ELF symbol tables
+    (<code>.symtab</code> if the binary isn't stripped, otherwise <code>.dynsym</code>), or in
+    DWARF debug info if you want file and line. C++ and Rust names are then
+    <em>demangled</em>, so <code>_ZN17InferencePipeline10runRequestEv</code> becomes
+    <code>InferencePipeline::runRequest</code>. Continuous profilers usually symbolize away from
+    the hot path, often on a central server that has the debug info, because symbol tables are
+    big. xpu-perf does it in-process when the run finishes.</p>
+
+    <h3>Folded stacks and flame graphs</h3>
+    <p>Brendan Gregg's FlameGraph tools use a very simple text format. Each line is a call stack
+    from root to leaf, joined by semicolons, followed by a count:</p>
+    <pre><code class="language-plaintext">main;serve;tokenize 25
+main;serve;forward;cudaLaunchKernel 8
+main;load_model;read_weights 30</code></pre>
+    <p><code>flamegraph.pl</code> turns this into an interactive SVG. Every frame is a box. The
+    box's width is the number of samples whose stack passes through that frame, and the boxes stack
+    upward from the root. The x-axis is <em>not</em> time: siblings are sorted alphabetically so
+    that identical stacks merge. A wide box near the top is a hot leaf; a wide plateau lower down
+    is code whose callees eat the time. Gregg's article "The Flame Graph" (<em>Communications of
+    the ACM</em>, 2016) is the standard reference. His 2024 "AI Flame Graphs" post applies the same
+    picture to GPU hardware samples, which is the idea xpu-perf builds on.</p>
+    <p>Because the format is just text, a tool can add frames that never existed on the CPU.
+    xpu-perf does exactly that: it appends a synthetic <code>[GPU_Kernel]...</code> leaf and gives
+    it a count derived from the kernel's GPU time. The standard <code>flamegraph.pl</code> needs no
+    changes to draw it.</p>
+
+    <h2>Background: how you get data out of an NVIDIA GPU</h2>
+    <p>eBPF runs on the CPU, in the kernel (or, with bpftime, in user space). It can see every
+    host-side CUDA call through uprobes on <code>libcudart</code> or <code>libcuda</code>. It can't
+    see when a kernel actually starts and finishes on the GPU. That information comes from the
+    vendor's profiling interfaces. eunomia-bpf has two tutorial repositories on them that are
+    good background reading for this chapter:</p>
+    <div class="grid">
+      <a class="card" href="https://github.com/eunomia-bpf/cupti-tutorial"><h4>cupti-tutorial</h4><p>"Tutorials for NVIDIA CUPTI
+      samples". NVIDIA's CUPTI samples, each rewritten as a tutorial: the Activity API
+      (<code>activity_trace</code>, <code>activity_trace_async</code>), the Callback API
+      (<code>callback_event</code>, <code>callback_timestamp</code>), events and metrics,
+      <code>pc_sampling</code>, <code>sass_source_map</code>, <code>unified_memory</code>,
+      <code>nvlink_bandwidth</code>. Its suggested path starts with <code>cupti_query</code> and
+      then <code>activity_trace</code>.</p></a>
+      <a class="card" href="https://github.com/eunomia-bpf/nvbit-tutorial"><h4>nvbit-tutorial</h4><p>A blog-style guide to NVBit
+      (based on NVBit 1.7.5), NVIDIA's research framework for dynamic binary instrumentation of GPU
+      SASS code. A tool is a shared library loaded with <code>LD_PRELOAD</code>. It can inject
+      calls before or after individual GPU instructions as each kernel is first loaded, for
+      example to count instructions or to trace memory accesses.</p></a>
+    </div>
+    <p><strong>CUPTI</strong> (CUDA Profiling Tools Interface) has two halves that matter
+    here. The <em>Callback API</em> calls your function at the entry and exit of every CUDA runtime
+    or driver API call, on the calling thread. The <em>Activity API</em> collects time-stamped
+    records of GPU work, including kernels (<code>CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL</code>),
+    memcpys and memsets, into buffers that CUPTI hands back to you asynchronously. Every API call
+    gets a <strong>correlation ID</strong>. The callback for <code>cudaLaunchKernel</code> sees
+    that ID, the runtime API activity record carries it, and the kernel activity record for the
+    launched kernel carries it too. That ID is what lets you join "who launched it" to "how long
+    it ran".</p>
+    <p>A tool doesn't need the application's cooperation to use CUPTI. If the environment variable
+    <code>CUDA_INJECTION64_PATH</code> names a shared library, the CUDA driver loads it during
+    initialization and calls its <code>InitializeInjection()</code> function, which can subscribe
+    to callbacks and enable activity kinds. xpu-perf uses this mechanism.</p>
+    <p>NVBit goes further and instruments the GPU code itself, but with much higher overhead. bpftime's
+    CUDA attach (<a href="15-bpftime-in-practice.html#gpu-and-cuda-probes">Chapter 15</a>)
+    compiles eBPF programs to PTX and runs them inside kernels. <a href="20-gpu-ext.html">Chapter
+    20</a> covers eBPF policies for the GPU driver's memory manager. xpu-perf is the lightest
+    approach of the three: it never touches GPU code and only uses CUPTI's records.</p>
+
+    <h2>xpu-perf at a glance</h2>
+    <p>The profiler is a single Go binary, <code>profiler/xpu-perf</code>, with three
+    subcommands. This is the real usage text from <code>main.go</code>:</p>
+    <pre data-file="profiler/main.go"><code class="language-go">fmt.Fprintf(os.Stderr, "Usage: %s &lt;command&gt; [options] &lt;target_binary&gt; [args...]\n\n", os.Args[0])
+fmt.Fprintf(os.Stderr, "GPU+CPU Performance Profiler\n\n")
+fmt.Fprintf(os.Stderr, "Commands:\n")
+fmt.Fprintf(os.Stderr, "  cpu     CPU-only sampling (no GPU profiling)\n")
+fmt.Fprintf(os.Stderr, "  gpu     GPU-only causality via uprobes (shows which CPU code launched GPU kernels)\n")
+fmt.Fprintf(os.Stderr, "  merge   Merge CPU sampling + GPU time (default, full profiling)\n")
+/* ... */
+fmt.Fprintf(os.Stderr, "  -o &lt;file&gt;          Output file for folded stack traces (default: merged_trace.folded)\n")
+fmt.Fprintf(os.Stderr, "  -cupti-lib &lt;path&gt;  Path to CUPTI trace injection library (uses embedded if not specified)\n")
+fmt.Fprintf(os.Stderr, "  -cuda-lib &lt;path&gt;   Path to CUDA runtime library (auto-detected if not specified)\n")
+fmt.Fprintf(os.Stderr, "  -debug-dir &lt;dir&gt;   Directory to save debug output files\n")
+/* ... */
+fmt.Fprintf(os.Stderr, "  -use-correlation-id  Use XpuPerfGetCorrelationId uprobe for exact correlation (default: true)\n")</code></pre>
+    <table>
+      <tr><th>Mode</th><th>CPU sampling (perf_event)</th><th>Launch-stack uprobe</th><th>CUPTI injected</th><th>What each folded line means</th></tr>
+      <tr><td><code>cpu</code></td><td>yes, 50 Hz, target PID only</td><td>no</td><td>no</td><td>count = CPU samples of that stack</td></tr>
+      <tr><td><code>gpu</code></td><td>no</td><td>yes</td><td>yes</td><td>stack + <code>[GPU_Kernel]name</code>, count = GPU time × 50/s</td></tr>
+      <tr><td><code>merge</code></td><td>yes</td><td>yes</td><td>yes</td><td>both kinds of line in one file</td></tr>
+    </table>
+    <p>In every mode xpu-perf <strong>launches the target itself</strong> and stops when the
+    target exits. It has no option to attach to a running PID. The "continuous" in the GitHub
+    tagline describes the goal, not the current command line.</p>
+
+    <h2>Architecture</h2>
+    <p>Four parties take part in a merge-mode run: the target process (with CUPTI and the injection
+    library loaded into it), the GPU, the Linux kernel running eBPF programs, and the xpu-perf
+    process.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 580" role="img" aria-label="xpu-perf data flow: the target process with libcudart, CUPTI and the injection library; the GPU; kernel eBPF programs for perf_event sampling and the correlation uprobe; the FIFO carrying JSON activity records; and the xpu-perf process with parser, reporter, correlator and folded writer.">
+        <style>
+          .a1{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .a2{fill:none;stroke:var(--accent);stroke-width:1.8}
+          .a3{fill:none;stroke:var(--accent2);stroke-width:1.8}
+          .at{fill:var(--fg);font:600 13.5px sans-serif}
+          .as{fill:var(--fg);font:11.5px monospace}
+          .am{fill:var(--muted);font:11.5px sans-serif}
+          .aa{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah22c)}
+          .ab{stroke:var(--accent2);stroke-width:1.8;fill:none;marker-end:url(#ah22d)}
+        </style>
+        <defs>
+          <marker id="ah22c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="ah22d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <!-- target process -->
+        <rect class="a1" x="14" y="14" width="500" height="190" rx="10"/>
+        <text class="at" x="28" y="36">Target process (started by xpu-perf)</text>
+        <rect class="a2" x="28" y="48" width="150" height="56" rx="6"/>
+        <text class="as" x="38" y="70">app / Python /</text>
+        <text class="as" x="38" y="88">PyTorch code</text>
+        <rect class="a2" x="200" y="48" width="140" height="56" rx="6"/>
+        <text class="as" x="210" y="70">libcudart</text>
+        <text class="as" x="210" y="88">cudaLaunchKernel</text>
+        <rect class="a2" x="360" y="48" width="140" height="56" rx="6"/>
+        <text class="as" x="370" y="70">libcupti</text>
+        <text class="as" x="370" y="88">callbacks</text>
+        <line class="aa" x1="178" y1="76" x2="198" y2="76"/>
+        <line class="aa" x1="340" y1="76" x2="358" y2="76"/>
+        <rect class="a3" x="216" y="120" width="284" height="72" rx="6"/>
+        <text class="as" x="226" y="140">libcupti_trace_injection.so</text>
+        <text class="as" x="226" y="158">XpuPerfCallbackHandler →</text>
+        <text class="as" x="226" y="176">XpuPerfGetCorrelationId(id)</text>
+        <line class="aa" x1="430" y1="104" x2="430" y2="118"/>
+        <text class="am" x="48" y="130">env set by xpu-perf:</text>
+        <text class="as" x="48" y="148">CUDA_INJECTION64_PATH</text>
+        <text class="as" x="48" y="166">CUPTI_TRACE_OUTPUT_FILE</text>
+        <text class="as" x="48" y="184">CUPTI_ENABLE_*=1</text>
+        <!-- GPU -->
+        <rect class="a1" x="560" y="14" width="386" height="190" rx="10"/>
+        <text class="at" x="574" y="36">NVIDIA GPU</text>
+        <rect class="a3" x="574" y="50" width="356" height="50" rx="6"/>
+        <text class="as" x="584" y="72">kernels run asynchronously on streams</text>
+        <text class="am" x="584" y="90">start/end timestamps recorded by CUPTI</text>
+        <rect class="a3" x="574" y="116" width="356" height="76" rx="6"/>
+        <text class="as" x="584" y="138">CUPTI Activity buffers (32 MB)</text>
+        <text class="as" x="584" y="156">{"type":"CONCURRENT_KERNEL",</text>
+        <text class="as" x="584" y="174"> "correlationId":17,"start":..}</text>
+        <line class="ab" x1="514" y1="76" x2="572" y2="76"/>
+        <text class="am" x="520" y="68">launch</text>
+        <!-- kernel -->
+        <rect class="a1" x="14" y="240" width="500" height="160" rx="10"/>
+        <text class="at" x="28" y="262">Linux kernel: eBPF programs</text>
+        <text class="am" x="362" y="262">OTel profiler fork</text>
+        <rect class="a2" x="28" y="274" width="220" height="56" rx="6"/>
+        <text class="as" x="38" y="294">perf_event CPU clock 50 Hz</text>
+        <text class="as" x="38" y="312">→ native_tracer_entry</text>
+        <rect class="a3" x="262" y="274" width="238" height="56" rx="6"/>
+        <text class="as" x="272" y="294">uprobe → capture_correlation_id</text>
+        <text class="as" x="272" y="312">map[0]=id; tail call →</text>
+        <rect class="a2" x="28" y="340" width="472" height="48" rx="6"/>
+        <text class="as" x="38" y="360">collect_trace(origin=SAMPLING | CUSTOM, context_value)</text>
+        <text class="as" x="38" y="378">unwinders (stack deltas, Python, JVM...) → trace events</text>
+        <line class="aa" x1="140" y1="330" x2="140" y2="338"/>
+        <line class="aa" x1="380" y1="330" x2="380" y2="338"/>
+        <line class="ab" x1="350" y1="192" x2="350" y2="272"/>
+        <text class="am" x="356" y="232">uprobe fires</text>
+        <line class="aa" x1="38" y1="104" x2="38" y2="272"/>
+        <text class="am" x="46" y="232">timer samples threads</text>
+        <!-- FIFO -->
+        <rect class="a1" x="560" y="240" width="386" height="160" rx="10"/>
+        <text class="at" x="574" y="262">Named pipe</text>
+        <text class="as" x="574" y="284">/tmp/cupti_trace_&lt;pid&gt;.pipe</text>
+        <text class="am" x="574" y="306">one JSON object per line, written by</text>
+        <text class="am" x="574" y="324">BufferCompleted() + fflush</text>
+        <text class="am" x="574" y="350">kinds kept by the parser:</text>
+        <text class="as" x="574" y="368">CONCURRENT_KERNEL, RUNTIME(*LaunchKernel*)</text>
+        <line class="ab" x1="752" y1="192" x2="752" y2="238"/>
+        <!-- xpu-perf -->
+        <rect class="a1" x="14" y="436" width="932" height="132" rx="10"/>
+        <text class="at" x="28" y="458">xpu-perf process (Go, root)</text>
+        <rect class="a2" x="28" y="470" width="190" height="64" rx="6"/>
+        <text class="as" x="38" y="490">SimpleReporter</text>
+        <text class="am" x="38" y="508">filter by origin / PID,</text>
+        <text class="am" x="38" y="524">ExtractStackFromTrace</text>
+        <rect class="a2" x="236" y="470" width="190" height="64" rx="6"/>
+        <text class="as" x="246" y="490">TraceCorrelator</text>
+        <text class="am" x="246" y="508">join on correlation ID,</text>
+        <text class="am" x="246" y="524">ns × 50 / 1e9 → samples</text>
+        <rect class="a3" x="574" y="470" width="190" height="64" rx="6"/>
+        <text class="as" x="584" y="490">CUPTIParser</text>
+        <text class="am" x="584" y="508">kernels[], runtimes[]</text>
+        <rect class="a2" x="444" y="470" width="112" height="64" rx="6"/>
+        <text class="as" x="452" y="490">.folded</text>
+        <text class="am" x="452" y="508">→ flamegraph.pl</text>
+        <text class="am" x="452" y="524">→ SVG</text>
+        <rect class="a2" x="782" y="470" width="150" height="64" rx="6"/>
+        <text class="as" x="792" y="490">Symbolizer</text>
+        <text class="am" x="792" y="508">ELF .symtab/.dynsym</text>
+        <text class="am" x="792" y="524">+ C++ demangle</text>
+        <line class="aa" x1="120" y1="400" x2="120" y2="468"/>
+        <line class="ab" x1="752" y1="400" x2="680" y2="468"/>
+        <line class="aa" x1="218" y1="502" x2="234" y2="502"/>
+        <path class="aa" d="M660,534 C660,560 330,560 330,537"/>
+        <line class="aa" x1="426" y1="520" x2="442" y2="520"/>
+      </svg>
+      <figcaption>Figure 22.2 — Data flow in merge mode. Paths drawn in the second accent color carry the
+      GPU-related information: the injection library, the correlation uprobe, CUPTI records and
+      the FIFO. The CPU path is the stock OpenTelemetry eBPF profiler. Drawn from
+      <code>profiler/main.go</code>, <code>cupti_trace/cupti_trace.cpp</code> and the eBPF sources.</figcaption>
+    </figure>
+
+    <p>The stepper below follows one merge-mode run from start to finish, in the order
+    <code>main()</code> does things.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Parse the subcommand, check root, extract the CUPTI library</h4>
+      <p><code>parseFlags()</code> reads <code>cpu|gpu|merge</code>. Flags are parsed before the root check,
+      so <code>--help</code> works without sudo. Unless <code>-cupti-lib</code> is given,
+      <code>ExtractEmbeddedCUPTILibrary()</code> writes the <code>//go:embed</code>-ed
+      <code>libcupti_trace_injection.so</code> to <code>$TMPDIR/xpu-perf/libcupti_trace_injection_&lt;pid&gt;.so</code>.</p></div>
+      <div class="step"><h4>2. Create the FIFO and start the CUPTI parser</h4>
+      <p>A named pipe <code>/tmp/cupti_trace_&lt;pid&gt;.pipe</code> is created with
+      <code>mkfifo</code>. A goroutine opens it and parses one JSON event per line, keeping kernel
+      records and <code>*LaunchKernel*</code> runtime records.</p></div>
+      <div class="step"><h4>3. Load the eBPF profiler</h4>
+      <p><code>tracer.NewTracer()</code> loads the OpenTelemetry eBPF profiler's programs and maps
+      with <code>SamplesPerSecond: 50</code> and <code>LoadProbe: true</code>. The fork also loads
+      <code>custom__generic</code> and its <code>custom_context_map</code>.</p></div>
+      <div class="step"><h4>4. Attach perf_event sampling (cpu, merge)</h4>
+      <p><code>trc.AttachTracer()</code> opens one software CPU-clock perf event per online CPU at
+      50 Hz and attaches <code>native_tracer_entry</code>. Then <code>EnableProfiling()</code>
+      switches the events on. The gpu mode skips this step.</p></div>
+      <div class="step"><h4>5. Attach the correlation uprobe (gpu, merge)</h4>
+      <p>By default xpu-perf loads <code>correlation_uprobe.ebpf.c</code>, hands it the profiler's
+      <code>custom_context_map</code>, puts the FD of <code>custom__generic</code> into slot 0 of
+      its own <code>prog_array</code>, and attaches a uprobe to
+      <code>XpuPerfGetCorrelationId</code> in the extracted library. With
+      <code>-use-correlation-id=false</code> it attaches the profiler's generic uprobe to
+      <code>cudaLaunchKernel*</code> in <code>libcudart</code> instead.</p></div>
+      <div class="step"><h4>6. Start the target with CUPTI injection</h4>
+      <p>After a 500 ms pause to let the map monitors start, the target is started with
+      <code>CUDA_INJECTION64_PATH</code>, <code>CUPTI_TRACE_OUTPUT_FILE</code> (the FIFO),
+      <code>CUPTI_ENABLE_MEMORY=1</code> and <code>CUPTI_ENABLE_CORRELATION_UPROBE=1</code>. Its
+      PID becomes the filter for sampling traces.</p></div>
+      <div class="step"><h4>7. Run: samples and launch stacks flow in</h4>
+      <p>Every 20 ms per CPU, a sample from the target becomes a <code>TRACE_SAMPLING</code> trace.
+      Every CUDA runtime callback calls <code>XpuPerfGetCorrelationId</code>; the uprobe turns it
+      into a <code>TRACE_CUSTOM</code> trace whose <code>ContextValue</code> is the correlation ID.
+      <code>SimpleReporter</code> collects both into the correlator. Statistics are logged every 5 s.</p></div>
+      <div class="step"><h4>8. Target exits: flush, correlate, write</h4>
+      <p>xpu-perf waits 200 ms for eBPF and 500 ms for CUPTI to flush, closes the tracer, then
+      calls <code>CorrelateTraces()</code>. Sampling stacks count 1 each. Launch stacks get
+      <code>[GPU_Kernel]name</code> appended and weight <code>(end−start)·50/1e9</code>. Counts
+      are rounded and written as a folded file.</p></div>
+    </div>
+
+    <h2>Where things live in the repo</h2>
+    <p>The repository mixes the current Go profiler with a lot of material from earlier phases of
+    the project (it began in June 2025 as "SystemScope", with a Rust profiler and a web
+    front-end design). The working code is in <code>profiler/</code> and <code>cupti_trace/</code>.</p>
+    <div class="grid">
+      <div class="card"><h4><code>profiler/</code></h4><p>The Go profiler. <code>main.go</code> (orchestration, CLI),
+      <code>correlation.go</code>, <code>cupti_parser.go</code>, <code>simple_reporter.go</code>,
+      <code>symbolizer.go</code>, <code>cupti_uprobe_attach.go</code> and
+      <code>cuda_kernel_uprobe_attach.go</code> (two <code>UprobeAttacher</code> implementations),
+      <code>cuda_utils.go</code> (ldd/nm discovery), <code>debug.go</code>, <code>embedded_resources.go</code>,
+      <code>flamegraph.pl</code>.</p></div>
+      <div class="card"><h4><code>profiler/ebpf/</code></h4><p><code>correlation_uprobe.ebpf.c</code>, the only eBPF
+      C file xpu-perf owns (61 lines). It is compiled by <code>bpf2go</code> through <code>go generate</code>;
+      a prebuilt <code>correlationuprobe_x86_bpfel.o</code> is also committed.</p></div>
+      <div class="card"><h4><code>profiler/opentelemetry-ebpf-profiler/</code></h4><p>Git submodule:
+      <a href="https://github.com/eunomia-bpf/opentelemetry-ebpf-profiler">eunomia-bpf's fork</a>,
+      pinned at <code>e19d3e80</code>, used through a <code>replace</code> directive in <code>go.mod</code>.
+      It adds <code>support/ebpf/custom_trace.ebpf.c</code>, the <code>TRACE_CUSTOM</code> origin and
+      FD getters on <code>Tracer</code>.</p></div>
+      <div class="card"><h4><code>cupti_trace/</code></h4><p><code>cupti_trace.cpp</code> (385 lines) and
+      <code>cupti_trace_print.h</code>: the CUPTI injection library that prints activity records as JSON lines
+      and exports <code>XpuPerfGetCorrelationId</code>. Built with <code>nvcc</code>; the Makefile defaults to
+      <code>CUDA_INSTALL_PATH ?= /usr/local/cuda-12.9</code>.</p></div>
+      <div class="card"><h4><code>test/</code></h4><p>Workloads: <code>mock-app/</code> (<code>vectorAdd.cu</code>,
+      <code>llm-inference.cu</code>, <code>cuda_graph_simple.cu</code>), <code>pytorch/</code> scripts,
+      <code>qwen3.cu/</code> (a CUDA Qwen3 inference program), <code>cpu-minimal/test_malloc.c</code>.</p></div>
+      <div class="card"><h4><code>tools/</code></h4><p>Newest activity (Nov 2025): bpftrace scripts that kprobe the NVIDIA
+      kernel modules (<code>nvidia</code>, <code>nvidia_uvm</code>, …), a test runner, and UVM decision-tracing
+      scripts (residency, prefetch hints, thrashing). Related to <a href="20-gpu-ext.html">Chapter 20</a>.</p></div>
+      <div class="card"><h4><code>documents/</code></h4><p>Design notes and prototypes: the SystemScope vision essay
+      <code>intro.md</code>, a survey of profiling tools, the custom tail-call proof of concept
+      (<code>custom-example/</code>), the older Python merger (<code>gpuperf.py</code>,
+      <code>merge_gpu_cpu_trace.py</code>), the earlier Rust profiler, front-end design docs and demos, and
+      CUPTI PC-sampling examples.</p></div>
+      <div class="card"><h4>Root files</h4><p><code>README.md</code>, <code>Makefile</code> (wraps
+      <code>profiler/</code>), a sample <code>gpu_trace.folded</code> and <code>flamegraph.svg</code> from a real
+      run, <code>.github/workflows/</code> (build-and-release, docker), a stale <code>dockerfile</code>.</p></div>
+    </div>
+
+    <h2>Code walkthrough 1: CPU sampling with perf_event eBPF</h2>
+    <p>xpu-perf doesn't write its own sampler. It calls into the OpenTelemetry eBPF profiler, which
+    Elastic donated to OpenTelemetry in 2024. The user-space side opens a software CPU-clock event per
+    CPU at the configured frequency and attaches the entry program. The kernel side is the
+    entry program itself:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="User side: AttachTracer (Go)">
+        <pre data-file="profiler/opentelemetry-ebpf-profiler/tracer/tracer.go"><code class="language-go">func (t *Tracer) AttachTracer() error {
+	tracerProg, ok := t.ebpfProgs["native_tracer_entry"]
+	if !ok {
+		return errors.New("entry program is not available")
+	}
+
+	perfAttribute := new(perf.Attr)
+	perfAttribute.SetSampleFreq(uint64(t.samplesPerSecond))
+	if err := perf.CPUClock.Configure(perfAttribute); err != nil {
+		return fmt.Errorf("failed to configure software perf event: %v", err)
+	}
+	/* ... */
+	for _, id := range onlineCPUIDs {
+		perfEvent, err := perf.Open(perfAttribute, perf.AllThreads, id, nil)
+		if err != nil {
+			return fmt.Errorf("failed to attach to perf event on CPU %d: %v", id, err)
+		}
+		if err := perfEvent.SetBPF(uint32(tracerProg.FD())); err != nil {
+			return fmt.Errorf("failed to attach eBPF program to perf event: %v", err)
+		}
+		*events = append(*events, perfEvent)
+	}
+	return nil
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Kernel side: native_tracer_entry (C)">
+        <pre data-file="profiler/opentelemetry-ebpf-profiler/support/ebpf/native_stack_trace.ebpf.c"><code class="language-c">SEC("perf_event/native_tracer_entry")
+int native_tracer_entry(struct bpf_perf_event_data *ctx)
+{
+  // Get the PID and TGID register.
+  u64 id  = bpf_get_current_pid_tgid();
+  u32 pid = id &gt;&gt; 32;
+  u32 tid = id &amp; 0xFFFFFFFF;
+
+  if (pid == 0 &amp;&amp; filter_idle_frames) {
+    return 0;
+  }
+
+  u64 ts = bpf_ktime_get_ns();
+  return collect_trace((struct pt_regs *)&amp;ctx-&gt;regs, TRACE_SAMPLING, pid, tid, ts, 0);
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Unwinder loop (C)">
+        <pre data-file="profiler/opentelemetry-ebpf-profiler/support/ebpf/native_stack_trace.ebpf.c"><code class="language-c">// unwind_native is the tail call destination for PROG_UNWIND_NATIVE.
+static EBPF_INLINE int unwind_native(struct pt_regs *ctx)
+{
+  /* ... */
+  UNROLL for (int i = 0; i &lt; NATIVE_FRAMES_PER_PROGRAM; i++)
+  {
+    unwinder = PROG_UNWIND_STOP;
+    /* ... */
+    error = push_native(
+      trace,
+      record-&gt;state.text_section_id,
+      record-&gt;state.text_section_offset,
+      record-&gt;state.return_address);
+    /* ... */
+    // Unwind the native frame using stack deltas. Stop if no next frame.
+    bool stop;
+    error = unwind_one_frame(&amp;record-&gt;state, &amp;stop);
+    if (error || stop) {
+      break;
+    }
+    /* ... */
+    error = get_next_unwinder_after_native_frame(record, &amp;unwinder);
+    if (error || unwinder != PROG_UNWIND_NATIVE) {
+      break;
+    }
+  }
+
+  // Tail call needed for recursion, switching to interpreter unwinder, or reporting
+  // trace due to end-of-trace or error. The unwinder program index is set accordingly.
+  record-&gt;state.unwind_error = error;
+  tail_call(ctx, unwinder);
+  /* ... */
+}</code></pre>
+      </div>
+    </div>
+    <p>Notice the shape of <code>unwind_native</code>. The verifier limits loop sizes and program
+    lengths (<a href="03-verifier.html">Chapter 03</a>), so the unwinder handles a fixed number of
+    frames per program and then <em>tail-calls</em> itself or another unwinder, for example the
+    Python one when it reaches an interpreter frame. <code>collect_trace</code> starts this chain,
+    and the finished trace is sent to user space. The frames it pushes are
+    <code>(file ID, offset)</code> pairs, not names. Symbolization happens later in Go.</p>
+    <p>Everything a sample needs (stack deltas, interpreter offsets, process mappings) is pushed
+    into maps by the profiler's user-space process manager as processes start and libraries load.
+    That is why xpu-perf calls <code>trc.StartPIDEventProcessor(ctx)</code> and
+    <code>trc.StartMapMonitors(...)</code> and then waits 500 ms before starting the target.</p>
+
+    <h2>Code walkthrough 2: the CUPTI injection library</h2>
+    <p>The injection library is the GPU half of the profiler. <code>InitializeInjection()</code>
+    calls <code>SetupCupti()</code>, which opens the output named by
+    <code>CUPTI_TRACE_OUTPUT_FILE</code>, subscribes a callback handler, and enables activity
+    kinds:</p>
+    <pre data-file="cupti_trace/cupti_trace.cpp"><code class="language-cpp">    // Subscribe to CUPTI callbacks
+    CUPTI_CALL(cuptiSubscribe(&amp;g_state.subscriberHandle,
+                              (CUpti_CallbackFunc)XpuPerfCallbackHandler, NULL));
+    /* ... */
+    // Optional: Enable eBPF correlation ID tracking via CUPTI_ENABLE_CORRELATION_UPROBE=1
+    const char *enableCorrelation = getenv("CUPTI_ENABLE_CORRELATION_UPROBE");
+    if (enableCorrelation &amp;&amp; atoi(enableCorrelation) == 1) {
+        // Enable all runtime API callbacks for correlation ID capture
+        CUPTI_CALL(cuptiEnableDomain(1, g_state.subscriberHandle,
+                                     CUPTI_CB_DOMAIN_RUNTIME_API));
+        printf("Correlation ID uprobe tracking: ENABLED\n");
+    }
+    /* ... */
+    // Register buffer callbacks
+    CUPTI_CALL(cuptiActivityRegisterCallbacks(BufferRequested, BufferCompleted));
+
+    // Enable activities
+    EnableActivities();</code></pre>
+    <p><code>EnableActivities()</code> always turns on <code>CUPTI_ACTIVITY_KIND_RUNTIME</code> and
+    <code>CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL</code>. It adds driver and overhead records with
+    <code>CUPTI_ENABLE_DRIVER=1</code>, and memcpy/memset/memory records with
+    <code>CUPTI_ENABLE_MEMORY=1</code>, which xpu-perf always sets. CUPTI asks for 32 MB buffers.
+    When one fills, <code>BufferCompleted</code> prints each record as a JSON line and calls
+    <code>fflush</code>, so records stream through the FIFO while the program runs.</p>
+    <p>The interesting part is the eBPF attachment point:</p>
+    <pre data-file="cupti_trace/cupti_trace.cpp"><code class="language-cpp">// Non-inline function for eBPF attachment
+// This function is specifically designed to be attached to by eBPF probes
+// The __attribute__((noinline)) and volatile counter ensure it's not optimized away
+extern "C" __attribute__((noinline, used)) uint32_t XpuPerfGetCorrelationId(uint32_t correlationId) {
+    // Increment global counter to prevent optimization
+    g_correlationCallCounter++;
+
+    // Return the correlation ID
+    // eBPF can read the parameter or return value
+    return correlationId;
+}
+
+static void CUPTIAPI XpuPerfCallbackHandler(void *userdata, CUpti_CallbackDomain domain,
+                                      CUpti_CallbackId cbid, void *cbdata) {
+    /* ... */
+    const CUpti_CallbackData *callbackData = (CUpti_CallbackData *)cbdata;
+    /* ... */
+    // Call non-inline function for eBPF attachment point
+    // This allows eBPF to capture the correlation ID
+    if (callbackData) {
+        XpuPerfGetCorrelationId(callbackData-&gt;correlationId);
+    }
+    /* ... */
+}</code></pre>
+    <p>This is a common trick: a function that does nothing useful, exported with C linkage, never
+    inlined, and given an argument that the observer wants. It works like a hand-made USDT probe.
+    Because the callback runs <em>on the thread that called the CUDA API, while that call is in
+    progress</em>, the user stack at this point contains the whole application call path:
+    <code>main → … → TransformerLayer::forward → cudaLaunchKernel → libcupti → XpuPerfCallbackHandler →
+    XpuPerfGetCorrelationId</code>. The last few frames are noise, and xpu-perf filters them out
+    later.</p>
+    <p>On the Go side, starting the target with injection is only a matter of environment
+    variables:</p>
+    <pre data-file="profiler/main.go"><code class="language-go">func startTargetWithCUPTI(cfg *Config, cuptiPipe string) *exec.Cmd {
+	cmd := exec.Command(cfg.targetBinary, cfg.targetArgs...)
+
+	// Set environment variables for CUPTI injection
+	envVars := []string{
+		fmt.Sprintf("CUDA_INJECTION64_PATH=%s", cfg.cuptiLibPath),
+		fmt.Sprintf("CUPTI_TRACE_OUTPUT_FILE=%s", cuptiPipe),
+		"CUPTI_ENABLE_MEMORY=1",
+	}
+
+	// Enable correlation uprobe if requested
+	if cfg.useCorrelationUprobe {
+		envVars = append(envVars, "CUPTI_ENABLE_CORRELATION_UPROBE=1")
+	}
+
+	cmd.Env = append(os.Environ(), envVars...)
+	/* ... */
+	return cmd
+}</code></pre>
+
+    <h2>Code walkthrough 3: the correlation uprobe and the tail call</h2>
+    <p>Now the eBPF side. The profiler can already capture a stack from a uprobe: upstream has a
+    <code>uprobe__generic</code> program that calls <code>collect_trace(ctx, TRACE_UPROBE, …, 0)</code>.
+    But that trace has no slot for "which CUDA call was this?". The fork adds a second entry point
+    that reads a 64-bit context value from a per-CPU map and stores it in the trace:</p>
+    <pre data-file="profiler/opentelemetry-ebpf-profiler/support/ebpf/custom_trace.ebpf.c"><code class="language-c">struct custom_context_map_t {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, u32);
+  __type(value, u64);
+  __uint(max_entries, 1);
+} custom_context_map SEC(".maps");
+
+// custom__generic serves as entry point for custom trace profiling with context_value.
+// This can be called as a tail call from external eBPF programs.
+// Not meant to be attached directly - just loaded for tail calling.
+SEC("uprobe/custom__generic")
+int custom__generic(struct pt_regs *ctx)
+{
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid      = pid_tgid &gt;&gt; 32;
+  u32 tid      = pid_tgid &amp; 0xFFFFFFFF;
+
+  if (pid == 0 || tid == 0) {
+    return 0;
+  }
+
+  u64 ts = bpf_ktime_get_ns();
+
+  // Retrieve context_value from the shared per-CPU map
+  u32 key0 = 0;
+  u64 *context_value_ptr = bpf_map_lookup_elem(&amp;custom_context_map, &amp;key0);
+  u64 context_value = context_value_ptr ? *context_value_ptr : 0;
+  /* ... */
+  return collect_trace(ctx, TRACE_CUSTOM, pid, tid, ts, context_value);
+}</code></pre>
+    <p>The same fork commit renames the trace field <code>offtime</code> (used by off-CPU profiling)
+    to <code>context_value</code> and adds <code>TRACE_CUSTOM</code> to the <code>TraceOrigin</code>
+    enum. In user space the value shows up as <code>meta.ContextValue</code>.</p>
+    <p>xpu-perf's own eBPF program is the small front end that fills that map and jumps:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="correlation_uprobe.ebpf.c">
+        <pre data-file="profiler/ebpf/correlation_uprobe.ebpf.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1);
+} custom_context_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 1);
+} prog_array SEC(".maps");
+
+SEC("uprobe/XpuPerfGetCorrelationId")
+int capture_correlation_id(struct pt_regs *ctx)
+{
+	// Get the correlation ID from the first parameter
+	// Use PT_REGS_PARM1 macro for portable parameter access
+	__u32 correlation_id = (__u32)PT_REGS_PARM1(ctx);
+
+	// Store the correlation ID in the shared map as a 64-bit value
+	// custom__generic will read this value when collecting the trace
+	__u32 key = 0;
+	__u64 context_value = (__u64)correlation_id;
+	bpf_map_update_elem(&amp;custom_context_map, &amp;key, &amp;context_value, BPF_ANY);
+
+	// Tail call to custom__generic to collect the stack trace
+	// Index 0 in prog_array contains the custom__generic program FD
+	// If the tail call succeeds, this function never returns
+	bpf_tail_call(ctx, &amp;prog_array, 0);
+	/* ... */
+	return 1;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="cupti_uprobe_attach.go">
+        <pre data-file="profiler/cupti_uprobe_attach.go"><code class="language-go">	// Get the custom__generic program FD from the tracer
+	customProgFD := trc.GetCustomTraceProgramFD()
+	/* ... */
+	customContextMapFD := trc.GetCustomContextMapFD()
+	/* ... */
+	spec, err := LoadCorrelationUprobe()
+	/* ... */
+	customContextMap, err := ebpf.NewMapFromFD(customContextMapFD)
+	/* ... */
+	opts := &amp;ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{
+			"custom_context_map": customContextMap,
+		},
+	}
+	/* ... */
+	coll, err := ebpf.NewCollectionWithOptions(spec, *opts)
+	/* ... */
+	progArray := coll.Maps["prog_array"]
+	/* ... */
+	key := uint32(0)
+	value := uint32(customProgFD)
+	if err := progArray.Put(&amp;key, &amp;value); err != nil {
+		return nil, fmt.Errorf("failed to add custom__generic to prog_array: %v", err)
+	}
+	/* ... */
+	prog := coll.Programs["capture_correlation_id"]
+	/* ... */
+	ex, err := link.OpenExecutable(libPath)
+	/* ... */
+	uprobe, err := ex.Uprobe("XpuPerfGetCorrelationId", prog, nil)</code></pre>
+      </div>
+    </div>
+    <p>Three eBPF ideas from Part I meet here (<a href="04-maps-helpers-kfuncs.html">Chapter 04</a>):</p>
+    <ul>
+      <li><strong>Map sharing across objects.</strong> <code>custom_context_map</code> is declared in
+      both C files, but cilium/ebpf's <code>MapReplacements</code> makes the second object use the
+      profiler's existing map FD instead of creating a new one. Both programs read and write the
+      same per-CPU slot.</li>
+      <li><strong>Per-CPU scratch.</strong> The uprobe program and the program it tail-calls form one
+      execution on one CPU (migration is disabled while a BPF program runs), so a one-entry <code>PERCPU_ARRAY</code> is a safe way to
+      pass a value from one program to the next.</li>
+      <li><strong>Tail calls between independently loaded programs.</strong> The prog array belongs
+      to xpu-perf's collection, but its slot 0 holds the FD of a program loaded by the profiler
+      library. The tail call reuses the same <code>pt_regs</code> context, so
+      <code>collect_trace</code> unwinds the stack exactly as it was at the uprobe. The Go code
+      keeps the collection open for the whole run. Closing it would destroy
+      <code>prog_array</code> and silently break every tail call.</li>
+    </ul>
+    <p>The alternative attacher, used with <code>-use-correlation-id=false</code>, is the older
+    design. It runs <code>ldd</code> on the target to find <code>libcudart.so</code>, runs
+    <code>nm -D</code> to list the undefined <code>cudaLaunchKernel*</code> symbols the target
+    imports, and attaches the profiler's stock uprobe there. Those traces carry no correlation ID,
+    so the correlator falls back to matching by order and time. If there are as many uprobe hits as
+    <code>*LaunchKernel*</code> runtime records, it pairs them one-to-one in time order. Otherwise
+    it walks both lists with a 10 ms tolerance.</p>
+
+    <h2>Code walkthrough 4: joining CPU stacks to GPU kernels</h2>
+    <p>Back in Go, the reporter decides which traces to keep, converts frames to strings, and
+    passes the correlation ID along:</p>
+    <pre data-file="profiler/simple_reporter.go"><code class="language-go">		if (meta.Origin == support.TraceOriginUProbe || meta.Origin == support.TraceOriginCustom) &amp;&amp; (r.correlator.gpuOnly || r.correlator.mergeMode) {
+			// Process uprobes and custom traces in GPU-only mode and merge mode (for correlation)
+			shouldProcess = true
+		} else if meta.Origin == support.TraceOriginSampling &amp;&amp; (r.correlator.cpuOnly || r.correlator.mergeMode) {
+			// Both CPU-only and merge mode: filter by target PID
+			if r.targetPID &gt; 0 &amp;&amp; int(meta.PID) == r.targetPID {
+				shouldProcess = true
+			}
+		}
+
+		if shouldProcess {
+			stack := ExtractStackFromTrace(trace, meta)
+			/* ... */
+			// Extract correlation ID from ContextValue if using correlation mode
+			correlationID := uint32(meta.ContextValue)</code></pre>
+    <p>Note that the eBPF sampler is system-wide. It samples every process on every CPU, and
+    xpu-perf throws away samples from other PIDs in user space. The PID filter compares the
+    process ID only, so samples from child processes the target forks are dropped too.</p>
+    <p><code>ExtractStackFromTrace</code> reverses the frames into root-first order, symbolizes each
+    one, and cleans up the CUDA end of the stack:</p>
+    <pre data-file="profiler/correlation.go"><code class="language-go">		// Filter out uninteresting internal profiler frames
+		if shouldFilterFrame(frameName) {
+			continue
+		}
+
+		// Collapse cudaLaunchKernel wrappers
+		if strings.Contains(frameName, "cudaLaunchKernel") {
+			if len(stack) == 0 || !strings.Contains(stack[len(stack)-1], "cudaLaunchKernel") {
+				stack = append(stack, "cudaLaunchKernel")
+			}
+		} else {
+			stack = append(stack, frameName)
+		}</code></pre>
+    <p><code>shouldFilterFrame</code> drops frames containing <code>libcupti.so</code> or
+    <code>libcupti_trace_injection</code>, and names starting with <code>XpuPerf</code>. Then the
+    join itself:</p>
+    <pre data-file="profiler/correlation.go"><code class="language-go">	// Build correlation ID -&gt; kernel mapping
+	kernelByCorr := make(map[int]*GPUKernelEvent)
+	for i := range kernels {
+		kernelByCorr[kernels[i].CorrelationID] = &amp;kernels[i]
+	}
+	/* ... */
+	for _, cpuTrace := range cpuTraces {
+		// Check if we have a correlation ID
+		if cpuTrace.CorrelationID == 0 {
+			noCorrelation++
+			continue
+		}
+
+		// Direct lookup by correlation ID
+		kernel := kernelByCorr[int(cpuTrace.CorrelationID)]
+
+		if kernel != nil {
+			merged := cpuTrace.Stack
+			merged = append(merged, fmt.Sprintf("[GPU_Kernel]%s", kernel.Name))
+			stackStr := strings.Join(merged, ";")
+			// Convert GPU duration (nanoseconds) to sample count using CPU sampling frequency
+			durationNs := float64(kernel.EndNs - kernel.StartNs)
+			samples := durationNs * float64(c.samplesPerSec) / 1e9
+			c.mergedStacks[stackStr] += samples
+			matched++
+		} else {
+			unmatched++
+		}
+	}</code></pre>
+    <p>The unit conversion is the part that makes a <em>merged</em> graph meaningful. A CPU
+    sample at 50 Hz stands for 20 ms of one thread's CPU time. So a kernel that ran for 36.2 ms is
+    worth 36.2 ms × 50 / 1000 ms = 1.81 "samples" (this is the worked example from
+    <code>profiler/README.md</code>). Values are summed as <code>float64</code> so that thousands
+    of tiny kernels don't each round to zero. <code>WriteFoldedOutput</code> rounds each stack's
+    total to the nearest integer and writes at least 1 for any non-zero total.</p>
+    <p>The other half of the join comes from the FIFO. <code>CUPTIParser</code> decodes each line
+    into this struct and keeps only kernel records and launch runtime records:</p>
+    <pre data-file="profiler/cupti_parser.go"><code class="language-go">type JSONEvent struct {
+	Type          string `json:"type"`
+	Start         int64  `json:"start"`
+	End           int64  `json:"end"`
+	Duration      int64  `json:"duration"`
+	Name          string `json:"name"`
+	CorrelationID int    `json:"correlationId"`
+	ProcessID     int    `json:"processId"`
+	ThreadID      int    `json:"threadId"`
+}
+/* ... */
+		// Process CONCURRENT_KERNEL events
+		if event.Type == "CONCURRENT_KERNEL" {
+		/* ... */
+		// Process RUNTIME events (especially cudaLaunchKernel)
+		if event.Type == "RUNTIME" &amp;&amp; strings.Contains(event.Name, "LaunchKernel") {</code></pre>
+
+    <figure>
+      <svg viewBox="0 0 960 330" role="img" aria-label="Timeline: the CPU thread calls cudaLaunchKernel with correlation IDs 17 and 18, the uprobe captures a stack tagged with each ID, the GPU runs kernels 17 and 18 later, CUPTI records carry the same IDs, and the correlator joins them.">
+        <style>
+          .t1{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .tc{fill:var(--accent);opacity:.85}
+          .tg{fill:var(--accent2);opacity:.85}
+          .tt{fill:var(--fg);font:600 13px sans-serif}
+          .ts{fill:var(--fg);font:11.5px monospace}
+          .tm{fill:var(--muted);font:11.5px sans-serif}
+          .tw{fill:#fff;font:600 11px monospace}
+          .ta{stroke:var(--fg);stroke-width:1.3;fill:none;stroke-dasharray:4 3;marker-end:url(#ah22e)}
+        </style>
+        <defs><marker id="ah22e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <text class="tm" x="150" y="20">time →</text>
+        <text class="tt" x="14" y="56">CPU thread</text>
+        <rect class="t1" x="150" y="38" width="790" height="30" rx="4"/>
+        <rect class="tc" x="160" y="42" width="150" height="22" rx="3"/>
+        <text class="tw" x="166" y="57">forward() CPU work</text>
+        <rect class="tc" x="312" y="42" width="40" height="22" rx="3"/>
+        <text class="tw" x="315" y="57">L17</text>
+        <rect class="tc" x="354" y="42" width="60" height="22" rx="3"/>
+        <rect class="tc" x="416" y="42" width="40" height="22" rx="3"/>
+        <text class="tw" x="419" y="57">L18</text>
+        <rect class="tc" x="458" y="42" width="300" height="22" rx="3" opacity=".45"/>
+        <text class="tw" x="470" y="57">cudaDeviceSynchronize (waiting)</text>
+        <text class="tt" x="14" y="112">eBPF uprobe</text>
+        <rect class="t1" x="150" y="94" width="790" height="30" rx="4"/>
+        <text class="ts" x="340" y="114">stack#17</text>
+        <text class="ts" x="444" y="114">stack#18</text>
+        <line class="ta" x1="332" y1="66" x2="332" y2="96"/>
+        <line class="ta" x1="436" y1="66" x2="436" y2="96"/>
+        <text class="tt" x="14" y="168">GPU stream</text>
+        <rect class="t1" x="150" y="150" width="790" height="30" rx="4"/>
+        <rect class="tg" x="350" y="154" width="250" height="22" rx="3"/>
+        <text class="tw" x="358" y="169">kernel 17: softmax (5 ms)</text>
+        <rect class="tg" x="602" y="154" width="150" height="22" rx="3"/>
+        <text class="tw" x="610" y="169">kernel 18: layerNorm</text>
+        <line class="ta" x1="332" y1="66" x2="350" y2="152"/>
+        <line class="ta" x1="436" y1="66" x2="602" y2="152"/>
+        <text class="tt" x="14" y="224">CUPTI records</text>
+        <text class="ts" x="150" y="216">{"type":"CONCURRENT_KERNEL","name":"..softmax..","correlationId":17,"start":S,"end":E}</text>
+        <text class="ts" x="150" y="236">{"type":"CONCURRENT_KERNEL","name":"..layerNorm..","correlationId":18,...}</text>
+        <rect class="t1" x="150" y="256" width="790" height="60" rx="6"/>
+        <text class="ts" x="164" y="278">join on 17:  main;…;forward;cudaLaunchKernel;[GPU_Kernel]softmax  += 5 ms × 50/s = 0.25</text>
+        <text class="ts" x="164" y="300">CPU samples during sync: main;…;cudaDeviceSynchronize;…  += 1 per 20 ms sample</text>
+        <text class="tm" x="14" y="290">correlator</text>
+      </svg>
+      <figcaption>Figure 22.3 — Why a join key is needed. Launch calls (L17, L18) return at once and
+      the kernels run later, so timestamps alone are ambiguous when launches are queued. The uprobe
+      tags each captured stack with CUPTI's correlation ID, and CUPTI writes the same ID on the
+      kernel's activity record. Durations are illustrative.</figcaption>
+    </figure>
+
+    <h2>The output: folded stacks with GPU leaves</h2>
+    <p>The repository root contains a real <code>gpu_trace.folded</code> produced on the authors'
+    machine (NVIDIA driver 575.57.08, judging by the library name) from the <code>llm-inference</code>
+    mock app. Here are its five lines, with the shared <code>_start+0x24;__libc_start_main+0x8a;libc.so.6+0x2a1c9;</code>
+    prefix removed for width:</p>
+    <pre data-file="gpu_trace.folded"><code class="language-plaintext">main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x107;layerNormKernel+0x50;__device_stub__Z15layerNormKernelPKfPfS0_S0_mmm+0x1ab;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z15layerNormKernelPKfPfS0_S0_mmm 32
+main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x1bd;softmaxKernel+0x33;__device_stub__Z13softmaxKernelPKfPfmm+0x152;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z13softmaxKernelPKfPfmm 318
+main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x2a4;residualAddKernel+0x33;__device_stub__Z17residualAddKernelPKfS0_Pfm+0x152;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z17residualAddKernelPKfS0_Pfm 11
+main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x385;layerNormKernel+0x50;__device_stub__Z15layerNormKernelPKfPfS0_S0_mmm+0x1ab;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z15layerNormKernelPKfPfS0_S0_mmm 53
+main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x45c;residualAddKernel+0x33;__device_stub__Z17residualAddKernelPKfS0_Pfm+0x152;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z17residualAddKernelPKfS0_Pfm 5</code></pre>
+    <p>Read it like any flame graph input. Of 419 total "samples", 318 (about 76%) are the softmax
+    kernel. At 50 per second that is about 6.4 s of GPU time, all launched from one call site in
+    <code>TransformerLayer::forward</code>. Four details are worth noting:</p>
+    <ul>
+      <li>The <code>__device_stub__…</code> frames are host-side stubs that nvcc generates for each
+      <code>&lt;&lt;&lt;…&gt;&gt;&gt;</code> launch. They show which kernel call site in the source did the launch.</li>
+      <li>The GPU leaf uses the raw mangled name (<code>_Z13softmaxKernelPKfPfmm</code>): kernel names
+      come straight from CUPTI and are not demangled.</li>
+      <li>Frames that have a symbol keep a <code>+0x…</code> offset. The two <code>layerNorm</code>
+      launches show up as separate towers under <code>forward+0x107</code> and <code>forward+0x385</code>.
+      That is useful for telling call sites apart, but it also means that one function sampled at
+      different instructions becomes several sibling frames in the CPU part of a graph.</li>
+      <li>Frames with no symbol fall back to <code>library+0xoffset</code>, as with <code>libcuda.so.575.57.08+0x51ccb5</code>.</li>
+    </ul>
+    <p>Render it with the copy of Gregg's script that ships in the repo:</p>
+    <pre><code class="language-bash">perl profiler/flamegraph.pl gpu_trace.folded &gt; gpu.svg</code></pre>
+    <p>The repo also commits rendered examples: <code>documents/examples/mock-cpu-gpu_flamegraph.svg</code>
+    (merge mode) and <code>documents/examples/mock-gpu-only.svg</code>. A web UI exists only as
+    design documents and HTML demos under <code>documents/server/</code>; the profiler itself
+    writes files.</p>
+
+    <h3>Try the merged view</h3>
+    <p>The widget below is <strong>illustrative</strong>. The stacks and numbers are made up for
+    teaching and are not xpu-perf output. It draws the same folded data three ways, as the three
+    modes would. Click a frame to zoom in, and click the root bar to zoom out. Frames in the main accent
+    color are CPU code; frames in the second accent color are <code>[GPU_Kernel]</code> leaves. In
+    <em>merge</em> mode, notice how the <code>forward</code> tower gets wider: its GPU kernels now count
+    next to its CPU samples, while the CPU time spent waiting in <code>cudaDeviceSynchronize</code>
+    stays visible as its own tower.</p>
+    <figure>
+      <div id="fg22" style="border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg3)">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+          <strong style="font-size:14px">Mode:</strong>
+          <button type="button" data-mode="cpu">cpu</button>
+          <button type="button" data-mode="gpu">gpu</button>
+          <button type="button" data-mode="merge">merge</button>
+          <span style="color:var(--muted);font-size:13px">Illustrative data — not real measurements</span>
+        </div>
+        <svg viewBox="0 0 900 140" width="100%" role="img" aria-label="Interactive flame graph with illustrative data"></svg>
+        <div class="fg22-info" style="font:13px monospace;color:var(--fg);min-height:1.4em;margin-top:6px">Hover a frame.</div>
+      </div>
+      <figcaption>Figure 22.4 — A tiny flame graph renderer fed with illustrative folded stacks for the
+      <code>cpu</code>, <code>gpu</code> and <code>merge</code> modes. Width = samples (CPU samples at
+      50 Hz, or GPU time × 50/s). The code is at the bottom of this page and has no dependencies.</figcaption>
+    </figure>
+
+    <h2>Build and run</h2>
+    <h3>What the README says</h3>
+    <p>Prerequisites listed in the README: Linux 5.10+, Go 1.19+, the CUDA Toolkit, root, and Perl.
+    (<code>profiler/go.mod</code> actually says <code>go 1.24.0</code>, so use a recent Go.) The
+    documented commands:</p>
+    <pre data-file="README.md"><code class="language-bash"># Install dependencies
+sudo apt-get install -y libelf1 libelf-dev zlib1g-dev make clang llvm git perl golang-go
+
+# Build the profiler
+cd profiler &amp;&amp; make
+
+# ...
+# Merge mode: CPU sampling + GPU kernels with call stacks
+sudo ./profiler/xpu-perf merge -o merged_trace.folded ./your_cuda_app
+
+# GPU-only: CPU→GPU causality (shows which CPU code launched kernels)
+sudo ./profiler/xpu-perf gpu -o gpu_trace.folded ./your_cuda_app
+
+# CPU-only: Pure CPU sampling without GPU overhead
+sudo ./profiler/xpu-perf cpu -o cpu_trace.folded ./your_cuda_app
+
+# Generate flamegraph
+perl profiler/flamegraph.pl merged_trace.folded &gt; flamegraph.svg</code></pre>
+    <p>For PyTorch, the README's test section runs the interpreter as the target:</p>
+    <pre data-file="README.md"><code class="language-bash">sudo -E env "PATH=$PATH" ./profiler/xpu-perf gpu -o pytorch.folded python3 test/pytorch/pytorch_longer.py
+perl profiler/flamegraph.pl pytorch.folded &gt; pytorch-flamegraph.svg</code></pre>
+    <p>Practical notes from reading the build files:</p>
+    <ul>
+      <li>Clone with submodules (<code>git clone --recursive</code> or <code>git submodule update --init</code>).
+      The Go module points at <code>./opentelemetry-ebpf-profiler</code> through a <code>replace</code> directive.</li>
+      <li><code>make</code> in <code>profiler/</code> runs <code>go generate</code>, which calls
+      <code>bpf2go -target amd64</code> on <code>ebpf/correlation_uprobe.ebpf.c</code>. That needs
+      <code>clang</code> and the libbpf headers. The latest commit (<code>b4fcc885</code>) adds
+      <code>libbpf-dev</code> to the CI dependencies for exactly this reason: without it the build fails
+      with "<code>bpf/bpf_helpers.h</code> file not found". The README's apt line doesn't list it yet.</li>
+      <li>Next, <code>make cupti</code> builds the injection library with <code>nvcc</code> from
+      <code>CUDA_INSTALL_PATH ?= /usr/local/cuda-12.9</code>. Override it for other CUDA versions:
+      <code>make CUDA_INSTALL_PATH=/usr/local/cuda</code> (a standard make variable override; not documented by the repo).</li>
+      <li>The <code>-cuda-lib</code> fallback list in <code>cuda_utils.go</code> is hard-coded to
+      <code>/usr/local/cuda-12.9</code>, <code>cuda-13.0</code>, <code>cuda-12.8</code> and <code>/usr/local/cuda</code>.
+      It only matters in the non-default <code>-use-correlation-id=false</code> path.</li>
+      <li><code>profiler/README.md</code> and the <code>profiler/Makefile</code> <code>test</code> target still use
+      the pre-November flag style (<code>./profile -gpu-only …</code>, <code>--gpu-only</code>). The current binary
+      rejects that with "Unknown command". Use the subcommand form above.</li>
+    </ul>
+
+    <h3>What I ran in the orb (no GPU)</h3>
+    <p>The orb has clang and the libbpf headers but no Go, no CUDA and no GPU. To check the CPU path I
+    downloaded Go 1.24.9 and checked the pinned fork out as the submodule. Because <code>go:embed</code>
+    needs the CUPTI library file to exist, I made an <strong>empty placeholder</strong>
+    <code>libcupti_trace_injection.so</code>. That is safe only because <code>cpu</code> mode never
+    injects it. With a symlinked submodule, Go's VCS stamping fails, hence
+    <code>-buildvcs=false</code>.</p>
+    <pre><code class="language-bash">cd profiler
+go generate ./...                 # bpf2go: 7.7 s, writes correlationuprobe_x86_bpfel.{go,o}
+: &gt; libcupti_trace_injection.so   # placeholder (no nvcc here) — CPU mode only
+GOFLAGS="-p=2 -buildvcs=false" go build -o xpu-perf .   # 14.6 s, 27.5 MB binary
+./xpu-perf --help                 # prints the usage shown above
+./xpu-perf cpu /bin/true          # "Error: This profiler must be run as root"
+sudo ./xpu-perf cpu -o cpu.folded ./burn
+perl flamegraph.pl cpu.folded &gt; cpu.svg</code></pre>
+    <p><code>burn</code> was a scratch C program (two noinline loops called from <code>work()</code>,
+    built with <code>-fno-omit-frame-pointer</code>) that ran for about 55 s before
+    <code>timeout</code> stopped it. The profiler ran without errors and ended with:</p>
+    <pre><code class="language-plaintext">level=info msg="Final stats - Total: 22187, Uprobe: 0, Sampling: 22187"
+Wrote 6 unique stacks (2787 total samples) to /tmp/xpuburn/cpu.folded</code></pre>
+    <p>That shows the system-wide sampler at work: 22,187 traces from all processes, of which 2,787
+    came from the target. Over about 55 s that is about 50 per second, which matches
+    <code>SamplesPerSecond: 50</code>. However, every kept stack was <strong>only the leaf
+    frame</strong> (for example <code>leaf_a+0x27 1916</code>), with no <code>main;work;</code> above
+    it. During the run the profiler logged 785 warnings
+    "<code>Outer map update failure: update: invalid argument</code>" from
+    <code>processmanager/ebpf/asyncupdate.go</code>, the code that installs per-binary stack-delta maps
+    into a map-in-map. I didn't track down the cause, so treat the truncated stacks as a result in
+    this orb's kernel environment (6.1), not as a claim about xpu-perf in general. The sample
+    output committed in the repo shows full stacks on the authors' machine. The GPU and merge modes
+    were not run.</p>
+
+    <div class="callout tip"><span class="label">Debugging a run</span><p>Pass
+    <code>-debug-dir DIR</code> to save the parsed CUPTI events, the raw CPU traces and the
+    correlation details (<code>profiler/debug.go</code>). The <code>matched=</code>,
+    <code>unmatched=</code> and <code>no_correlation=</code> counters printed at the end say whether
+    the join worked. A high <code>no_correlation</code> count means the uprobe traces arrived
+    without an ID.</p></div>
+
+    <h2>Recent history</h2>
+    <p>The repo has 173 commits. Its history falls into clear phases:</p>
+    <ul>
+      <li><strong>June 2025 — SystemScope.</strong> The first commits (from 2025-06-07) build a "combined
+      profiler", a Rust eBPF profiler (kept in <code>documents/rust-profiler/</code>), front-end demos and
+      releases v0.0.1–v0.0.9. Only v0.0.1 has an attached asset.</li>
+      <li><strong>Late August 2025 — CUPTI and the rename.</strong> The CUPTI injection library, a Python
+      driver <code>gpuperf.py</code>, a CUPTI-to-Chrome-trace converter, and a Python merger of CPU
+      and GPU traces. Commit <code>44ba1fb</code> (2025-08-29) renames the project from systemscope to
+      xpu-perf.</li>
+      <li><strong>October 2025.</strong> CUDA graph node tracking in the injection library, the mock
+      apps (<code>vectorAdd</code>, <code>llm-inference</code>), and trimming of stacks to the first
+      <code>cudaLaunchKernel</code>/<code>__device_stub__</code>.</li>
+      <li><strong>November 2–16, 2025 — the Go profiler.</strong> <code>02e5131</code> adds the Go profiler
+      built on the OpenTelemetry eBPF profiler. It is followed by uprobe support and SimpleReporter, merge
+      mode, the correlation-ID uprobe (<code>7668dc0</code> "Add eBPF support for capturing CUPTI
+      correlation IDs", <code>9f68304</code> "Implement CUDA kernel and correlation ID uprobes"), a CUPTI PC
+      sampling example (<code>d37c8d2</code>), and the subcommand CLI (<code>275f2f2</code>, 2025-11-16).
+      The matching fork commits (<code>0b6df71</code>, <code>e19d3e8</code>, 2025-11-10) add
+      <code>custom__generic</code>.</li>
+      <li><strong>November 16–24, 2025 — NVIDIA kernel-module tracing.</strong> A bpftrace test runner over
+      the NVIDIA modules (<code>tools/bpftrace-script/TEST_RESULTS.md</code> counts 3,202 traceable
+      functions: 885 in <code>nvidia</code>, 2,019 in <code>nvidia_uvm</code>, 192 in <code>nvidia_drm</code>,
+      106 in <code>nvidia_modeset</code>), UVM scripts for residency selection, prefetch hints,
+      thrashing and chunk-to-VA mapping, and a PyTorch RAG demo.</li>
+      <li><strong>2026-09-17 — <code>b4fcc885</code>.</strong> The only 2026 commit: adds
+      <code>libbpf-dev</code> to both CI workflows and bumps <code>softprops/action-gh-release</code> to v3
+      (marked <code>[skip ci]</code>). The workflow runs listed on GitHub for the November 2025 commits all
+      failed. I didn't read the logs. A likely cause is that <code>make</code> also builds the CUPTI library
+      with <code>nvcc</code>, which the stock Ubuntu runner doesn't have.</li>
+    </ul>
+
+    <h2>Benefits and limitations</h2>
+    <h3>What the design gets right</h3>
+    <ul>
+      <li><strong>No changes to the application.</strong> CUPTI injection is enabled through an environment
+      variable, and stacks come from eBPF. You don't recompile, add a library, or edit Python.</li>
+      <li><strong>Exact joins.</strong> Joining on the correlation ID avoids guessing from timestamps, which
+      breaks down when launches are queued, as they usually are.</li>
+      <li><strong>Strong CPU unwinding for free.</strong> Building on the OpenTelemetry eBPF profiler brings
+      <code>.eh_frame</code>-based native unwinding and interpreter unwinders. That's how Python frames can
+      appear above PyTorch's C++ frames without frame pointers.</li>
+      <li><strong>Lingua franca output.</strong> The output is folded stacks, so any flame graph tool can
+      read it: <code>flamegraph.pl</code>, speedscope, or tools that convert to pprof.</li>
+      <li><strong>Very little new eBPF.</strong> 61 lines of C plus a 43-line addition to the fork. The tail-call
+      and map-replacement pattern (prototyped in <code>documents/custom-example/</code>) can carry any
+      64-bit context value, not only CUDA IDs.</li>
+    </ul>
+    <h3>Limitations and open questions</h3>
+    <ul>
+      <li><strong>Launch-only, not attach.</strong> xpu-perf starts the target itself, and CUPTI injection
+      only works at CUDA initialization. You can't profile a service that is already running.</li>
+      <li><strong>x86-64, NVIDIA, root.</strong> <code>bpf2go</code> runs with <code>-target amd64</code>, CUPTI
+      is NVIDIA-only, and both eBPF and uprobes need root. The README's overhead figures ("&lt; 1% CPU
+      overhead, &lt; 5% GPU overhead") come with no benchmark in the repo.</li>
+      <li><strong>Kernel time only.</strong> The parser keeps kernel and launch records. Memcpy and memset
+      records are collected (<code>CUPTI_ENABLE_MEMORY=1</code>) but don't appear in the folded output.
+      There is no stall-reason or PC-level GPU detail like iaprof's EU stalls or CUPTI PC sampling,
+      although the repo has PC-sampling experiments in <code>documents/pc_sampling_start_stop/</code>.</li>
+      <li><strong>Summed time is not wall time.</strong> Kernels on concurrent streams add up, as do
+      CPU samples from several threads, so a merged graph's total can be more than the run time. Off-CPU
+      time is not sampled (<code>OffCPUThreshold: 0</code>), so a thread blocked in a sleeping
+      synchronize call disappears, while one spinning in it shows up as CPU.</li>
+      <li><strong>Possible double counting (my reading, unverified).</strong> <code>XpuPerfCallbackHandler</code>
+      calls <code>XpuPerfGetCorrelationId</code> for every runtime-API callback it gets, and CUPTI
+      runtime callbacks fire at both <code>API_ENTER</code> and <code>API_EXIT</code> with the same
+      correlation ID. <code>correlateByCorrelationID</code> adds the kernel's duration once per matching
+      trace. If both callbacks produce a trace, each kernel would count twice. I couldn't test this
+      without a GPU. A uniform factor of two would leave the proportions among GPU kernels unchanged
+      but would skew the CPU-versus-GPU ratio in merge mode.</li>
+      <li><strong>Many uprobe hits.</strong> With <code>cuptiEnableDomain(RUNTIME_API)</code>, every CUDA runtime
+      call (not just launches) fires the uprobe and unwinds a stack. Uprobes trap into the kernel
+      (<a href="05-program-types-and-hooks.html">Chapter 05</a>). For launch-heavy workloads this is the main
+      cost, and the kind that bpftime's user-space uprobes (<a href="14-bpftime-architecture.html">Chapter 14</a>)
+      are meant to reduce.</li>
+      <li><strong>Symbolization details.</strong> Frames keep <code>+0x</code> offsets, which splits one
+      function into many frames. <code>Symbolizer.Symbolize</code> scans the symbol table linearly for every
+      lookup (the README says "binary search"). Kernel names are not demangled.</li>
+      <li><strong>Project hygiene.</strong> The docs and the CLI disagree in places, CI is red, the
+      <code>dockerfile</code> points at a <code>/root/src/bootstrap</code> that no longer exists, and there are
+      no tests beyond the sample apps.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <p>xpu-perf is one of several projects converging on the same idea: eBPF for CPU stacks plus a
+    vendor interface for GPU activity.</p>
+    <table>
+      <tr><th>Tool</th><th>CPU side</th><th>GPU side</th><th>How CPU and GPU are linked</th><th>Deployment / output</th></tr>
+      <tr><td><strong>xpu-perf</strong></td><td>OTel eBPF profiler fork, 50 Hz, target PID</td><td>CUPTI injection: kernel start/end</td><td>uprobe on a noinline function in the injection lib; CUPTI correlation ID</td><td>launch-a-command CLI; folded stacks / SVG</td></tr>
+      <tr><td><strong>Parca Agent</strong> (Polar Signals)</td><td>Based on the OTel eBPF profiler since v0.32.0 (Aug 2024); the design docs describe 19 Hz per CPU</td><td><code>parcagpu</code>: a CUPTI shim library exposing USDT probes (kernel timing, PC sampling with stall reasons)</td><td>eBPF on the USDT probes; GPU events joined with CUDA stack traces (released in v0.43.0, Oct 2025)</td><td>always-on agent for the whole fleet; Parca server / Polar Signals Cloud</td></tr>
+      <tr><td><strong>Grafana Pyroscope</strong></td><td>Alloy's <code>pyroscope.ebpf</code> embeds Grafana's fork of the OTel eBPF profiler; Pyroscope also ingests OTLP from the upstream profiler</td><td>none documented</td><td>—</td><td>continuous, Grafana UI</td></tr>
+      <tr><td><strong>OpenTelemetry eBPF profiler</strong></td><td>whole-system, <code>.eh_frame</code> stack deltas, many interpreters; default 20 samples/s</td><td>none upstream</td><td>—</td><td>OTLP profiles signal; collector receiver</td></tr>
+      <tr><td><strong>iaprof</strong> (Intel)</td><td>eBPF CPU stacks</td><td>Intel Xe GPU EU-stall hardware sampling</td><td>CPU stacks linked to GPU kernels and stall samples ("AI Flame Graphs")</td><td>text stream → flame graphs, FlameScope-style heatmaps</td></tr>
+      <tr><td><strong>NVIDIA Nsight Systems / Compute</strong></td><td>Systems: CPU sampling and OS/runtime tracing on a timeline</td><td>Systems: kernel and memcpy timeline; Compute: deep per-kernel metrics (replays kernels)</td><td>timeline views; API-to-kernel links shown in the GUI</td><td>developer tools for a profiling session, not always-on</td></tr>
+      <tr><td><strong>HPCToolkit</strong></td><td>call-path sampling</td><td>CUPTI / ROCTracer / Level Zero; PC sampling</td><td>attributes GPU metrics to calling contexts that span CPU and GPU</td><td>HPC, post-mortem viewer</td></tr>
+    </table>
+    <p>The closest relative is clearly <strong>Parca's GPU support</strong>. Both projects load a CUPTI
+    shim into the CUDA process, both expose a probe point for eBPF in that shim (a real USDT probe in
+    <code>parcagpu</code>, a <code>noinline</code> function in xpu-perf), and both reuse the OpenTelemetry
+    eBPF profiler for stacks. The differences are in maturity and deployment. Parca's is an
+    always-on agent that detects when CUDA processes load the library and sends data to a server.
+    xpu-perf is a research CLI that starts one command and writes one file. <strong>iaprof</strong>
+    goes further on the GPU side, with hardware stall samples instead of just kernel durations, but
+    only on Intel GPUs. <strong>Nsight Systems</strong> gives the richest timeline, but it is built
+    for a single profiling session, not for production.</p>
+    <p>Within eunomia-bpf, xpu-perf fits between two other projects. bpftime's CUDA attach
+    (<a href="15-bpftime-in-practice.html">Chapter 15</a>) can run eBPF <em>inside</em> GPU kernels,
+    which could someday provide finer GPU-side samples than CUPTI's kernel records. The NVIDIA UVM
+    tracing scripts in <code>tools/</code> lead into gpu_ext (<a href="20-gpu-ext.html">Chapter 20</a>),
+    which uses eBPF to change the GPU driver's memory policies instead of just watching them.</p>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Why can't xpu-perf get GPU kernel durations from a uprobe on <code>cudaLaunchKernel</code> alone?</p>
+        <button class="opt">uprobes cannot attach to CUDA libraries</button>
+        <button class="opt" data-right>The launch call returns as soon as the kernel is queued; the kernel runs later on the GPU, so only CUPTI's activity records have its real start and end</button>
+        <button class="opt">The verifier rejects programs that read GPU memory</button>
+        <div class="why">Kernel launches are asynchronous. The uprobe gives the <em>who</em> (the CPU stack). CUPTI's
+        <code>CONCURRENT_KERNEL</code> records give the <em>how long</em>. The correlation ID joins them.</div></div>
+      <div class="q"><p><strong>Q2.</strong> In merge mode, a kernel ran for 36.2 ms. How many "samples" does it add to its stack before rounding?</p>
+        <button class="opt">36.2</button>
+        <button class="opt">0.0362</button>
+        <button class="opt" data-right>1.81 (36.2 ms × 50 samples/s)</button>
+        <button class="opt">50</button>
+        <div class="why"><code>samples = durationNs × samplesPerSec / 1e9</code> with <code>samplesPerSec = 50</code>,
+        the CPU sampling rate, so GPU time and CPU samples use the same unit.</div></div>
+      <div class="q"><p><strong>Q3.</strong> How does the correlation ID get from the uprobe into the stack trace that the profiler reports?</p>
+        <button class="opt">The uprobe writes it to the ring buffer next to the stack</button>
+        <button class="opt" data-right>It is stored in a shared one-entry per-CPU map, then a tail call jumps to the fork's <code>custom__generic</code>, which reads the map and passes the value to <code>collect_trace</code> as <code>context_value</code></button>
+        <button class="opt">CUPTI writes it into the thread's TLS and the unwinder reads it</button>
+        <div class="why">See <code>correlation_uprobe.ebpf.c</code> and <code>custom_trace.ebpf.c</code>. <code>MapReplacements</code>
+        makes both objects use the same <code>custom_context_map</code>.</div></div>
+      <div class="q"><p><strong>Q4.</strong> Which unwinding method lets the OpenTelemetry eBPF profiler walk native stacks of libraries built without frame pointers?</p>
+        <button class="opt">Copying a chunk of raw user stack into every sample, like <code>perf --call-graph dwarf</code></button>
+        <button class="opt">LBR hardware branch records</button>
+        <button class="opt" data-right>Stack deltas derived from <code>.eh_frame</code>, loaded into eBPF maps and applied per PC in the kernel</button>
+        <div class="why"><code>doc/internals.md</code>: deltas map each PC to how to find the caller. Go binaries use
+        <code>.gopclntab</code> instead.</div></div>
+      <div class="q"><p><strong>Q5.</strong> You run <code>sudo xpu-perf merge -o out.folded ./app</code>. Which statement is true?</p>
+        <button class="opt">It attaches to every CUDA process already running on the host</button>
+        <button class="opt" data-right>It starts <code>./app</code> itself with <code>CUDA_INJECTION64_PATH</code> set, keeps CPU samples only from that PID, and writes <code>out.folded</code> when the app exits</button>
+        <button class="opt">It streams profiles to a Parca server</button>
+        <div class="why">There is no attach-to-PID option. CUPTI injection works at CUDA initialization, which is
+        why the profiler launches the target.</div></div>
+      <div class="q"><p><strong>Q6.</strong> In a flame graph, what does the horizontal position of a frame mean?</p>
+        <button class="opt">The time at which the function ran</button>
+        <button class="opt" data-right>Nothing about time: siblings are sorted alphabetically so equal stacks merge; only width (sample count) carries meaning</button>
+        <button class="opt">The CPU number</button>
+        <div class="why">That is the key difference between a flame graph and a timeline such as Nsight Systems or
+        a Chrome trace. Gregg's CACM article explains it.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/xpu-perf">eunomia-bpf/xpu-perf</a>, studied at commit
+      <a href="https://github.com/eunomia-bpf/xpu-perf/tree/b4fcc885875aacfc7c4605ee5458cea49e9e6672"><code>b4fcc885</code></a> (2026-09-17).
+      Files cited: <code>README.md</code>, <code>profiler/README.md</code>, <code>profiler/main.go</code>, <code>profiler/correlation.go</code>,
+      <code>profiler/cupti_parser.go</code>, <code>profiler/simple_reporter.go</code>, <code>profiler/symbolizer.go</code>,
+      <code>profiler/cupti_uprobe_attach.go</code>, <code>profiler/cuda_kernel_uprobe_attach.go</code>, <code>profiler/cuda_utils.go</code>,
+      <code>profiler/ebpf/correlation_uprobe.ebpf.c</code>, <code>cupti_trace/cupti_trace.cpp</code>, <code>gpu_trace.folded</code>,
+      <code>tools/bpftrace-script/TEST_RESULTS.md</code>.</li>
+      <li><a href="https://github.com/eunomia-bpf/opentelemetry-ebpf-profiler">eunomia-bpf/opentelemetry-ebpf-profiler</a> (fork), at
+      <a href="https://github.com/eunomia-bpf/opentelemetry-ebpf-profiler/tree/e19d3e80f7f74f2c5a89e0304ddccc8a4c777107"><code>e19d3e80</code></a>:
+      <code>support/ebpf/custom_trace.ebpf.c</code>, <code>support/ebpf/native_stack_trace.ebpf.c</code>, <code>tracer/tracer.go</code>,
+      <code>doc/internals.md</code>. Upstream: <a href="https://github.com/open-telemetry/opentelemetry-ebpf-profiler">open-telemetry/opentelemetry-ebpf-profiler</a>.</li>
+      <li><a href="https://github.com/eunomia-bpf/cupti-tutorial">eunomia-bpf/cupti-tutorial</a> and
+      <a href="https://github.com/eunomia-bpf/nvbit-tutorial">eunomia-bpf/nvbit-tutorial</a> (READMEs).</li>
+      <li>NVIDIA. CUPTI documentation (Activity API, Callback API, injection): <a href="https://docs.nvidia.com/cupti/">docs.nvidia.com/cupti</a>.</li>
+      <li>O. Villa, M. Stephenson, D. Nellans, S. W. Keckler. "NVBit: A Dynamic Binary Instrumentation Framework for NVIDIA GPUs."
+      52nd IEEE/ACM International Symposium on Microarchitecture (MICRO-52), 2019.
+      <a href="https://doi.org/10.1145/3352460.3358307">doi:10.1145/3352460.3358307</a>; code <a href="https://github.com/NVlabs/NVBit">NVlabs/NVBit</a>.</li>
+      <li>B. Gregg. "The Flame Graph." <em>Communications of the ACM</em> 59(6), 2016.
+      <a href="https://doi.org/10.1145/2909476">doi:10.1145/2909476</a>; <a href="https://www.brendangregg.com/flamegraphs.html">brendangregg.com/flamegraphs.html</a>;
+      tools <a href="https://github.com/brendangregg/FlameGraph">brendangregg/FlameGraph</a>.</li>
+      <li>B. Gregg. "The Return of the Frame Pointers," 2024-03-17.
+      <a href="https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html">brendangregg.com</a>.</li>
+      <li>B. Gregg. "AI Flame Graphs," 2024-10-29.
+      <a href="https://www.brendangregg.com/blog/2024-10-29/ai-flame-graphs.html">brendangregg.com</a>; tool <a href="https://github.com/intel/iaprof">intel/iaprof</a>.</li>
+      <li>G. Ren, E. Tune, T. Moseley, Y. Shi, S. Rus, R. Hundt. "Google-Wide Profiling: A Continuous Profiling Infrastructure for Data Centers."
+      <em>IEEE Micro</em> 30(4), 2010. <a href="https://doi.org/10.1109/MM.2010.68">doi:10.1109/MM.2010.68</a></li>
+      <li>K. Zhou, L. Adhianto, J. Anderson, et al. "Measurement and Analysis of GPU-accelerated Applications with HPCToolkit."
+      <em>Parallel Computing</em> 108, 2021. <a href="https://arxiv.org/abs/2109.06931">arXiv:2109.06931</a></li>
+      <li>OpenTelemetry blog. "Elastic Contributes its Continuous Profiling Agent to OpenTelemetry," 2024.
+      <a href="https://opentelemetry.io/blog/2024/elastic-contributes-continuous-profiling-agent">opentelemetry.io</a></li>
+      <li>Parca Agent design (perf_event CPU clock, 19 Hz): <a href="https://www.parca.dev/docs/parca-agent-design">parca.dev/docs/parca-agent-design</a>;
+      F. Branczyk, "Parca + OpenTelemetry = Bright Future," 2024-08-13,
+      <a href="https://www.polarsignals.com/blog/posts/2024/08/13/parca-opentelemetry-bright-future">polarsignals.com</a>.</li>
+      <li>Polar Signals. "Continuous NVIDIA CUDA Profiling In Production," 2025-10-22.
+      <a href="https://www.polarsignals.com/blog/posts/2025/10/22/gpu-profiling">polarsignals.com</a>; <a href="https://github.com/parca-dev/parcagpu">parca-dev/parcagpu</a>.</li>
+      <li>Grafana Alloy <code>pyroscope.ebpf</code> reference:
+      <a href="https://grafana.com/docs/alloy/latest/reference/components/pyroscope/pyroscope.ebpf/">grafana.com/docs/alloy</a>;
+      Pyroscope and the OTel eBPF profiler: <a href="https://grafana.com/docs/pyroscope/latest/configure-client/opentelemetry/ebpf-profiler/">grafana.com/docs/pyroscope</a>.</li>
+      <li>NVIDIA Nsight Systems: <a href="https://docs.nvidia.com/nsight-systems/">docs.nvidia.com/nsight-systems</a>;
+      Nsight Compute: <a href="https://docs.nvidia.com/nsight-compute/">docs.nvidia.com/nsight-compute</a>.</li>
+      <li><code>perf_event_open(2)</code> man page: <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html">man7.org</a>;
+      kernel uprobe tracer: <a href="https://docs.kernel.org/trace/uprobetracer.html">docs.kernel.org/trace/uprobetracer.html</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="21-nccl-ebpf.html"><small>Previous</small>21 · nccl-eBPF</a>
+      <a class="next" href="23-agentsight.html"><small>Next</small>23 · AgentSight</a>
+    </div>
+  </main>
+</div>
+<script>
+/* Chapter 22 widget: a dependency-free flame graph renderer.
+   ILLUSTRATIVE DATA ONLY — not output from xpu-perf. */
+(function () {
+  var root = document.getElementById("fg22");
+  if (!root) return;
+  var svg = root.querySelector("svg");
+  var info = root.querySelector(".fg22-info");
+  var NS = "http://www.w3.org/2000/svg";
+  var CPU = [
+    ["main;load_model;read_weights", 30],
+    ["main;serve;tokenize", 25],
+    ["main;serve;forward;build_inputs", 12],
+    ["main;serve;forward;cudaLaunchKernel", 8],
+    ["main;serve;cudaDeviceSynchronize", 22],
+    ["main;serve;detokenize", 5]
+  ];
+  var GPU = [
+    ["main;serve;forward;cudaLaunchKernel;[GPU_Kernel]matmul", 90],
+    ["main;serve;forward;cudaLaunchKernel;[GPU_Kernel]attention", 60],
+    ["main;serve;forward;cudaLaunchKernel;[GPU_Kernel]layernorm", 15]
+  ];
+  var DATA = { cpu: CPU, gpu: GPU, merge: CPU.concat(GPU) };
+  var ROW = 20, W = 900;
+  var focus = null, tree = null;
+
+  function build(lines) {
+    var r = { name: "all", value: 0, kids: {}, parent: null };
+    lines.forEach(function (l) {
+      var node = r; r.value += l[1];
+      l[0].split(";").forEach(function (f) {
+        if (!node.kids[f]) node.kids[f] = { name: f, value: 0, kids: {}, parent: node };
+        node = node.kids[f]; node.value += l[1];
+      });
+    });
+    (function layout(n, x0, depth) {
+      n.x0 = x0; n.x1 = x0 + n.value; n.depth = depth;
+      var x = x0;
+      Object.keys(n.kids).sort().forEach(function (k) { layout(n.kids[k], x, depth + 1); x += n.kids[k].value; });
+    })(r, 0, 0);
+    return r;
+  }
+  function maxDepth(n) {
+    var d = n.depth;
+    Object.keys(n.kids).forEach(function (k) { d = Math.max(d, maxDepth(n.kids[k])); });
+    return d;
+  }
+  function isAncestor(a, n) { for (var p = n; p; p = p.parent) if (p === a) return true; return false; }
+
+  function draw() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var depth = maxDepth(tree) + 1, H = depth * ROW + 4;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var f = focus || tree, span = f.x1 - f.x0, total = tree.value;
+    (function walk(n) {
+      var onPath = isAncestor(n, f);           // ancestors of focus span full width
+      var inside = isAncestor(f, n);           // focus and its descendants
+      if (!onPath && !inside) return;
+      var x = onPath ? 0 : (n.x0 - f.x0) / span * W;
+      var w = onPath ? W : n.value / span * W;
+      var y = H - (n.depth + 1) * ROW;
+      var g = document.createElementNS(NS, "g");
+      g.style.cursor = "pointer";
+      var rect = document.createElementNS(NS, "rect");
+      rect.setAttribute("x", x + 0.5); rect.setAttribute("y", y + 1);
+      rect.setAttribute("width", Math.max(w - 1, 0.5)); rect.setAttribute("height", ROW - 2);
+      rect.setAttribute("rx", 2);
+      var gpu = n.name.indexOf("[GPU_Kernel]") === 0;
+      rect.setAttribute("fill", gpu ? "var(--accent2)" : "var(--accent)");
+      rect.setAttribute("fill-opacity", n === tree ? 0.35 : (gpu ? 0.9 : 0.55 + 0.08 * (n.depth % 4)));
+      g.appendChild(rect);
+      if (w > 34) {
+        var t = document.createElementNS(NS, "text");
+        t.setAttribute("x", x + 4); t.setAttribute("y", y + ROW - 6);
+        t.setAttribute("fill", "var(--fg)");
+        t.setAttribute("style", "font:11px monospace;pointer-events:none");
+        var max = Math.floor((w - 8) / 6.7);
+        t.textContent = n.name.length > max ? n.name.slice(0, Math.max(max - 1, 1)) + "…" : n.name;
+        g.appendChild(t);
+      }
+      var pct = (100 * n.value / total).toFixed(1);
+      g.addEventListener("mouseenter", function () {
+        info.textContent = n.name + " — " + n.value + " samples (" + pct + "% of all)" + (gpu ? " · GPU time × 50/s" : "");
+      });
+      g.addEventListener("click", function () { focus = (n === tree) ? null : n; draw(); });
+      svg.appendChild(g);
+      Object.keys(n.kids).forEach(function (k) { walk(n.kids[k]); });
+    })(tree);
+  }
+  function setMode(m) {
+    tree = build(DATA[m]); focus = null;
+    root.querySelectorAll("button[data-mode]").forEach(function (b) {
+      b.style.fontWeight = b.getAttribute("data-mode") === m ? "700" : "400";
+      b.setAttribute("aria-pressed", b.getAttribute("data-mode") === m ? "true" : "false");
+    });
+    info.textContent = "Mode " + m + ": " + tree.value + " samples in total (illustrative). Hover or click a frame.";
+    draw();
+  }
+  root.querySelectorAll("button[data-mode]").forEach(function (b) {
+    b.addEventListener("click", function () { setMode(b.getAttribute("data-mode")); });
+  });
+  setMode("merge");
+})();
+</script>
+</body>
+</html>

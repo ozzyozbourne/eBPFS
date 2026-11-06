@@ -45,7 +45,7 @@
     code", so that developers pick up the development method by running and changing real
     programs.</p>
     <p>The project was created in December 2022. It is MIT-licensed and is mainly written by
-    GitHub user <code>yunwei37</code>, by far the largest committer (lesson 36 is signed by Yusheng Zheng), with a number of
+    GitHub user <code>yunwei37</code> (Yusheng Zheng, who also signs lesson 36 and founded eunomia-bpf), by far the largest committer, with a number of
     other regular contributors. When surveyed on 2026-11-06 it had about 4,300 GitHub stars
     and 600 forks, which makes it one of the most visible eunomia-bpf repositories. The same
     lessons are published as a website at <a href="https://eunomia.dev/tutorials/">eunomia.dev/tutorials</a>
@@ -197,7 +197,7 @@
     <p>Some numbers, from <code>git ls-files</code> at the studied commit: <code>src/</code>
     holds 673 tracked files, 67 English READMEs and 71 <code>*.bpf.c</code> files. There are
     55 numbered directories (<code>0-introduce</code> to <code>54-exec-image-inspector</code>)
-    and 12 unnumbered lesson directories under <code>features/</code>, <code>xpu/</code>,
+    and 11 unnumbered lesson directories under <code>features/</code>, <code>xpu/</code>,
     <code>cgroup/</code> and <code>bpftrace-tutorial/</code>. The generated index lists 64
     lessons.</p>
 
@@ -436,7 +436,8 @@ test_status=ci-build</code></pre>
     turns <code>const volatile</code> globals into command-line flags, and prints the events
     the program emits. A lesson in this style is just the kernel file, the README and a
     <code>.config</code>. The setup commands, copied from <code>src/1-helloworld/README.md</code>:</p>
-    <pre data-file="bpf-developer-tutorial/src/1-helloworld/README.md"><code class="language-bash">$ wget https://aka.pw/bpf-ecli -O ecli &amp;&amp; chmod +x ./ecli
+    <pre data-file="bpf-developer-tutorial/src/1-helloworld/README.md"><code class="language-bash"># condensed from the README's code blocks; some prompts and comments added
+$ wget https://aka.pw/bpf-ecli -O ecli &amp;&amp; chmod +x ./ecli
 $ ./ecli -h
 Usage: ecli [--help] [--version] [--json] [--no-cache] url-and-args
 
@@ -687,7 +688,8 @@ int BPF_PROG(do_unlinkat_exit, int dfd, struct filename *name, long ret)
     a kernel older than 5.5 on x86 or 6.0 on arm64, or a kernel without
     <code>CONFIG_DEBUG_INFO_BTF</code>.</p>
     <p>Build and test commands for lesson 2, from the README:</p>
-    <pre data-file="bpf-developer-tutorial/src/2-kprobe-unlink/README.md"><code class="language-bash">$ ecc kprobe-link.bpf.c
+    <pre data-file="bpf-developer-tutorial/src/2-kprobe-unlink/README.md"><code class="language-bash"># condensed from the README's code blocks; some prompts and comments added
+$ ecc kprobe-link.bpf.c
 Compiling bpf object...
 Packing ebpf object and config into package.json...
 $ sudo ecli run package.json
@@ -967,16 +969,20 @@ int BPF_PROG(restrict_connect, struct socket *sock, struct sockaddr *address, in
     }
     return 0;
 }</code></pre>
-    <p>The extra <code>int ret</code> argument is the decision of earlier LSM programs on the
-    same hook. Returning it unchanged when it is non-zero respects the rule that a BPF LSM
-    program cannot turn a denial into an allow. 16843009 is <code>0x01010101</code>, which
+    <p>The extra <code>int ret</code> argument is, in the kernel documentation's words, "the
+    return value from the previous BPF program or 0 if it's the first hook". Returning it
+    unchanged when it is non-zero is a convention, not something the kernel enforces: the
+    hook's result is whatever the last BPF program returns, so a program that ignored
+    <code>ret</code> and returned 0 could undo an earlier BPF program's denial. The code
+    comment calls this the "cannot override a denial" rule. 16843009 is <code>0x01010101</code>, which
     reads the same in either byte order, so the comparison works without
     <code>bpf_htonl</code>. This shortcut only works for that address. For any other address
     you need the byte-order conversion.</p>
     <p>The README first checks that the kernel has BPF LSM compiled in <em>and</em> enabled.
     This is the most common reason the lesson fails, and it is why <code>.config</code>
     marks it <code>not-in-ci</code>:</p>
-    <pre data-file="bpf-developer-tutorial/src/19-lsm-connect/README.md"><code class="language-bash">$ cat /boot/config-$(uname -r) | grep BPF_LSM
+    <pre data-file="bpf-developer-tutorial/src/19-lsm-connect/README.md"><code class="language-bash"># condensed from the README's code blocks; some prompts and comments added
+$ cat /boot/config-$(uname -r) | grep BPF_LSM
 CONFIG_BPF_LSM=y
 $ cat /sys/kernel/security/lsm
 ndlock,lockdown,yama,integrity,apparmor
@@ -996,13 +1002,15 @@ $ curl 1.1.1.1
 curl: (7) Couldn't connect to server</code></pre>
     <p>(The <code>ndlock</code> in the README's sample output is copied as written; the kernel
     lists the Landlock LSM as <code>landlock</code>.) Chapter
-    <a href="05-program-types-and-hooks.html">05</a> covers the LSM hook family. In the
+    <a href="05-program-types-and-hooks.html">05</a> covers the LSM hook family and shows this
+    same program next to a policy that blocks <code>bpf()</code> itself. In the
     repository, the security track continues with <code>bpf_send_signal</code> (25), cgroup
     policy (<code>src/cgroup</code>) and TCP quarantine with socket iterators (51).</p>
 
     <h3>Lesson 44: a CPU scheduler in BPF</h3>
     <p>Lesson 44 brings in sched_ext, the struct_ops-based scheduler class merged in Linux
-    6.12 (chapter <a href="05-program-types-and-hooks.html">05</a>). The program is the
+    6.12 (chapter <a href="05-program-types-and-hooks.html">05</a>, which also quotes this
+    lesson's <code>select_cpu</code> callback in its struct_ops section). The program is the
     kernel's <code>scx_simple</code> example, copied into the lesson with its own copy of the
     <code>scx</code> headers under <code>include/</code>. It implements a global weighted
     virtual-time scheduler that can switch to FIFO:</p>
@@ -1093,7 +1101,8 @@ SCX_OPS_DEFINE(simple_ops,
     schedulers) rust ≥ 1.70.0. The kernel needs <code>CONFIG_SCHED_CLASS_EXT=y</code>,
     <code>CONFIG_DEBUG_INFO_BTF=y</code>, <code>CONFIG_BPF_JIT=y</code> and related options.
     Then:</p>
-    <pre data-file="bpf-developer-tutorial/src/44-scx-simple/README.md"><code class="language-bash">make
+    <pre data-file="bpf-developer-tutorial/src/44-scx-simple/README.md"><code class="language-bash"># condensed from the README's code blocks; some prompts and comments added
+make
 ./scx_simple -f      # -f: FIFO mode; -v verbose; -h help
 local=123 global=456
 local=124 global=457</code></pre>
@@ -1105,8 +1114,11 @@ local=124 global=457</code></pre>
     <code>scx_bpf_dsq_move_to_local</code> (see the kernel's
     <code>tools/sched_ext/include/scx/compat.bpf.h</code>). According to
     <a href="https://docs.ebpf.io/linux/kfuncs/scx_bpf_consume/">docs.ebpf.io</a>, the old
-    <code>scx_bpf_consume</code> alias was removed in 6.17. I have not tested the unmodified
-    lesson on 6.17 or later. Expect to port it to the new names, or copy the current
+    names stayed as aliases until 6.17. The kernel source agrees: <code>kernel/sched/ext.c</code>
+    still defines <code>scx_bpf_dispatch</code> and <code>scx_bpf_consume</code> at v6.16 and
+    no longer mentions them at v6.17. The lesson declares them as plain (non-<code>__weak</code>)
+    <code>__ksym</code>s, so libbpf should refuse to load it on 6.17 or later. I have not run
+    the unmodified lesson on such a kernel. Expect to port it to the new names, or copy the current
     <code>scx_simple</code> from the kernel tree. CI only builds this lesson; it does not
     load it. The README's build section also says to "navigate to the kernel's
     <code>tools/sched_ext/</code> directory and run make", although the lesson ships its own
@@ -1205,7 +1217,8 @@ static int attach_cuda_func(struct cuda_events_bpf *skel, const char *lib_path,
     trace whichever library or application you name with <code>-p</code> (the default is
     <code>/usr/local/cuda/lib64/libcudart.so</code>), which matters because CUDA applications
     often link the runtime statically. Commands from the README:</p>
-    <pre data-file="bpf-developer-tutorial/src/47-cuda-events/README.md"><code class="language-bash"># Build both the tracer and the example
+    <pre data-file="bpf-developer-tutorial/src/47-cuda-events/README.md"><code class="language-bash"># condensed from the README's code blocks; some prompts and comments added
+# Build both the tracer and the example
 make
 
 # Start the tracing tool
@@ -1229,7 +1242,10 @@ sudo ./cuda_events -p ./basic02 -d $PID</code></pre>
     combines CPU stacks captured at <code>cudaLaunchKernel</code> with CUPTI kernel timing to
     draw a merged CPU-to-GPU flame graph (its example profiles a Qwen3 0.6B inference).
     <code>xpu/gpu-kernel-driver</code> ships bpftrace scripts for the DRM scheduler, i915,
-    amdgpu, NVIDIA driver and vblank events (<code>drm_scheduler.bt</code>, <code>intel_i915.bt</code>, <code>amd_amdgpu.bt</code>, <code>nvidia_driver.bt</code>, <code>drm_vblank.bt</code>). For eBPF that changes GPU behavior,
+    amdgpu, NVIDIA driver and vblank events (<code>drm_scheduler.bt</code>, <code>intel_i915.bt</code>, <code>amd_amdgpu.bt</code>, <code>nvidia_driver.bt</code>, <code>drm_vblank.bt</code>). For eBPF that runs <em>inside</em>
+    GPU kernels, the lesson 47 README points to bpftime's GPU examples, which compile eBPF to
+    PTX (chapters <a href="15-bpftime-in-practice.html">15</a> and
+    <a href="16-llvmbpf.html">16</a>). For eBPF that changes GPU behavior,
     lesson 47 points to gpu_ext (chapter <a href="20-gpu-ext.html">20</a>); continuous
     CPU+GPU profiling is covered by xpu-perf (chapter <a href="22-xpu-perf.html">22</a>).</p>
 
@@ -1237,7 +1253,8 @@ sudo ./cuda_events -p ./basic02 -d $PID</code></pre>
     <p>The lessons added in 2026 (50–54) follow a stricter template: a real CLI, a
     <code>tests/</code> directory with a Python integration test, and explicit operational
     limits. Lesson 52 uses <code>fsession</code>, new in Linux 7.0, where one program runs at
-    both entry and exit of <code>vfs_read</code> and keeps a per-call cookie. Its opening
+    both entry and exit of <code>vfs_read</code> and keeps a per-call cookie (the hook itself is
+    explained in chapter <a href="05-program-types-and-hooks.html">05</a>). Its opening
     lines show the cost of shipping a frozen <code>vmlinux.h</code>:</p>
     <pre data-file="bpf-developer-tutorial/src/52-fsession-latency/fsession_latency.bpf.c"><code class="language-c">#define bpf_session_is_return bpf_session_is_return_vmlinux_snapshot
 #define bpf_session_cookie bpf_session_cookie_vmlinux_snapshot
@@ -1436,11 +1453,13 @@ int BPF_PROG(measure_vfs_read, struct file *file, char *buf, size_t count,
       <code>ret</code> early when it is non-zero?</p>
         <button class="opt">To avoid a verifier loop error</button>
         <button class="opt">Because <code>ret</code> holds the destination port</button>
-        <button class="opt" data-right>A BPF LSM program must not override an earlier denial on the same hook</button>
+        <button class="opt" data-right>So that it does not override an earlier BPF program's denial on the same hook</button>
         <button class="opt">To skip IPv6 sockets</button>
-        <div class="why">The last argument of an LSM BPF program is the return value so far.
-        The code comment says it is "satisfying 'cannot override a denial' rule": once
-        another program has denied the call, this one passes the denial on.</div></div>
+        <div class="why">The last argument of an LSM BPF program is the return value of the
+        previous BPF program on that hook (0 for the first). The code comment says it is
+        "satisfying 'cannot override a denial' rule": once another program has denied the
+        call, this one passes the denial on. The kernel does not enforce this; each program
+        has to follow the convention.</div></div>
       <div class="q"><p><strong>Q5.</strong> Lesson 47 declares its uprobes as a bare
       <code>SEC("uprobe")</code>. What follows from that?</p>
         <button class="opt">The programs attach to every binary on the system</button>

@@ -1,0 +1,1520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · gpu_ext: eBPF policies for GPU memory and scheduling · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="20">
+<meta name="chapter-part" content="Part V · eBPF for GPUs and accelerators">
+<meta name="chapter-summary" content="How gpu_ext adds struct_ops hooks and kfuncs to NVIDIA's open UVM and RM driver so eBPF programs can choose GPU page prefetching, chunk eviction order and TSG timeslices, how its request-then-validate model keeps the driver in charge, how the device-side half (from eGPU, now in bpftime) runs eBPF inside CUDA kernels, and what the ASPLOS '27 paper and its artifact actually show.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/gpu_ext">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part V · eBPF for GPUs and accelerators › 20 · gpu_ext</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 20</div>
+      <h1>gpu_ext: eBPF policies inside the GPU driver</h1>
+      <p class="lede">A 59 GiB model does not fit in a 32 GB GPU. The NVIDIA driver can still run it
+      by paging memory between host RAM and the GPU on demand, but its built-in rules decide what to
+      fetch early, what to evict and which process gets the GPU next. Those rules are the same for
+      every workload. This chapter shows how <code>gpu_ext</code> replaces them with eBPF programs:
+      the hooks it adds to the NVIDIA open kernel modules, the policies in the repo, the device-side
+      half that runs eBPF inside CUDA kernels, and what its paper does and does not show.</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="05-program-types-and-hooks.html">05</a> (struct_ops, sched_ext), <a href="15-bpftime-in-practice.html">15</a>, <a href="16-llvmbpf.html">16</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/gpu_ext">eunomia-bpf/gpu_ext</a> @ <code>50a51ad4</code></span><span>~60 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>On a CPU, Linux decides which pages stay in RAM, which get swapped out and which thread runs
+    next. If you do not like those decisions you can tune them, and since sched_ext and cache_ext
+    you can even replace them with eBPF (<a href="05-program-types-and-hooks.html">Chapter 05</a>).
+    On an NVIDIA GPU the same decisions are made by the GPU driver. The kernel module
+    <code>nvidia-uvm</code> moves pages between host and device memory. The core module
+    <code>nvidia</code> sets how long each GPU context may run before it is switched out. Both use
+    fixed heuristics: a tree-based prefetcher with one threshold, roughly LRU eviction of 2 MB
+    chunks, and a fixed timeslice per context.</p>
+    <p>Those heuristics work for some programs and not others. The paper behind this chapter
+    (Figure 1 of arXiv:2512.12615) shows how different the page-fault patterns are.
+    Building a Faiss index scans memory sequentially, while querying it is random. LLM prefill is
+    periodic and sequential, decode is sparse, and DNN training touches memory in periodic blocks. A
+    prefetcher tuned for one of these patterns hurts another. When two tenants share a GPU, the
+    driver has no idea that one of them is a latency-critical inference server and the other a
+    background training job.</p>
+    <p>There are two usual ways out. Both are poor. Frameworks such as vLLM or llama.cpp can manage
+    offloading themselves, but each has to do it separately, none of them sees the other tenants,
+    and none can touch the driver's fault handler or timeslices. Research systems such as GPREEMPT
+    or TimeGraph modify the driver directly. That is powerful, but each new policy is a new kernel
+    patch, and a bug in it can hang the GPU or crash the kernel.</p>
+    <p><strong>gpu_ext</strong> takes the sched_ext approach. It adds a small number of hook points
+    to the NVIDIA open GPU kernel modules, exposes them as <code>struct_ops</code> tables, and lets
+    eBPF programs make the decisions. The kernel verifier checks those programs, and a
+    validation step in the driver checks each decision before it is applied. It also has a second,
+    newer half: eBPF programs compiled to PTX and injected <em>into</em> running CUDA kernels, so that
+    policies can see what happens on the device and not only in the driver.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>gpu_ext does not let eBPF manage
+    GPU memory. The driver still owns the page tables, the chunk lists and the hardware runlists. A
+    policy only <em>requests</em> a choice the driver already makes: which pages to prefetch on this
+    fault, whether this chunk goes to the head or the tail of the eviction list, what timeslice this
+    context gets. It does so through a kfunc that records the request. After the callback returns,
+    the driver validates the request against current state and either applies it or falls back to
+    its native behaviour. The camera-ready paper calls this separating the effect of a callback
+    from its trigger.</p></div>
+
+    <div class="callout warn"><span class="label">Status</span><p>This is research code for one
+    vendor. It targets the NVIDIA open kernel modules only. It needs a custom-built
+    <code>nvidia-uvm.ko</code> (and <code>nvidia.ko</code> for scheduling), loaded with
+    <code>insmod</code>, and a kernel with BTF (the paper uses Linux 6.15). The README warns:
+    "<strong>NEVER run <code>make modules_install</code></strong>". The orb used to write this chapter
+    has no GPU, so nothing here was run. The commands and outputs come from the repository's
+    documentation.</p></div>
+
+    <h2>GPU background a programmer needs</h2>
+    <p>You do not need to know CUDA well to follow gpu_ext, but you need five ideas: kernels and
+    warps, device memory, unified virtual memory, GPU page faults, and how the GPU time-slices between
+    processes.</p>
+
+    <h3>Kernels, blocks, warps and SMs</h3>
+    <p>A CUDA <em>kernel</em> is a function that runs on the GPU. You launch it from the host with a
+    grid of <em>thread blocks</em>, for example <code>vectorAdd&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(a, b, c)</code>.
+    Each block is assigned to a <em>streaming multiprocessor</em> (SM). An SM runs the threads of a
+    block in groups of 32 called <em>warps</em>. All 32 threads of a warp execute the same
+    instruction at the same time on different data. NVIDIA calls this SIMT (single instruction,
+    multiple threads). When threads in a warp take different sides of an <code>if</code>, the warp
+    runs both sides one after the other with some lanes masked off. This is called
+    <em>divergence</em>, and it is the main reason a CPU-style eBPF program cannot simply be copied
+    onto the GPU.</p>
+    <p>The host submits work through <em>channels</em>, which are command queues the GPU reads directly.
+    A CUDA stream maps to a channel. Channels of one context are grouped into a <em>TSG</em>
+    (Time-Slice Group). The hardware scheduler picks TSGs from a per-engine <em>runlist</em> and runs
+    each one for its timeslice before switching. Submitting work does not involve the kernel: user
+    space writes into a ring buffer and rings a doorbell. The driver therefore sees when a TSG is
+    created, bound and destroyed, but not each kernel launch. This is why gpu_ext's scheduling hooks
+    sit on TSG lifecycle events, and why it adds uprobes on <code>cuLaunchKernel</code> to see
+    launches.</p>
+
+    <h3>Device memory and unified virtual memory</h3>
+    <p>A discrete GPU has its own memory (VRAM, 32 GB on the RTX 5090 used in the paper), connected to
+    the host over PCIe. The classic CUDA model makes you allocate VRAM with <code>cudaMalloc</code> and
+    copy data explicitly. <em>Unified Virtual Memory</em> (UVM, also called unified or managed memory)
+    gives the CPU and GPU one virtual address range instead. <code>cudaMallocManaged</code> returns a
+    pointer that is valid on both sides. Pages move to whichever processor touches them. You can
+    allocate more managed memory than the GPU has. This is called <em>oversubscription</em>, and the
+    driver then has to evict GPU-resident pages back to the host to make room.</p>
+    <p>On Linux the open-source <code>nvidia-uvm.ko</code> module implements this. Its units are worth
+    memorising because they appear in every hook signature:</p>
+    <ul>
+      <li><strong>Page</strong>: 4 KB on the host side.</li>
+      <li><strong>VA block</strong>: a 2 MB aligned piece of virtual address space (<code>uvm_va_block_t</code>),
+      i.e. 512 pages. Faults are serviced per VA block, and the prefetcher only works inside one block.</li>
+      <li><strong>Root chunk</strong>: a 2 MB piece of physical GPU memory managed by the PMM (physical
+      memory manager, <code>uvm_pmm_gpu.c</code>). Eviction works on root chunks.</li>
+    </ul>
+
+    <h3>GPU page faults, replay and migration</h3>
+    <p>Since Pascal, NVIDIA GPUs support <em>replayable</em> faults. When a warp touches a managed page
+    that is not mapped in GPU memory, the GPU MMU writes a fault entry into a hardware fault buffer
+    and stalls that warp. Other warps keep running. It then interrupts the host. The UVM driver's
+    bottom half reads a batch of entries, groups them by VA block, decides where each page should
+    live, allocates GPU chunks (evicting others if needed), copies the data over PCIe with the GPU's
+    copy engine, updates the GPU page tables, and finally tells the GPU to <em>replay</em> the
+    faulting accesses. Each round trip is expensive (an interrupt, driver work, a PCIe transfer and
+    a replay), so the driver tries to prefetch: when it services a fault, it can also migrate neighbouring pages it expects to
+    be used soon.</p>
+    <p>The stock prefetcher lives in <code>uvm_perf_prefetch.c</code>. For each VA block it keeps a
+    bitmap tree of which pages are already resident. On a fault it walks from the faulting page up the
+    tree, and picks the largest subregion in which more than <code>uvm_perf_prefetch_threshold</code>
+    percent of pages are already resident (default 51, a module parameter). It then prefetches the
+    rest of that subregion. That is the single global rule gpu_ext makes programmable.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 470" role="img" aria-label="CPU and GPU memory with UVM. A warp faults on a managed page; the GPU MMU logs a fault in the fault buffer; the UVM driver on the host services the batch, decides prefetch, may evict a 2 MB chunk, migrates pages over PCIe, updates GPU page tables, and replays the access.">
+        <style>
+          .b1{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .b2{fill:none;stroke:var(--accent);stroke-width:2}
+          .b3{fill:none;stroke:var(--accent2);stroke-width:2;stroke-dasharray:6 4}
+          .t1{fill:var(--fg);font:600 14px sans-serif}
+          .t2{fill:var(--fg);font:12px monospace}
+          .t3{fill:var(--muted);font:12px sans-serif}
+          .a1{stroke:var(--fg);stroke-width:1.6;fill:none;marker-end:url(#ah20a)}
+          .a2{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#ah20b)}
+          .n{fill:var(--accent);font:700 13px sans-serif}
+        </style>
+        <defs>
+          <marker id="ah20a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="ah20b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+        </defs>
+        <!-- Host -->
+        <rect class="b1" x="10" y="10" width="440" height="450" rx="10"/>
+        <text class="t1" x="24" y="34">Host (CPU)</text>
+        <rect class="b1" x="24" y="48" width="410" height="70" rx="8"/>
+        <text class="t1" x="36" y="70">Application</text>
+        <text class="t2" x="36" y="92">p = cudaMallocManaged(48 GB)</text>
+        <text class="t2" x="36" y="108">kernel&lt;&lt;&lt;g,b&gt;&gt;&gt;(p)   // no explicit copies</text>
+        <rect class="b2" x="24" y="132" width="410" height="200" rx="8"/>
+        <text class="t1" x="36" y="154">nvidia-uvm.ko (fault bottom half)</text>
+        <text class="t2" x="36" y="178">fetch_fault_buffer_entries()</text>
+        <text class="t2" x="36" y="198">service_fault_batch()</text>
+        <text class="t2" x="48" y="218">uvm_va_block_select_residency()</text>
+        <text class="t2" x="48" y="238">uvm_perf_prefetch_get_hint_va_block()</text>
+        <text class="t2" x="60" y="258">compute_prefetch_region()  ◀ prefetch hook</text>
+        <text class="t2" x="48" y="278">PMM alloc / pick_root_chunk_to_evict() ◀ evict hook</text>
+        <text class="t2" x="48" y="298">copy engine push, map PTEs</text>
+        <text class="t2" x="36" y="318">push_replay_on_gpu()</text>
+        <rect class="b1" x="24" y="346" width="410" height="100" rx="8"/>
+        <text class="t1" x="36" y="368">Host DRAM (128 GB in the paper's Server A)</text>
+        <rect class="b1" x="40" y="380" width="70" height="50" rx="4"/><text class="t3" x="50" y="410">pages</text>
+        <rect class="b1" x="120" y="380" width="70" height="50" rx="4"/>
+        <rect class="b1" x="200" y="380" width="70" height="50" rx="4"/>
+        <text class="t3" x="286" y="402">evicted chunks</text>
+        <text class="t3" x="286" y="420">land back here</text>
+        <!-- GPU -->
+        <rect class="b1" x="510" y="10" width="440" height="450" rx="10"/>
+        <text class="t1" x="524" y="34">GPU (device)</text>
+        <rect class="b1" x="524" y="48" width="200" height="120" rx="8"/>
+        <text class="t1" x="536" y="70">SM</text>
+        <text class="t2" x="536" y="92">warp 0 (32 lanes)</text>
+        <text class="t2" x="536" y="110">warp 1  ✗ stalled</text>
+        <text class="t2" x="536" y="128">warp 2</text>
+        <text class="t3" x="536" y="152">other warps keep running</text>
+        <rect class="b1" x="740" y="48" width="196" height="120" rx="8"/>
+        <text class="t1" x="752" y="70">GPU MMU</text>
+        <text class="t3" x="752" y="92">page not resident →</text>
+        <text class="t3" x="752" y="110">write fault entry</text>
+        <rect class="b1" x="752" y="122" width="170" height="34" rx="4"/>
+        <text class="t2" x="760" y="144">fault buffer</text>
+        <rect class="b1" x="524" y="190" width="412" height="130" rx="8"/>
+        <text class="t1" x="536" y="212">VRAM (32 GB): 2 MB root chunks</text>
+        <rect class="b2" x="540" y="226" width="80" height="40" rx="4"/><text class="t3" x="548" y="250">used</text>
+        <rect class="b2" x="630" y="226" width="80" height="40" rx="4"/><text class="t3" x="638" y="250">used</text>
+        <rect class="b3" x="720" y="226" width="80" height="40" rx="4"/><text class="t3" x="728" y="250">victim</text>
+        <rect class="b1" x="810" y="226" width="110" height="40" rx="4"/><text class="t3" x="818" y="250">free pool</text>
+        <text class="t3" x="540" y="290">eviction list: HEAD (evicted first) … TAIL (safest)</text>
+        <text class="t3" x="540" y="308">VA block = 2 MB = 512 × 4 KB pages</text>
+        <rect class="b1" x="524" y="340" width="412" height="106" rx="8"/>
+        <text class="t1" x="536" y="362">Copy engine + PCIe</text>
+        <text class="t3" x="536" y="384">migration host → GPU (faulted + prefetched pages)</text>
+        <text class="t3" x="536" y="404">eviction GPU → host (whole 2 MB chunk)</text>
+        <text class="t3" x="536" y="424">milliseconds per large transfer; this is the cost</text>
+        <text class="t3" x="536" y="440">prefetch and eviction policies try to hide</text>
+        <!-- arrows -->
+        <line class="a1" x1="724" y1="110" x2="740" y2="110"/>
+        <text class="n" x="728" y="104">1</text>
+        <path class="a2" d="M752,156 C640,175 520,170 434,180"/>
+        <text class="n" x="600" y="180">2 interrupt</text>
+        <path class="a1" d="M200,430 C330,470 500,420 524,400"/>
+        <text class="n" x="300" y="456">3 migrate</text>
+        <path class="a2" d="M434,318 C480,330 500,250 540,250"/>
+        <text class="n" x="456" y="300">4 map</text>
+        <path class="a1" d="M434,318 C470,140 500,120 524,112"/>
+        <text class="n" x="470" y="140">5 replay</text>
+      </svg>
+      <figcaption>Figure 20.1 — The UVM fault path. Function names are from NVIDIA's open
+      <code>kernel-open/nvidia-uvm/</code> (575.57.08). The two marked lines are where gpu_ext calls
+      eBPF.</figcaption>
+    </figure>
+
+    <h3>Why eBPF, and why here</h3>
+    <p>The driver is the only layer that sees every tenant, owns the fault handler and can set
+    hardware timeslices. That makes it the right place for policy. But it is a large C codebase maintained
+    by NVIDIA, and a bad pointer in it can take down the machine. Linux already solved the same problem for the CPU scheduler: sched_ext lets
+    a verified eBPF program implement <code>struct sched_ext_ops</code>, and the kernel falls back to
+    the fair scheduler if the program misbehaves. gpu_ext's README says it directly: "Inspired by
+    Linux kernel's <code>sched_ext</code>, gpu_ext brings the same extensibility to GPU drivers."</p>
+
+    <h2>What gpu_ext is</h2>
+    <p>gpu_ext has two halves, built by the same group (eunomia-bpf, UC Santa Cruz and
+    collaborators):</p>
+    <div class="grid">
+      <div class="card"><h4>Host side: driver hooks</h4><p>A fork of NVIDIA's open GPU kernel modules
+      (<a href="https://github.com/eunomia-bpf/gpu_ext-kernel-modules">gpu_ext-kernel-modules</a>)
+      that registers two struct_ops types, <code>gpu_mem_ops</code> in <code>nvidia-uvm</code> and
+      <code>nv_gpu_sched_ops</code> in <code>nvidia</code>, plus seven kfuncs at the pinned commit (one more on
+      the 575 branch). Policies are ordinary
+      libbpf programs in <code>gpu_ext/extension/</code>.</p></div>
+      <div class="card"><h4>Device side: eBPF in CUDA kernels</h4><p>eBPF programs compiled to PTX by
+      llvmbpf and patched into running CUDA kernels by bpftime's <code>nv_attach_impl</code>. This came
+      from the eGPU prototype (HCDS '25), whose repository says it "has been merged into bpftime". It is
+      covered in <a href="15-bpftime-in-practice.html#gpu-and-cuda-probes">Chapter 15</a> and
+      <a href="16-llvmbpf.html">Chapter 16</a>.</p></div>
+      <div class="card"><h4>Glue: maps and uprobes</h4><p>Host policies can also attach uprobes
+      (for example on <code>cuLaunchKernel</code> or <code>llama_decode</code>) and kprobes. They can
+      share maps with sched_ext CPU schedulers and with device-side programs, so one policy can see
+      application phase, driver state and GPU state together.</p></div>
+    </div>
+
+    <p>The history matters, because the paper and the code have moved at different speeds:</p>
+    <ul>
+      <li><strong>eGPU</strong> (2024–2025): "the first system to dynamically offload eBPF instrumentation
+      and bytecode directly onto running GPU kernels using real-time PTX injection" (eGPU README).
+      Observability only. Paper: HCDS '25.</li>
+      <li><strong>gpu_ext repo</strong> created 2025-11-20. The first driver commit in the kernel-module
+      fork, <code>920d44e6</code> (2025-11-21), is "Add BPF struct_ops support and initialization to UVM
+      driver". Scheduling hooks followed on 2025-12-05.</li>
+      <li><strong>arXiv:2512.12615</strong> (v1 2025-12-14, v2 2025-12-20), "gpu_ext: Extensible OS
+      Policies for GPUs via eBPF". Linux Plumbers 2025 talk "Extending eBPF to GPU Device and Driver
+      Contexts" on 2025-12-12.</li>
+      <li><strong>ASPLOS '27</strong>: after a shepherded revision (recorded verbatim in
+      <code>docs/revision-shepherd-comment.md</code>), the camera-ready is titled "Safe and Programmable
+      OS-Level GPU Resource Management with eBPF" (Crossref: ASPLOS '27 Vol. 1, pp. 804–820,
+      DOI 10.1145/3845814.3850045). The last commit studied here (2026-09-24) is "Update paper submodule
+      to gpu_ext camera-ready version".</li>
+    </ul>
+
+    <figure>
+      <svg viewBox="0 0 960 520" role="img" aria-label="Layers of the GPU stack and where gpu_ext attaches eBPF: uprobes in the application and CUDA runtime; struct_ops gpu_mem_ops in nvidia-uvm; struct_ops nv_gpu_sched_ops and kprobes in nvidia; device-side eBPF trampolines in GPU kernels; shared maps across layers.">
+        <style>
+          .L{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .H{fill:none;stroke:var(--accent);stroke-width:2.2}
+          .D{fill:none;stroke:var(--accent2);stroke-width:2.2}
+          .tt{fill:var(--fg);font:600 14px sans-serif}
+          .ts{fill:var(--fg);font:12px monospace}
+          .tm{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--muted);stroke-width:1.4;fill:none;stroke-dasharray:4 3}
+        </style>
+        <rect class="L" x="10" y="10" width="600" height="84" rx="9"/>
+        <text class="tt" x="24" y="34">User space: PyTorch, vLLM, llama.cpp, Faiss</text>
+        <text class="tm" x="24" y="56">unmodified applications; libcuda / libcudart</text>
+        <text class="ts" x="24" y="78">cuLaunchKernel · cudaMallocManaged · llama_decode</text>
+        <rect class="H" x="400" y="20" width="200" height="66" rx="7"/>
+        <text class="tt" x="410" y="42">uprobe / uprobe.s</text>
+        <text class="tm" x="410" y="62">phase detection,</text>
+        <text class="tm" x="410" y="78">launch-time preemption</text>
+
+        <rect class="L" x="10" y="110" width="600" height="80" rx="9"/>
+        <text class="tt" x="24" y="134">Linux kernel 6.15+: BPF core</text>
+        <text class="tm" x="24" y="156">verifier · struct_ops maps · kfunc BTF sets · bpf_wq</text>
+        <text class="tm" x="24" y="176">sched_ext CPU scheduler (sched_gpu_*.bpf.c) can share maps</text>
+
+        <rect class="L" x="10" y="206" width="295" height="150" rx="9"/>
+        <text class="tt" x="24" y="230">nvidia-uvm.ko</text>
+        <rect class="H" x="22" y="242" width="272" height="104" rx="7"/>
+        <text class="ts" x="32" y="262">struct gpu_mem_ops</text>
+        <text class="ts" x="32" y="282"> gpu_page_prefetch[_iter]</text>
+        <text class="ts" x="32" y="300"> gpu_block_activate/access</text>
+        <text class="ts" x="32" y="318"> gpu_evict_prepare</text>
+        <text class="tm" x="32" y="338">kfuncs: set_prefetch_region, …reorder</text>
+
+        <rect class="L" x="315" y="206" width="295" height="150" rx="9"/>
+        <text class="tt" x="329" y="230">nvidia.ko (RM, open part)</text>
+        <rect class="H" x="327" y="242" width="272" height="104" rx="7"/>
+        <text class="ts" x="337" y="262">struct nv_gpu_sched_ops</text>
+        <text class="ts" x="337" y="282"> on_task_init / on_bind</text>
+        <text class="ts" x="337" y="300"> on_task_destroy</text>
+        <text class="ts" x="337" y="318"> (+on_timeslice_control)</text>
+        <text class="tm" x="337" y="338">kfuncs: set_timeslice, preempt_tsg …</text>
+
+        <rect class="L" x="10" y="372" width="600" height="56" rx="9"/>
+        <text class="tt" x="24" y="396">GSP firmware · runlists · MMU · copy engines</text>
+        <text class="tm" x="24" y="416">closed; policies never touch it directly</text>
+
+        <rect class="L" x="10" y="444" width="600" height="66" rx="9"/>
+        <text class="tt" x="24" y="468">GPU device: CUDA kernels on SMs</text>
+        <rect class="D" x="300" y="452" width="300" height="50" rx="7"/>
+        <text class="ts" x="310" y="472">eBPF → PTX trampolines (bpftime)</text>
+        <text class="tm" x="310" y="492">entry / exit / memory ops, warp leader</text>
+
+        <rect class="L" x="640" y="10" width="310" height="500" rx="9"/>
+        <text class="tt" x="654" y="34">Control plane (your loader)</text>
+        <text class="ts" x="654" y="58">sudo ./extension/eviction_lfu</text>
+        <text class="tm" x="654" y="80">libbpf skeleton: open → load →</text>
+        <text class="tm" x="654" y="98">bpf_map__attach_struct_ops()</text>
+        <text class="tm" x="654" y="128">writes tunables into maps</text>
+        <text class="tm" x="654" y="146">(prefetch %, PIDs, timeslices)</text>
+        <text class="tt" x="654" y="190">Shared maps</text>
+        <text class="tm" x="654" y="212">kernel maps for host hooks;</text>
+        <text class="tm" x="654" y="230">GPU-resident maps for device code,</text>
+        <text class="tm" x="654" y="248">flushed to host at kernel boundaries</text>
+        <text class="tt" x="654" y="300">Rules</text>
+        <text class="tm" x="654" y="322">one gpu_mem_ops and one</text>
+        <text class="tm" x="654" y="340">nv_gpu_sched_ops at a time</text>
+        <text class="tm" x="654" y="358">(cmpxchg singleton, like sched_ext)</text>
+        <text class="tm" x="654" y="388">decisions are requests; the</text>
+        <text class="tm" x="654" y="406">driver validates and may ignore</text>
+        <line class="ar" x1="610" y1="140" x2="640" y2="140"/>
+        <line class="ar" x1="610" y1="290" x2="640" y2="290"/>
+        <line class="ar" x1="610" y1="476" x2="640" y2="476"/>
+      </svg>
+      <figcaption>Figure 20.2 — Where gpu_ext attaches eBPF. Boxes outlined in the first accent colour
+      are host-side hooks (uprobes, and the struct_ops added by the driver fork). The box in the second
+      accent colour is the device side from bpftime.</figcaption>
+    </figure>
+
+    <h2>Where the code lives</h2>
+    <p>The main repository is 1.6 GB, mostly experiment records, so clone it sparsely. The commands
+    below were used for this chapter:</p>
+    <pre><code class="language-bash">git clone --depth 1 --filter=blob:none --sparse https://github.com/eunomia-bpf/gpu_ext
+cd gpu_ext
+git sparse-checkout set --no-cone '/*.md' '/Makefile' '/extension/' '/tools/' '/docs/README.md'</code></pre>
+    <p>Its top-level layout, from the README and the tree at <code>50a51ad4</code>:</p>
+    <div class="grid">
+      <div class="card"><h4><code>extension/</code></h4><p>The policies. Each <code>NAME.bpf.c</code> is a
+      struct_ops (or kprobe/uprobe) program and <code>NAME.c</code> its libbpf loader. Shared headers:
+      <code>bpf_testmod.h</code> (memory struct_ops and kfuncs), <code>gpu_sched_set_timeslices.h</code>
+      (scheduling), <code>uvm_types.h</code>, <code>nvidia_rm_types.h</code>. Also
+      <code>cleanup_struct_ops_tool.c</code> and <code>SAFE_POLICY_ROUTES.md</code>.</p></div>
+      <div class="card"><h4><code>kernel-module/nvidia-module/</code></h4><p>Submodule pointing at
+      <a href="https://github.com/eunomia-bpf/gpu_ext-kernel-modules">gpu_ext-kernel-modules</a>. Pinned
+      to <code>c4fd5655</code>, the port to NVIDIA 610.43.02. The README still says 575.57.08, which is
+      the <code>test-sched</code> branch.</p></div>
+      <div class="card"><h4><code>workloads/</code></h4><p>Benchmarks per system (llama.cpp, vLLM, PyTorch
+      GNN, Faiss, and the revision's MoE-Infinity, XSched, GPREEMPT, LMCache …), each with a
+      <code>uv</code> project, run scripts and dated result reports.</p></div>
+      <div class="card"><h4><code>microbench/</code></h4><p>Mechanism benchmarks: <code>memory/</code>
+      (UVM modes and oversubscription), <code>multi-stream/</code>, <code>clc_bench/</code> (Blackwell
+      cluster launch control policies), <code>trampoline-scaling/</code>, <code>fig15-device/</code>
+      (device map tiers and an evidence audit).</p></div>
+      <div class="card"><h4><code>docs/</code></h4><p>Driver notes (<code>driver_docs/</code>, partly in
+      Chinese), experiment and safety records (<code>experiment/</code>), the paper submodule
+      (<code>docs/paper</code> → <code>yunwei37/gbpf-paper</code>), LPC and GPU MODE slides.</p></div>
+      <div class="card"><h4><code>ARTIFACT.md</code>, <code>scripts/artifact/</code></h4><p>The entry
+      point for reproducing paper numbers, including a CPU-only <code>reanalyze.py</code> that
+      recomputes published statistics without a GPU.</p></div>
+      <div class="card"><h4><code>tools/</code></h4><p><code>cuda_sched_trace</code>: a tracer for CUDA
+      launches and scheduling events.</p></div>
+      <div class="card"><h4><code>libbpf/</code>, <code>bpftool/</code>, <code>vmlinux/</code></h4><p>Submodules
+      and BTF headers used to build the policies.</p></div>
+    </div>
+    <p>The driver fork changes 30 files compared with NVIDIA's 610.43.02 commit <code>57130a27</code>
+    (GitHub compare API). The ones that matter for understanding:</p>
+    <table>
+      <tr><th>File</th><th>Change</th><th>What it does</th></tr>
+      <tr><td><code>kernel-open/nvidia-uvm/uvm_bpf_struct_ops.c</code> / <code>.h</code></td><td>new, 457 + 61 lines</td><td>Defines and registers <code>struct gpu_mem_ops</code>, the memory kfuncs, and the <code>uvm_bpf_call_*</code> wrappers.</td></tr>
+      <tr><td><code>kernel-open/nvidia-uvm/uvm_perf_prefetch.c</code></td><td>+98 −29</td><td>Calls the prefetch hooks from <code>compute_prefetch_region()</code>.</td></tr>
+      <tr><td><code>kernel-open/nvidia-uvm/uvm_pmm_gpu.c</code> / <code>.h</code></td><td>+273 −26, +45</td><td>Calls activate, access and evict_prepare. Routes all root-chunk list moves through one helper that tracks list state and generation.</td></tr>
+      <tr><td><code>kernel-open/common/inc/nv-gpu-transition-validator.h</code></td><td>new, 529 lines</td><td>Shared request recording and validation for prefetch, PMM and scheduler decisions.</td></tr>
+      <tr><td><code>kernel-open/nvidia/nv-gpu-sched-hooks.c</code> / <code>.h</code></td><td>new, 515 + 134 lines</td><td>Defines <code>struct nv_gpu_sched_ops</code>, the scheduling kfuncs, and traceable <code>noinline</code> hook functions.</td></tr>
+      <tr><td><code>src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c</code></td><td>+97 −1</td><td>Calls the task-init hook inside TSG construction and applies validated timeslice and interleave values.</td></tr>
+      <tr><td><code>kernel-open/nvidia-uvm/uvm_pmm_test.c</code>, <code>kernel-open/tests/transition-validator/</code></td><td>+520, new</td><td>Tests for the validators.</td></tr>
+    </table>
+    <p>The paper's description, "lightweight instrumentation (~100 LOC)" in NVIDIA's modules plus
+    "a standalone file (~1 KLOC)" for hook registration, matches this shape. The later safety work
+    (validators and tests) added much more.</p>
+
+    <h2>How the driver hooks work</h2>
+
+    <h3>Registering a struct_ops type from a module</h3>
+    <p>If you read <a href="05-program-types-and-hooks.html">Chapter 05</a>, this part will look
+    familiar. A kernel subsystem (here, a module) declares a table of function pointers, provides
+    stub implementations for control-flow integrity, says which helpers and kfuncs its programs may
+    call, and registers it with <code>register_bpf_struct_ops()</code>. The memory table, as defined in
+    the driver:</p>
+    <pre data-file="gpu_ext-kernel-modules/kernel-open/nvidia-uvm/uvm_bpf_struct_ops.c"><code class="language-c">/* Shared struct_ops definition between kernel module and BPF program */
+struct gpu_mem_ops {
+	int (*gpu_test_trigger)(const char *buf, int len);
+
+	/* Prefetch hooks */
+	int (*gpu_page_prefetch)(
+		uvm_page_index_t page_index,
+		uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
+		uvm_va_block_region_t *max_prefetch_region,
+		uvm_bpf_prefetch_decision_t *decision_ctx);
+
+	int (*gpu_page_prefetch_iter)(
+		uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
+		uvm_va_block_region_t *max_prefetch_region,
+		uvm_va_block_region_t *current_region,
+		unsigned int counter,
+		uvm_bpf_prefetch_decision_t *decision_ctx);
+
+	/* PMM eviction policy hooks */
+	int (*gpu_block_activate)(
+		uvm_pmm_gpu_t *pmm,
+		uvm_gpu_chunk_t *chunk,
+		uvm_bpf_pmm_decision_ctx_t *decision_ctx);
+
+	int (*gpu_block_access)(
+		uvm_pmm_gpu_t *pmm,
+		uvm_gpu_chunk_t *chunk,
+		uvm_bpf_pmm_decision_ctx_t *decision_ctx);
+
+	int (*gpu_evict_prepare)(
+		uvm_pmm_gpu_t *pmm,
+		struct list_head *va_block_used,
+		struct list_head *va_block_unused);
+};
+/* ... CFI stubs, kfuncs ... */
+/* Registration function */
+static int gpu_mem_ops_reg(void *kdata, struct bpf_link *link)
+{
+	struct gpu_mem_ops *ops = kdata;
+
+	/* Only one instance at a time */
+	if (cmpxchg(&amp;uvm_ops, NULL, ops) != NULL)
+		return -EEXIST;
+
+	pr_info("gpu_mem_ops registered in nvidia-uvm\n");
+	return 0;
+}
+/* ... */
+static struct bpf_struct_ops gpu_mem_ops_struct_ops = {
+	.verifier_ops = &amp;gpu_mem_ops_verifier_ops,
+	.init = gpu_mem_ops_init,
+	.init_member = gpu_mem_ops_init_member,
+	.reg = gpu_mem_ops_reg,
+	.unreg = gpu_mem_ops_unreg,
+	.cfi_stubs = &amp;__bpf_ops_gpu_mem_ops,
+	.name = "gpu_mem_ops",
+	.owner = THIS_MODULE,
+};</code></pre>
+    <p>A few design choices are visible here:</p>
+    <ul>
+      <li><strong>One policy at a time.</strong> <code>reg</code> installs the table with a
+      <code>cmpxchg</code> against <code>NULL</code>, so a second loader gets <code>-EEXIST</code>. The
+      repo's <code>CLAUDE.md</code> says it bluntly: "BPF struct_ops is a global singleton — only one can
+      be loaded at a time." To combine prefetching and eviction you write one program that implements
+      both, which is why there are files such as <code>prefetch_always_max_cycle_moe.bpf.c</code>.</li>
+      <li><strong>Raw driver types in the signature.</strong> Hooks receive pointers to
+      <code>uvm_pmm_gpu_t</code>, <code>uvm_gpu_chunk_t</code> and the prefetch bitmap tree. The
+      verifier allows reading them through BTF (<code>bpf_tracing_btf_ctx_access</code>), but
+      <code>gpu_mem_ops_btf_struct_access</code> returns <code>-EACCES</code>, so any write through those
+      pointers is rejected at load time. The <code>decision_ctx</code> argument is the only way to say
+      anything back.</li>
+      <li><strong>Helpers.</strong> <code>get_func_proto</code> returns <code>bpf_base_func_proto()</code>:
+      maps, <code>bpf_printk</code>, time and similar basics.</li>
+      <li><strong>kfuncs for kprobes too.</strong> <code>uvm_bpf_struct_ops_init()</code> registers the
+      kfunc set for <code>BPF_PROG_TYPE_STRUCT_OPS</code> and also, as "non-fatal", for
+      <code>BPF_PROG_TYPE_KPROBE</code>.</li>
+      <li><strong>A test hook.</strong> <code>gpu_test_trigger</code> is called when you write to
+      <code>/proc/bpf_testmod_trigger</code>, so you can check that a program attached without
+      producing a GPU fault. <code>extension/struct_ops.bpf.c</code> is the hello-world for it.</li>
+    </ul>
+    <p>The call into eBPF happens in small wrappers that read the RCU-protected table pointer. If no
+    policy is loaded, the wrapper returns <code>UVM_BPF_ACTION_DEFAULT</code> and the driver behaves as
+    stock. This is what the paper measures as "hooks enabled but no policy attached", with overhead
+    "less than 0.2%".</p>
+    <pre data-file="gpu_ext-kernel-modules/kernel-open/nvidia-uvm/uvm_bpf_struct_ops.c"><code class="language-c">NvS64 uvm_bpf_call_gpu_page_prefetch(
+	uvm_page_index_t page_index,
+	uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
+	uvm_va_block_region_t *max_prefetch_region,
+	nv_gpu_prefetch_decision_t *decision)
+{
+	struct gpu_mem_ops *ops;
+	uvm_bpf_prefetch_decision_t decision_ctx = {0};
+	int ret = UVM_BPF_ACTION_DEFAULT;
+
+	rcu_read_lock();
+	ops = rcu_dereference(uvm_ops);
+	if (ops &amp;&amp; ops-&gt;gpu_page_prefetch) {
+		ret = ops-&gt;gpu_page_prefetch(page_index, bitmap_tree,
+						       max_prefetch_region,
+						       &amp;decision_ctx);
+	}
+	rcu_read_unlock();
+
+	*decision = decision_ctx.request;
+	return (NvS64)ret;
+}</code></pre>
+
+    <h3>The prefetch hook</h3>
+    <p>Here is NVIDIA's original <code>compute_prefetch_region()</code> in 575.57.08. It walks the
+    bitmap tree from the faulting page upward and keeps the largest subregion whose residency count
+    exceeds the threshold:</p>
+    <pre data-file="NVIDIA/open-gpu-kernel-modules@575.57.08/kernel-open/nvidia-uvm/uvm_perf_prefetch.c"><code class="language-c">static uvm_va_block_region_t compute_prefetch_region(uvm_page_index_t page_index,
+                                                     uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
+                                                     uvm_va_block_region_t max_prefetch_region)
+{
+    NvU16 counter;
+    uvm_perf_prefetch_bitmap_tree_iter_t iter;
+    uvm_va_block_region_t prefetch_region = uvm_va_block_region(0, 0);
+
+    uvm_perf_prefetch_bitmap_tree_traverse_counters(counter,
+                                                    bitmap_tree,
+                                                    page_index - max_prefetch_region.first + bitmap_tree-&gt;offset,
+                                                    &amp;iter) {
+        uvm_va_block_region_t subregion = uvm_perf_prefetch_bitmap_tree_iter_get_range(bitmap_tree, &amp;iter);
+        NvU16 subregion_pages = uvm_va_block_region_num_pages(subregion);
+
+        UVM_ASSERT(counter &lt;= subregion_pages);
+        if (counter * 100 &gt; subregion_pages * g_uvm_perf_prefetch_threshold)
+            prefetch_region = subregion;
+    }
+
+    // Clamp prefetch region to actual pages
+    /* ... */
+    return prefetch_region;
+}</code></pre>
+    <p>gpu_ext rewrites the start of this function. It asks the policy first, validates the answer,
+    and then takes one of three paths depending on the return code: <code>BYPASS</code> (1) uses the
+    policy's region, <code>ENTER_LOOP</code> (2) runs the tree walk but asks
+    <code>gpu_page_prefetch_iter</code> about each subregion, and <code>DEFAULT</code> (0) runs the
+    original loop. Trimmed from the fork's diff:</p>
+    <pre data-file="gpu_ext-kernel-modules/kernel-open/nvidia-uvm/uvm_perf_prefetch.c"><code class="language-c">    raw_action = uvm_bpf_call_gpu_page_prefetch(page_index,
+                                                bitmap_tree,
+                                                &amp;max_prefetch_region,
+                                                &amp;initial_decision);
+    region_result = nv_gpu_transition_validate_region(&amp;initial_decision,
+                                                       max_prefetch_region.first,
+                                                       max_prefetch_region.outer,
+                                                       PAGES_PER_UVM_VA_BLOCK,
+                                                       type_outer,
+                                                       &amp;validated_region);
+    initial_effect = nv_gpu_transition_prefetch_initial_effect(raw_action,
+                                                               region_result);
+
+    if (initial_effect == NV_GPU_PREFETCH_INITIAL_BYPASS) {
+        prefetch_region.first = (uvm_page_index_t)validated_region.first;
+        prefetch_region.outer = (uvm_page_index_t)validated_region.outer;
+    }
+    else if (initial_effect == NV_GPU_PREFETCH_INITIAL_ITERATE) {
+        uvm_perf_prefetch_bitmap_tree_traverse_counters(counter, bitmap_tree, /* ... */, &amp;iter) {
+            /* ... translate subregion to absolute page indices ... */
+            iterator_action = uvm_bpf_call_gpu_page_prefetch_iter(bitmap_tree,
+                                                                  &amp;max_prefetch_region,
+                                                                  &amp;current_region,
+                                                                  counter,
+                                                                  &amp;iterator_decision);
+            /* ... validate; on COMMIT take this subregion ... */
+        }
+    }
+    else {
+        /* native threshold loop, unchanged in behaviour */
+    }</code></pre>
+    <p>Note the limit this imposes. <code>max_prefetch_region</code> is at most one VA block, so a
+    policy can choose any subrange of the current 2 MB block and nothing beyond it. Earlier versions
+    had a <code>bpf_gpu_migrate_range()</code> kfunc for cross-block prefetch driven by
+    <code>bpf_wq</code>. The README's roadmap reports "~20% improvement on microbenchmarks" for it. It
+    has since been removed. In <code>extension/README.md</code>, the authors say the kfunc turned an
+    integer <code>va_space</code> handle back into a kernel pointer "without native object lifetime
+    guarantees". <code>extension/Makefile</code> now lists 14 policies that depended on it in
+    <code>DEFERRED_VA_SPACE_APPS</code> and leaves them out of the default build.</p>
+
+    <h3>The eviction hooks</h3>
+    <p>The PMM keeps root chunks on lists. When it needs a free 2 MB chunk and the free lists are empty,
+    <code>pick_root_chunk_to_evict()</code> takes the first chunk from the "unused" list, then from the
+    "used" list. Upstream, a chunk moves to the tail of "used" when it becomes allocated and evictable,
+    so the head holds the oldest chunks, which makes this roughly LRU by activation. gpu_ext adds three
+    calls:</p>
+    <ul>
+      <li><code>gpu_block_activate</code>, from <code>chunk_update_lists_locked()</code> right after the
+      native move to the tail of the used list. This is the main eviction hook.</li>
+      <li><code>gpu_block_access</code>, from <code>root_chunk_update_eviction_list()</code> when a root
+      chunk is marked used. Upstream calls that only from <code>block_mark_memory_used()</code>, when a
+      whole 2 MB block becomes GPU-resident. That is much rarer than "every access", and it is why the
+      extension README tells authors to put eviction logic in <code>gpu_block_activate</code> and says
+      the access hook "从未被调用" (is never called).</li>
+      <li><code>gpu_evict_prepare</code>, from <code>pick_root_chunk_to_evict()</code> after the free-list
+      check and before the unused/used selection. It receives the two list heads, but only for
+      reading.</li>
+    </ul>
+    <pre data-file="gpu_ext-kernel-modules/kernel-open/nvidia-uvm/uvm_pmm_gpu.c"><code class="language-c">        else if (root_chunk-&gt;chunk.state != UVM_PMM_GPU_CHUNK_STATE_FREE) {
+            /* ... */
+            uvm_pmm_root_list_update_locked(pmm,
+                                            &amp;root_chunk-&gt;chunk,
+                                            &amp;pmm-&gt;root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED],
+                                            UVM_PMM_ROOT_LIST_VA_BLOCK_USED,
+                                            UVM_PMM_ROOT_LIST_OP_MOVE_TAIL);
+
+            // Call BPF hook: chunk activated (became evictable)
+            // Pass root_chunk, not the sub-chunk, since we moved root_chunk-&gt;chunk.list
+            uvm_bpf_call_gpu_block_activate(pmm, &amp;root_chunk-&gt;chunk);
+        }
+/* ... in pick_root_chunk_to_evict() ... */
+    // Call BPF hook after free list check, before unused/used list selection
+    // BPF can reorder the chunks in these lists
+    if (!chunk) {
+        uvm_bpf_call_gpu_evict_prepare(pmm,
+                                          &amp;pmm-&gt;root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED],
+                                          &amp;pmm-&gt;root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]);
+    }</code></pre>
+    <p>A policy cannot choose a victim directly. It can only ask for the current chunk to go to the
+    head of the used list (evict sooner) or the tail (evict later). The paper says handlers "may
+    reorder but never remove regions in the kernel-maintained eviction list". The kernel keeps
+    eviction authority under memory pressure. With only head/tail moves, many textbook algorithms can
+    only be approximated. <code>SAFE_POLICY_ROUTES.md</code> says its 2Q is "best described as two-hit
+    segmented LRU", because the interface "cannot maintain a separately sized A1out ghost queue,
+    insert at an interior queue boundary, or demote an arbitrary Am entry".</p>
+
+    <h3>Request, then validate, then commit</h3>
+    <p>The first eviction interface (commit <code>b63e7fde</code>, 2025-11-24) gave policies
+    <code>bpf_uvm_pmm_chunk_move_head(chunk, list)</code> and <code>_move_tail</code>. Each was a bare
+    <code>list_move()</code> on a list pointer the policy passed in, so it changed driver lists
+    immediately. The September 2026 revision replaced those calls with
+    request kfuncs. The commits in the kernel fork are "feat: validate UVM prefetch transitions",
+    "feat: validate PMM policy transitions" and "feat: validate scheduler policy transitions", all
+    from 2026-09-01. A request kfunc writes into a callback-local structure and touches nothing
+    else:</p>
+    <pre data-file="gpu_ext-kernel-modules/kernel-open/nvidia-uvm/uvm_bpf_struct_ops.c"><code class="language-c">/* Record one callback-local prefetch request without narrowing its endpoints. */
+__bpf_kfunc int bpf_gpu_set_prefetch_region(uvm_bpf_prefetch_decision_t *decision_ctx,
+					    u64 first,
+					    u64 outer)
+{
+	if (!decision_ctx)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	return nv_gpu_transition_record_prefetch(&amp;decision_ctx-&gt;request,
+						 first,
+						 outer);
+}
+
+/* Record one callback-local PMM reorder request without mutating any list. */
+__bpf_kfunc int bpf_gpu_request_reorder(uvm_bpf_pmm_decision_ctx_t *decision_ctx,
+					u64 destination,
+					u64 position)
+{
+	if (!decision_ctx)
+		return NV_GPU_TRANSITION_REJECT_IDENTITY;
+
+	return nv_gpu_transition_record_pmm(&amp;decision_ctx-&gt;request,
+					    destination,
+					    position);
+}
+/* ... */
+BTF_KFUNCS_START(uvm_bpf_kfunc_ids_set)
+BTF_ID_FLAGS(func, bpf_gpu_strstr)
+BTF_ID_FLAGS(func, bpf_gpu_set_prefetch_region, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpf_gpu_request_reorder, KF_TRUSTED_ARGS)
+BTF_KFUNCS_END(uvm_bpf_kfunc_ids_set)</code></pre>
+    <p><code>docs/revision-safety-design.md</code> spells out the contract. The first request is
+    recorded. Repeating the same request is idempotent. A different second request "latches a
+    conflict", and the whole decision is then dropped. Before calling the hook, the driver records a
+    snapshot: the owning PMM, the root chunk identity, the list it is on and a <em>generation</em>
+    counter that changes whenever the chunk changes lists. After the callback, still under the PMM list
+    lock, it checks that the snapshot still matches and that the request is one of the allowed moves
+    (<code>USED</code>/<code>HEAD</code> or <code>USED</code>/<code>TAIL</code>). Only then does it move
+    the chunk once, through the same helper the native code uses. For prefetch, the region must lie
+    inside <code>max_prefetch_region</code> and fit the page-index type. An invalid initial request
+    falls back to native prefetching. The pointer is marked <code>KF_TRUSTED_ARGS</code>, so the
+    verifier only accepts the <code>decision_ctx</code> the hook was called with.</p>
+    <p>The camera-ready design section describes this from the policy's side: kfuncs restrict actions
+    to "<em>selection</em> (choosing resources, e.g., eviction order, tenant preemption priority) and
+    <em>timing</em> (when to act, e.g., proactive prefetch)". Policies "cannot allocate memory or
+    remove tasks, and fall back to the driver's original behavior under resource pressure or
+    misconfiguration." This is the same idea as sched_ext's watchdog and fallback to the fair class,
+    applied to individual decisions instead of the whole scheduler.</p>
+
+    <h3>The scheduling hooks</h3>
+    <p>Scheduling hooks live in the core <code>nvidia</code> module, around TSG lifecycle in the
+    resource manager (RM). The RM code calls <code>noinline</code> functions such as
+    <code>nv_gpu_sched_task_init()</code>. These are traceable with plain kprobes or bpftrace (the
+    header shows a bpftrace one-liner), and they also dispatch to a struct_ops table:</p>
+    <pre data-file="gpu_ext/extension/gpu_sched_set_timeslices.h"><code class="language-c">/* Context structures - must match kernel definitions */
+struct nv_gpu_task_init_ctx {
+    __u64 tsg_id;
+    __u32 engine_type;
+    __u64 default_timeslice;
+    __u32 default_interleave;
+    __u32 runlist_id;
+};
+/* ... nv_gpu_bind_ctx, nv_gpu_task_destroy_ctx, nv_gpu_timeslice_control_ctx ... */
+
+/* GPU Scheduler struct_ops definition */
+struct nv_gpu_sched_ops {
+    int (*on_task_init)(struct nv_gpu_task_init_ctx *ctx);
+    int (*on_bind)(struct nv_gpu_bind_ctx *ctx);
+    int (*on_task_destroy)(struct nv_gpu_task_destroy_ctx *ctx);
+    int (*on_timeslice_control)(struct nv_gpu_timeslice_control_ctx *ctx);
+};
+/* ... */
+/* Set timeslice for a TSG during task_init */
+extern int bpf_nv_gpu_set_timeslice(struct nv_gpu_task_init_ctx *ctx,
+                                    __u64 timeslice_us) __weak __ksym;
+
+/* Set interleave level for a TSG during task_init */
+extern int bpf_nv_gpu_set_interleave(struct nv_gpu_task_init_ctx *ctx,
+                                     __u32 interleave_level) __weak __ksym;
+
+/* Reject binding for a TSG during on_bind */
+extern void bpf_nv_gpu_reject_bind(struct nv_gpu_bind_ctx *ctx) __weak __ksym;</code></pre>
+    <p>The fourth member, <code>on_timeslice_control</code>, exists on the 575 <code>test-sched</code>
+    branch and in the extension header. The pinned 610 port has only the first three
+    (<code>GPUBPF-PORT.md</code>: "the six-member <code>gpu_mem_ops</code> and three-member
+    <code>nv_gpu_sched_ops</code> interfaces are preserved"). In <code>kchangrpapiConstruct_IMPL</code>
+    the fork fills an input context from the new TSG's defaults, calls the hook, validates the
+    requested timeslice and interleave level with <code>nv_gpu_transition_validate_scheduler()</code>,
+    and then applies them with the driver's own <code>kfifoChannelGroupSetTimeslice()</code> and
+    <code>kchangrpSetInterleaveLevel()</code>.</p>
+    <p>There is one more scheduling kfunc that does not belong to the struct_ops:
+    <code>bpf_nv_gpu_preempt_tsg(hClient, hTsg)</code>. It is flagged <code>KF_SLEEPABLE</code> because
+    preemption waits for the hardware, and it is registered for <code>BPF_PROG_TYPE_UNSPEC</code> so
+    that sleepable uprobes can call it. The README roadmap reports two working trigger paths: from a
+    struct_ops hook through <code>bpf_wq</code>, and from a "sleepable uprobe on
+    <code>cuLaunchKernel</code> (avg 312us, no bpf_wq needed)".</p>
+
+    <table>
+      <tr><th>kfunc</th><th>Module</th><th>Called from</th><th>Effect</th></tr>
+      <tr><td><code>bpf_gpu_set_prefetch_region(ctx, first, outer)</code></td><td>nvidia-uvm</td><td><code>gpu_page_prefetch[_iter]</code></td><td>Request <code>[first, outer)</code> inside the current VA block</td></tr>
+      <tr><td><code>bpf_gpu_request_reorder(ctx, dest, pos)</code></td><td>nvidia-uvm</td><td><code>gpu_block_activate/access</code></td><td>Request move to USED head or tail</td></tr>
+      <tr><td><code>bpf_gpu_strstr(...)</code></td><td>nvidia-uvm</td><td>any</td><td>Test only; returns −1</td></tr>
+      <tr><td><code>bpf_nv_gpu_set_timeslice(ctx, us)</code></td><td>nvidia</td><td><code>on_task_init</code></td><td>Request a timeslice for the new TSG</td></tr>
+      <tr><td><code>bpf_nv_gpu_set_interleave(ctx, lvl)</code></td><td>nvidia</td><td><code>on_task_init</code></td><td>Request runlist interleave level (LOW/MEDIUM/HIGH = 0/1/2)</td></tr>
+      <tr><td><code>bpf_nv_gpu_reject_bind(ctx)</code></td><td>nvidia</td><td><code>on_bind</code></td><td>Admission control: refuse binding to the runlist</td></tr>
+      <tr><td><code>bpf_nv_gpu_override_timeslice(ctx, us)</code></td><td>nvidia (575 branch)</td><td><code>on_timeslice_control</code></td><td>Override a later timeslice change</td></tr>
+      <tr><td><code>bpf_nv_gpu_preempt_tsg(hClient, hTsg)</code></td><td>nvidia</td><td>sleepable uprobe, <code>bpf_wq</code></td><td>Preempt another tenant's TSG now</td></tr>
+    </table>
+
+    <h2>A UVM page fault, step by step</h2>
+    <p>Here is one fault on a 48 GB managed buffer, with an eBPF prefetch-and-eviction policy loaded.
+    Step through it:</p>
+    <div class="stepper">
+      <div class="step"><h4>1. A warp touches a non-resident page</h4><p>A thread in warp 1 of some SM loads
+      from address <code>p + 0x3a5000</code>. The GPU MMU finds no valid mapping, writes a fault entry
+      (address, access type, client) into the replayable fault buffer, and stalls that warp. Other warps
+      keep running. The GPU raises an interrupt.</p></div>
+      <div class="step"><h4>2. The UVM bottom half fetches a batch</h4><p><code>uvm_parent_gpu_service_replayable_faults()</code>
+      calls <code>fetch_fault_buffer_entries()</code> to read many entries at once. It sorts them, removes
+      duplicates and groups them by VA block. <code>service_fault_batch()</code> then walks the groups.
+      This is a kernel worker thread, not the application, which is why <code>bpf_get_current_pid_tgid()</code>
+      in a hook does not return the faulting process (extension README, rule 5).</p></div>
+      <div class="step"><h4>3. Pick residency for the block</h4><p>For the 2 MB VA block that contains the address,
+      <code>service_fault_batch_block_locked()</code> asks <code>uvm_va_block_select_residency()</code>
+      where each faulted page should live, which is the GPU here. Under the block lock,
+      <code>uvm_va_block_service_locked()</code> starts servicing.</p></div>
+      <div class="step"><h4>4. The prefetch hook runs</h4><p><code>uvm_perf_prefetch_get_hint_va_block()</code>
+      updates the residency bitmap tree and reaches <code>compute_prefetch_region()</code>. The driver
+      calls <code>gpu_page_prefetch(page_index, tree, max_region, ctx)</code>. An always-max policy calls
+      <code>bpf_gpu_set_prefetch_region(ctx, max.first, max.outer)</code> and returns 1 (BYPASS).</p></div>
+      <div class="step"><h4>5. The driver validates the request</h4><p><code>nv_gpu_transition_validate_region()</code>
+      checks that <code>[first, outer)</code> lies inside the block's maximum region and that there was a
+      single, non-conflicting request. Here it passes, so the whole rest of the 2 MB block is added to the
+      migration mask. Had it failed, the stock 51% threshold rule would have run instead.</p></div>
+      <div class="step"><h4>6. Allocate GPU memory, maybe evict</h4><p>The block needs a 2 MB root chunk on the GPU.
+      If the free pool is empty, <code>pick_root_chunk_to_evict()</code> calls <code>gpu_evict_prepare</code>
+      (observe only), takes the head of the unused list or else of the used list, and migrates that
+      chunk's pages back to host memory. The policy's earlier head/tail requests decided which chunk is at
+      the head.</p></div>
+      <div class="step"><h4>7. Migrate and map</h4><p>The copy engine moves the faulted and prefetched pages from host
+      DRAM over PCIe. The driver updates the GPU page tables. The new root chunk goes to the tail of the
+      used list, and the driver calls <code>gpu_block_activate(pmm, chunk, ctx)</code>.</p></div>
+      <div class="step"><h4>8. The eviction hook requests a position</h4><p>An LFU policy sets the new chunk's
+      frequency to 1 in a map and calls <code>bpf_gpu_request_reorder(ctx, USED, HEAD)</code>. After the
+      callback, the driver checks the PMM/root identity, the list state and the generation under the list
+      lock, and then moves the chunk to the head once. A frequent chunk would instead be requested at the
+      TAIL, the safest position.</p></div>
+      <div class="step"><h4>9. Replay</h4><p><code>push_replay_on_gpu()</code> tells the GPU to replay the faulted
+      accesses. Warp 1 resumes. Its neighbours' later accesses to the prefetched pages hit in GPU memory and
+      do not fault, which is the whole point of a good prefetch policy.</p></div>
+    </div>
+
+    <h2>Writing policies</h2>
+    <p>A gpu_ext policy is a normal libbpf program. You include <code>vmlinux.h</code> and the
+    extension headers, write <code>SEC("struct_ops/NAME")</code> functions with
+    <code>BPF_PROG()</code>, and put the table in <code>SEC(".struct_ops")</code>. The loader opens the
+    skeleton, loads it and calls <code>bpf_map__attach_struct_ops()</code>. This section walks through
+    five real programs from <code>extension/</code>.</p>
+
+    <h3>Always prefetch the whole block</h3>
+    <p>The simplest useful policy. The table in <code>extension/README.md</code> calls it "最基础也最有效的策略" (the most basic and
+    most effective policy). It ignores the bitmap tree and asks for the whole <code>max_prefetch_region</code>
+    on every fault. The first tab is the whole file minus two commented-out debug prints. The loader
+    tab is trimmed.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="prefetch_always_max.bpf.c">
+<pre data-file="gpu_ext/extension/prefetch_always_max.bpf.c"><code class="language-c">/* SPDX-License-Identifier: GPL-2.0 */
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include "uvm_types.h"
+#include "bpf_testmod.h"
+
+char _license[] SEC("license") = "GPL";
+
+/* Always prefetch the maximum region policy
+ * This is the simplest policy that always prefetches the entire max_prefetch_region
+ */
+SEC("struct_ops/gpu_page_prefetch")
+int BPF_PROG(gpu_page_prefetch,
+             uvm_page_index_t page_index,
+             uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
+             uvm_va_block_region_t *max_prefetch_region,
+             uvm_bpf_prefetch_decision_t *decision_ctx)
+{
+    /* Use BPF CO-RE helpers to read max_prefetch_region fields */
+    uvm_page_index_t max_first = BPF_CORE_READ(max_prefetch_region, first);
+    uvm_page_index_t max_outer = BPF_CORE_READ(max_prefetch_region, outer);
+
+    /* Use kfunc to set result_region */
+    bpf_gpu_set_prefetch_region(decision_ctx, max_first, max_outer);
+
+    /* Return BYPASS to skip default kernel computation */
+    return 1; /* UVM_BPF_ACTION_BYPASS */
+}
+
+/* This hook is called on each tree iteration - not used in always_max policy */
+SEC("struct_ops/gpu_page_prefetch_iter")
+int BPF_PROG(gpu_page_prefetch_iter,
+             uvm_perf_prefetch_bitmap_tree_t *bitmap_tree,
+             uvm_va_block_region_t *max_prefetch_region,
+             uvm_va_block_region_t *current_region,
+             unsigned int counter,
+             uvm_bpf_prefetch_decision_t *decision_ctx)
+{
+    /* Not used in always_max policy */
+    return 0; /* UVM_BPF_ACTION_DEFAULT */
+}
+
+/* Dummy implementation for the old test trigger */
+SEC("struct_ops/gpu_test_trigger")
+int BPF_PROG(gpu_test_trigger, const char *buf, int len)
+{
+    return 0;
+}
+
+/* Define the struct_ops map */
+SEC(".struct_ops")
+struct gpu_mem_ops uvm_ops_always_max = {
+    .gpu_test_trigger = (void *)gpu_test_trigger,
+    .gpu_page_prefetch = (void *)gpu_page_prefetch,
+    .gpu_page_prefetch_iter = (void *)gpu_page_prefetch_iter,
+};</code></pre></div>
+      <div class="tab-panel" data-label="prefetch_always_max.c (loader)">
+<pre data-file="gpu_ext/extension/prefetch_always_max.c"><code class="language-c">int main(int argc, char **argv) {
+    struct prefetch_always_max_bpf *skel;
+    struct bpf_link *link;
+    int err;
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    /* Set up libbpf debug output */
+    libbpf_set_print(libbpf_print_fn);
+
+    /* Check and report old struct_ops instances */
+    cleanup_old_struct_ops();
+
+    /* Open BPF application */
+    skel = prefetch_always_max_bpf__open();
+    if (!skel) {
+        fprintf(stderr, "Failed to open BPF skeleton\n");
+        return 1;
+    }
+
+    /* Load BPF programs */
+    err = prefetch_always_max_bpf__load(skel);
+    if (err) {
+        fprintf(stderr, "Failed to load BPF skeleton: %d\n", err);
+        goto cleanup;
+    }
+
+    /* Register struct_ops */
+    link = bpf_map__attach_struct_ops(skel-&gt;maps.uvm_ops_always_max);
+    if (!link) {
+        err = -errno;
+        fprintf(stderr, "Failed to attach struct_ops: %s (%d)\n", strerror(-err), err);
+        goto cleanup;
+    }
+
+    printf("Successfully loaded and attached BPF prefetch_always_max prefetch policy!\n");
+    /* ... */
+    while (!exiting) {
+        sleep(1);
+    }
+
+    printf("\nDetaching struct_ops...\n");
+    bpf_link__destroy(link);
+
+cleanup:
+    prefetch_always_max_bpf__destroy(skel);
+    return err &lt; 0 ? -err : 0;
+}</code></pre></div>
+    </div>
+    <p>Four details to notice. <code>BPF_CORE_READ</code> is used even for a two-field struct, because
+    the layout of <code>uvm_va_block_region_t</code> comes from the module's BTF, not from
+    <code>vmlinux.h</code> (<a href="06-btf-core-libbpf.html">Chapter 06</a>). The return value is a
+    plain integer that the driver interprets. Unused hooks can be left <code>NULL</code> (as in the
+    LFU table below) or given a stub. And the policy stays attached exactly as long as the loader
+    process holds the <code>bpf_link</code>. Ctrl-C detaches it and the driver goes back to stock
+    behaviour.</p>
+
+    <h3>A tunable prefetcher with a user-space control loop</h3>
+    <p><code>prefetch_adaptive_sequential.bpf.c</code> reads three single-entry array maps on every
+    fault: a percentage of the maximum region, a direction (forward from the faulting page, backward,
+    or from the start of the block), and an optional fixed page count. Without <code>-p</code>, its
+    loader measures PCIe throughput once a second and rewrites the percentage map, so the kernel
+    program stays simple and the control logic lives in user space. The forward branch:</p>
+    <pre data-file="gpu_ext/extension/prefetch_adaptive_sequential.bpf.c"><code class="language-c">    } else {
+        /* FORWARD: Prefetch pages AFTER page_index (higher addresses) */
+        new_first = page_index + 1;
+
+        /* If page_index+1 &gt;= max_outer, there's nothing to prefetch forward */
+        if (new_first &gt;= max_outer) {
+            bpf_gpu_set_prefetch_region(decision_ctx, 0, 0);
+            return 1; /* UVM_BPF_ACTION_BYPASS */
+        }
+
+        /* Clamp new_first to max_first */
+        if (new_first &lt; max_first)
+            new_first = max_first;
+
+        /* Calculate new_outer */
+        new_outer = new_first + prefetch_pages;
+        /* Clamp to max_outer */
+        if (new_outer &gt; max_outer)
+            new_outer = max_outer;
+    }</code></pre>
+    <p>Try the arithmetic. The widget below is a JavaScript copy of the three branches (illustrative,
+    not repo code), for a 512-page VA block:</p>
+    <div class="callout tip" id="pf-widget"><span class="label">Try it: prefetch region</span>
+      <p>
+        <label>fault page_index <input id="pf-page" type="number" min="0" max="511" value="200" style="width:5em"></label>
+        <label>percent <input id="pf-pct" type="number" min="0" max="100" value="25" style="width:4em"></label>
+        <label>num_pages <input id="pf-num" type="number" min="0" max="512" value="0" style="width:4em"></label>
+        <label>direction <select id="pf-dir"><option value="0">forward</option><option value="1">backward</option><option value="2">forward_start</option></select></label>
+      </p>
+      <p><code id="pf-out">…</code></p>
+      <svg id="pf-bar" viewBox="0 0 512 24" preserveAspectRatio="none" style="width:100%;height:24px" role="img" aria-label="VA block pages with prefetch region highlighted"></svg>
+    </div>
+
+    <h3>LFU eviction with maps</h3>
+    <p>An eviction policy keeps its own metadata in maps and expresses it only through head/tail
+    requests. <code>eviction_lfu.bpf.c</code> keeps a frequency per chunk. New chunks go to the head
+    (evicted first), and a chunk whose frequency rises goes to the tail. Trimmed (the comments in the
+    file are in Chinese and were translated here):</p>
+    <pre data-file="gpu_ext/extension/eviction_lfu.bpf.c"><code class="language-c">/* Map 1: chunk -&gt; frequency (like key_table) */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 100000);
+    __type(key, u64);    // chunk address
+    __type(value, u32);  // frequency
+} chunk_freq SEC(".maps");
+/* ... freq_to_chunk array, lfu_global state, increase_freq() ... */
+
+SEC("struct_ops/gpu_block_activate")
+int BPF_PROG(gpu_block_activate,
+             uvm_pmm_gpu_t *pmm,
+             uvm_gpu_chunk_t *chunk,
+             uvm_bpf_pmm_decision_ctx_t *decision_ctx)
+{
+    u64 addr = (u64)chunk;
+    u32 freq = 1;
+    struct lfu_state *state = get_state();
+
+    // like classic LFU put() inserting a new element: freq = 1
+    bpf_map_update_elem(&amp;chunk_freq, &amp;addr, &amp;freq, BPF_ANY);
+    bpf_map_update_elem(&amp;freq_to_chunk, &amp;freq, &amp;addr, BPF_ANY);
+
+    if (state) {
+        state-&gt;min_freq = 1;  // inserting a new element always makes min_freq = 1
+        state-&gt;total_chunks++;
+    }
+
+    // a new chunk has the lowest frequency: put it at HEAD (evicted first)
+    bpf_gpu_request_reorder(decision_ctx, NV_GPU_PMM_DESTINATION_USED, NV_GPU_PMM_POSITION_HEAD);
+
+    return 1; // BYPASS
+}
+/* ... gpu_block_access calls increase_freq(), which requests TAIL when freq rises ... */
+
+SEC(".struct_ops")
+struct gpu_mem_ops uvm_ops_lfu_clean = {
+    .gpu_test_trigger = (void *)NULL,
+    .gpu_page_prefetch = (void *)NULL,
+    .gpu_page_prefetch_iter = (void *)NULL,
+    .gpu_block_activate = (void *)gpu_block_activate,
+    .gpu_block_access = (void *)gpu_block_access,
+    .gpu_evict_prepare = (void *)gpu_evict_prepare,
+};</code></pre>
+    <p>A comment in the file admits the main limitation: "BPF 无法维护双向链表" (BPF cannot maintain the
+    doubly linked list), and strict ordering would need a <code>bpf_gpu_block_insert_after()</code>
+    kfunc that does not exist. Note also the use of the chunk's kernel address as a map key: it is
+    read as a scalar and only used as an identity. The extension README also warns that hash maps can
+    cause trouble in this hot path: "HASH map 在高 eviction 压力下超时导致 Xid 31" (under heavy eviction
+    pressure, hash map timeouts led to Xid 31, an NVIDIA MMU fault error). Newer policies such as
+    <code>eviction_2q_approx</code> use fixed per-CPU arrays instead.</p>
+
+    <h3>Per-process GPU timeslices</h3>
+    <p><code>gpu_sched_set_timeslices.bpf.c</code> gives each process name a timeslice. User space
+    fills <code>process_timeslice</code> (comm → microseconds). When a new TSG is created, the hook
+    looks the name up and requests the value:</p>
+    <pre data-file="gpu_ext/extension/gpu_sched_set_timeslices.bpf.c"><code class="language-c">SEC("struct_ops/on_task_init")
+int BPF_PROG(on_task_init, struct nv_gpu_task_init_ctx *init_ctx)
+{
+    char comm[TASK_COMM_LEN];
+    __u64 *timeslice;
+    __u32 *interleave;
+
+    inc_stat(STAT_TASK_INIT);
+
+    if (!init_ctx)
+        return 0;
+
+    /* Get current process name */
+    bpf_get_current_comm(&amp;comm, sizeof(comm));
+
+    interleave = bpf_map_lookup_elem(&amp;process_interleave, comm);
+    if (interleave) {
+        if (bpf_nv_gpu_set_interleave(init_ctx, *interleave) == 0)
+            inc_stat(STAT_INTERLEAVE_MOD);
+        else
+            inc_stat(STAT_SETTER_ERROR);
+    }
+    /* ... bpf_printk ... */
+    /* Look up timeslice for this process */
+    timeslice = bpf_map_lookup_elem(&amp;process_timeslice, comm);
+    if (timeslice &amp;&amp; *timeslice &gt; 0) {
+        __u64 old_ts = init_ctx-&gt;default_timeslice;
+        __u64 new_ts = *timeslice;
+
+        if (bpf_nv_gpu_set_timeslice(init_ctx, new_ts) != 0) {
+            inc_stat(STAT_SETTER_ERROR);
+            return 0;
+        }
+        /* ... stats, history ring ... */
+        return 1;
+    }
+
+    inc_stat(STAT_POLICY_MISS);
+    return 0;
+}
+/* ... on_bind, on_task_destroy, on_timeslice_control ... */
+SEC(".struct_ops")
+struct nv_gpu_sched_ops gpu_sched_ops = {
+    .on_task_init = (void *)on_task_init,
+    .on_bind = (void *)on_bind,
+    .on_task_destroy = (void *)on_task_destroy,
+    .on_timeslice_control = (void *)on_timeslice_control,
+};</code></pre>
+    <p>Here <code>bpf_get_current_comm()</code> works, unlike in the UVM hooks, because TSG creation
+    runs in the context of the process that made the RM ioctl. This is how the paper's multi-tenant
+    experiment gives latency-critical processes a 1 s timeslice and best-effort ones 200 µs.</p>
+
+    <h3>Preempting another tenant at launch time</h3>
+    <p>The driver never sees individual kernel launches, but user space does. This uprobe fires on
+    every <code>cuLaunchKernel</code> of the latency-critical process and immediately preempts a
+    background TSG. The background TSG's handles were captured earlier with kprobes on the RM ioctl
+    path (<code>test_preempt_kfunc.bpf.c</code> documents the "3-probe kprobe strategy").</p>
+    <pre data-file="gpu_ext/extension/test_uprobe_preempt.bpf.c"><code class="language-c">extern int bpf_nv_gpu_preempt_tsg(u32 hClient, u32 hTsg) __ksym;
+/* ... maps: target_tsg, uprobe_stats, uprobe_latency ... */
+SEC("uprobe.s//usr/lib/x86_64-linux-gnu/libcuda.so:cuLaunchKernel")
+int preempt_on_launch(struct pt_regs *ctx)
+{
+	inc_stat(STAT_UPROBE_HIT);
+
+	if (!enabled) {
+		inc_stat(STAT_SKIPPED);
+		return 0;
+	}
+
+	__u32 zero = 0;
+	struct tsg_entry *tsg = bpf_map_lookup_elem(&amp;target_tsg, &amp;zero);
+	if (!tsg || tsg-&gt;hClient == 0)
+		return 0;
+
+	__u64 start = bpf_ktime_get_ns();
+	int ret = bpf_nv_gpu_preempt_tsg(tsg-&gt;hClient, tsg-&gt;hTsg);
+	__u64 elapsed = bpf_ktime_get_ns() - start;
+	/* ... record latency and success/failure counters ... */
+	return 0;
+}</code></pre>
+    <p>The <code>.s</code> in <code>uprobe.s</code> marks a sleepable program (<a href="05-program-types-and-hooks.html">Chapter 05</a>),
+    which is required because the kfunc is <code>KF_SLEEPABLE</code>. This program is a test. The
+    paper's Table 1 lists its "Preemption Control" policy at 925 lines. The related sources in the
+    repo are <code>gpreempt_policy.*</code> and <code>gpu_preempt_ctrl.*</code>; the paper does not say
+    which files its count covers.</p>
+
+    <h3>The policy catalogue</h3>
+    <p>The extension directory has many more policies. Grouped as in <code>extension/README.md</code>:</p>
+    <table>
+      <tr><th>Group</th><th>Examples</th><th>Notes</th></tr>
+      <tr><td>Eviction</td><td><code>eviction_fifo</code>, <code>_lfu</code>, <code>_mru</code>, <code>_2q_approx</code>, <code>_pid_quota</code>, <code>_freq_pid_decay</code>, <code>_fifo_chance</code>, <code>_cycle_moe</code></td><td>All built on head/tail reorder requests.</td></tr>
+      <tr><td>Prefetch</td><td><code>prefetch_none</code>, <code>_always_max</code>, <code>_adaptive_sequential</code>, <code>_adaptive_tree_iter</code>, <code>_stride</code>, <code>_delta_markov</code>, <code>_pid_tree</code>, <code>_serving_adaptive</code></td><td><code>delta_markov</code> needs a read-only kprobe on <code>uvm_perf_prefetch_get_hint_va_block</code> to learn which VA block a fault is in, because the hook signature does not include it.</td></tr>
+      <tr><td>Combined</td><td><code>prefetch_always_max_cycle_moe</code>, <code>_template_belady</code>, <code>_max_mru_expert</code>, <code>_reuse_dist</code>, <code>_always_max_qos</code></td><td>One table implementing both prefetch and eviction (singleton).</td></tr>
+      <tr><td>Phase detection (uprobes)</td><td><code>prefetch_llama_phase</code>, <code>_vllm_phase</code>, <code>_faiss_uprobe</code></td><td>Currently in <code>DEFERRED_VA_SPACE_APPS</code>, so not built by default.</td></tr>
+      <tr><td>GPU scheduling</td><td><code>gpu_sched_set_timeslices</code>, <code>gpu_preempt_ctrl</code>, <code>gpreempt_policy</code></td><td>Use <code>nv_gpu_sched_ops</code> and the preempt kfunc.</td></tr>
+      <tr><td>CPU scheduling (sched_ext)</td><td><code>sched_gpu_serving</code>, <code>_xcoord</code>, <code>_coord</code>, <code>_minimal</code></td><td>Need <code>SCX_INCLUDE_DIR</code>. <code>sched_gpu_coord</code> uses a latency-critical process's GPU fault rate as feedback to throttle best-effort CPU time.</td></tr>
+      <tr><td>Tracing</td><td><code>chunk_trace</code>, <code>prefetch_trace</code>, <code>gpu_sched_trace</code></td><td>CSV output, e.g. <code>sudo timeout 30 ./chunk_trace &gt; /tmp/trace.csv</code>.</td></tr>
+    </table>
+
+    <h2>The device side: eBPF inside CUDA kernels</h2>
+    <p>Host hooks see faults and TSGs, but not what happens inside a kernel: which warps are
+    imbalanced, which addresses a loop is about to touch, when a thread block finishes. For that,
+    gpu_ext uses device-side eBPF. The mechanics belong to bpftime and llvmbpf and are covered in
+    <a href="15-bpftime-in-practice.html#gpu-and-cuda-probes">Chapter 15</a> (the CUDA attach pipeline,
+    GPU maps, <code>bpftime trace</code> late attach) and <a href="16-llvmbpf.html">Chapter 16</a> (the
+    eBPF→PTX backend). In outline: bpftime's agent hooks CUDA's fat-binary registration, extracts the
+    PTX of the target kernel, compiles the eBPF program to PTX with llvmbpf, splices it in as a
+    trampoline at kernel entry, exit or selected memory instructions, and hands the patched PTX back
+    to the driver. The gpu_ext repo's device smoke test is a typical program:</p>
+    <pre data-file="gpu_ext/workloads/bpftime-device-smoke/probe.bpf.c"><code class="language-c">/* Device return-event counter, adapted from bpftime's threadhist example. */
+#define BPF_NO_GLOBAL_DATA
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+#ifdef DEVICE_SMOKE_NEGATIVE_LANE_BRANCH
+static u64 (*device_lane_id)(void) = (void *)511;
+#endif
+
+struct {
+    __uint(type, 1502); /* BPFTIME per-GPU-thread array, not a kernel map. */
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} call_count SEC(".maps");
+
+SEC("kretprobe/_Z9vectorAddPKfS0_Pfi")
+int cuda__count_return(void)
+{
+#ifdef DEVICE_SMOKE_NEGATIVE_LANE_BRANCH
+    /* Strict-only negative: never run this object with verification bypassed. */
+    if (device_lane_id() != 0)
+        return 0;
+#endif
+    u32 key = 0;
+    u64 *count = bpf_map_lookup_elem(&amp;call_count, &amp;key);
+    if (count)
+        *count += 1;
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+    <p>The negative variant shows what the paper's <strong>SIMT-aware verifier</strong> is for. The
+    branch condition depends on the lane ID, a value that differs between the 32 threads of a warp. The
+    paper's rule is that branch conditions, loop bounds and map-update keys must be
+    <em>warp-uniform</em> (the same for all lanes) or derived through a warp-level reduction. Lane-varying
+    values may be computed with but must not steer control flow or side effects. The verifier propagates
+    uniformity through the bytecode's dataflow, starting from BTF annotations that mark uniform context
+    fields. It also bans GPU-wide barriers and non-uniform atomics and applies per-hook instruction
+    budgets. The runtime then executes a verified handler <em>once per warp</em>: a warp leader is
+    chosen with <code>__ffs(__activemask())</code>, inputs are gathered with
+    <code>__ballot_sync</code>/<code>__shfl_sync</code>, and results are broadcast back.</p>
+    <p>Maps are the other device-side problem. A GPU thread reading a host map crosses PCIe. The
+    arXiv paper's Figure 12(b) measures CPU map access as about 6000× slower than GPU-side operations.
+    So gpu_ext describes <em>hierarchical</em> maps. Hot per-warp or per-SM state lives in GPU shared
+    memory, frequently used state in GPU global memory, and cold state in host DRAM. Updates go in
+    through warp leaders without atomics, and a daemon merges GPU shards into host-visible snapshots
+    at kernel completion boundaries. Consistency is relaxed, which the paper argues is enough for
+    statistics-driven policies.</p>
+    <p>Device code can also <em>act</em>. In the arXiv microbenchmark, a device-side handler issues
+    <code>prefetch.global.L2</code> instructions that raise non-blocking page faults early, and the host
+    prefetch hook then extends them. A strided vector-add over 40 GB (1.25× oversubscribed) runs
+    1.34× faster with device-only prefetch and 1.77× with host plus device stride prefetch, while a
+    mismatched sequential policy is 8% slower. On Blackwell GPUs, block-level scheduling policies
+    (<code>MaxSteals</code>, <code>LatencyBudget</code>, 16 and 19 lines of code in Table 1) use cluster
+    launch control to decide which work a block claims.</p>
+
+    <div class="callout danger"><span class="label">Read the repo's own audits</span><p>The device-side
+    safety story is less finished than the paper's wording suggests, and the repo says so.
+    <code>docs/revision-safety-design.md</code> (2026-09-03) records that the GPU SIMT verifier lives in a
+    bpftime branch (<code>revision/r5-safety-evidence</code>), while the bpftime build used for
+    experiments has <code>ENABLE_EBPF_VERIFIER=OFF</code>. It concludes that "strict verifier-to-device
+    deployment is not established by the CPU tests". <code>microbench/fig15-device/legacy-evidence-audit.md</code>
+    finds that the device-overhead figure comparing "eGPU-style" with warp-aggregated execution "has no
+    pinned warp-aggregation implementation or official eGPU artifact behind its two labels". It
+    recommends stopping that comparison until both implementations are pinned. Treat the 60–80%
+    device-overhead reduction below in that light.</p></div>
+
+    <h2>Building and running</h2>
+    <p>Everything below is from the README and <code>docs/driver_docs/MODULE_LOAD_UNLOAD_GUIDE.md</code>.
+    It needs an NVIDIA GPU supported by the open modules, matching kernel headers, CUDA 12.8+ and root.
+    None of it was run for this chapter.</p>
+    <pre data-file="gpu_ext/README.md"><code class="language-bash"># Ubuntu 22.04+
+sudo apt-get install -y --no-install-recommends \
+    build-essential gcc g++ make \
+    clang llvm \
+    libelf1 libelf-dev zlib1g-dev \
+    pkg-config
+
+# 1. eBPF policies (builds libbpf and bpftool from submodules first)
+make build
+
+# 2. The modified driver
+cd kernel-module/nvidia-module
+make modules -j$(nproc)</code></pre>
+    <p>The build produces <code>kernel-open/nvidia.ko</code>, <code>nvidia-modeset.ko</code>,
+    <code>nvidia-drm.ko</code> and <code>nvidia-uvm.ko</code>. They replace the running driver only
+    until reboot:</p>
+    <pre data-file="gpu_ext/README.md"><code class="language-bash"># Unload system modules
+sudo systemctl stop nvidia-persistenced 2&gt;/dev/null || true
+sudo systemctl stop gdm3 2&gt;/dev/null || true
+sleep 2
+sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2&gt;/dev/null || true
+
+# Load custom modules via insmod (in dependency order)
+sudo insmod kernel-module/nvidia-module/kernel-open/nvidia.ko
+sudo insmod kernel-module/nvidia-module/kernel-open/nvidia-modeset.ko
+sudo insmod kernel-module/nvidia-module/kernel-open/nvidia-drm.ko
+sudo insmod kernel-module/nvidia-module/kernel-open/nvidia-uvm.ko
+
+# Revert without reboot
+sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia
+sudo modprobe nvidia &amp;&amp; sudo modprobe nvidia_uvm</code></pre>
+    <p>Then attach a policy and check that it is there:</p>
+    <pre data-file="gpu_ext/README.md"><code class="language-bash">sudo ./extension/prefetch_adaptive_sequential      # foreground, Ctrl-C detaches
+sudo ./extension/eviction_lfu &amp;                    # or in the background
+sudo bpftool prog list | grep struct_ops</code></pre>
+    <p>Some loaders take arguments. These examples are from <code>extension/README.md</code> and the
+    loader's <code>--help</code> text:</p>
+    <pre data-file="gpu_ext/extension/README.md"><code class="language-bash">sudo ./prefetch_always_max_cycle_moe                     # combined policy
+sudo ./prefetch_pid_tree -p 1234 -P 20 -l 5678 -L 80      # PID-aware prefetch
+sudo ./prefetch_adaptive_sequential -d forward -n 32      # fixed 32 pages after the fault
+sudo bpftool map list | grep struct_ops                   # what is registered
+sudo ./cleanup_struct_ops_tool                            # remove stale registrations</code></pre>
+    <p>The last line exists because "<code>bpftool struct_ops unregister</code> 在 kernel 6.15.11 上
+    segfault" (segfaults on kernel 6.15.11). If a loader dies without destroying its link, the singleton
+    stays taken and the next loader fails with <code>-EEXIST</code>. The newer "safe ABI" loaders are
+    more careful: they "only destroy the links they create" and do not remove other processes'
+    registrations.</p>
+    <p>A few environment notes from the repository:</p>
+    <ul>
+      <li>The pinned driver is the 610.43.02 port. <code>GPUBPF-PORT.md</code> says it built for 6.15.11
+      and for 7.1.12 (where module BTF has to be generated by hand with the kernel's
+      <code>gen-btf.sh</code>) and that "Runtime load/attach testing is pending". The 575.57.08 line on
+      <code>test-sched</code> is the one the experiments used.</li>
+      <li>Workloads use <code>uv</code>, one environment per workload, and must run serially because the
+      struct_ops and the GPU are shared.</li>
+      <li>Without a GPU you can still check published numbers: <code>python3 -B scripts/artifact/reanalyze.py --campaign all</code>
+      recomputes 90 published cell summaries (ARTIFACT.md).</li>
+    </ul>
+
+    <h2>What the evaluation reports</h2>
+    <p>There are two versions of the paper, and their headline numbers differ, so cite the one you mean.
+    All numbers below are quoted from the paper or the repo, not measured here. The arXiv v2 setup is an
+    RTX 5090 (32 GB) with a Core Ultra 9 285K and 128 GB DDR5, plus a P40 server for observability.
+    Results are the geometric mean of 10 trials unless noted.</p>
+    <table>
+      <tr><th>Experiment</th><th>Reported result</th><th>Source</th></tr>
+      <tr><td>llama.cpp, GPT-OSS-120B MXFP4 (59 GiB, 1.84× oversubscribed), decode</td><td>4.8× over framework offloading (<code>ncmoe</code>). The camera-ready adds 1.76× over application-tuned <code>cudaMemAdvise</code> hints.</td><td>arXiv v2 Fig. 5; ASPLOS eval</td></tr>
+      <tr><td>vLLM, Qwen-30B FP8 MoE, 100 concurrent ShareGPT requests</td><td>Mean and p99 TTFT 1.7–2× better, decode throughput 1.3× vs <code>--cpu-offload-gb 8</code></td><td>arXiv v2 Fig. 6</td></tr>
+      <tr><td>Faiss SIFT, IVF4096,Flat, 20M–100M vectors</td><td>Index build −21–29%, search latency −10–16%</td><td>arXiv v2 Fig. 8</td></tr>
+      <tr><td>2 LC + 4 BE compute-bound processes, GPREEMPT-style timeslices</td><td>LC P99 launch latency 1188 µs → 53 µs; BE throughput 11.38 → 11.47 kernels/s</td><td>arXiv v2 Fig. 9</td></tr>
+      <tr><td>Two memory-bound tenants (HotSpot, GEMM, K-Means)</td><td>Total completion time −55–92% with memory priority policies; scheduler-only policies &lt;1%</td><td>arXiv v2 Fig. 10</td></tr>
+      <tr><td>llama.cpp (LC) + GNN training (BE) on one GPU</td><td>TPOT −40–45%, TTFT −14–20%, GNN epoch 23.2 s → 16.7 s</td><td>arXiv v2 Fig. 11</td></tr>
+      <tr><td>Hooks on, no policy (GEMM, HotSpot, 1.1× oversubscribed)</td><td>&lt;0.2% overhead</td><td>arXiv v2 §6.4.1</td></tr>
+      <tr><td>Device observability on P40 (llama.cpp prefill)</td><td>kernelretsnoop 8%, threadhist 3%, launchlate 14% vs NVBit 85%, 87%, 93%</td><td>arXiv v2 Table 2</td></tr>
+      <tr><td>Reimplemented prior policies</td><td>MoE-Infinity TTFT −22.1% native vs −22.5% gpu_ext; FineMoE +24.6%, 0.21% from native; POD-Attention −0.44% to +1.18% vs native</td><td>ASPLOS eval (matched ports)</td></tr>
+      <tr><td>Agentic policy search</td><td>20 days, 974 benchmark runs, 244 code edits, 59 policies, 5.5M tokens ($388); abstract: "zero OS kernel panics"</td><td>ASPLOS eval and abstract</td></tr>
+    </table>
+    <p>Two things help when you read these numbers. First, ask whether a gain comes from the
+    <em>policy</em> or the <em>mechanism</em>. The ASPLOS shepherd asked the authors to make that explicit:
+    a 4.8× speedup over llama.cpp's own offloading says that a well-chosen UVM prefetch policy beats
+    that framework's strategy, not that eBPF is fast. The matched-port results, where the same policy
+    runs natively and as gpu_ext and lands within about 1%, are the cleaner measure of the mechanism's
+    cost. Second, <code>ARTIFACT.md</code> keeps adverse and failed runs on purpose, and the dated
+    reports state their exact scope. For example, the LMCache local-disk read p99 of 323.707 / 123.141 /
+    118.097 ms (FIFO / native / BPF) is a "Scheduled-arrival storage latency, not vLLM TTFT".</p>
+
+    <h2>Recent activity</h2>
+    <p>The commit history shows the project in two phases. Commit counts come from a shallow fetch of
+    <code>gpu_ext</code> since 2026-06-01, plus the GitHub API for the kernel fork.</p>
+    <ul>
+      <li><strong>Driver fork, Nov 2025 – Mar 2026</strong> (<code>test-sched</code> lineage): UVM struct_ops
+      (2025-11-21), prefetch hooks and <code>bpf_uvm_strstr</code> (11-23), PMM eviction hooks (11-24),
+      scheduling hooks and struct_ops (12-05), a helper to read the current process name (12-06), rename of
+      <code>uvm_gpu_ext</code> to <code>gpu_mem_ops</code> (2026-02-27), cross-block prefetch with deferred work
+      (2026-02/03), kfuncs registered for tracing programs (2026-03-06).</li>
+      <li><strong>Main repo, up to 2026-04-16</strong>: policies, workloads and the CLC benchmark driver. The
+      next commit after that is dated 2026-08-31.</li>
+      <li><strong>2026-08-31 to 2026-09-24, about 1,300 commits</strong>: the ASPLOS revision. They include the
+      610.43.02 port (08-31); the transition validators for prefetch, PMM and scheduler (09-01); GSP
+      propagation and per-runlist identity on <code>test-sched</code> (09-02 to 09-04); removal of the raw
+      VA-space migration kfunc from the default build; and new baselines run as native vs gpu_ext ports
+      (MoE-Infinity, Expert Buffering, FineMoE, Hummingbird, POD-Attention, XSched, GPREEMPT, LMCache
+      local disk). They also add an artifact guide with CPU-only reanalysis, an MoE adaptive-prefetch
+      "byte governor" campaign (09-10), and finally "Update paper submodule to gpu_ext camera-ready
+      version" (09-24).</li>
+      <li><strong>eGPU</strong>: last pushed 2025-11-24. Its README now points to bpftime. GitHub does not mark
+      it archived, but it is no longer developed.</li>
+    </ul>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefit: policy without a driver fork per idea</h4><p>Once the hooked driver is
+      loaded, a new prefetch or eviction policy is a 100–500 line eBPF program you can swap without
+      restarting the application or reloading the module. That is the sched_ext argument, applied to the
+      GPU.</p></div>
+      <div class="card"><h4>Benefit: application transparency</h4><p>None of the evaluated frameworks were
+      modified. Phase information comes from uprobes, and the policies act in the driver every tenant goes
+      through.</p></div>
+      <div class="card"><h4>Benefit: cross-layer state</h4><p>A single policy can combine an application
+      uprobe, a driver fault hook, a sched_ext CPU scheduler and (with bpftime) device-side counters
+      through shared maps.</p></div>
+      <div class="card"><h4>Benefit: decisions are validated</h4><p>Since the revision, policies record
+      requests and the driver checks them against current state before acting, so a buggy policy loses
+      performance, not correctness, for the covered transitions.</p></div>
+      <div class="card"><h4>Limit: it is still a forked driver</h4><p>You must build and <code>insmod</code> a
+      modified NVIDIA module that matches your kernel. Nothing here is upstream in NVIDIA's tree or in
+      Linux. The paper's portability section maps the design onto HMM and DRM scheduler concepts, but there
+      is no AMD or Intel implementation.</p></div>
+      <div class="card"><h4>Limit: narrow, coarse interface</h4><p>Prefetch stays inside one 2 MB VA block
+      (cross-block migration was removed for safety). Eviction is head/tail only. There is one system-wide
+      memory policy and one scheduling policy. The camera-ready calls independent per-tenant policies
+      "future work".</p></div>
+      <div class="card"><h4>Limit: context surprises</h4><p>UVM hooks run in a driver worker thread, so you
+      cannot filter by PID there. <code>gpu_block_access</code> fires only when a block becomes resident.
+      Hash maps under eviction pressure caused Xid 31 errors in the authors' testing.</p></div>
+      <div class="card"><h4>Limit: device safety still in progress</h4><p>By the repo's own audit, the SIMT
+      verifier was not enabled in the measured device runtime, and one device-overhead comparison lacks a
+      pinned implementation.</p></div>
+    </div>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>sched_ext and cache_ext</strong>: the CPU-side models gpu_ext copies. sched_ext is in
+      <a href="05-program-types-and-hooks.html">Chapter 05</a>. cache_ext (SOSP '25) does the same for the
+      Linux page cache, with eviction-list operations much like gpu_ext's.</li>
+      <li><strong>bpftime, eGPU and llvmbpf</strong>: the device-side runtime
+      (<a href="14-bpftime-architecture.html">14</a>, <a href="15-bpftime-in-practice.html">15</a>,
+      <a href="16-llvmbpf.html">16</a>).</li>
+      <li><strong>NCCLbpf</strong> (<a href="21-nccl-ebpf.html">Chapter 21</a>) puts eBPF policies inside
+      NCCL, and <strong>xpu-perf</strong> (<a href="22-xpu-perf.html">Chapter 22</a>) profiles CPU and GPU
+      continuously. These are the other two Part V projects.</li>
+      <li><strong>Driver-level GPU scheduling</strong>: TimeGraph (ATC '11), Gdev (ATC '12), GPREEMPT
+      (ATC '25), GCAPS. These change the driver for one policy each.</li>
+      <li><strong>User-space GPU schedulers and runtimes</strong>: XSched (OSDI '25), Paella (SOSP '23),
+      LithOS (SOSP '25), KTransformers, and vLLM's PagedAttention. They are programmable but bound to one
+      framework.</li>
+      <li><strong>GPU binary instrumentation</strong>: NVBit (MICRO '19) and Neutrino (OSDI '25). They
+      offer high visibility for profiling, but no safety checks and no control actions.</li>
+      <li><strong>UVM studies</strong>: UVMBench, and the access-aware UVM management papers cited by gpu_ext,
+      such as Forest (ISCA '25) and SUV (MICRO '24).</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> An eBPF eviction policy wants chunk X evicted as late as possible.
+        What can it do?</p>
+        <button class="opt">Call a kfunc that removes X from the eviction list</button>
+        <button class="opt" data-right>From <code>gpu_block_activate</code>, call <code>bpf_gpu_request_reorder(ctx, USED, TAIL)</code>; the driver validates and moves it after the callback</button>
+        <button class="opt">Write <code>chunk-&gt;list</code> directly through the BTF pointer</button>
+        <div class="why">Policies may only request head/tail reordering of the chunk the callback is about.
+        Writes through driver pointers are rejected (<code>btf_struct_access</code> returns <code>-EACCES</code>),
+        and the driver keeps eviction authority.</div></div>
+      <div class="q"><p><strong>Q2.</strong> What does returning <code>1</code> from <code>gpu_page_prefetch</code> mean?</p>
+        <button class="opt">Prefetch one page</button>
+        <button class="opt">Enter the bitmap-tree loop and call <code>gpu_page_prefetch_iter</code></button>
+        <button class="opt" data-right>BYPASS: use the region requested with <code>bpf_gpu_set_prefetch_region</code> (if it validates) instead of the native threshold rule</button>
+        <div class="why"><code>enum uvm_bpf_action</code>: DEFAULT 0, BYPASS 1, ENTER_LOOP 2. An invalid request falls
+        back to native behaviour.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why can't a UVM prefetch policy filter on the faulting process with
+        <code>bpf_get_current_pid_tgid()</code>?</p>
+        <button class="opt">The kfunc set does not include it</button>
+        <button class="opt" data-right>Faults are serviced by a UVM driver worker thread, so "current" is not the application</button>
+        <button class="opt">GPU processes have no PID</button>
+        <div class="why">The extension README's rule 5 says so. TSG creation is different: it runs in the calling
+        process, which is why <code>gpu_sched_set_timeslices</code> can use <code>bpf_get_current_comm()</code>.</div></div>
+      <div class="q"><p><strong>Q4.</strong> Why does the launch-time preemption program use <code>SEC("uprobe.s/…")</code>?</p>
+        <button class="opt">Uprobes on shared libraries must be sleepable</button>
+        <button class="opt" data-right><code>bpf_nv_gpu_preempt_tsg</code> is registered with <code>KF_SLEEPABLE</code>, so only sleepable programs may call it</button>
+        <button class="opt">The <code>.s</code> selects the CUDA stream</button>
+        <div class="why">Preemption waits for the GPU. The alternative trigger from non-sleepable struct_ops
+        hooks goes through <code>bpf_wq</code>.</div></div>
+      <div class="q"><p><strong>Q5.</strong> Under the paper's SIMT-aware rules, which device-side code is rejected?</p>
+        <button class="opt">Computing a lane-specific address and discarding it</button>
+        <button class="opt">A map update keyed by the block index</button>
+        <button class="opt" data-right><code>if (lane_id() != 0) return 0;</code> before a map update</button>
+        <div class="why">Branch conditions, loop bounds and map keys must be warp-uniform. Lane ID varies across the
+        warp. The repo's <code>DEVICE_SMOKE_NEGATIVE_LANE_BRANCH</code> fixture is exactly this negative case.</div></div>
+      <div class="q"><p><strong>Q6.</strong> You start <code>eviction_lfu</code> while <code>prefetch_always_max</code> is still running. What happens?</p>
+        <button class="opt">Both policies run together</button>
+        <button class="opt">The newer one replaces the older one</button>
+        <button class="opt" data-right>Attaching fails: <code>gpu_mem_ops_reg</code> uses <code>cmpxchg</code> and returns <code>-EEXIST</code> while one table is registered</button>
+        <div class="why">One <code>gpu_mem_ops</code> at a time. To combine prefetch and eviction, write one table that
+        implements both, e.g. <code>prefetch_always_max_cycle_moe</code>.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/gpu_ext">eunomia-bpf/gpu_ext</a>, studied at
+      <a href="https://github.com/eunomia-bpf/gpu_ext/tree/50a51ad4e8584d295df7c1942fe7e736cdd101ba"><code>50a51ad4</code></a> (2026-09-24).
+      Files: <code>README.md</code>, <code>ARTIFACT.md</code>, <code>CLAUDE.md</code>, <code>extension/</code> (README, Makefile,
+      <code>bpf_testmod.h</code>, <code>gpu_sched_set_timeslices.{h,bpf.c}</code>, <code>prefetch_always_max.{bpf.c,c}</code>,
+      <code>prefetch_adaptive_sequential.{bpf.c,c}</code>, <code>eviction_lfu.bpf.c</code>, <code>eviction_fifo.bpf.c</code>,
+      <code>test_uprobe_preempt.bpf.c</code>, <code>test_preempt_kfunc.bpf.c</code>, <code>SAFE_POLICY_ROUTES.md</code>),
+      <code>docs/revision-safety-design.md</code>, <code>docs/revision-shepherd-comment.md</code>,
+      <code>microbench/fig15-device/</code>, <code>workloads/bpftime-device-smoke/</code>.</li>
+      <li><a href="https://github.com/eunomia-bpf/gpu_ext-kernel-modules">eunomia-bpf/gpu_ext-kernel-modules</a>, a fork of
+      NVIDIA open-gpu-kernel-modules. Pinned commit
+      <a href="https://github.com/eunomia-bpf/gpu_ext-kernel-modules/tree/c4fd5655a08dce6eb3e027ac3ed58b0b85b9543c"><code>c4fd5655</code></a>
+      (branch <code>port/nvidia-610.43.02</code>). Compared with NVIDIA <code>57130a27</code>. Branch <code>test-sched</code> at <code>86e7e0dd</code>.
+      Files: <code>kernel-open/nvidia-uvm/uvm_bpf_struct_ops.{c,h}</code>, <code>uvm_perf_prefetch.c</code>, <code>uvm_pmm_gpu.c</code>,
+      <code>kernel-open/nvidia/nv-gpu-sched-hooks.{c,h}</code>, <code>kernel_channel_group_api.c</code>, <code>GPUBPF-PORT.md</code>.</li>
+      <li><a href="https://github.com/NVIDIA/open-gpu-kernel-modules/tree/575.57.08">NVIDIA/open-gpu-kernel-modules @ 575.57.08</a>:
+      <code>kernel-open/nvidia-uvm/uvm_perf_prefetch.c</code>, <code>uvm_gpu_replayable_faults.c</code>, <code>uvm_va_block.c</code>,
+      <code>uvm_pmm_gpu.c</code>.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, M. Jiang, X. Gao, J. Su, Y. Hu, W. Mao, W. Zhang, D. Williams, A. Quinn.
+      "gpu_ext: Extensible OS Policies for GPUs via eBPF." arXiv:2512.12615 [cs.OS], 2025 (v2, 20 Dec 2025).
+      <a href="https://arxiv.org/abs/2512.12615">arxiv.org/abs/2512.12615</a></li>
+      <li>Y. Zheng et al. "Safe and Programmable OS-Level GPU Resource Management with eBPF." Proceedings of the 32nd ACM
+      International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS '27), Volume 1,
+      pp. 804–820, 2027. <a href="https://doi.org/10.1145/3845814.3850045">doi:10.1145/3845814.3850045</a>. Camera-ready source:
+      <a href="https://github.com/yunwei37/gbpf-paper/tree/8cf95bd8b412fc35eeadec048a15d824256566ad">yunwei37/gbpf-paper @ 8cf95bd8</a>.</li>
+      <li>Y. Yang, T. Yu, Y. Zheng, A. Quinn. "eGPU: Extending eBPF Programmability and Observability to GPUs."
+      4th Workshop on Heterogeneous Composable and Disaggregated Systems (HCDS '25), pp. 73–79, 2025.
+      <a href="https://doi.org/10.1145/3723851.3726984">doi:10.1145/3723851.3726984</a>; repo
+      <a href="https://github.com/eunomia-bpf/eGPU">eunomia-bpf/eGPU</a> (merged into bpftime).</li>
+      <li>Y. Zheng, T. Yu. "Extending eBPF to GPU Device and Driver Contexts." Linux Plumbers Conference 2025, eBPF track.
+      <a href="https://lpc.events/event/19/contributions/2168/">lpc.events/event/19/contributions/2168</a></li>
+      <li><a href="https://github.com/eunomia-bpf/bpftime">eunomia-bpf/bpftime</a> (device-side runtime,
+      <code>attach/nv_attach_impl</code>) and <a href="https://github.com/eunomia-bpf/llvmbpf">eunomia-bpf/llvmbpf</a> (eBPF→PTX).</li>
+      <li>Linux kernel documentation: <a href="https://docs.kernel.org/scheduler/sched-ext.html">Extensible Scheduler Class (sched_ext)</a>
+      and <a href="https://docs.kernel.org/bpf/kfuncs.html">BPF Kernel Functions (kfuncs)</a>.</li>
+      <li>NVIDIA. <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/index.html">CUDA Programming Guide</a>
+      (SIMT architecture, unified memory programming).</li>
+      <li>T. Zussman et al. "cache_ext: Customizing the Page Cache with eBPF." SOSP '25, 2025.
+      <a href="https://doi.org/10.1145/3731569.3764820">doi:10.1145/3731569.3764820</a></li>
+      <li>R. Fan et al. "GPREEMPT: GPU Preemptive Scheduling Made General and Efficient." USENIX ATC '25, 2025.
+      <a href="https://www.usenix.org/conference/atc25/presentation/fan">usenix.org/conference/atc25/presentation/fan</a></li>
+      <li>W. Shen et al. "XSched: Preemptive Scheduling for Diverse XPUs." OSDI '25, 2025.
+      <a href="https://www.usenix.org/conference/osdi25/presentation/shen-weihang">usenix.org/conference/osdi25/presentation/shen-weihang</a></li>
+      <li>O. Villa et al. "NVBit: A Dynamic Binary Instrumentation Framework for NVIDIA GPUs." MICRO '19, 2019.
+      <a href="https://doi.org/10.1145/3352460.3358307">doi:10.1145/3352460.3358307</a></li>
+      <li>Y. Gu et al. "UVMBench: A Comprehensive Benchmark Suite for Researching Unified Virtual Memory in GPUs." arXiv:2007.09822, 2020.
+      <a href="https://arxiv.org/abs/2007.09822">arxiv.org/abs/2007.09822</a></li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="19-bpf-benchmark.html"><small>Previous</small>19 · bpf-benchmark</a>
+      <a class="next" href="21-nccl-ebpf.html"><small>Next</small>21 · NCCLbpf</a>
+    </div>
+  </main>
+</div>
+<script>
+/* Chapter 20 widget: re-implements the three branches of prefetch_adaptive_sequential.bpf.c in JS. */
+(function () {
+  var page = document.getElementById('pf-page'), pct = document.getElementById('pf-pct'),
+      num = document.getElementById('pf-num'), dir = document.getElementById('pf-dir'),
+      out = document.getElementById('pf-out'), bar = document.getElementById('pf-bar');
+  if (!page) return;
+  var NS = 'http://www.w3.org/2000/svg';
+  function rect(x, w, fill) {
+    var r = document.createElementNS(NS, 'rect');
+    r.setAttribute('x', x); r.setAttribute('y', 2); r.setAttribute('width', Math.max(w, 0));
+    r.setAttribute('height', 20); r.style.fill = fill; bar.appendChild(r);
+  }
+  function update() {
+    var maxFirst = 0, maxOuter = 512, total = maxOuter - maxFirst;
+    var p = Math.min(Math.max(parseInt(page.value, 10) || 0, 0), 511);
+    var c = Math.min(Math.max(parseInt(pct.value, 10) || 0, 0), 100);
+    var n = Math.max(parseInt(num.value, 10) || 0, 0);
+    var d = parseInt(dir.value, 10), first = 0, outer = 0, pages;
+    if (c === 0) { pages = 0; }
+    else if (n > 0) { pages = n; }
+    else if (c >= 100) { pages = total; }
+    else { pages = Math.floor(total * c / 100); if (pages === 0) pages = 1; }
+    if (pages > 0) {
+      if (d === 1) {
+        if (p > maxFirst) { outer = p; first = p >= pages ? p - pages : 0;
+          if (first < maxFirst) first = maxFirst; if (outer > maxOuter) outer = maxOuter; }
+      } else if (d === 2) {
+        first = maxFirst; outer = Math.min(maxFirst + pages, maxOuter);
+      } else {
+        first = p + 1;
+        if (first >= maxOuter) { first = 0; outer = 0; }
+        else { if (first < maxFirst) first = maxFirst; outer = Math.min(first + pages, maxOuter); }
+      }
+    }
+    out.textContent = 'bpf_gpu_set_prefetch_region(ctx, ' + first + ', ' + outer + ')  → ' +
+      (outer - first) + ' pages (' + ((outer - first) * 4) + ' KB), return 1 /* BYPASS */';
+    while (bar.firstChild) bar.removeChild(bar.firstChild);
+    rect(0, 512, 'var(--bg3)');
+    rect(first, outer - first, 'var(--accent)');
+    rect(p, 1.5, 'var(--accent2)');
+  }
+  [page, pct, num, dir].forEach(function (el) { el.addEventListener('input', update); });
+  update();
+})();
+</script>
+</body>
+</html>

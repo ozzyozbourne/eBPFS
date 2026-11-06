@@ -1016,7 +1016,8 @@ int handle__sched_switch(u64 *ctx)
       the kernel's <code>tgid</code> (process ID) and <code>targ_pid</code> with the kernel's <code>pid</code> (thread ID),
       while <code>main.rs</code> fills <code>targ_pid</code> from the CLI argument <em>pid</em> and <code>targ_tgid</code>
       from the argument <em>tid</em>. So the argument called "pid" filters on a thread and the one called "tid" filters on a
-      process. Fix the names when you adapt it.</p>
+      process. The upstream libbpf-rs example (<code>9680ea7</code>) still crosses the names the same way. Fix them
+      when you adapt it.</p>
 
     <h3>The user side and its age</h3>
     <p>The template's <code>main.rs</code> targets the libbpf-rs 0.20 API. libbpf-rs has moved on: the repository's

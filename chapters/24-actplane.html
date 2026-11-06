@@ -1,0 +1,1401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>24 · ActPlane: information-flow enforcement for AI agents · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="24">
+<meta name="chapter-part" content="Part VI · eBPF for AI agents">
+<meta name="chapter-summary" content="How ActPlane compiles a small information-flow policy language into an eBPF/BPF-LSM engine that tracks labels across an agent's processes, files and sockets, and blocks, kills or explains rule violations.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/ActPlane">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VI · eBPF for AI agents › 24 · ActPlane</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 24</div>
+      <h1>ActPlane: information-flow enforcement for AI agents</h1>
+      <p class="lede">A coding agent reads <code>.env</code> while debugging. Twenty tool calls
+      later, a Python script it wrote earlier opens a socket. Did the secret leave the
+      machine? A tool-call filter cannot tell, and a sandbox cannot express "this data may
+      not go there". This chapter shows how ActPlane uses eBPF to attach labels to
+      processes, files and network endpoints, propagate them on every fork, read and write,
+      and stop or explain the action that would violate a policy.</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="05-program-types-and-hooks.html">05</a>, <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: eunomia-bpf/ActPlane @ <code>bb89c77b</code></span><span>~60 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>AI coding agents such as Claude Code and Codex run real commands on real machines.
+    They read repositories, call compilers and test runners, fetch web pages, install
+    packages and push commits. Each tool call can start arbitrary subprocesses. Projects try
+    to steer this behaviour with instruction files (<code>CLAUDE.md</code>,
+    <code>AGENTS.md</code>) that say things like "never push to main", "run the tests before
+    committing", or "data read from <code>.env</code> must not reach the network". These are
+    policies. The model follows them only probabilistically. Long contexts make it forget
+    them. Planning errors route around them. Indirect prompt injection, where an attacker
+    plants instructions in content the agent reads
+    (<a href="#ref-greshake">Greshake et al., 2023</a>), can override them on purpose.</p>
+
+    <p>There are three common ways to enforce such policies, and each one leaves a gap:</p>
+    <div class="grid">
+      <div class="card"><h4>Prompt constraints</h4><p>Instructions in the context window.
+      Cheap and flexible, but not deterministic: the model can ignore them, and an injected
+      instruction competes with them on equal terms.</p></div>
+      <div class="card"><h4>Tool-layer guards</h4><p>Hooks or gateways that inspect each tool
+      call (a regex on the Bash command, an MCP gateway). Deterministic, but blind to what
+      happens <em>inside</em> the tool: <code>bash -c</code>, a Python
+      <code>subprocess.run</code>, or a script the agent wrote ten turns earlier.</p></div>
+      <div class="card"><h4>Sandboxes</h4><p>Containers, VMs, Landlock, seccomp. They cover
+      every path, but they answer "may this process touch this resource?", not "may data
+      derived from A flow to B?" or "did tests run since the last edit?". Their denials are a
+      bare <code>EPERM</code> that tells the agent nothing.</p></div>
+    </div>
+
+    <p>ActPlane (<a href="#ref-repo">repo</a>, <a href="#ref-paper">paper</a>) sits below all
+    three. It watches the operating-system actions of an agent's whole process tree with
+    eBPF, so a rule holds whichever tool path the agent takes. Its rules are
+    <strong>information-flow</strong> rules: labels mark where data came from, and they
+    follow the data across fork, exec, file reads and writes and network connections. And
+    when a rule fires, ActPlane sends a human-readable reason back to the agent, so a
+    cooperative but fallible agent can try another way instead of retrying the same
+    command.</p>
+
+    <p>The paper motivates this with a study of 64 popular repositories that contain
+    <code>CLAUDE.md</code> or <code>AGENTS.md</code> (2,116 statements). 64% of the
+    statements are policies. Of 1,361 policies, 83% concern something observable on the
+    system, and 16% are <em>cross-event</em>: they depend on ordering or data lineage across
+    operations ("run tests before committing"). 81% of the repositories contain at least one
+    cross-event policy (<a href="#ref-paper">paper §2.2</a>). A per-call filter cannot
+    enforce cross-event policies, because the facts it needs happened in earlier calls.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>ActPlane is runtime
+    information-flow control (IFC) implemented as an eBPF state machine. Every process, file
+    and IPv4 endpoint the agent touches carries a 64-bit label set in a BPF map. Fixed
+    transfer functions update those sets on each hooked event, using only a bitwise OR, and
+    compiled rules check them at the same hook. A <code>block</code> rule returns
+    <code>-EPERM</code> from a BPF-LSM hook before the operation commits. A
+    <code>kill</code> rule sends <code>SIGKILL</code> with <code>bpf_send_signal()</code>.
+    A <code>notify</code> rule only reports. In every case the agent gets the rule's
+    <code>because</code> text.</p></div>
+
+    <p>This chapter is about enforcement. Observing what an agent does (its prompts, TLS
+    traffic and process tree) is the subject of <a href="23-agentsight.html">chapter 23,
+    AgentSight</a>. ActPlane actually descends from AgentSight's code base. The repository's
+    <code>CLAUDE.md</code> says the SSL/HTTP analyzers, web server and frontend were removed,
+    leaving "the labeled information-flow engine plus a minimal Rust compiler/driver".</p>
+
+    <h2>Information-flow control in ten minutes</h2>
+    <p>Access control asks whether a subject may perform an operation on an object.
+    Information-flow control asks a different question: where may <em>information</em> go?
+    The difference matters when data is copied. If a process may read a secret and may also
+    write to the network, access control allows both operations, and the secret leaks. IFC
+    tracks the fact that the process now <em>contains</em> secret-derived information, so
+    its later network write is a flow from secret to network, and the policy can forbid
+    it.</p>
+
+    <h3>Labels, sources, sinks and propagation</h3>
+    <p>Dorothy Denning's 1976 paper <a href="#ref-denning">"A Lattice Model of Secure
+    Information Flow"</a> gave the formal basis. Each object carries a security class, and
+    classes form a lattice. When information flows from A to B, B's class must be at least
+    A's (B ⊒ A), and a value computed from several inputs gets the join (least upper bound)
+    of their classes. In practice the lattice is often the power set of a label set, and
+    join is set union. That is the model ActPlane uses: a node's label set is a
+    <code>u64</code> bitmask, and join is <code>|</code>.</p>
+    <p>Four words are used throughout this chapter:</p>
+    <ul>
+      <li><strong>Source</strong>: where a label is introduced. Reading <code>**/.env</code>
+      introduces <code>SECRET</code>. Executing <code>codex</code> introduces
+      <code>AGENT</code>.</li>
+      <li><strong>Propagation</strong>: the fixed rules that move labels along flows. A
+      child inherits its parent's labels. A reader absorbs a file's labels. A written file
+      absorbs the writer's labels.</li>
+      <li><strong>Sink</strong>: an operation that a policy checks, such as connecting to an
+      endpoint, writing under <code>/shared</code>, or executing <code>git push</code>.</li>
+      <li><strong>Declassification / endorsement</strong>: a sanctioned way to remove a
+      confidentiality label (a redactor clears <code>SECRET</code>) or to add an integrity
+      label (a human-approval tool adds <code>REVIEWED</code>). Without these, everything
+      ends up labeled and every rule fires.</li>
+    </ul>
+
+    <h3>IFC in operating systems</h3>
+    <p>Language-level IFC (Myers' <a href="#ref-jflow">JFlow</a>, 1999) checks flows inside
+    one program at compile time. That cannot help when the "program" is an LLM that writes
+    and runs new scripts on the fly. The OS-level line of work is the closer ancestor:</p>
+    <ul>
+      <li><a href="#ref-asbestos">Asbestos</a> (SOSP 2005) attached labels to processes and
+      messages, so that a web server's per-user state could be isolated even from bugs in the
+      server.</li>
+      <li><a href="#ref-histar">HiStar</a> (OSDI 2006) built a new kernel whose objects all
+      carry labels, and made every flow between them explicit. A Unix library ran on top of
+      these objects.</li>
+      <li><a href="#ref-flume">Flume</a> (SOSP 2007) brought decentralized IFC to stock
+      Linux as a reference monitor in user space. Processes and files carry secrecy and
+      integrity tags. Unprivileged processes can create tags and hold capabilities to add or
+      drop them, which is how declassification is controlled.</li>
+      <li><a href="#ref-taintdroid">TaintDroid</a> (OSDI 2010) tracked taint through
+      Android's Dalvik VM, files and IPC to detect apps that leak private data.</li>
+      <li><a href="#ref-camflow">CamFlow</a> (2017) and <a href="#ref-camquery">CamQuery</a>
+      (CCS 2018) recorded whole-system provenance with an LSM, and CamQuery ran analyses
+      inline in the kernel that could prevent violations. ActPlane's own design notes call
+      CamQuery "the single closest piece of prior art"
+      (<code>docs/design/related_work.md</code>).</li>
+    </ul>
+    <p>For agents, recent tool-level systems apply IFC at the harness boundary.
+    <a href="#ref-fides">FIDES</a> labels data that tool calls return, and
+    <a href="#ref-camel">CaMeL</a> separates trusted control flow from untrusted data.
+    ActPlane's position is that these see only calls that go through the harness, while the
+    kernel sees everything the agent's processes actually do. What ActPlane adds to the OS
+    line is three things: an eBPF substrate that needs no kernel patch or module, a small
+    policy language that an agent can write, and the feedback loop.</p>
+
+    <div class="callout tip"><span class="label">Taint vs IFC</span><p>The code still says
+    "taint" (<code>taint.h</code>, <code>taint_config</code>, <code>TAINT_VIOLATION</code>).
+    The <code>CLAUDE.md</code> explains the distinction the authors draw: classic taint
+    analysis is "single-bit, usually offline, and aimed at finding vulnerabilities", while
+    ActPlane keeps many labels at run time and enforces policy on them.</p></div>
+
+    <h2>The architecture in one picture</h2>
+    <figure>
+      <svg viewBox="0 0 900 360" role="img" aria-label="ActPlane architecture: policy YAML compiled in userspace into a fixed config blob, loaded into an eBPF engine with LSM and tracepoint hooks; matches flow back through a ring buffer to a feedback file that agent hooks inject into the model">
+        <style>
+          .b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .k{fill:none;stroke:var(--accent);stroke-width:2}
+          .u{fill:none;stroke:var(--accent2);stroke-width:2}
+          .tx{fill:var(--fg);font:13px sans-serif}
+          .mo{fill:var(--fg);font:12px monospace}
+          .mu{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah24a)}
+          .ln{stroke:var(--border);stroke-width:1;stroke-dasharray:5 4}
+        </style>
+        <defs><marker id="ah24a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="mu" x="10" y="20">agent</text>
+        <text class="mu" x="10" y="130">user space</text>
+        <text class="mu" x="10" y="250">kernel</text>
+        <line class="ln" x1="0" y1="100" x2="900" y2="100"/>
+        <line class="ln" x1="0" y1="215" x2="900" y2="215"/>
+        <rect class="b" x="40" y="30" width="200" height="55" rx="6"/><text class="tx" x="52" y="52">agent (Claude Code, Codex)</text><text class="mu" x="52" y="72">writes / reads actplane.yaml</text>
+        <rect class="b" x="300" y="30" width="250" height="55" rx="6"/><text class="tx" x="312" y="52">agent's process tree</text><text class="mu" x="312" y="72">bash, python, git, curl, ...</text>
+        <rect class="b" x="620" y="30" width="250" height="55" rx="6"/><text class="tx" x="632" y="52">PostToolUse hook / MCP</text><text class="mo" x="632" y="72">actplane feedback-hook</text>
+        <rect class="u" x="40" y="115" width="200" height="80" rx="6"/><text class="tx" x="52" y="137">actplane-ifc-compiler</text><text class="mu" x="52" y="157">parse DSL, DNF, globs</text><text class="mo" x="52" y="177">-&gt; struct taint_config</text>
+        <rect class="u" x="300" y="115" width="250" height="80" rx="6"/><text class="tx" x="312" y="137">actplane-runtime</text><text class="mu" x="312" y="157">load engine (aya), seed pid,</text><text class="mu" x="312" y="175">drain ring buffer, format reason</text>
+        <rect class="u" x="620" y="115" width="250" height="80" rx="6"/><text class="tx" x="632" y="137">feedback mailbox</text><text class="mo" x="632" y="157">.actplane/last-violation.txt</text><text class="mo" x="632" y="177">events.jsonl, audit.jsonl</text>
+        <rect class="k" x="40" y="230" width="830" height="115" rx="8"/>
+        <text class="tx" x="52" y="252" style="font-weight:600">eBPF engine (bpf/process.bpf.c, taint_engine.bpf.h)</text>
+        <rect class="b" x="60" y="265" width="240" height="66" rx="6"/><text class="tx" x="72" y="285">hooks</text><text class="mo" x="72" y="303">lsm/* (block, pre-op)</text><text class="mo" x="72" y="321">tp/* (notify, kill)</text>
+        <rect class="b" x="320" y="265" width="260" height="66" rx="6"/><text class="tx" x="332" y="285">label state (BPF maps)</text><text class="mo" x="332" y="303">ts_proc ts_file ts_endp</text><text class="mo" x="332" y="321">ts_sess ts_rules ts_updates</text>
+        <rect class="b" x="600" y="265" width="250" height="66" rx="6"/><text class="tx" x="612" y="285">verdict</text><text class="mo" x="612" y="303">-EPERM / SIGKILL / report</text><text class="mo" x="612" y="321">emit_violation() -&gt; rb</text>
+        <path class="ar" d="M140,85 V113"/>
+        <path class="ar" d="M240,155 H298"/>
+        <path class="ar" d="M425,195 V228"/>
+        <path class="ar" d="M425,85 V100 M425,100 V113" style="stroke-dasharray:4 3"/>
+        <path class="ar" d="M725,263 L560,197"/>
+        <path class="ar" d="M550,155 H618"/>
+        <path class="ar" d="M745,115 V87"/>
+        <path class="ar" d="M620,57 H552" />
+        <text class="mu" x="250" y="148">config blob</text>
+        <text class="mu" x="432" y="222">seed + load</text>
+        <text class="mu" x="560" y="57">reason</text>
+      </svg>
+      <figcaption>Figure 24.1 — Policy text goes down, verdicts come up. The compiler turns
+      the DSL into a fixed-size C struct, the runtime loads the prebuilt CO-RE object and
+      seeds the agent's pid, the kernel engine propagates labels and decides, and only
+      matches come back up through the ring buffer to the agent's hook.</figcaption>
+    </figure>
+
+    <p>There are four parts (README "How it works"):</p>
+    <ul>
+      <li><strong>Kernel engine</strong> (<code>bpf/</code>): hooks fork, exec, exit, open,
+      read/write, unlink, rename, connect and receive. It keeps a label set per process,
+      file and endpoint, propagates labels, evaluates compiled rules, and emits an event
+      only when a rule matches.</li>
+      <li><strong>Policy compiler</strong> (<code>crates/actplane-ifc-compiler/</code>):
+      parses the policy language and lowers it to the fixed kernel ABI defined in
+      <code>bpf/taint.h</code>.</li>
+      <li><strong>Runtime</strong> (<code>crates/actplane-runtime/</code>): finds
+      <code>actplane.yaml</code>, loads the prebuilt eBPF object with the
+      <a href="https://aya-rs.dev/">aya</a> Rust library (no clang or libbpf at run time),
+      seeds the target process, and turns kernel matches into feedback.</li>
+      <li><strong>CLI</strong> (<code>crates/actplane-cli/</code>): the
+      <code>actplane</code> command with <code>init</code>, <code>compile</code>,
+      <code>doctor</code>, <code>run</code>, <code>watch</code>, <code>attach</code>,
+      <code>mcp</code>, <code>control</code> and <code>feedback-hook</code>.</li>
+    </ul>
+    <p>One design choice runs through all of it: <em>the kernel decides, user space only
+    explains</em>. The rule's name and its <code>because</code> string never enter the
+    kernel. The kernel reports a numeric rule id, and the runtime maps it back to the text.
+    So a bug in user-space formatting can make feedback worse, but it cannot let a
+    forbidden operation through.</p>
+
+    <h2>The policy language</h2>
+    <p>A policy is a YAML file (<code>actplane.yaml</code> or
+    <code>.actplane/policy.yaml</code>) with a DSL block under <code>policy: |</code>. The
+    DSL has three kinds of declaration: <code>source</code>, <code>rule</code>, and the
+    transforms <code>declassify</code>/<code>endorse</code>. The full grammar is in
+    <code>docs/rule-language.md</code> §2 and in the paper's appendix A:</p>
+    <pre data-file="docs/rule-language.md"><code class="language-plaintext">policy      := decl*
+decl        := source_decl | sink_decl | xform_decl
+source_decl := "source" IDENT "=" node_kind PATTERN          # node_kind: file|endpoint|exec
+sink_decl   := "rule" IDENT ":" clause+ ["because" STRING]
+clause      := EFFECT op_pattern ["if" expr] ["unless" cond]
+EFFECT      := "block" | "notify" | "kill"                    # required
+xform_decl  := ("declassify"|"endorse") IDENT "by" "exec" PATTERN
+op_pattern  := "exec" PATTERN [ARG]
+             | ("read"|"write"|"unlink"|"open") "file" PATTERN
+             | ("connect"|"recv") "endpoint" PATTERN
+expr        := term (("and"|"or") term)*
+term        := ["not"] IDENT | "true"
+cond        := "target" ["not"] PATTERN
+             | "lineage-includes" "exec" PATTERN
+             | "after" gate_event [ "exits" EXIT_CODE ] [ "since" since_event ("or" since_event)* ]</code></pre>
+    <p>A clause matches an event when three things hold: the operation and its target
+    match the pattern, the boolean expression after <code>if</code> holds over the
+    <em>subject's</em> labels (the process doing the operation), and the
+    <code>unless</code> condition is false. The <code>unless</code> conditions are what
+    make rules usable:</p>
+    <ul>
+      <li><code>target PAT</code> / <code>target not PAT</code>: scope the rule to (or away
+      from) a region, for example "writes anywhere except <code>/work/**</code>".</li>
+      <li><code>lineage-includes exec G</code>: <em>mandatory mediation</em>. The operation is
+      allowed only if the process or one of its ancestors executed <code>G</code>, for
+      example "<code>prod.db</code> is reachable only through the migration tool".</li>
+      <li><code>after exec G [exits N] [since EV]</code>: <em>temporal ordering</em>. The
+      operation is allowed only if <code>G</code> ran earlier in this lineage (and exited
+      with status <code>N</code>). With <code>since</code>, a later matching event makes the
+      gate stale again, the way a build system treats <code>foo.o</code> as stale when
+      <code>foo.c</code> changes.</li>
+    </ul>
+    <p>Exec patterns without a <code>/</code> are basename matches (<code>exec "git"</code>
+    means <code>exec "**/git"</code>). An optional second string is one argv token, so
+    <code>exec "git" "push"</code> matches a git process with a <code>push</code> argument.
+    If several clauses match one event, the strongest effect wins: <code>kill</code> &gt;
+    <code>block</code> &gt; <code>notify</code>.</p>
+
+    <h3>Real policies</h3>
+    <p>The examples below are copied from the repository. The tabs show the three problem
+    classes this curriculum cares about: exfiltration, prompt injection and destructive
+    commands. The project's own default policy is a workflow rule.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Exfiltration">
+        <pre data-file="test/policies/01_secret_no_exfil.yaml"><code class="language-yaml">version: 1
+policy: |
+  source SECRET = file "**/.env"
+  source SECRET = file "/etc/secrets/**"
+
+  rule no-exfil:
+    block connect endpoint "*" if SECRET
+    block write file "/shared/**" if SECRET
+    because "secret data must not leave the host"</code></pre>
+        <p>Any process that has read a <code>.env</code> file, or that descends from such a
+        process, or that read a file such a process wrote, cannot connect anywhere or write
+        under <code>/shared</code>. The companion file
+        <code>test/policies/08_secret_declassify.yaml</code> adds
+        <code>declassify SECRET by exec "**/redact"</code>, so output that went through the
+        redactor may leave.</p>
+      </div>
+      <div class="tab-panel" data-label="Prompt injection">
+        <pre data-file="test/policies/02_prompt_injection_review.yaml"><code class="language-yaml">version: 1
+policy: |
+  source UNTRUST = endpoint "*"
+  source UNTRUST = file "**/downloads/**"
+
+  rule no-injected-priv:
+    block exec "git" "push" if UNTRUST and not REVIEWED
+    block exec "**/deploy*" if UNTRUST and not REVIEWED
+    because "untrusted input must not drive privileged actions"
+
+  endorse REVIEWED by exec "**/human-approve"</code></pre>
+        <p>Content that came from the network or from a downloads folder marks the reader
+        <code>UNTRUST</code>. A privileged action by a process carrying that label needs the
+        <code>REVIEWED</code> integrity label, which only a process that executed
+        <code>human-approve</code> (or its descendants) gets. Note that the repo's support
+        matrix says argv-token rules such as <code>exec "git" "push"</code> are observed
+        after exec, so <code>block</code> is not a pre-op denial for them. The equivalent
+        example E2 in <code>docs/rule-language.md</code> uses <code>kill</code> for the
+        <code>git push</code> clause for that reason.</p>
+      </div>
+      <div class="tab-panel" data-label="Destructive commands">
+        <pre data-file="docs/rule-language.md"><code class="language-plaintext">source AGENT = exec "**/codex"
+rule confirm-destructive:
+  kill exec "git" "--force"  if AGENT  unless after exec "**/confirm" since exec "git"
+  kill write file "/data/**"         if AGENT  unless after exec "**/confirm"
+  because "each force-push needs a fresh confirm; a stale confirm doesn't count"</code></pre>
+        <p>Example E11. <code>since exec "git"</code> makes a confirmation single-use: any
+        later <code>git</code> run makes it stale, so one <code>confirm</code> cannot
+        authorize every future force-push.</p>
+      </div>
+      <div class="tab-panel" data-label="Workflow (repo default)">
+        <pre data-file="actplane.yaml"><code class="language-yaml">version: 1
+
+feedback:
+  path: .actplane/last-violation.txt
+
+policy: |
+  source AGENT = exec "**/claude"
+  source AGENT = exec "**/codex"
+
+  # No auto-commit — agent must not commit without explicit user approval.
+  # Gate: write .actplane/commit-approved to signal user approval; re-arms after each commit.
+  rule no-auto-commit:
+    block exec "git" "commit"
+      if AGENT unless after write ".actplane/commit-approved"
+        since exec "git" "commit"
+    because "Write to .actplane/commit-approved after user says 'commit', then run git commit."</code></pre>
+        <p>The policy the ActPlane repository applies to agents working on ActPlane itself.
+        The gate is a file write, and every commit re-arms it.</p>
+      </div>
+      <div class="tab-panel" data-label="Test before commit">
+        <pre data-file="docs/rule-language.md"><code class="language-plaintext">source AGENT = exec "**/codex"
+rule test-before-commit:
+  kill exec "git" "commit"
+    if AGENT  unless after exec "**/pytest" since write "src/**" or write "tests/**"
+  because "tests are stale — you edited code after the last passing run; re-run the test suite, then commit"</code></pre>
+        <p>Example E5, the canonical cross-event rule. A plain <code>after</code> would let
+        edit → test → edit → commit slip through; <code>since</code> closes that hole.</p>
+      </div>
+    </div>
+
+    <h3>The propagation model</h3>
+    <p>Propagation is not part of the policy. It is the fixed meaning of a flow, defined in
+    <code>docs/rule-language.md</code> §1.5. σ(n) is node <em>n</em>'s label set, and every
+    update happens <em>before</em> the sink check on the same event:</p>
+    <pre data-file="docs/rule-language.md"><code class="language-plaintext">fork(p,c)    : σ(c) ∪= σ(p)                      # child inherits parent
+exec(p,f)    : σ(p) ∪= σ(f) ∪ srcExec(f)         # process absorbs file + exec-source labels
+read(p,f)    : σ(p) ∪= σ(f)                      # reader absorbs file labels
+write(p,f)   : σ(f) ∪= σ(p)                      # written file inherits writer labels (derivation)
+unlink(p,f)  : (no flow)
+connect(p,e) : σ(e) ∪= σ(p)                      # egress: endpoint records writer labels
+recv(p,e)    : σ(p) ∪= σ(e)                      # received data taints receiver</code></pre>
+    <p>The invariant the document states is that label <em>L</em> is in σ(n) iff information
+    from some <em>L</em>-source has reached <em>n</em> through a chain of these events. The
+    state is the transitive closure of provenance, but it is maintained incrementally, in
+    O(1) per event, with no graph walk. That is what makes it cheap enough to run inside a
+    hook on every syscall.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 380" role="img" aria-label="Label propagation across processes, files and sockets: codex labeled AGENT forks bash, bash reads .env and gains SECRET, writes out.json which gains SECRET, a separate uploader reads out.json and gains SECRET, its connect is blocked">
+        <style>
+          .p{fill:var(--bg3);stroke:var(--accent2);stroke-width:2}
+          .f{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .e{fill:none;stroke:var(--accent);stroke-width:2.5}
+          .tx{fill:var(--fg);font:13px sans-serif}
+          .mo{fill:var(--fg);font:12px monospace}
+          .lb{fill:var(--accent);font:bold 11px monospace}
+          .lb2{fill:var(--accent2);font:bold 11px monospace}
+          .mu{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah24b)}
+          .bad{stroke:var(--accent);stroke-width:2.5;fill:none;marker-end:url(#ah24b)}
+        </style>
+        <defs><marker id="ah24b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="mu" x="20" y="20">rounded = process (ts_proc)   square = file (ts_file)   dashed = endpoint (ts_endp)</text>
+        <rect class="p" x="20" y="45" width="150" height="56" rx="20"/><text class="mo" x="38" y="70">codex (root)</text><text class="lb2" x="38" y="90">{AGENT}</text>
+        <rect class="p" x="230" y="45" width="150" height="56" rx="20"/><text class="mo" x="248" y="70">bash</text><text class="lb2" x="248" y="90">{AGENT}</text>
+        <rect class="p" x="440" y="45" width="190" height="56" rx="20"/><text class="mo" x="458" y="70">python debug.py</text><text class="lb" x="458" y="90">{AGENT, SECRET}</text>
+        <rect class="f" x="440" y="170" width="190" height="50"/><text class="mo" x="452" y="192">/repo/.env</text><text class="lb" x="452" y="210">source: {SECRET}</text>
+        <rect class="f" x="690" y="45" width="190" height="56"/><text class="mo" x="702" y="70">/tmp/out.json</text><text class="lb" x="702" y="90">{AGENT, SECRET}</text>
+        <rect class="p" x="690" y="170" width="190" height="56" rx="20"/><text class="mo" x="702" y="195">upload.sh (later)</text><text class="lb" x="702" y="215">{AGENT, SECRET}</text>
+        <rect class="e" x="690" y="300" width="190" height="56" style="stroke-dasharray:6 4"/><text class="mo" x="702" y="324">203.0.113.7:443</text><text class="mu" x="702" y="344">sink: connect</text>
+        <path class="ar" d="M170,73 H228"/><text class="mu" x="178" y="64">fork</text>
+        <path class="ar" d="M380,73 H438"/><text class="mu" x="384" y="64">fork+exec</text>
+        <path class="ar" d="M535,168 V103"/><text class="mu" x="542" y="140">read: σ(p) ∪= σ(f)</text>
+        <path class="ar" d="M630,73 H688"/><text class="mu" x="634" y="64">write</text>
+        <path class="ar" d="M785,101 V168"/><text class="mu" x="792" y="140">read</text>
+        <path class="bad" d="M785,226 V298"/><text class="tx" x="560" y="268" style="font-weight:600">rule no-exfil: SECRET ⇒ -EPERM</text>
+        <text class="mu" x="20" y="150">upload.sh was spawned by bash</text>
+        <text class="mu" x="20" y="168">in a later tool call; it never</text>
+        <text class="mu" x="20" y="186">opened .env itself, but it read</text>
+        <text class="mu" x="20" y="204">a file derived from it.</text>
+      </svg>
+      <figcaption>Figure 24.2 — Labels follow data, not names. <code>SECRET</code> enters at
+      the read of <code>.env</code>, spreads to <code>/tmp/out.json</code> through a write,
+      and reaches a process that never touched <code>.env</code> through a read. Its connect
+      is the sink. This is example E7 ("transitive derived-data tracking") from
+      <code>docs/rule-language.md</code>.</figcaption>
+    </figure>
+
+    <div class="callout warn"><span class="label">Over-tainting is deliberate</span><p>A
+    process that reads one byte of a secret is labeled <code>SECRET</code> for the rest of
+    its life, and so is every file it writes, even if the output does not contain the
+    secret. The support matrix says so directly: "ActPlane favors preserving provenance
+    over silently missing a derived flow." The tools for controlling this are
+    <code>declassify</code>, scoping rules with <code>target</code>, and keeping agent
+    sessions short.</p></div>
+
+    <h2>Inside the kernel engine</h2>
+
+    <h3>Which hooks, and why both kinds</h3>
+    <p>ActPlane uses two families of program from <a href="05-program-types-and-hooks.html">chapter
+    05</a>. It uses no kprobes and no cgroup programs (<code>grep -i cgroup bpf/</code>
+    finds nothing).</p>
+    <table>
+      <tr><th>Family</th><th>Sections in <code>bpf/process.bpf.c</code></th><th>Role</th></tr>
+      <tr><td>BPF LSM (14 programs)</td><td><code>lsm/bprm_check_security</code>,
+      <code>file_open</code>, <code>file_permission</code>, <code>file_truncate</code>,
+      <code>mmap_file</code>, <code>file_mprotect</code>, <code>path_truncate</code>,
+      <code>path_unlink</code>, <code>path_rename</code>, <code>socket_connect</code>,
+      <code>socket_recvmsg</code>, plus <code>task_kill</code>,
+      <code>ptrace_access_check</code>, <code>bpf</code> for self-protection</td>
+      <td>Pre-operation decisions. The hook runs after the kernel has resolved the path or
+      copied the socket address, and returning <code>-EPERM</code> stops the operation.
+      Only active when <code>bpf</code> is in <code>/sys/kernel/security/lsm</code>.</td></tr>
+      <tr><td>Tracepoints</td><td><code>tp/sched/sched_process_fork</code>,
+      <code>sched_process_exec</code> (several stages), <code>sched_process_exit</code>;
+      <code>tp/syscalls/sys_enter_*</code> / <code>sys_exit_*</code> for openat, openat2,
+      creat, truncate, read, write, unlink(at), rename(at2), connect, accept(4), bind,
+      sendto, recvfrom, sendmsg, recvmsg, mmap, mprotect, mremap, munmap, pipe(2),
+      socketpair, dup/dup2/dup3, fcntl, close, sendfile64, copy_file_range, splice</td>
+      <td>Lineage (fork, exec, exit), argv capture, and the fallback path when BPF LSM is
+      off. They can notify or kill, but they cannot stop the syscall.</td></tr>
+    </table>
+    <p>Why keep tracepoints when LSM hooks exist? There are three reasons in the code and
+    docs. First, there is no LSM hook for fork, and the exec tracepoint is where argv is
+    available: <code>handle_exec</code> reads <code>mm-&gt;arg_start</code> to get the
+    command line, which <code>bprm_check_security</code> does not have in a convenient form.
+    That is why the docs say argv-token rules (<code>git push</code>) should use
+    <code>kill</code>: the new image may have started, but it is killed before it gets far.
+    Second, exit status is only known at <code>sched_process_exit</code>, which arms
+    <code>after exec G exits 0</code> gates. Third, many kernels, including stock
+    distribution kernels, do not enable BPF LSM. On those, ActPlane still works as a
+    notify/kill harness.</p>
+
+    <h3>The rule ABI</h3>
+    <p>The compiler and the kernel share one header. Each source, transform, gate and
+    <code>since</code> invalidator becomes a <code>taint_update</code>; each lowered clause
+    becomes a <code>taint_rule</code>. The label condition is just two masks:</p>
+    <pre data-file="bpf/taint.h"><code class="language-c">#define TAINT_PAT_LEN     64
+/* ... */
+#define MAX_TAINT_LABELS  64   /* labels are a u64 bitmask */
+/* Sized for 100+ rules in one policy. Table loops run via bpf_loop (callback
+ * verified once), so these bounds cost memory, not verifier path count. */
+#define MAX_TAINT_UPDATES 320
+#define MAX_TAINT_RULES   128
+
+/* sink operations */
+enum taint_op {
+	TOP_EXEC    = 0, /* exec comm */
+	TOP_OPEN    = 1, /* open/read path */
+	TOP_WRITE   = 2, /* write/unlink/rename path (mutation) */
+	TOP_CONNECT = 3, /* connect host/ip */
+	TOP_RECV    = 4, /* recv from endpoint (data ingress) */
+};
+/* ... */
+struct taint_rule {
+	unsigned char op;         /* enum taint_op */
+	unsigned char match;      /* enum taint_match (target) */
+	unsigned char cond_kind;  /* enum taint_cond */
+	unsigned char cond_neg;   /* for TCOND_TARGET: invert the match */
+	unsigned char cond_match; /* enum taint_match for cond_pat */
+	unsigned char effect;     /* enum taint_effect */
+	char target[TAINT_PAT_LEN];
+	char arg[TAINT_ARG_LEN];  /* exec @arg token, "" = ignore */
+	char cond_pat[TAINT_PAT_LEN];
+	unsigned long long req;    /* all these label bits must be set */
+	unsigned long long forbid; /* none of these may be set */
+	unsigned long long gate;   /* gate bit for LINEAGE/AFTER */
+	/* ... rule_id, ipv4/mask, cond_ipv4/mask, gate_idx, domain_id, since_mask ... */
+};
+/* ... */
+/* boolean label predicate: required bits all set, forbidden bits all clear */
+static __always_inline int taint_mask_ok(unsigned long long labels,
+					 unsigned long long req,
+					 unsigned long long forbid)
+{
+	return (labels &amp; req) == req &amp;&amp; (labels &amp; forbid) == 0ULL;
+}</code></pre>
+    <p>A label expression like <code>UNTRUST and not REVIEWED</code> becomes
+    <code>req = UNTRUST_bit</code>, <code>forbid = REVIEWED_bit</code>. An
+    <code>or</code> cannot be expressed in one (req, forbid) pair, so the compiler expands
+    the expression to disjunctive normal form and emits one kernel rule per disjunct:</p>
+    <pre data-file="crates/actplane-ifc-compiler/src/dsl/lower.rs"><code class="language-rust">/// expr -&gt; disjunction of (req_mask, forbid_mask)
+fn dnf(e: &amp;Expr, ctx: &amp;mut Ctx) -&gt; Result&lt;Vec&lt;(u64, u64)&gt;, String&gt; {
+    Ok(match e {
+        Expr::True =&gt; vec![(0, 0)],
+        Expr::Label(l) =&gt; vec![(ctx.label_bit(l)?, 0)],
+        Expr::Not(l) =&gt; vec![(0, ctx.label_bit(l)?)],
+        Expr::Or(a, b) =&gt; {
+            let mut v = dnf(a, ctx)?;
+            v.extend(dnf(b, ctx)?);
+            v
+        }
+        Expr::And(a, b) =&gt; {
+            let (da, db) = (dnf(a, ctx)?, dnf(b, ctx)?);
+            let mut v = Vec::new();
+            for (ra, fa) in &amp;da {
+                for (rb, fb) in &amp;db {
+                    v.push((ra | rb, fa | fb));
+                }
+            }
+            v
+        }
+    })
+}</code></pre>
+    <p>Globs are lowered the same way, into one of five kernel match kinds (exact, prefix,
+    suffix, contains, any). There is no regex engine in the kernel. Hostnames are resolved
+    by the compiler to IPv4 addresses, so the kernel only compares numbers. The structs in
+    <code>lower.rs</code> are <code>#[repr(C)]</code> copies of the C ones, and a test guards
+    the total size. The <code>CLAUDE.md</code> warns that any change to <code>taint.h</code>
+    must be mirrored in <code>lower.rs</code>.</p>
+
+    <h3>Label state in maps</h3>
+    <p>The engine's state lives in hash maps declared in
+    <code>bpf/taint_engine.bpf.h</code>. A process entry holds labels and the gate bits
+    seen in its ancestry; a file entry is keyed by a real <code>(dev, inode)</code> when the
+    hook has a <code>struct file</code>, so a rename or a hard link does not lose the
+    label:</p>
+    <pre data-file="bpf/taint_engine.bpf.h"><code class="language-c">struct proc_state {
+	__u64 labels;
+	__u64 lin_gates; /* gate bits seen in this pid's ancestor chain (incl self) */
+};
+/* ... */
+struct file_id {
+	__u64 ino;
+	__u32 dev;
+	__u32 _pad;
+};
+/* ... */
+struct file_state {
+	__u64 labels;
+	__u32 last_write_epoch;
+	__u32 _pad;
+};
+/* ... */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, pid_t);
+	__type(value, struct proc_state);
+} ts_proc SEC(".maps");
+/* ... */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct file_domain_id);
+	__type(value, struct file_state);
+} ts_file SEC(".maps");
+/* ... */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct endp_domain_id); /* IPv4 (network order) + domain */
+	__type(value, __u64);
+} ts_endp SEC(".maps");</code></pre>
+    <p>Other maps hold the rule and update tables (<code>ts_rules</code>,
+    <code>ts_updates</code>, <code>ts_counts</code>), lineage roots (<code>ts_root</code>),
+    per-session gate epochs (<code>ts_sess</code>), provenance records that let feedback say
+    <em>which</em> file introduced a label (<code>ts_*_prov</code>), per-domain state
+    (<code>cap_*</code>), and the output ring buffer <code>rb</code>. In tracepoint-only mode,
+    when a hook only has a user-space path, files fall back to a key of
+    <code>(0, fnv1a(path))</code>.</p>
+
+    <h3>Propagation code</h3>
+    <p>Fork is the simplest case. The tracepoint handler calls <code>te_fork</code>, which
+    does nothing for processes outside the agent's tree and otherwise copies the parent's
+    state for every domain depth and records the lineage root:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="fork">
+        <pre data-file="bpf/process.bpf.c"><code class="language-c">SEC("tp/sched/sched_process_fork")
+int handle_fork(struct trace_event_raw_sched_process_fork *ctx)
+{
+	pid_t parent_tgid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	te_fork(parent_tgid, ctx-&gt;child_pid);
+	te_copy_fork_fds(parent_tgid, ctx-&gt;child_pid);
+	return 0;
+}</code></pre>
+        <pre data-file="bpf/taint_engine.bpf.h"><code class="language-c">static __always_inline void te_fork(pid_t ppid, pid_t cpid)
+{
+	if (!te_pid_active(ppid))
+		return;
+	cap_fork(ppid, cpid);
+	for (int i = 0; i &lt; CAP_DOMAIN_DEPTH; i++) {
+		__u32 domain_id = te_domain_for_depth(ppid, i);
+		if (i &gt; 0 &amp;&amp; !domain_id)
+			break;
+		te_copy_proc_domain_state(ppid, cpid, domain_id);
+	}
+	pid_t r = te_root(ppid);
+	bpf_map_update_elem(&amp;ts_root, &amp;cpid, &amp;r, BPF_ANY);
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="write">
+        <pre data-file="bpf/taint_engine.bpf.h"><code class="language-c">/* write: file absorbs proc labels; stamp `since write` invalidators (this is
+ * what makes a gate go stale when the agent edits an input again). The label
+ * flow is gated on pl != 0, but invalidator stamping is not — editing an
+ * unlabeled source file must still invalidate a prior gate. ... */
+static __always_inline void te_write_flow_domain(pid_t pid, struct file_id *fid,
+						 const char *path, __u32 domain_id)
+{
+	if (!te_pid_active(pid) || !cap_domain_matches_pid(pid, domain_id))
+		return;
+	struct te_update_ctx u = {
+		.pid = pid,
+		.domain_id = domain_id,
+		.op = TOP_WRITE,
+		.target = path,
+	};
+	te_collect_file_updates(&amp;u);
+	__u64 pl = te_labels_for_domain(pid, domain_id);
+	if (!u.gates &amp;&amp; !u.invals &amp;&amp; !pl)
+		return;
+	pid_t r = te_root(pid);
+	__u32 ep = te_tick(r, domain_id);
+	if (u.gates || u.invals)
+		te_stamp(r, domain_id, ep, u.gates, u.invals);
+	if (pl) {
+		struct file_domain_id *fdom = te_file_domain_tmp();
+		if (!fdom)
+			return;
+		te_file_domain_key_for(domain_id, fid, fdom);
+		struct file_state *fs = bpf_map_lookup_elem(&amp;ts_file, fdom);
+		if (fs) {
+			fs-&gt;labels |= pl;
+			fs-&gt;last_write_epoch = ep;
+		} else {
+			struct file_state ns = { .labels = pl, .last_write_epoch = ep };
+			bpf_map_update_elem(&amp;ts_file, fdom, &amp;ns, BPF_ANY);
+		}
+		te_copy_proc_prov_to_file(pid, fdom, pl);
+	}
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="after … since">
+        <pre data-file="bpf/taint_engine.bpf.h"><code class="language-c">static __noinline int te_after_satisfied(const struct taint_rule *r, pid_t pid)
+{
+	pid_t rt = te_root(pid);
+	struct te_sess *s = te_sess_get(rt, r-&gt;domain_id);
+
+	if (!s)
+		return 0;
+	if (r-&gt;since_mask == 0)
+		return (s-&gt;gate_bits &amp; r-&gt;gate) ? 1 : 0;
+	__u32 gidx = r-&gt;gate_idx;
+	if (gidx &gt;= MAX_TAINT_GATES)
+		return 0;
+	__u32 ge = s-&gt;gate_epoch[gidx];
+	if (ge == 0)
+		return 0; /* gate never fired -&gt; stale */
+	__u32 last_inval = 0;
+	for (int i = 0; i &lt; MAX_TAINT_INVALS; i++) {
+		if (r-&gt;since_mask &amp; (1ULL &lt;&lt; i)) {
+			__u32 ie = s-&gt;inval_epoch[i];
+			if (ie &gt; last_inval)
+				last_inval = ie;
+		}
+	}
+	return ge &gt; last_inval ? 1 : 0;
+}</code></pre>
+        <p>Staleness is a comparison of two counters. Each lineage root has a monotonic
+        epoch. Running the gate stamps <code>gate_epoch[g]</code>, and a matching
+        <code>since</code> event stamps <code>inval_epoch[s]</code>. The gate is fresh iff
+        it was stamped after every invalidator.</p>
+      </div>
+    </div>
+    <p>Two things stand out. Every helper starts with <code>te_pid_active()</code>, so
+    processes outside an ActPlane domain cost one hash lookup and nothing else. And the code
+    is written around the verifier (<a href="03-verifier.html">chapter 03</a>). Rule tables
+    are scanned with <code>bpf_loop()</code>, so a callback is verified once whatever the
+    table size. Heavy helpers are <code>__noinline</code> so that each gets its own stack
+    frame. The string matchers in <code>taint.h</code> are branchless, so that their
+    verification cost does not depend on the bytes being compared. <code>bpf/README.md</code> and
+    <code>CLAUDE.md</code> list these tricks under "eBPF verifier gotchas", and several recent
+    commits are verifier stack-depth fixes.</p>
+
+    <h2>The enforcement point</h2>
+    <p>Every hook funnels into a small number of handlers (<code>te_handle_event</code>,
+    <code>te_handle_exec_event</code>, and the exec tail-call pipeline). Each one computes
+    the subject's labels, scans the rules for the strongest matching effect, and then acts.
+    The hook's <em>mode</em> decides which effects it may act on:</p>
+    <pre data-file="bpf/process.bpf.c"><code class="language-c">static __always_inline __u32 te_tracepoint_mode(void)
+{
+	return TE_MODE_NOTIFY;
+}
+
+static __always_inline __u32 te_effect_mode(__u32 backend_mode, __u32 effect)
+{
+	if (effect == TEFFECT_NOTIFY)
+		return TE_MODE_NOTIFY;
+	if (effect == TEFFECT_KILL)
+		return TE_MODE_KILL;
+	if (effect == TEFFECT_BLOCK &amp;&amp; backend_mode == TE_MODE_BLOCK)
+		return TE_MODE_BLOCK;
+	return TE_MODE_UNSUPPORTED;
+}
+
+static __always_inline __u32 te_supported_effects(__u32 backend_mode)
+{
+	if (backend_mode == TE_MODE_BLOCK)
+		return (1U &lt;&lt; TEFFECT_BLOCK);
+	return (1U &lt;&lt; TEFFECT_NOTIFY) | (1U &lt;&lt; TEFFECT_KILL);
+}</code></pre>
+    <p>LSM programs pass <code>TE_MODE_BLOCK</code>; tracepoints pass
+    <code>TE_MODE_NOTIFY</code>. As I read this code, the LSM hooks therefore evaluate only
+    <code>block</code> clauses, and the tracepoints evaluate <code>notify</code> and
+    <code>kill</code> clauses. A <code>block</code> rule with no LSM behind it maps to
+    <code>TE_MODE_UNSUPPORTED</code> and does nothing, which matches the documentation:
+    "Without BPF LSM, <code>block</code> is unsupported and tracepoints do not evaluate
+    it." Here is the LSM hook for <code>connect()</code> and the decision code at the end of
+    <code>te_handle_event</code>:</p>
+    <pre data-file="bpf/process.bpf.c"><code class="language-c">SEC("lsm/socket_connect")
+int BPF_PROG(enforce_socket_connect, struct socket *sock, struct sockaddr *address,
+	     int addrlen)
+{
+	(void)sock;
+	(void)addrlen;
+	return te_handle_net(TE_REF_SOCKADDR_KERN, address, 0,
+			     TE_ACCESS_CONNECT, TE_MODE_BLOCK);
+}
+
+/* ... inside te_handle_event(), after the rule scan ... */
+	if (rid &gt;= 0) {
+		action = te_effect_mode(ev-&gt;mode, effect);
+		if (action != TE_MODE_UNSUPPORTED)
+			emit_violation(ev-&gt;pid, rid, display,
+				       ev-&gt;obj_kind == TE_OBJ_ENDPOINT ? ev-&gt;ip : 0,
+				       ev-&gt;obj_kind, fid,
+				       matched_domain_id, matched_labels,
+				       matched_op,
+				       action == TE_MODE_BLOCK ||
+					       (action == TE_MODE_KILL &amp;&amp; ev-&gt;mode == TE_MODE_BLOCK),
+				       action == TE_MODE_KILL, effect);
+		if (action == TE_MODE_BLOCK)
+			return -EPERM;
+		if (action == TE_MODE_KILL) {
+			bpf_send_signal(SIGKILL);
+			if (ev-&gt;mode == TE_MODE_BLOCK)
+				return -EPERM;
+		}
+	}
+
+	if (ev-&gt;obj_kind == TE_OBJ_FILE &amp;&amp; (policy_features &amp; TE_POLICY_FILE_FLOW)) {
+		if (ev-&gt;access &amp; TE_ACCESS_READ)
+			te_read(ev-&gt;pid, fid, ev-&gt;target);
+		if (ev-&gt;access &amp; TE_ACCESS_WRITE)
+			te_write_flow(ev-&gt;pid, fid, ev-&gt;target);
+	} else if (ev-&gt;obj_kind == TE_OBJ_ENDPOINT) {
+		if (ev-&gt;access &amp; TE_ACCESS_CONNECT)
+			te_connect_flow(ev-&gt;ip, ev-&gt;pid);
+		if (ev-&gt;access &amp; TE_ACCESS_RECV)
+			te_recv_flow(ev-&gt;ip, ev-&gt;pid);
+	}
+
+	return 0;</code></pre>
+    <p>Note the ordering. A denied operation returns <em>before</em> the flow functions
+    run, so a blocked write does not label the file. Only allowed operations propagate. The
+    LSM verdict convention is the one from <a href="05-program-types-and-hooks.html">chapter
+    05</a>: 0 allows and a negative errno denies. The connect fails in the agent's process
+    with <code>EPERM</code>, just as if SELinux had refused it.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 330" role="img" aria-label="Enforcement point: a connect syscall passes through security_socket_connect where the BPF LSM program checks scope, labels and rules, and returns -EPERM; in parallel the sys_enter_connect tracepoint can only notify or SIGKILL">
+        <style>
+          .b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .k{fill:none;stroke:var(--accent);stroke-width:2}
+          .c{fill:none;stroke:var(--accent2);stroke-width:2}
+          .tx{fill:var(--fg);font:13px sans-serif}
+          .mo{fill:var(--fg);font:12px monospace}
+          .mu{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah24c)}
+        </style>
+        <defs><marker id="ah24c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <rect class="b" x="20" y="30" width="160" height="50" rx="6"/><text class="mo" x="32" y="52">upload.sh</text><text class="mo" x="32" y="70">connect(fd, addr)</text>
+        <rect class="c" x="220" y="30" width="200" height="50" rx="6"/><text class="mo" x="232" y="52">tp sys_enter_connect</text><text class="mu" x="232" y="70">notify / kill only</text>
+        <rect class="b" x="460" y="30" width="200" height="50" rx="6"/><text class="mo" x="472" y="52">__sys_connect()</text><text class="mu" x="472" y="70">copy sockaddr in</text>
+        <rect class="k" x="460" y="120" width="420" height="180" rx="8"/>
+        <text class="mo" x="472" y="142">security_socket_connect() -&gt; lsm/socket_connect</text>
+        <text class="mo" x="480" y="168">1. te_pid_active(pid)?      no -&gt; return 0</text>
+        <text class="mo" x="480" y="190">2. labels = ts_proc[pid] (per domain)</text>
+        <text class="mo" x="480" y="212">3. bpf_loop over ts_rules: op, ip/mask,</text>
+        <text class="mo" x="480" y="230">   taint_mask_ok(req, forbid), unless-cond</text>
+        <text class="mo" x="480" y="254">4. match block -&gt; emit_violation(rb)</text>
+        <text class="mo" x="480" y="276">5. return -EPERM  (no te_connect_flow)</text>
+        <rect class="b" x="20" y="200" width="300" height="50" rx="6"/><text class="tx" x="32" y="222">connect() returns -1, errno=EPERM</text><text class="mu" x="32" y="240">tool output shows the failure</text>
+        <rect class="b" x="20" y="270" width="300" height="50" rx="6"/><text class="tx" x="32" y="292">runtime reads rb -&gt; reason text</text><text class="mo" x="32" y="310">.actplane/last-violation.txt</text>
+        <path class="ar" d="M180,55 H218"/><path class="ar" d="M420,55 H458"/>
+        <path class="ar" d="M560,80 V118"/>
+        <path class="ar" d="M460,230 L322,225"/>
+        <path class="ar" d="M460,262 L322,290"/>
+      </svg>
+      <figcaption>Figure 24.3 — The two enforcement points for one <code>connect()</code>.
+      The syscall tracepoint fires first and can report or kill. The LSM hook runs inside
+      the kernel's connect path, after the address has been copied into kernel memory
+      (so there is no time-of-check/time-of-use race on user memory), and its return value
+      is the verdict.</figcaption>
+    </figure>
+
+    <p>The single output is <code>emit_violation()</code>. It reserves a ring-buffer record
+    (<a href="04-maps-helpers-kfuncs.html">chapter 04</a>), fills it with numbers, and leaves
+    the words to user space:</p>
+    <pre data-file="bpf/process.bpf.c"><code class="language-c">static __always_inline void emit_violation(pid_t pid, unsigned int rule_id,
+					   const char *target, u32 conn_ip,
+					   /* ... obj_kind, fid, domain_id, matched_labels,
+					      op, blocked, killed, effect ... */)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct event *v = bpf_ringbuf_reserve(&amp;rb, sizeof(*v), 0);
+	if (!v)
+		return;
+	v-&gt;type = EVENT_TYPE_TAINT_VIOLATION;
+	v-&gt;pid = pid;
+	v-&gt;ppid = BPF_CORE_READ(task, real_parent, tgid);
+	v-&gt;blocked = blocked;
+	v-&gt;killed = killed;
+	v-&gt;effect = effect;
+	/* ... */
+	v-&gt;taint_rule_id = rule_id;
+	v-&gt;conn_ip = conn_ip;
+	v-&gt;taint_label = te_labels_for_domain(pid, domain_id);
+	v-&gt;matched_labels = matched_labels;
+	fill_violation_provenance(v, pid, domain_id, matched_labels,
+				  obj_kind, fid, conn_ip);
+	bpf_get_current_comm(&amp;v-&gt;comm, sizeof(v-&gt;comm));
+	/* ... */
+	bpf_ringbuf_submit(v, 0);
+}</code></pre>
+
+    <h2>Walkthrough: a blocked exfiltration attempt</h2>
+    <p>This stepper follows policy <code>01_secret_no_exfil.yaml</code> through the flow of
+    figure 24.2, on a machine where BPF LSM is active. The kernel functions named are the
+    real ones. The scenario (file names, the IP address) is illustrative.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Compile and launch</h4><p><code>sudo -E actplane run --
+      codex</code>. The compiler gives <code>AGENT</code> bit 0 and <code>SECRET</code> bit 1
+      and lowers <code>block connect endpoint "*" if SECRET</code> to one
+      <code>taint_rule</code> with <code>op = TOP_CONNECT</code>, match <em>any</em>,
+      <code>req = 0b10</code>, <code>effect = BLOCK</code>. The runtime loads the engine,
+      sees <code>bpf</code> in <code>/sys/kernel/security/lsm</code> and sets the rodata
+      <code>enforce_mode = 1</code>.</p></div>
+      <div class="step"><h4>2. Start the agent stopped, then seed it</h4><p>The runtime
+      spawns <code>/bin/sh -c 'kill -STOP $$; exec "$@"'</code> as the invoking user, waits
+      until it is stopped, writes its pid into <code>ts_proc</code>/<code>ts_root</code> and
+      binds it to a domain in <code>cap_task</code>. It also marks its own pid as protected,
+      then sends <code>SIGCONT</code>. Because seeding happens before the agent's first
+      instruction, no early event escapes.</p></div>
+      <div class="step"><h4>3. The agent debugs and reads <code>.env</code></h4><p>Codex runs
+      <code>bash -c 'python debug.py'</code>. <code>sched_process_fork</code> copies
+      <code>{AGENT}</code> to each child. When python opens <code>/repo/.env</code>,
+      <code>lsm/file_open</code> runs: no block rule matches an open, so the hook returns 0.
+      Then the read flow (<code>te_read_domain</code>) runs. The path matches the
+      <code>file "**/.env"</code> source update, so <code>SECRET</code> is ORed into
+      python's entry together with any labels stored for the file in <code>ts_file</code>,
+      giving <code>{AGENT, SECRET}</code>. A provenance record notes that the label came from
+      opening <code>/repo/.env</code>.</p></div>
+      <div class="step"><h4>4. Derived data lands in a file</h4><p>Python writes a summary
+      to <code>/tmp/out.json</code>. <code>lsm/file_permission</code> with
+      <code>MAY_WRITE</code> → no write rule matches outside <code>/shared</code> → allowed →
+      <code>te_write_flow_domain</code> ORs <code>{AGENT, SECRET}</code> into the file's
+      <code>ts_file</code> entry, keyed by its (dev, inode).</p></div>
+      <div class="step"><h4>5. A later tool call reads the file</h4><p>Many turns later, the
+      model runs <code>bash upload.sh</code>, which reads <code>/tmp/out.json</code>. The new
+      shell got <code>{AGENT}</code> by fork. The read flow adds the file's
+      <code>SECRET</code>. A tool-call filter that looked only for <code>.env</code> in the
+      command line saw nothing suspicious in either call.</p></div>
+      <div class="step"><h4>6. The connect hits the sink</h4><p><code>upload.sh</code> runs
+      <code>curl https://203.0.113.7/</code>. In curl's <code>connect()</code>,
+      <code>lsm/socket_connect</code> calls <code>te_handle_net(..., TE_MODE_BLOCK)</code>.
+      The rule scan finds op = connect, IP matches <em>any</em>, and
+      <code>taint_mask_ok(labels, 0b10, 0)</code> is true. The result is effect BLOCK and
+      mode BLOCK.</p></div>
+      <div class="step"><h4>7. Deny and report</h4><p><code>emit_violation()</code> puts a
+      record with <code>rule_id = 0</code>, <code>blocked = 1</code>, the IP and the
+      provenance of <code>SECRET</code> (the read of <code>/repo/.env</code>) in the ring
+      buffer, and the hook returns <code>-EPERM</code>. <code>te_connect_flow</code> never
+      runs. curl prints "Operation not permitted" and exits non-zero.</p></div>
+      <div class="step"><h4>8. The agent learns why</h4><p>The runtime maps rule 0 to
+      <code>no-exfil</code> and writes the reason ("secret data must not leave the host") to
+      the run's feedback mailbox. After the Bash tool call, Claude Code's or Codex's
+      <code>PostToolUse</code> hook runs <code>actplane feedback-hook</code>, which injects
+      the reason into the next model turn. The model can then pick a sanctioned path, such
+      as running the redactor if the policy declares
+      <code>declassify SECRET by exec "**/redact"</code>.</p></div>
+    </div>
+
+    <div class="callout danger"><span class="label">Without BPF LSM</span><p>On a kernel
+    without <code>bpf</code> in the LSM list, step 6 changes completely. The
+    <code>block</code> clause is <code>TE_MODE_UNSUPPORTED</code> and nothing happens.
+    <code>actplane compile</code> warns about this, and <code>doctor</code> prints
+    "<code>block</code> rules will not fire". The repo's own e2e cases use
+    <code>kill connect endpoint "*"</code> instead, which works from the
+    <code>sys_enter_connect</code> tracepoint but is post-event: the documentation says that
+    "the triggering syscall may already have completed".</p></div>
+
+    <h2>Scoping: whose actions are checked</h2>
+    <p>ActPlane scopes by <strong>process lineage</strong>, not by cgroup. A process is
+    in scope iff its pid is bound in the <code>cap_task</code> map
+    (<code>te_pid_active(pid)</code> is <code>cap_task_bound(pid)</code>). The fork
+    tracepoint extends the binding to children, so everything the agent spawns, however many
+    <code>bash -c</code> or <code>python -c</code> hops deep, is in scope, and nothing else on
+    the host is. This is how the README can promise that "nothing descended from
+    <code>codex</code>, however many hops, may run <code>git</code>" and still leave the
+    developer's own terminal alone. Compare <a href="25-agentcgroup.html">chapter 25</a>,
+    which looks at agents through cgroups for resource control.</p>
+    <p>There are three ways in:</p>
+    <ul>
+      <li><code>actplane run -- &lt;cmd&gt;</code>: strict. The target is started stopped and
+      seeded before it runs (code below).</li>
+      <li><code>actplane mcp --auto-attach-parent</code>: started by the agent as an MCP
+      server. It tries passwordless sudo, loads the engine and seeds the <em>parent</em>
+      Codex process.</li>
+      <li><code>actplane attach --pid &lt;pid&gt;</code>: post-hoc. Future events are
+      covered, but "ActPlane does not reconstruct labels or file/network history from
+      before the attach".</li>
+    </ul>
+    <pre data-file="crates/actplane-runtime/src/runtime.rs"><code class="language-rust">fn spawn_stopped_target(
+    cmd: &amp;[String],
+    feedback: &amp;FeedbackPaths,
+    policy_path: Option&lt;&amp;Path&gt;,
+    run_as_root: bool,
+    new_process_group: bool,
+) -&gt; Result&lt;Child&gt; {
+    /* ... */
+    let drop_to = target_user(run_as_root);
+    let mut target = Command::new("/bin/sh");
+    target.arg("-c");
+    target.arg("kill -STOP $$; exec \"$@\"");
+    target.arg("actplane-target");
+    target.args(cmd);
+    /* ... stdio, ACTPLANE_FEEDBACK_FILE / ACTPLANE_HOOK_STATE env ... */
+    unsafe {
+        target.pre_exec(move || {
+            mark_non_stdio_fds_cloexec()?;
+            /* ... setpgid ... */
+            if let Some((uid, gid)) = drop_to {
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut target = target.spawn()?;
+    /* ... wait_for_stopped_process(pid, 5 s), else SIGKILL ... */
+    Ok(target)
+}</code></pre>
+    <p>The <code>kill -STOP $$</code> trick avoids a race: the shell stops itself before
+    <code>exec</code>, the runtime seeds the pid, and only then does <code>SIGCONT</code> let
+    the real command start. The target also runs as the invoking user (from
+    <code>SUDO_UID</code>/<code>SUDO_GID</code>), not as root.</p>
+
+    <h3>Policy domains</h3>
+    <p>Agents spawn sub-agents, and a sub-agent may want its own rules: a reviewer should
+    be read-only, a builder should not touch the network. <code>docs/security_model.md</code>
+    defines a <strong>domain</strong> as "the runtime policy boundary for a process tree"
+    with one invariant, monotonic tightening:</p>
+    <pre data-file="docs/security_model.md"><code class="language-plaintext">policy(D) = policy(parent(D)) + local(D)
+
+policy(child) &gt;= policy(parent)</code></pre>
+    <p>A child domain can add bindings, labels and gates and can narrow its scope. It cannot
+    remove an inherited rule, widen scope, or enable hook classes that were not reserved when
+    the engine loaded. Deltas are compiled in user space and submitted through a
+    <code>BPF_MAP_TYPE_USER_RINGBUF</code> (<code>cap_req</code>). The admission check runs
+    <em>in the kernel</em> (<code>bpf/capability.bpf.h</code>), so a compromised compiler
+    can only weaken the rules it was asked to add, never inherited ones. CLI shape:</p>
+    <pre data-file="docs/security_model.md"><code class="language-bash">actplane control bind-child --pid 1234 --child-id 1234
+actplane control delta add --domain-id 1234 --delta rules/no-curl.dsl
+actplane control launch-child --delta rules/no-curl.dsl -- codex --cd /work</code></pre>
+
+    <h3>Protecting the enforcer</h3>
+    <p>An agent with sudo could simply kill ActPlane or detach its programs. When BPF LSM
+    is active, three hooks close that door for processes <em>inside</em> a domain, uid 0
+    included: <code>lsm/task_kill</code> and <code>lsm/ptrace_access_check</code> refuse to
+    signal or trace the protected control pid, and <code>lsm/bpf</code> refuses most
+    <code>bpf()</code> commands:</p>
+    <pre data-file="bpf/process.bpf.c"><code class="language-c">SEC("lsm/bpf")
+int BPF_PROG(enforce_bpf_syscall, int cmd, union bpf_attr *attr,
+	     unsigned int size, bool privileged)
+{
+	pid_t caller = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	/* ... */
+	if (!te_pid_active(caller))
+		return 0;
+
+	/* Runtime clients may need to open pinned maps while already managed.
+	 * Map mutation is limited to protected pids or domains that already carry
+	 * runtime authority. */
+	switch (cmd) {
+	case BPF_MAP_LOOKUP_ELEM:
+	case BPF_MAP_GET_NEXT_KEY:
+	case BPF_OBJ_GET:
+	case BPF_OBJ_GET_INFO_BY_FD:
+		return 0;
+	case BPF_MAP_UPDATE_ELEM:
+	case BPF_MAP_DELETE_ELEM:
+		return te_pid_can_control_bpf(caller) ? 0 : -EPERM;
+	default:
+		return -EPERM;
+	}
+}</code></pre>
+    <p>Processes outside every domain "remain ordinary host administrators and can still stop
+    or unload the engine" (<code>bpf/README.md</code>). That is by design: the human
+    operator is trusted, the agent is not.</p>
+
+    <h2>Directory map</h2>
+    <pre><code class="language-plaintext">ActPlane/                     (@ bb89c77b, crate version 0.1.8)
+├── actplane.yaml             policy this repo applies to agents working on it
+├── bpf/                      the kernel engine ("ebpf-ifc-engine" crate)
+│   ├── process.bpf.c         all hooks: 14 lsm/*, sched + syscall tracepoints; emit_violation()
+│   ├── taint_engine.bpf.h    label maps, propagation (te_fork/te_read/te_write_flow/...),
+│   │                         rule scans via bpf_loop, epochs for after/since
+│   ├── taint.h               rule ABI shared with Rust + branchless matchers
+│   ├── capability.bpf.h      domains, user-ringbuf delta admission (cap_req/cap_state/...)
+│   ├── channel.bpf.h         stdin/stdout/stderr as pseudo-files ("stdio:stdout")
+│   ├── process.c / process.h C loader for raw config blobs (dev/test path)
+│   ├── test_taint.c          C unit tests for the matchers
+│   ├── prebuilt/             process.bpf.o (CO-RE) and process-legacy.bpf.o (5.10-6.0)
+│   ├── src/lib.rs            aya loader: pinning, seeding, bpf_lsm_active()
+│   └── build.rs, Makefile    ACTPLANE_REBUILD_BPF=1 regenerates prebuilt/
+├── crates/
+│   ├── actplane-ifc-compiler/src/dsl/   ast.rs parse.rs lower.rs mod.rs (DSL -&gt; taint_config)
+│   ├── actplane-runtime/src/            runtime.rs (run/attach/seed), mcp.rs, feedback.rs,
+│   │                                    hook.rs, control.rs, audit.rs, report.rs, config.rs
+│   └── actplane-cli/src/                main.rs (clap), doctor.rs, setup.rs, templates.rs
+├── docs/
+│   ├── rule-language.md      formal model + examples E1-E13
+│   ├── security_model.md     domains, monotonic deltas
+│   ├── support-matrix.md     what needs BPF LSM, operational limits
+│   ├── cookbook.md, agent-integrations.md, compare.md
+│   ├── design/               arch notes, related_work.md, rq2-performance/ benchmark scripts
+│   └── empirical-study/      CLAUDE.md/AGENTS.md study figures and audit scripts
+├── policies/, policy/        sample policies
+├── test/
+│   ├── policies/             24 valid + 7 invalid policy fixtures
+│   └── e2e_cases.yaml        live E1-E12 cases for script/e2e_examples.sh
+├── script/                   e2e driver, CLAUDE.snippet.md, agent-feedback.md
+└── vmlinux/                  vmlinux.h per arch for CO-RE builds</code></pre>
+    <p>The paper describes "roughly 3.2 K LoC" of Rust and "roughly 1.8 K LoC of BPF C". The
+    tree has grown since: at this commit <code>process.bpf.c</code> alone is 3,953 lines
+    and <code>taint_engine.bpf.h</code> is 2,581.</p>
+
+    <h2>Build and use</h2>
+    <h3>Install and first run</h3>
+    <p>The README's quick start. The eBPF object ships prebuilt (CO-RE), so only a Rust
+    toolchain is needed:</p>
+    <pre data-file="README.md"><code class="language-bash">cargo install actplane
+
+actplane init                                  # write a starter actplane.yaml
+actplane compile                               # validate rules (no privileges)
+actplane doctor                                # diagnose hooks, MCP, kernel support
+
+codex                                         # MCP auto-attach tries passwordless sudo
+sudo -E actplane run claude -p "review this repo"</code></pre>
+    <p>Other commands from the README and the CLI help:</p>
+    <pre><code class="language-bash"># collected from README.md, CLAUDE.md, docs/support-matrix.md and `actplane --help`
+actplane init --list-templates                        # 10 built-in templates
+actplane init --template no-git-branch --out actplane.yaml
+actplane init --with-codex                            # writes .codex/hooks.json
+actplane init --with-mcp                              # writes .mcp.json (auto-attach)
+actplane compile --explain --report-out docs/actplane-review.txt
+actplane compile --json &gt; actplane-compile-report.json
+sudo -E actplane attach --pid &lt;pid&gt;                   # post-hoc attach
+actplane --rule "$(cat policy.dsl)" compile --out policy.bin
+sudo ./bpf/process --config policy.bin                # raw C loader (dev)</code></pre>
+    <p>Requirements (README): Linux 5.10+ with BTF (<code>/sys/kernel/btf/vmlinux</code>).
+    5.10–6.0 get a legacy object that supports static exec/file/IPv4 policies. The full
+    runtime needs 6.1+. <code>run</code> and <code>watch</code> need root or
+    <code>CAP_BPF</code> + <code>CAP_SYS_ADMIN</code>. <code>block</code> needs BPF LSM.
+    The template list printed by the build used in this chapter:</p>
+    <pre><code class="language-plaintext">ActPlane policy templates
+  no-git-branch            process      kill   Prevent agent-created git branches and worktrees
+  no-git-push              process      kill   Prevent agent-created git pushes
+  no-secret-egress         ifc          block  Stop local secret-derived data from reaching the network
+  test-before-commit       causal       kill   Require a fresh test run before git commit
+  dependency-update-gate   causal       kill   Require validation before dependency-aware commits
+  protected-branch-push    vcs          kill   Require session approval before protected push
+  workspace-confinement    sandbox      block  Confine writes to an allowed workspace path
+  readonly-review          sandbox      block  Make a review domain read-only
+  no-network               network      block  Disable external network egress
+  prod-db-via-migrate      mediation    block  Require a mediation tool for production database access</code></pre>
+
+    <h3>Agent integration</h3>
+    <p>Feedback travels through the agent's own hook system. For Claude Code
+    (<code>.claude/settings.local.json</code>), from the README:</p>
+    <pre data-file="README.md"><code class="language-json">{
+  "hooks": {
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "actplane feedback-hook" }] }],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "actplane feedback-hook" }] }]
+  }
+}</code></pre>
+    <p>When a rule fires, the README shows output like this, and the same reason lands in
+    the next model turn:</p>
+    <pre data-file="README.md"><code class="language-plaintext">🚫 KILLED: process 'git' (pid 4213, ppid 4210) — /usr/bin/git
+   effect: kill
+   reason: no git under the agent; use the review workflow</code></pre>
+
+    <h3>What happened on this orb</h3>
+    <p>I built and tried ActPlane on the curriculum's build machine (Linux 6.1, active LSMs
+    <code>capability,landlock</code>, so <strong>no BPF LSM</strong>):</p>
+    <ul>
+      <li><code>cargo build --release -p actplane</code> (2 jobs) finished in 1 min 56 s.</li>
+      <li>The C matcher tests (<code>bpf/test_taint.c</code>) passed: 38 passed, 0 failed.
+      The compiler tests (<code>cargo test -p actplane-ifc-compiler</code>) passed: 41 passed,
+      1 ignored.</li>
+      <li><code>actplane compile --explain</code> on a <code>kill connect endpoint "*" if
+      SECRET</code> policy reported "BPF-LSM pre-op block: unavailable" and "connect
+      tracepoint kill … timing: post-event termination; the triggering syscall may already
+      have completed". <code>actplane doctor</code> printed "⚠ BPF-LSM: not active;
+      <code>block</code> rules will not fire (capability,landlock)".</li>
+      <li><code>sudo -E actplane run -- bash -c '…'</code> <strong>failed to load</strong>.
+      The verifier rejected the exec pipeline with "tail_calls are not allowed in non-JITed
+      programs with bpf-to-bpf calls". This kernel was built without a BPF JIT (there is no
+      <code>/proc/sys/net/core/bpf_jit_enable</code>), and, as the message says, the verifier
+      does not allow tail calls (<a href="04-maps-helpers-kfuncs.html">chapter 04</a>) in a
+      program that also uses BPF-to-BPF calls unless the program is JIT-compiled.
+      <code>doctor</code> did not detect this case.</li>
+    </ul>
+    <p>So no enforcement was observed for this chapter. The behaviour described in the
+    stepper comes from reading the code and docs, not from a run. To try it, use a kernel
+    with the BPF JIT enabled (standard on x86-64 distributions) and, for <code>block</code>,
+    <code>lsm=...,bpf</code> on the kernel command line. Note also that <code>run</code>
+    refuses a policy that does not declare a <code>COMMAND</code> or <code>AGENT</code> label
+    to seed the target with.</p>
+
+    <h2>Evaluation</h2>
+    <p>All numbers below are from the paper (<a href="#ref-paper">arXiv 2606.25189v2</a>),
+    measured on an Intel Core Ultra 9 285K (24 cores), 125 GiB RAM, Linux 6.15.11. None were
+    reproduced here.</p>
+    <h3>Does it catch more violations?</h3>
+    <p>RQ2 samples 38 rules from the study (20 per-event, 18 cross-event). A Codex agent
+    generated five traces per rule (two compliant, three violating, 190 in total), including
+    indirect paths such as a commit inside a script. An LLM judge labels each outcome. "DCR"
+    is the paper's decision-compliance rate:</p>
+    <table>
+      <tr><th>System</th><th>DCR</th><th>TP</th><th>TN</th><th>FP</th><th>FN</th></tr>
+      <tr><td>Prompt-filter (LLM allow/block per tool call)</td><td>48.4%</td><td>44</td><td>48</td><td>28</td><td>70</td></tr>
+      <tr><td>Tool-regex (hook-style pattern matching)</td><td>45.3%</td><td>38</td><td>48</td><td>28</td><td>76</td></tr>
+      <tr><td>FIDES (tool-level IFC)</td><td>48.9%</td><td>41</td><td>52</td><td>24</td><td>73</td></tr>
+      <tr><td>ActPlane-opaque (no feedback)</td><td>53.7%</td><td>27</td><td>75</td><td>1</td><td>87</td></tr>
+      <tr><td>ActPlane</td><td>75.8%</td><td>86</td><td>58</td><td>18</td><td>28</td></tr>
+    </table>
+    <p>ActPlane detects 77.2% of violations, against 34–40% for the baselines. The paper
+    attributes 17 of the 18 false positives to rules that were translated too broadly.
+    Feeding the 28 false-negative traces back to the translation agent for one revision
+    recovered 26. The opaque ablation is the interesting row: the same kernel engine
+    without semantic feedback gets 86 → 27 correct violation outcomes, because an agent that
+    sees only <code>EPERM</code> often does not recover toward compliance.</p>
+
+    <h3>Can agents write the rules?</h3>
+    <p>RQ1: a Codex agent (GPT-5.5) translated all 607 OS-enforceable policies from the study
+    into 1,283 rule lines in 34 minutes, at $0.028 per policy. 74% have at most two clauses.
+    Effects split 66% notify, 29% block, 5% kill. 28% use an <code>after</code>/<code>since</code>
+    gate. <code>declassify</code>/<code>endorse</code> were never used.</p>
+
+    <h3>Safety benchmark</h3>
+    <p>RQ5 runs the 361 OpenAgentSafety tasks, whose completion requires an unsafe side
+    effect such as exfiltrating credentials or wiping configuration. A Codex agent generated
+    a per-task policy from the task description, loaded as higher-authority policy. Of 106
+    baseline-unsafe tasks, ActPlane terminated 78 before the harmful effect completed and
+    missed 28, a 74% prevention rate. The misses are described as hook-coverage gaps:
+    the agent reached the effect through a path the current hooks do not observe. RQ4
+    (OctoBench, 21 in-scope tasks) reports +9.9 points on user-query reward and +2.8 on
+    compliance reward.</p>
+
+    <h3>Overhead</h3>
+    <p>With no-hit policies (rules loaded but never firing), end-to-end overhead is 1.9% on
+    an agent-trace replay and 6.5% on a Linux kernel build at 32 rules, and stays below 8.4%
+    at 100 rules. Per-syscall medians (µs, from the paper's table 3):</p>
+    <table>
+      <tr><th>Operation</th><th>Native</th><th>AP-1</th><th>AP-32</th><th>AP-100</th></tr>
+      <tr><td>fork</td><td>48.94</td><td>52.06</td><td>74.05</td><td>69.33</td></tr>
+      <tr><td>exec</td><td>248.30</td><td>263.95</td><td>314.86</td><td>317.03</td></tr>
+      <tr><td>open</td><td>0.58</td><td>1.24</td><td>6.92</td><td>13.40</td></tr>
+      <tr><td>write</td><td>0.27</td><td>0.78</td><td>0.79</td><td>0.84</td></tr>
+      <tr><td>connect</td><td>0.58</td><td>0.61</td><td>1.98</td><td>3.17</td></tr>
+    </table>
+    <p>Open is the worst case in relative terms (0.58 → 13.4 µs at 100 rules), because it
+    does a path lookup and a rule scan per call. The paper's argument is that an entire tool
+    call's syscalls cost orders of magnitude less than the 2–10 s of one LLM turn. The
+    benchmark harness is in <code>docs/design/rq2-performance/</code>
+    (<code>run_perf.py</code>, <code>run_macro.py</code>, <code>syscall_microbench.c</code>).
+    <code>docs/ARTIFACT.md</code> notes that the micro and macro result directories recorded
+    a dirty git tree and should be rerun on a clean commit for a final artifact.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Covers every path</h4><p>Rules attach to kernel events of the
+      whole process tree. <code>bash -c</code>, <code>python -c subprocess</code>, a compiled
+      helper and a script from ten turns ago all produce the same hooked exec, open and
+      connect.</p></div>
+      <div class="card"><h4>Cross-event policies</h4><p>Labels, lineage gates and epochs
+      express data flow, mandatory mediation and "tests since last edit". A per-call check
+      cannot express any of these.</p></div>
+      <div class="card"><h4>Feedback, not just EPERM</h4><p>The <code>because</code> text
+      reaches the model through hooks or MCP. The paper's ablation shows this is where much
+      of the compliance gain comes from.</p></div>
+      <div class="card"><h4>Cheap and deployable</h4><p>Prebuilt CO-RE object, aya loader,
+      no kernel module. Propagation is a map lookup and an OR. Monotonic domains let
+      sub-agents tighten their own policy at run time.</p></div>
+    </div>
+    <p>Limitations, mostly from the repo's own <code>support-matrix.md</code>, the paper's
+    threat model, and the code:</p>
+    <ul>
+      <li><strong>Hard denial needs BPF LSM.</strong> Without it, ActPlane can notify and
+      kill, and a kill from a tracepoint may come after the syscall completed. Argv-token exec
+      rules (<code>git push</code>) are never pre-op, even with LSM.</li>
+      <li><strong>The orb case:</strong> the engine needs the BPF JIT, because the exec
+      pipeline uses tail calls together with BPF-to-BPF calls.</li>
+      <li><strong>Coarse, conservative labels.</strong> Labels are per process and per file,
+      not per byte. One read taints a long-lived process. At most 64 labels, 128 kernel rules
+      and 320 updates per config.</li>
+      <li><strong>Matching is by name and number.</strong> Exec rules match the basename or
+      argv tokens. A custom Git client avoids <code>exec "git"</code> rules (though its
+      writes and connects are still visible). Endpoints are IPv4 numbers; hostnames are
+      resolved at compile time, and IPv6, hostname globs and batch UDP syscalls are limited
+      or unsupported.</li>
+      <li><strong>Channel coverage.</strong> mmap, Unix sockets, pipes, SCM_RIGHTS,
+      sendfile, splice and copy_file_range need the advanced hook profile. Shared memory
+      is called out as limited. File <em>contents</em> are out of scope.</li>
+      <li><strong>Trust model.</strong> Kernel compromise, <code>CAP_BPF</code>
+      compromise and side channels are out of scope. Rules the agent writes for itself give
+      compliance help, not security. Only higher-authority rules loaded before the agent
+      starts carry guarantees. <code>attach</code> does not see history from before the
+      attach.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>eBPF security tools.</strong> Tetragon, Tracee and KubeArmor
+      (<a href="08-ecosystem.html">chapter 08</a>) enforce per-event predicates with LSM
+      hooks or <code>bpf_send_signal</code>. The paper's related-work section says these
+      offer "per-event predicates or single-channel lineage flags", while ActPlane propagates
+      multi-label flows across channels. Lesson 19 of the bpf-developer-tutorial
+      (<a href="05-program-types-and-hooks.html">chapter 05</a>) is a five-line version of
+      the same <code>lsm/socket_connect</code> idea.</li>
+      <li><strong>Sandboxes.</strong> Landlock, seccomp, AppArmor, gVisor, containers. They
+      complement ActPlane: they bound what the agent can reach, and ActPlane decides what
+      reachable data may do. The paper borrows Landlock's and Capsicum's self-restriction
+      principle for agent-authored rules.</li>
+      <li><strong>OS IFC and provenance.</strong> Asbestos, HiStar, Flume, TaintDroid,
+      CamFlow/CamQuery (covered above). ActPlane's model is closest to CamQuery's inline
+      in-kernel analysis, rebuilt on BPF LSM, which landed in Linux 5.7
+      (<a href="#ref-lwn-krsi">LWN on KRSI</a>, <a href="#ref-lsmdoc">kernel docs</a>).</li>
+      <li><strong>Agent guardrails.</strong> FIDES and CaMeL (IFC at the tool or interpreter
+      layer), AgentSpec, NeMo Guardrails, LlamaFirewall, and Claude Code/Codex approval
+      hooks. These see harness-mediated requests; ActPlane is designed to be used alongside
+      them.</li>
+      <li><strong>Sibling chapters.</strong> <a href="23-agentsight.html">23 AgentSight</a>
+      observes agents with eBPF. <a href="25-agentcgroup.html">25 agentcgroup</a> covers
+      their resource use. <a href="26-reward-guard-and-safe-change.html">26</a> covers
+      reward-hacking guards and safe change.</li>
+    </ul>
+
+    <h2>Recent development</h2>
+    <p>The master branch at the commit studied (<code>bb89c77b</code>, 2026-10-16) shows this
+    history, from the GitHub commit list:</p>
+    <ul>
+      <li><strong>October 2026:</strong> dependency bumps only (serde_json, tokio, libc, the
+      <code>rmcp</code> MCP SDK).</li>
+      <li><strong>September 2026:</strong> evaluation audits ("Audit RQ2 outcomes by
+      execution path and FIDES", "Audit OpenAgentSafety policy inventory compilation"), a
+      switch to a PR-only workflow, and kernel fixes: "preserve file-source provenance across
+      rename", "select verifier-safe rename hooks", "reduce file-flow verifier stack
+      depth".</li>
+      <li><strong>August 2026:</strong> a paper revision sync described in the commit message
+      as an "ATC 2026 rebuttal" (the venue outcome is not verified here), and an
+      <code>rmcp</code> upgrade from 2.x to 3.x.</li>
+      <li><strong>July 2026:</strong> "reduce rule evaluation stack depth", aya 0.13 → 0.14,
+      and a set of fixes for the Linux 5.10 legacy runtime ("Fail closed on legacy runtime
+      errors", "Extend Linux 5.10 static policy coverage").</li>
+    </ul>
+    <p>The recurring theme is the verifier. Most kernel-side commits fight stack depth and
+    program complexity as more channels are covered.</p>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Process A reads <code>.env</code> (a
+      <code>SECRET</code> source) and writes <code>/tmp/x</code>. Process B, started later in
+      another tool call of the same agent, reads <code>/tmp/x</code> and calls
+      <code>connect()</code>. Under <code>block connect endpoint "*" if SECRET</code> with BPF
+      LSM active, what happens?</p>
+        <button class="opt">Nothing: B never opened <code>.env</code>, so it has no label</button>
+        <button class="opt" data-right>The connect fails with EPERM: the write gave <code>/tmp/x</code> SECRET, and B's read copied it into B</button>
+        <button class="opt">B is killed with SIGKILL at the read of <code>/tmp/x</code></button>
+        <div class="why">Write propagates σ(f) ∪= σ(p) and read propagates σ(p) ∪= σ(f).
+        The rule is checked at the connect sink, so the read is allowed and the connect is
+        denied (example E7).</div></div>
+      <div class="q"><p><strong>Q2.</strong> On a kernel whose LSM list is
+      <code>capability,landlock</code>, which policy effect can still stop an agent's
+      <code>git push</code>?</p>
+        <button class="opt"><code>block exec "git" "push"</code></button>
+        <button class="opt" data-right><code>kill exec "git" "push"</code>, from the exec tracepoint with bpf_send_signal(SIGKILL)</button>
+        <button class="opt">Neither; ActPlane does not load without BPF LSM</button>
+        <div class="why">Without BPF LSM, <code>block</code> maps to
+        <code>TE_MODE_UNSUPPORTED</code>. <code>kill</code> runs from tracepoints. Argv-token
+        rules are post-exec anyway, so the docs recommend <code>kill</code> for
+        them.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does a blocked write not add the writer's
+      labels to the file?</p>
+        <button class="opt">Because LSM hooks cannot update maps</button>
+        <button class="opt" data-right>Because the handler returns -EPERM before calling the flow functions; only allowed operations propagate</button>
+        <button class="opt">Because the runtime removes the label in user space afterwards</button>
+        <div class="why">In <code>te_handle_event</code>, the <code>return -EPERM</code> comes
+        before <code>te_read</code>/<code>te_write_flow</code>/<code>te_connect_flow</code>.</div></div>
+      <div class="q"><p><strong>Q4.</strong> How does ActPlane decide whether a process is
+      subject to the policy at all?</p>
+        <button class="opt">It attaches its programs to the agent's cgroup</button>
+        <button class="opt">It matches the process's comm against the policy on every event</button>
+        <button class="opt" data-right>The pid must be bound in the <code>cap_task</code> map; the runtime seeds the root, and the fork tracepoint extends the binding to children</button>
+        <div class="why"><code>te_pid_active(pid)</code> is <code>cap_task_bound(pid)</code>.
+        There are no cgroup programs in <code>bpf/</code>. Scoping is by process
+        lineage.</div></div>
+      <div class="q"><p><strong>Q5.</strong> <code>unless after exec "**/pytest" since write
+      "src/**"</code>: the agent runs pytest, edits <code>src/a.py</code>, then commits. Is the
+      commit allowed?</p>
+        <button class="opt">Yes, pytest ran in this lineage</button>
+        <button class="opt" data-right>No: the write stamped a later inval_epoch than pytest's gate_epoch, so the gate is stale</button>
+        <button class="opt">Only if pytest exited 0</button>
+        <div class="why"><code>te_after_satisfied</code> requires
+        <code>gate_epoch &gt; last_inval</code>. Without <code>since</code> the gate would be
+        latching and the commit would pass. <code>exits 0</code> is a separate
+        qualifier.</div></div>
+      <div class="q"><p><strong>Q6.</strong> In the paper's RQ2, what happened when semantic
+      feedback was removed (ActPlane-opaque)?</p>
+        <button class="opt">Nothing changed; the kernel verdict is what matters</button>
+        <button class="opt" data-right>Correct violation outcomes fell from 86 to 27 and false negatives rose from 28 to 87, while false positives fell to 1</button>
+        <button class="opt">False positives rose sharply</button>
+        <div class="why">The engine still detected violations, but an agent seeing only EPERM
+        often did not recover toward compliance, so the judge counted many as
+        FN.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li id="ref-repo"><a href="https://github.com/eunomia-bpf/ActPlane">eunomia-bpf/ActPlane</a>, studied at commit <a href="https://github.com/eunomia-bpf/ActPlane/tree/bb89c77bcb29cfa81ba1fb212b5634c353c7352b"><code>bb89c77b</code></a> (2026-10-16): <code>README.md</code>, <code>CLAUDE.md</code>, <code>docs/rule-language.md</code>, <code>docs/security_model.md</code>, <code>docs/support-matrix.md</code>, <code>docs/ARTIFACT.md</code>, <code>bpf/README.md</code>, <code>bpf/process.bpf.c</code>, <code>bpf/taint_engine.bpf.h</code>, <code>bpf/taint.h</code>, <code>crates/</code>.</li>
+      <li id="ref-paper">Y. Zheng, T. Wu, Q. Fu, T. Yu, W. Mao, T. Ma, D. Williams, W. Wang, A. Quinn, <a href="https://arxiv.org/abs/2606.25189">"ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses"</a>, arXiv:2606.25189 [cs.OS], v2, June 2026. (The README's BibTeX omits T. Ma; the arXiv record lists nine authors.)</li>
+      <li id="ref-denning">D. E. Denning, <a href="https://doi.org/10.1145/360051.360056">"A Lattice Model of Secure Information Flow"</a>, Communications of the ACM 19(5), 1976.</li>
+      <li id="ref-asbestos">P. Efstathopoulos, M. Krohn, S. VanDeBogart, C. Frey, D. Ziegler, E. Kohler, D. Mazières, F. Kaashoek, R. Morris, <a href="https://doi.org/10.1145/1095810.1095813">"Labels and Event Processes in the Asbestos Operating System"</a>, ACM SOSP 2005.</li>
+      <li id="ref-histar">N. Zeldovich, S. Boyd-Wickizer, E. Kohler, D. Mazières, <a href="https://www.usenix.org/conference/osdi-06/making-information-flow-explicit-histar">"Making Information Flow Explicit in HiStar"</a>, USENIX OSDI 2006.</li>
+      <li id="ref-flume">M. Krohn, A. Yip, M. Brodsky, N. Cliffer, M. F. Kaashoek, E. Kohler, R. Morris, <a href="https://doi.org/10.1145/1294261.1294293">"Information Flow Control for Standard OS Abstractions"</a> (Flume), ACM SOSP 2007.</li>
+      <li id="ref-jflow">A. C. Myers, <a href="https://doi.org/10.1145/292540.292561">"JFlow: Practical Mostly-Static Information Flow Control"</a>, ACM POPL 1999.</li>
+      <li id="ref-taintdroid">W. Enck et al., <a href="https://www.usenix.org/conference/osdi10/taintdroid-information-flow-tracking-system-realtime-privacy-monitoring">"TaintDroid: An Information-Flow Tracking System for Realtime Privacy Monitoring on Smartphones"</a>, USENIX OSDI 2010.</li>
+      <li id="ref-camflow">T. Pasquier, J. Singh, D. Eyers, J. Bacon, <a href="https://doi.org/10.1109/TCC.2015.2489211">"CamFlow: Managed Data-Sharing for Cloud Services"</a>, IEEE Transactions on Cloud Computing 5(3), 2017.</li>
+      <li id="ref-camquery">T. Pasquier, X. Han, T. Moyer, A. Bates, O. Hermant, D. Eyers, J. Bacon, M. Seltzer, <a href="https://doi.org/10.1145/3243734.3243776">"Runtime Analysis of Whole-System Provenance"</a> (CamQuery), ACM CCS 2018.</li>
+      <li id="ref-greshake">K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, M. Fritz, <a href="https://doi.org/10.1145/3605764.3623985">"Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection"</a>, ACM AISec 2023.</li>
+      <li id="ref-fides">M. Costa et al., <a href="https://arxiv.org/abs/2505.23643">"Securing AI Agents with Information-Flow Control"</a> (FIDES), arXiv:2505.23643, 2025.</li>
+      <li id="ref-camel">E. Debenedetti et al., <a href="https://arxiv.org/abs/2503.18813">"Defeating Prompt Injections by Design"</a> (CaMeL), arXiv:2503.18813, 2025.</li>
+      <li id="ref-agentsight">Y. Zheng, Y. Hu, T. Yu, A. Quinn, <a href="https://doi.org/10.1145/3766882.3767169">"AgentSight: System-Level Observability for AI Agents Using eBPF"</a>, Proceedings of the 4th Workshop on Practical Adoption Challenges of ML for Systems, ACM, 2025. See <a href="23-agentsight.html">chapter 23</a>.</li>
+      <li id="ref-lsmdoc"><a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>, Linux kernel documentation.</li>
+      <li id="ref-lwn-krsi">J. Corbet, <a href="https://lwn.net/Articles/808048/">"KRSI — the other BPF security module"</a>, LWN.net, 2019.</li>
+      <li><a href="https://aya-rs.dev/">Aya</a>, the Rust eBPF library ActPlane's runtime uses to load the prebuilt object.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="23-agentsight.html"><small>Previous</small>23 · AgentSight</a>
+      <a class="next" href="25-agentcgroup.html"><small>Next</small>25 · agentcgroup</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

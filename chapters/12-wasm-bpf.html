@@ -825,8 +825,9 @@ llvm-strip -g bootstrap.bpf.o       # 30,376 bytes on the orb</code></pre></div>
         <pre><code class="language-bash">make -C ../../runtime/cpp/third_party/bpftool/src     # the eunomia-bpf fork
 ../../runtime/cpp/third_party/bpftool/src/bpftool -w gen skeleton bootstrap.bpf.o &gt; bootstrap.skel.h</code></pre></div>
       <div class="step"><h4>5. Compile the user half to Wasm</h4>
-        <p>With <a href="https://github.com/WebAssembly/wasi-sdk">wasi-sdk</a> (the README installs release 17 into
-          <code>/opt/wasi-sdk</code>; CI uses 20, which is what I used):</p>
+        <p>With <a href="https://github.com/WebAssembly/wasi-sdk">wasi-sdk</a> (the bootstrap example's README installs release 17 into
+          <code>/opt/wasi-sdk</code>, as do the test workflows through <code>make /opt/wasi-sdk</code>; the
+          image-publishing workflow uses 20, which is what I used):</p>
         <pre><code class="language-bash">ln -f -s ../../wasm-sdk/c/libbpf-wasm.h libbpf-wasm.h
 /opt/wasi-sdk/bin/clang -O2 --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
   -Wl,--allow-undefined,--export-table -o bootstrap.wasm bootstrap.c
@@ -1048,8 +1049,9 @@ func main() {
         a fixed trampoline (<code>call_sample_cb</code>) as the table index and a pointer to the boxed closure as
         <code>ctx</code>.</li>
       <li>The Go guest uses TinyGo's <code>//go:embed</code> for the object and the special
-        <code>callback-wrapper</code> import with an exported <code>go-callback</code>. The CI builds Go examples with
-        TinyGo 0.29 and runs them only under the Rust runtime (<code>examples/go-execve/Makefile</code> skips the test for
+        <code>callback-wrapper</code> import with an exported <code>go-callback</code>. The test workflows install
+        TinyGo 0.27 (<code>make tinygo</code> in the top-level Makefile) and the image-publishing workflow installs 0.29;
+        Go examples run only under the Rust runtime (<code>examples/go-execve/Makefile</code> skips the test for
         <code>IMPL=cpp</code>).</li>
     </ul>
 
@@ -1136,7 +1138,8 @@ func main() {
       next to the cost of the work most tools do per event.</p>
     <p>The paper also describes features that I could not find in the repository at the studied commit: a CO-RE pass
       that rewrites <code>pt_regs</code> accesses for other architectures, automatic BTF download, and automatic fallback
-      to the userspace runtime bpftime (<a href="14-bpftime-architecture.html">14</a>) when kernel eBPF is unavailable. A
+      to the userspace runtime bpftime (<a href="14-bpftime-architecture.html">14</a>) for uprobe programs when kernel
+      eBPF is unavailable. A
       search of <code>runtime/</code> for <code>bpftime</code>, <code>pt_regs</code> and <code>btfhub</code> finds
       nothing outside vendored headers. Treat them as part of the research design, possibly implemented elsewhere, not as
       features of this repository.</p>

@@ -531,8 +531,11 @@ class var_size_hash_map_impl {
     <p>A long-lived target can outlive many loader runs. The segment therefore carries a small
     seqlock, <code>bpftime_global_epoch_state</code>: odd values mean "server is resetting
     handlers", even values identify a stable session. On startup the syscall server calls
-    <code>begin_new_session()</code>, and when the agent sees the epoch change it destroys its
-    old attachments and rebinds. The segment also records alive agent and server PIDs so the last
+    <code>begin_new_session()</code>. The agent reads the epoch each time it scans the handler
+    table, and if it has changed it destroys its old attachments and rebinds. An agent started
+    with plain <code>bpftime start</code> scans only once, at startup. Later scans happen when the
+    agent is asked to refresh, for example by the auto-refresh thread that <code>bpftime trace</code>
+    enables (<a href="15-bpftime-in-practice.html#the-bpftime-cli">chapter 15</a>). The segment also records alive agent and server PIDs so the last
     process out can remove it.</p>
 
     <h2>The agent: getting code into the target</h2>
@@ -1085,8 +1088,12 @@ void setup_syscall_tracer()
       <li><strong>Page 0 must be mappable.</strong> zpoline's README tells users to run
       <code>echo 0 &gt; /proc/sys/vm/mmap_min_addr</code>. bpftime makes the same
       <code>MAP_FIXED</code> mmap at address 0, so it has the same requirement unless the process
-      may map low addresses anyway. Page 0 is then set to execute-only, so ordinary NULL loads and
-      stores still fault.</li>
+      may map low addresses anyway. Page 0 is then <code>mprotect</code>ed to <code>PROT_EXEC</code> only
+      (the source comment says "Keep normal behavior of dereferencing null-pointers"). NULL
+      <em>stores</em> still fault. NULL <em>loads</em> fault only where the kernel can enforce
+      execute-only pages, which on x86-64 needs protection keys (PKU). On a CPU without PKU, such as
+      the one this review ran on, a test page mapped <code>PROT_EXEC</code> only could still be read, so a
+      NULL read in the target would return the sled's <code>0x90</code> bytes instead of crashing.</li>
       <li><strong>The hook cannot hook itself.</strong> The transformer skips its own
       <code>syscall_addr</code> instruction, which is used to issue the real syscall. More subtly,
       <code>agent-transformer.cpp</code> loads the full agent only <em>after</em> rewriting, with
@@ -1253,8 +1260,11 @@ ebpf_jit_fn ebpf_compile(struct ebpf_vm *vm, char **errmsg);</code></pre>
         <code>STRICT</code> to reject it. A third point, from reading the code without running it:
         the check in <code>handle_sysbpf</code> keys on <code>prog_type</code>
         (<code>TRACEPOINT</code> or <code>SOCKET_FILTER</code>), while libbpf loads
-        <code>SEC("uprobe")</code> programs as <code>BPF_PROG_TYPE_KPROBE</code>. If that holds,
-        uprobe programs skip PREVAIL on this path. Treat this as unverified.</p>
+        <code>SEC("uprobe")</code> programs as <code>BPF_PROG_TYPE_KPROBE</code> (its section table maps
+        <code>uprobe+</code> to <code>KPROBE</code>). This is the only call site of
+        <code>verify_ebpf_program()</code> in the tree, so uprobe programs appear to skip PREVAIL
+        even with <code>STRICT</code>. That conclusion comes from reading the code; it was not checked by
+        running a verifier-enabled build.</p>
       </div>
       <div class="tab-panel" data-label="Kernel verifier: RUN_WITH_KERNEL">
         <p>With <code>BPFTIME_RUN_WITH_KERNEL=true</code> the syscall server lets the real kernel
@@ -1368,8 +1378,8 @@ ebpf_jit_fn ebpf_compile(struct ebpf_vm *vm, char **errmsg);</code></pre>
     Tong Yu (eunomia-bpf Community), Yiwei Yang (UC Santa Cruz), Yanpeng Hu (ShanghaiTech),
     Xiaozheng Lai (SCUT), Dan Williams (Virginia Tech) and Andi Quinn (UC Santa Cruz), in the
     19th USENIX Symposium on Operating Systems Design and Implementation (OSDI '25), Boston,
-    July 2025, pages 557–574. The OSDI paper reframes bpftime from "faster uprobes" to "a safe
-    extension framework for applications".</p>
+    July 2025, pages 557–574. The OSDI paper reframes bpftime from faster uprobes to a safe
+    extension framework for applications.</p>
 
     <h3>The problem the paper poses</h3>
     <p>Applications are extended all the time: Nginx and Apache modules, Lua in Redis and
@@ -1520,18 +1530,26 @@ Extension_Class(
 
     <div class="callout tip"><span class="label">Reading the numbers</span><p>All of these
     numbers come from the authors' machines and builds, measured on the paper's version of the
-    code. Two details of the current tree affect comparisons. The memory-read rows were
+    code. One provenance oddity: the uprobe and uretprobe rows (2561.57/190.02 and
+    3019.45/187.10 ns) are identical, digit for digit, to the repo's
+    <code>benchmark/uprobe/example_results.md</code>, which says it ran on an Intel Core Ultra 7 258V
+    laptop, not on Server A (see <a href="15-bpftime-in-practice.html">chapter 15</a>). Two details of
+    the current tree affect comparisons. The memory-read rows were
     presumably measured with a plain <code>memcpy</code>. At this commit
     <code>ENABLE_PROBE_READ_CHECK</code> and <code>ENABLE_PROBE_WRITE_CHECK</code> default to
     <code>ON</code>, and they route <code>bpf_probe_read*</code> and
     <code>bpf_probe_write_user</code> through <code>process_vm_readv</code>/<code>writev</code>,
     which are system calls. Also, the kernel's uprobe path has become cheaper since the paper (see
     the 6.11 and 6.18 changes in <a href="05-program-types-and-hooks.html">chapter 05</a>).
-    The <code>bpf-benchmark</code> repo (<a href="19-bpf-benchmark.html">chapter 19</a>) is
-    where the project keeps its current benchmarks.</p></div>
+    The README's "Performance Benchmarks" section points to the <code>bpf-benchmark</code> repo
+    (<a href="19-bpf-benchmark.html">chapter 19</a>) for how the project evaluates performance, and the
+    in-tree <code>benchmark/</code> results are discussed in
+    <a href="15-bpftime-in-practice.html">chapter 15</a>.</p></div>
 
     <h2>Building and using it</h2>
-    <p>The build is CMake. The Makefile targets wrap it. From <code>installation.md</code> and the
+    <p>This is the short version; <a href="15-bpftime-in-practice.html">chapter 15</a> covers
+    installation (including the container image and build options) and the examples in full.
+    The build is CMake. The Makefile targets wrap it. From <code>installation.md</code> and the
     <code>Makefile</code> at this commit:</p>
 
     <pre data-file="bpftime/installation.md"><code class="language-bash">sudo apt-get update &amp;&amp; sudo apt-get install \
@@ -1704,8 +1722,8 @@ int do_count(struct pt_regs *ctx)
         <button class="opt" data-right>Each 2-byte <code>syscall</code> becomes a 2-byte <code>call *%rax</code>; <code>%rax</code> holds the syscall number, so the call lands in the sled on page 0 and slides to a jump into the hook</button>
         <button class="opt">Because frida-gum needs a trampoline at a fixed address</button>
         <div class="why">This is zpoline. The replacement fits in the original two bytes, so no
-        instruction relocation is needed. Page 0 is then made execute-only, so NULL loads and
-        stores still fault.</div></div>
+        instruction relocation is needed. Page 0 is then set to <code>PROT_EXEC</code> only, so NULL
+        stores still fault. NULL loads fault only on CPUs where Linux can enforce execute-only pages (PKU).</div></div>
       <div class="q"><p><strong>Q4.</strong> According to Table 3 of the OSDI '25 paper, which
       operation is <em>slower</em> in bpftime than in kernel eBPF?</p>
         <button class="opt">Uprobe</button>

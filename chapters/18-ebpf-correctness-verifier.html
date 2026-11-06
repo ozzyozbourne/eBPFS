@@ -1,0 +1,1153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · ebpf-correctness-verifier: Translation Validation for eBPF Rewrites · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="18">
+<meta name="chapter-part" content="Part IV · Verifier, correctness and performance">
+<meta name="chapter-summary" content="How ebpf-tv checks that a rewritten eBPF object behaves like the original: translation validation, the K2-derived Z3 encoding of registers, memory, maps and helpers, the PASS/FAIL/UNKNOWN contract, a real test run, and measured gaps in the model.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/ebpf-correctness-verifier">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+<style>
+  /* Chapter-local classes for the inline SVG diagrams. */
+  .d-box { fill: var(--bg3); stroke: var(--border); stroke-width: 1.5; }
+  .d-acc { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .d-acc2 { fill: none; stroke: var(--accent2); stroke-width: 2; }
+  .d-fillacc2 { fill: var(--accent2); }
+  .d-dash { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+  .d-t { fill: var(--fg); font: 14px var(--font); }
+  .d-s { fill: var(--muted); font: 12px var(--font); }
+  .d-m { fill: var(--fg); font: 12px var(--mono); }
+  .d-h { fill: var(--accent); font: 600 14px var(--font); }
+  .d-h2 { fill: var(--accent2); font: 600 14px var(--font); }
+</style>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part IV · Verifier, correctness and performance › 18 · ebpf-correctness-verifier</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 18</div>
+      <h1>ebpf-correctness-verifier: Translation Validation for eBPF Rewrites</h1>
+      <p class="lede">The kernel verifier tells you a program is <em>safe</em>. It does not tell you that the
+      program still does what it did before someone rewrote it. When the rewrite comes from a new compiler
+      flag, a superoptimizer, a hand edit or an LLM agent, you want a second question answered: does the new
+      bytecode return the same verdict, write the same maps and touch the packet the same way as the old one, for every input?
+      <code>ebpf-tv</code> asks Z3 exactly that. This chapter explains the idea, reads the encoding, runs the
+      tests, and measures where the model still has holes.</p>
+      <div class="meta"><span>Prerequisites: <a href="02-ebpf-isa-and-vm.html">Chapter 02</a> (ISA), <a href="03-verifier.html">Chapter 03</a> (verifier), <a href="04-maps-helpers-kfuncs.html">Chapter 04</a> (maps and helpers)</span><span>Repo: <a href="https://github.com/eunomia-bpf/ebpf-correctness-verifier">eunomia-bpf/ebpf-correctness-verifier</a> @ <code>59ca424</code></span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Every eBPF program that reaches the kernel passes the verifier first
+    (<a href="03-verifier.html">Chapter 03</a>). The verifier walks every path, tracks the type and range of each
+    register, and rejects the program if any path could read out of bounds, leak a kernel pointer, run forever
+    or call a helper with the wrong arguments. That is a strong guarantee, but it is a guarantee about
+    <em>safety</em>. A program that drops every packet is perfectly safe. So is a program whose
+    <code>if (proto == IPPROTO_TCP)</code> became <code>if (proto == IPPROTO_UDP)</code> after an "optimization".
+    The verifier accepts both without complaint.</p>
+
+    <p>That gap used to matter mostly to compiler writers. It matters more now, because eBPF bytecode is
+    increasingly rewritten by tools after the programmer has finished writing it:</p>
+    <ul>
+      <li>Superoptimizers such as K2 and EPSO search for shorter instruction sequences that compute the same result.</li>
+      <li>Post-compilation optimizers such as Merlin rewrite bytecode with peephole rules before loading.</li>
+      <li>Agent-driven loops such as bpf-benchmark (<a href="19-bpf-benchmark.html">Chapter 19</a>) let an LLM
+      propose rewrites and keep whichever ones the verifier accepts and the benchmark rewards.</li>
+      <li>Ordinary toolchain changes do it too. Upgrading clang, or moving from <code>-mcpu=v1</code> to
+      <code>-mcpu=v3</code>, produces different bytecode from the same C.</li>
+    </ul>
+    <p>In all of these cases there is an <em>old</em> object that you trust because it has been running in
+    production, and a <em>new</em> object that is supposed to behave the same. Benchmarks and tests check a
+    handful of inputs. What you would like is a proof that holds for all inputs. Getting that proof for a single
+    concrete pair of programs, instead of for the tool that produced them, is called
+    <strong>translation validation</strong>. eunomia-bpf's <code>ebpf-correctness-verifier</code> repository
+    builds a small translation validator for eBPF object files. The CLI is called <code>ebpf-tv</code>.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p><code>ebpf-tv check old.bpf.o new.bpf.o</code>
+    encodes both programs as bit-vector formulas over the <em>same</em> symbolic inputs (context register,
+    packet bytes, initial map contents, helper return values). It then asks Z3 whether any input makes their
+    observable outputs differ. "No such input" is <code>PASS</code>. "Here is one" is <code>FAIL</code>. Anything
+    the model cannot express is meant to be <code>UNKNOWN</code>, which callers treat as a rejection.</p></div>
+
+    <h2>Translation validation in one page</h2>
+    <p>There are two ways to trust a program transformer. <em>Compiler verification</em> proves once, ahead of
+    time, that the transformer is correct for every possible input program. CompCert does this for C, and
+    Jitterbug does it for the kernel's BPF JITs (see <a href="#related-work">Related work</a>). It is the strongest
+    guarantee. It is also very expensive, and it has to be redone whenever the transformer changes.
+    <em>Translation validation</em>, introduced by Pnueli, Siegel and Singerman in 1998, gives up on the
+    transformer. After each run, a separate checker proves that this one output matches this one input. The
+    transformer can be a heuristic, a random search or a language model. Only the checker has to be trusted.
+    Necula applied the idea to gcc in 2000, and Alive2 does it today for LLVM IR.</p>
+
+    <p>For loop-free code the check reduces to one satisfiability question, often drawn as a "miter":
+    feed the same inputs to both programs and ask whether their outputs can differ.</p>
+    <ol>
+      <li>Give every input a symbolic name. For eBPF that means the initial registers (<code>r1</code> holds the
+      context pointer, <code>r10</code> the frame pointer), the packet or context bytes, the initial contents
+      of every map, and the value each helper call returns.</li>
+      <li>Translate each program into a formula <code>P(in, out)</code> that holds exactly when running the
+      program on <code>in</code> produces <code>out</code>. Registers become 64-bit bit-vectors, so wrap-around
+      and shifts behave as they do on the machine.</li>
+      <li>Ask the solver for an assignment where <code>P_old(in, out₁) ∧ P_new(in, out₂) ∧ out₁ ≠ out₂</code>.
+      If the solver says <em>unsat</em>, no input distinguishes the programs. If it says <em>sat</em>, its
+      model is a concrete counterexample input.</li>
+    </ol>
+
+    <h3>A worked example</h3>
+    <p>Strength reduction replaces a multiply by a power of two with a shift. In eBPF assembly
+    (<a href="02-ebpf-isa-and-vm.html">Chapter 02</a>), with <code>r1</code> as the input:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="old: multiply"><pre><code class="nohighlight">bf 10 00 00 00 00 00 00   r0 = r1
+27 00 00 00 08 00 00 00   r0 *= 8
+95 00 00 00 00 00 00 00   exit</code></pre></div>
+      <div class="tab-panel" data-label="new: shift"><pre><code class="nohighlight">bf 10 00 00 00 00 00 00   r0 = r1
+67 00 00 00 03 00 00 00   r0 &lt;&lt;= 3
+95 00 00 00 00 00 00 00   exit</code></pre></div>
+      <div class="tab-panel" data-label="wrong: shift by 2"><pre><code class="nohighlight">bf 10 00 00 00 00 00 00   r0 = r1
+67 00 00 00 02 00 00 00   r0 &lt;&lt;= 2
+95 00 00 00 00 00 00 00   exit</code></pre></div>
+    </div>
+    <p>The question "can these return different values?" is short in SMT-LIB, the solver's input language.
+    This query is <strong>illustrative and hand-written</strong>, not code from the repository:</p>
+    <pre><code class="language-lisp">(declare-const r1 (_ BitVec 64))
+(define-fun old_r0 () (_ BitVec 64) (bvmul r1 #x0000000000000008))
+(define-fun new_r0 () (_ BitVec 64) (bvshl r1 #x0000000000000003))
+(assert (not (= old_r0 new_r0)))
+(check-sat)</code></pre>
+    <p>Running it with Z3 (the Python <code>z3-solver</code> package, inside the orb) gives <code>unsat</code>:
+    there is no 64-bit <code>r1</code> for which <code>r1*8</code> and <code>r1&lt;&lt;3</code> differ, overflow
+    included. Changing the shift to 2 gives <code>sat</code> and the model <code>r1 = 2305843009213693952</code>,
+    which is 2<sup>61</sup>. Z3 does not hunt for a "nice" input such as 1. It returns any assignment that
+    satisfies the formula.</p>
+    <p>The same two pairs, written as raw 8-byte instructions and passed to the repository's backend, give the
+    same answers:</p>
+    <pre><code class="nohighlight">$ smt_ebpf_equiv --old mul8.ins --new shl3.ins --map empty.maps --desc constant.desc
+  "result": "PASS",
+  "reason": "smt_equivalent",
+$ smt_ebpf_equiv --old mul8.ins --new shl2.ins --map empty.maps --desc constant.desc
+  "result": "FAIL",
+  "reason": "smt_counterexample",</code></pre>
+    <p>Real programs need more than one register. They branch, read packets, update maps and call helpers. The
+    rest of this chapter shows how <code>ebpf-tv</code> encodes each of those, and what it leaves out.</p>
+
+    <div class="callout tip"><span class="label">Why this works for eBPF</span><p>Translation validation is
+    hardest for loops and unbounded memory, because no finite formula captures them exactly. Classic eBPF
+    programs avoid both. The verifier historically rejected back edges, the stack is 512 bytes, and maps have
+    fixed key and value sizes. That is why a straight-line SMT encoding covers a useful share of real eBPF.
+    K2 used the same observation in 2021.</p></div>
+
+    <h2>What the repository is, and what it is not</h2>
+    <p>The repository is young and small. It was created on 2026-06-30. At the commit studied
+    (<code>59ca424</code>, 2026-09-16) it has 64 commits and about 19,700 lines of C++ and shell. It contains:</p>
+    <div class="grid">
+      <div class="card"><h4><code>ebpf-tv</code></h4><p>A C++17 CLI (<code>tools/ebpf_tv.cc</code>) with
+      <code>check</code>, <code>doctor</code>, <code>capabilities</code> and <code>selftest</code>. It reads ELF
+      objects, extracts the program section and map metadata, runs the backend and merges stage results.</p></div>
+      <div class="card"><h4><code>smt_ebpf_equiv</code></h4><p>The equivalence backend
+      (<code>tools/smt_equiv.cc</code> + <code>lib/ebpf_smt</code>). It takes raw instructions plus map and
+      input descriptions and calls Z3 in-process. Exit code 0/1/2 = PASS/FAIL/UNKNOWN.</p></div>
+      <div class="card"><h4><code>lib/ebpf_smt</code></h4><p>The SMT model of eBPF. It was extracted from the
+      K2 superoptimizer (<code>smartnic/superopt</code>, commit <code>f50ee1f</code>), with K2's search code
+      removed. K2's MIT notice is kept in <code>LICENSE.origin</code>.</p></div>
+      <div class="card"><h4>Tests</h4><p>CLI smoke tests, 190 instruction-level SMT checks, raw pass/fail
+      smoke tests, ELF integration tests, and a 62-case corpus of real C programs compiled with clang.</p></div>
+    </div>
+
+    <p>The project's own documents are explicit about scope. <code>docs/mvp-architecture.md</code> lists as
+    non-goals: proving load-time safety, running <code>BPF_PROG_RUN</code>, orchestrating an optimizer,
+    synthesizing programs, comparing C or Rust source, and full CO-RE/BTF modelling. The tool does not generate
+    transformations. It only judges them. The transformation can be anything that turns one object into another
+    for the same section.</p>
+
+    <div class="callout warn"><span class="label">What about PREVAIL?</span><p>The GitHub description still
+    says "based on Z3 and prevail", but the current code does not use PREVAIL. The only mention left is in
+    <code>tests/cli_smoke.sh</code>, which checks that the help text does <em>not</em> contain the word. The
+    history explains why. On 2026-06-30 the first design was a Python CLI that ran the PREVAIL verifier on both
+    objects (stages <code>prevail_old</code> and <code>prevail_new</code>, flag <code>--prevail-bin</code>) before
+    a K2-based equivalence stage. Commit <code>ec136b4</code> on 2026-07-02 ("Add maintained SMT verifier
+    backend") deleted <code>scripts/prevail-smoke.sh</code> and its CI workflow. The README now says
+    "<code>ebpf-tv</code> does not prove program safety". Safety is left to the caller's verifier, which can be
+    the kernel or PREVAIL (<a href="03-verifier.html#prevail-abstract-interpretation-done-properly-pldi-2019">Chapter 03</a>).</p></div>
+
+    <p>Activity follows the same shape. There was a burst of design work on 2026-06-29 and 06-30, about thirty
+    one-helper-per-commit "Model <code>bpf_…</code> helper" commits on 2026-07-02 and 07-03, the rewrite from
+    Python to C++ on 2026-07-05 (<code>2c7986a</code>), and one more commit on 2026-09-16. Nothing has landed in the
+    seven weeks since. Treat it as a research prototype with a carefully written contract, not as a finished
+    product.</p>
+
+    <h2>The pipeline</h2>
+    <figure>
+      <svg viewBox="0 0 900 330" role="img" aria-label="ebpf-tv pipeline: two ELF objects go through ebpf-tv check, which extracts metadata and sections, then smt_ebpf_equiv builds formulas and Z3 decides PASS, FAIL or UNKNOWN; rule commands run after PASS">
+        <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-fillacc2"/></marker></defs>
+        <rect x="10" y="50" width="130" height="50" rx="8" class="d-box"/>
+        <text x="75" y="80" text-anchor="middle" class="d-m">old.bpf.o</text>
+        <rect x="10" y="140" width="130" height="50" rx="8" class="d-box"/>
+        <text x="75" y="170" text-anchor="middle" class="d-m">new.bpf.o</text>
+        <rect x="170" y="20" width="300" height="225" rx="12" class="d-acc"/>
+        <text x="185" y="42" class="d-h">ebpf-tv check  (tools/ebpf_tv.cc)</text>
+        <text x="185" y="70" class="d-s">1. files exist; identity backend? bytes equal</text>
+        <text x="185" y="94" class="d-s">2. section name → program type, must match</text>
+        <text x="185" y="118" class="d-s">3. maps: legacy SEC("maps") or BTF .maps</text>
+        <text x="185" y="142" class="d-s">4. map relocations (llvm-readelf -r)</text>
+        <text x="185" y="166" class="d-s">5. write .maps + .desc (input type, pkt size)</text>
+        <text x="185" y="190" class="d-s">6. dump section bytes → old.ins / new.ins</text>
+        <text x="185" y="214" class="d-s">   (llvm-objcopy --dump-section)</text>
+        <rect x="500" y="20" width="235" height="225" rx="12" class="d-acc"/>
+        <text x="515" y="42" class="d-h">smt_ebpf_equiv</text>
+        <text x="515" y="70" class="d-s">raw loader + helper-argument checks</text>
+        <text x="515" y="94" class="d-s">CFG; back edge → reject</text>
+        <text x="515" y="118" class="d-s">per-block SSA formulas</text>
+        <text x="515" y="142" class="d-s">shared symbolic inputs</text>
+        <text x="515" y="166" class="d-s">model safety check (K2)</text>
+        <text x="515" y="190" class="d-s">F = pre ∧ PL_old ∧ PL_new ⇒ post</text>
+        <text x="515" y="214" class="d-s">(lib/ebpf_smt/src/verify)</text>
+        <rect x="765" y="30" width="125" height="70" rx="8" class="d-box"/>
+        <text x="827" y="58" text-anchor="middle" class="d-t">Z3 "bv"</text>
+        <text x="827" y="78" text-anchor="middle" class="d-m">check(¬F)</text>
+        <rect x="765" y="130" width="125" height="115" rx="8" class="d-box"/>
+        <text x="777" y="155" class="d-m">unsat → PASS</text>
+        <text x="777" y="180" class="d-m">sat   → FAIL</text>
+        <text x="777" y="205" class="d-m">else  → UNKNOWN</text>
+        <text x="777" y="230" class="d-s">exit 0 / 1 / 2</text>
+        <rect x="500" y="270" width="390" height="50" rx="8" class="d-box"/>
+        <text x="695" y="292" text-anchor="middle" class="d-t">--rule-command …  (only after PASS)</text>
+        <text x="695" y="310" text-anchor="middle" class="d-s">your own policy checks; same 0/1/2 exit contract</text>
+        <path d="M140,75 L168,95" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M140,165 L168,145" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M470,130 L498,130" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M735,65 L763,65" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M827,100 L827,128" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M827,245 L827,268" class="d-dash" marker-end="url(#ar1)"/>
+        <text x="20" y="300" class="d-s">Result precedence over all stages: FAIL &gt; UNKNOWN &gt; PASS.</text>
+        <text x="20" y="318" class="d-s">Safety (kernel verifier, PREVAIL) runs outside this pipeline.</text>
+      </svg>
+      <figcaption>Figure 18.1 — The <code>check</code> pipeline with <code>--equiv-backend smt</code>. The front end
+      deals with ELF objects and metadata. The backend deals with raw instructions and formulas.</figcaption>
+    </figure>
+
+    <p>The stepper below follows one real run: the repository's XDP example, in which the old object returns 1
+    directly and the new one computes <code>0 + 1</code>.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Choose a backend</h4><p>With the default <code>--equiv-backend identity</code>, the
+      only check is <code>same_file_bytes(old, new)</code>. Identical files pass. Anything else is
+      <code>UNKNOWN</code> with reason <code>non_identical_requires_equivalence_backend</code>. That default is
+      deliberate: a tool that says nothing is better than one that says "pass" without proof. Passing
+      <code>--equiv-backend smt</code> (or the aliases <code>builtin</code> and <code>experimental-smt</code>)
+      selects the Z3 backend.</p></div>
+      <div class="step"><h4>2. Check the section types match</h4><p><code>infer_section_program_type()</code>
+      maps section prefixes to program types (<code>xdp</code>, <code>tracepoint/</code>, <code>classifier</code>
+      or <code>tc</code>, <code>kprobe/</code>, <code>uprobe/</code>). Comparing an XDP section with a tracepoint
+      section is <code>FAIL</code> (<code>program_type_mismatch</code>), because the two would get different
+      contexts.</p></div>
+      <div class="step"><h4>3. Build a shared environment</h4><p>The CLI tries
+      <code>llvm-objcopy --dump-section=maps=…</code> for legacy <code>struct bpf_map_def</code> maps and
+      <code>--dump-section=.BTF=…</code> for libbpf-style <code>SEC(".maps")</code> maps. It reads
+      <code>R_BPF_64_64</code> relocations with <code>llvm-readelf -r</code> so each map reference in the
+      bytecode becomes a map index. In the example there are no maps, so the stages report
+      <code>legacy_maps_not_found</code>, <code>btf_section_not_found</code> and
+      <code>map_relocations_not_found</code> (each a PASS), and the stage <code>smt_env</code> reports
+      <code>generated_smt_environment</code>.</p></div>
+      <div class="step"><h4>4. Describe the input</h4><p>A <code>.desc</code> file states the input kind.
+      <code>infer_smt_input_type()</code> chooses <code>pkt</code> for <code>xdp*</code> sections, <code>skb</code>
+      for TC classifiers and <code>constant</code> otherwise. Packet inputs default to 64 bytes
+      (<code>SMT_DEFAULT_PACKET_SIZE</code>). The backend's log line confirms it:
+      <code>program input type set as 1</code>, <code>maximum packet size set as 64 bytes</code>.</p></div>
+      <div class="step"><h4>5. Extract raw bytecode</h4><p><code>llvm-objcopy --dump-section=xdp=old.ins</code>
+      writes the section as raw 8-byte instructions. This is the form the backend reads. Here that is 2
+      instructions for the old object and 3 for the new one (<code>old_len: 2</code>, <code>new_len: 3</code>).</p></div>
+      <div class="step"><h4>6. Encode and solve</h4><p><code>smt_ebpf_equiv</code> loads both programs, builds
+      their control-flow graphs and per-block formulas, checks K2's model-level memory safety for each, and
+      hands Z3 the implication "same inputs ∧ old ∧ new ⇒ same outputs". Z3 proves it valid, so the stage
+      result is <code>PASS</code> with reason <code>smt_equivalence_pass</code>.</p></div>
+      <div class="step"><h4>7. Combine and run rules</h4><p><code>combine()</code> folds all stages
+      (FAIL &gt; UNKNOWN &gt; PASS). Only if the result is PASS do the <code>--rule-command</code> hooks run, with
+      <code>{old}</code>, <code>{new}</code>, <code>{section}</code> and similar placeholders substituted. The
+      process exits 0 only for an overall PASS.</p></div>
+    </div>
+
+    <h2>How the code is organised</h2>
+    <p>Directory map at <code>59ca424</code>, with line counts from <code>wc -l</code>:</p>
+    <pre><code class="nohighlight">ebpf-correctness-verifier/
+├── CMakeLists.txt             targets ebpf-tv, smt_ebpf_equiv, ebpf_smt_inst_codegen_test; 5 CTest tests
+├── Makefile                   test, test-cli, test-smt-smoke, test-corpus, test-smt-z3-release (Z3 4.16.0)
+├── .github/workflows/ci.yml   Ubuntu 24.04: make test; second job against pinned upstream Z3
+├── tools/
+│   ├── ebpf_tv.cc             2300  CLI: ELF/BTF parsing, objcopy/readelf, stages, JSON, rule commands
+│   └── smt_equiv.cc            255  backend wrapper: load pair → validator::is_equal_to → exit 0/1/2
+├── lib/ebpf_smt/              extracted from K2 (smartnic/superopt @ f50ee1f), LICENSE.origin (MIT)
+│   └── src/
+│       ├── raw_program_loader.cc  637  .ins/.maps/.desc reader, helper-argument preconditions (project-owned)
+│       ├── verify/
+│       │   ├── cfg.cc         315  basic blocks, DFS loop rejection, topological sort
+│       │   ├── smt_prog.cc    290  per-block formulas, path conditions, program logic PL
+│       │   ├── validator.cc   369  pre/post conditions, safety check, equivalence query, counterexamples
+│       │   └── z3client.cc    238  optional out-of-process Z3 server (disabled by smt_equiv)
+│       └── isa/ebpf/
+│           ├── inst.cc       1857  opcode tables, smt_inst / smt_inst_jmp / smt_inst_end, interpreter
+│           ├── inst_codegen.cc 3751  predicates: ALU, loads/stores, memory tables, maps, ~60 helpers
+│           ├── inst_var.cc   2083  symbolic state: registers, memory tables, map tables, shared randoms
+│           ├── canonicalize.cc 1354  program canonical form (for K2's equality cache)
+│           └── inst_codegen_test.cc 1898  interpreter-vs-SMT checks (190 assertions)
+├── tests/
+│   ├── cli_smoke.sh, smt_equiv_smoke.sh, smt_cli_integration.sh
+│   ├── real_app_corpus.sh     62 cases: compile old/new C, run ebpf-tv check, assert result
+│   └── real_apps/*.c          ~130 small XDP/TC/tracepoint/fentry/cgroup programs + common.h
+├── scripts/run-smt-xdp-example.sh, examples/smt-xdp/README.md
+└── docs/                      backend-contract, support-matrix, mvp-architecture, test-plan,
+                               backend-dev (provenance), heimdall-notes, reproduction-notes, dependency-policy</code></pre>
+    <p>Two-thirds of the C++ is K2's eBPF model. The project's own code is the ELF front end, the raw loader
+    and the helper models added in July. <code>docs/backend-dev.md</code> records what was removed from K2:
+    "search, proposal, MCMC, or optimization drivers", the toy ISA, benchmark runners and the
+    <code>bm_opti*</code> example programs.</p>
+
+    <h2>Building and running it</h2>
+    <p>The README lists <code>clang cmake g++ libz3-dev llvm</code> on Ubuntu 24.04. The Debian 12 orb used for
+    this chapter already had clang 14.0.6, CMake 3.25.1, LLVM 14 and <code>libz3-dev</code> 4.8.12. Building all
+    three targets with two jobs took about two minutes:</p>
+    <pre><code class="language-bash">git clone https://github.com/eunomia-bpf/ebpf-correctness-verifier
+cd ebpf-correctness-verifier
+cmake -S . -B build
+cmake --build build -j2
+ctest --test-dir build --output-on-failure</code></pre>
+    <p>Real output from that run:</p>
+    <pre><code class="nohighlight">Test project /home/user/workspace/src/ebpf-correctness-verifier/build
+    Start 1: ebpf_tv_cli_smoke
+1/5 Test #1: ebpf_tv_cli_smoke ................   Passed    0.08 sec
+    Start 2: ebpf_smt_inst_codegen_test
+2/5 Test #2: ebpf_smt_inst_codegen_test .......   Passed    2.47 sec
+    Start 3: smt_equiv_smoke
+3/5 Test #3: smt_equiv_smoke ..................   Passed    0.13 sec
+    Start 4: ebpf_tv_smt_cli_integration
+4/5 Test #4: ebpf_tv_smt_cli_integration ......   Passed    0.54 sec
+    Start 5: ebpf_tv_real_app_corpus
+5/5 Test #5: ebpf_tv_real_app_corpus ..........   Passed   49.66 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Total Test time (real) =  52.88 sec</code></pre>
+    <p><code>make test</code> runs the same build plus the XDP example. The other entry points are
+    <code>make test-cli</code>, <code>make test-smt-smoke</code>, <code>make test-corpus</code> and
+    <code>make test-example-smt-xdp</code>. <code>make test-smt-z3-release</code> downloads Z3 4.16.0, checks its
+    SHA-256 and rebuilds against it. That target was not run here.</p>
+
+    <p>Two diagnostic commands are worth knowing:</p>
+    <pre><code class="nohighlight">$ build/smt_ebpf_equiv --version
+{
+  "backend": "smt",
+  "wrapper": "smt_ebpf_equiv",
+  "source": {
+    "provenance": "docs/backend-dev.md",
+    "origin_commit": "f50ee1f"
+  },
+  "z3": {
+    "mode": "in-process-system-library",
+    "full_version": "4.8.12.0",
+    ...
+  },
+  "z3server": false
+}
+$ build/ebpf-tv doctor --smt-equiv build/smt_ebpf_equiv --output text
+PASS
+doctor_ebpf_tv: PASS (binary_version): 0.1.0
+doctor_objcopy: PASS (objcopy_found): /usr/bin/llvm-objcopy
+doctor_readelf: PASS (readelf_found): /usr/bin/llvm-readelf
+doctor_smt_equiv: PASS (smt_equiv_version)</code></pre>
+    <p><code>build/ebpf-tv capabilities</code> prints the supported slice as JSON: which map types, helpers and
+    metadata forms are modelled, and which cases are known to return UNKNOWN.</p>
+
+    <h3>The XDP example</h3>
+    <p><code>scripts/run-smt-xdp-example.sh</code> shows the intended use on ELF objects. It compiles a trivial
+    XDP program with clang, then uses <code>llvm-objcopy --update-section</code> to replace its code with two
+    hand-written instruction sequences:</p>
+    <pre data-file="scripts/run-smt-xdp-example.sh"><code class="language-bash">"$CLANG" -target bpf -O2 -g0 -c "$tmp/base.c" -o "$tmp/base.o"
+
+printf '\xB7\x00\x00\x00\x01\x00\x00\x00\x95\x00\x00\x00\x00\x00\x00\x00' \
+  &gt;"$tmp/old.ins"
+printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00\x00\x00\x00\x00\x00\x00' \
+  &gt;"$tmp/new.ins"
+
+"$OBJCOPY" --update-section=xdp="$tmp/old.ins" "$tmp/base.o" "$tmp/old.o"
+"$OBJCOPY" --update-section=xdp="$tmp/new.ins" "$tmp/base.o" "$tmp/new.o"
+/* ... */
+"${cli[@]}" check "$tmp/old.o" "$tmp/new.o" \
+  --section xdp \
+  --equiv-backend smt \
+  --smt-equiv "$SMT_EQUIV" \
+  --objcopy-bin "$OBJCOPY" \
+  --timeout 120 \
+  &gt;"$tmp/result.json"</code></pre>
+    <p><code>b7 00 … 01</code> is <code>r0 = 1</code>, <code>07 00 … 01</code> is <code>r0 += 1</code> and
+    <code>95</code> is <code>exit</code>. Running the script prints a JSON document with one object per stage.
+    Trimmed to the stages that matter:</p>
+    <pre><code class="language-json">{
+  "result": "PASS",
+  "stages": [
+    { "name": "smt_maps_old",  "reason": "legacy_maps_not_found",     "result": "PASS", ... },
+    { "name": "smt_btf_old",   "reason": "btf_section_not_found",     "result": "PASS", ... },
+    { "name": "smt_reloc_old", "reason": "map_relocations_not_found", "result": "PASS", ... },
+    { "name": "smt_env",       "reason": "generated_smt_environment", "result": "PASS",
+      "stdout": "{\"map_source\": \"none\"}" },
+    { "name": "extract_old",   "reason": "section_extracted",         "result": "PASS", ... },
+    { "name": "equivalence",   "reason": "smt_equivalence_pass",      "result": "PASS",
+      "command": [".../smt_ebpf_equiv", "--old", ".../old.ins", "--new", ".../new.ins",
+                  "--map", ".../generated.maps", "--desc", ".../generated.desc"], ... }
+  ]
+}</code></pre>
+    <p>Every stage records the exact command it ran, its exit code, stdout and stderr. That makes the output
+    usable by an agent or CI job. The question "why UNKNOWN?" can be answered by reading the JSON, without
+    re-running anything.</p>
+
+    <h2>Inside the SMT encoding</h2>
+    <p>The encoding is K2's (Xu et al., SIGCOMM 2021, §5 of the paper). Reading it in this repository's
+    trimmed form is easier than reading the full superoptimizer. Figure 18.2 shows the overall shape. The
+    subsections take each part of eBPF state in turn.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 370" role="img" aria-label="SMT encoding: shared symbolic inputs feed the old and new program formulas; a post condition compares return values, maps and packet; Z3 checks the negation">
+        <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-fillacc2"/></marker></defs>
+        <rect x="200" y="10" width="500" height="80" rx="10" class="d-acc"/>
+        <text x="450" y="32" text-anchor="middle" class="d-h">shared inputs (pre ∧ same_input)</text>
+        <text x="215" y="54" class="d-m">input = r1 (ctx)   r10 = stack_start + 0x200</text>
+        <text x="215" y="74" class="d-m">packet/skb bytes · initial map contents · rand_u32_0..n</text>
+        <rect x="20" y="130" width="390" height="125" rx="10" class="d-box"/>
+        <text x="35" y="152" class="d-h2">PL_old  (prog id 0)</text>
+        <text x="35" y="176" class="d-m">r_0_0_0_1 = 0x1</text>
+        <text x="35" y="196" class="d-m">pgm_exit_type_0 = 0</text>
+        <text x="35" y="216" class="d-m">ret_val_0 = r_0_0_0_1</text>
+        <text x="35" y="240" class="d-s">names: r_&lt;prog&gt;_&lt;block&gt;_&lt;reg&gt;_&lt;version&gt;</text>
+        <rect x="490" y="130" width="390" height="125" rx="10" class="d-box"/>
+        <text x="505" y="152" class="d-h2">PL_new  (prog id 1)</text>
+        <text x="505" y="176" class="d-m">r_1_0_0_1 = 0x0</text>
+        <text x="505" y="196" class="d-m">r_1_0_0_2 = 0x1 + r_1_0_0_1</text>
+        <text x="505" y="216" class="d-m">ret_val_1 = r_1_0_0_2</text>
+        <text x="505" y="240" class="d-s">each write makes a fresh SSA version</text>
+        <rect x="150" y="290" width="600" height="70" rx="10" class="d-acc"/>
+        <text x="450" y="312" text-anchor="middle" class="d-h">post = maps equal ∧ packet equal ∧ skb equal ∧ ret_val_0 = ret_val_1</text>
+        <text x="450" y="334" text-anchor="middle" class="d-t">Z3: is  pre ∧ same_input ∧ PL_old ∧ PL_new ∧ ¬post  satisfiable?</text>
+        <text x="450" y="352" text-anchor="middle" class="d-s">unsat → equivalent within the model · sat → model = counterexample input</text>
+        <path d="M330,90 L250,128" class="d-acc2" marker-end="url(#ar2)"/>
+        <path d="M570,90 L650,128" class="d-acc2" marker-end="url(#ar2)"/>
+        <path d="M215,255 L330,288" class="d-acc2" marker-end="url(#ar2)"/>
+        <path d="M685,255 L570,288" class="d-acc2" marker-end="url(#ar2)"/>
+      </svg>
+      <figcaption>Figure 18.2 — The equivalence query for the XDP example. The register names are the ones the
+      backend actually generates (see <a href="#reading-a-real-formula">Reading a real formula</a>).</figcaption>
+    </figure>
+
+    <h3>Registers: static single assignment</h3>
+    <p>Each of the eleven registers is a 64-bit bit-vector constant. Each write creates a new version, named
+    <code>r_&lt;prog&gt;_&lt;block&gt;_&lt;reg&gt;_&lt;version&gt;</code>, so a block becomes a conjunction of
+    equalities. This is SSA form, written as logic. <code>inst::smt_inst</code> is one large switch. Here are a
+    few of its cases:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">  z3::expr curDst = sv.get_cur_reg_var(_dst_reg);
+  z3::expr curSrc = sv.get_cur_reg_var(_src_reg);
+  z3::expr newDst = string_to_expr("false");
+  // update register according to the opcode type
+  if (_opcode == CALL) {
+    newDst = sv.update_reg_var(0); // r0 contains return value
+  } else if ((op_type == OP_OTHERS) || (op_type == OP_LD)) {
+    newDst = sv.update_reg_var(_dst_reg);
+  }
+  /* ... */
+  switch (_opcode) {
+    case ADD64XC: sv.mem_var.add_ptr(NEWDST, CURDST, IMM, path_cond); return predicate_add(CURDST, IMM, NEWDST);
+    case ADD64XY: sv.mem_var.add_ptr(NEWDST, CURDST, CURSRC, path_cond); return predicate_add(CURDST, CURSRC, NEWDST);
+    case SUB64XY: return predicate_sub(CURDST, CURSRC, NEWDST);
+    case MUL64XC: return predicate_mul(CURDST, IMM, NEWDST);
+    /* ... */
+    case LDXB: return predicate_ld8(CURSRC, OFF, sv, NEWDST, block, enable_addr_off, is_win);
+    /* ... */
+    case CALL: return predicate_helper_function(imm, R1, R2, R3, R4, R5, R0, sv, block, enable_addr_off, is_win);
+    default: return string_to_expr("false");
+  }</code></pre>
+    <p>The <code>predicate_*</code> helpers are macros over Z3's C++ operators, for example
+    <code>#define ADD_EXPR(in1, in2, out) (out EQ in1 + in2)</code> in <code>inst_codegen.h</code>. 32-bit ALU
+    operations use <code>SET_HIGHER32_ZERO(...)</code> to zero the upper half, as the ISA requires. Note the
+    <code>add_ptr</code> calls: when an add or move derives one register from another, the model records that the
+    result may point into the same memory region. Later loads use that to pick which memory table to read.</p>
+
+    <h3>Control flow: blocks, path conditions and no loops</h3>
+    <p><code>graph::gen_graph</code> (<code>verify/cfg.cc</code>) splits the program into basic blocks and runs a
+    DFS. Any back edge is an error:</p>
+    <pre data-file="lib/ebpf_smt/src/verify/cfg.cc"><code class="language-cpp">  for (size_t i = 0; i &lt; gnodes_out[cur_gnode_id].size(); i++) {
+    unsigned int next_gnode_id = gnodes_out[cur_gnode_id][i];
+    if (visited[next_gnode_id] &amp;&amp; (!finished[next_gnode_id])) {
+      string err_msg  = "illegal input: loop from node " + \
+                        to_string(cur_gnode_id) + gnodes[cur_gnode_id].to_str() + \
+                        " to node " + \
+                        to_string(next_gnode_id) + gnodes[next_gnode_id].to_str();
+      throw (err_msg);
+    }
+  }</code></pre>
+    <p>The exception propagates to <code>smt_equiv.cc</code>, which reports <code>UNKNOWN</code>. This is the
+    right answer: bounded loops (allowed by the kernel since 5.3) and <code>bpf_loop</code> are outside the
+    model. Loop-free control flow is encoded in <code>smt_prog::gen_smt</code>. Blocks are visited in topological
+    order. Each block gets its own register versions, and incoming edges are joined with an implication from the
+    edge's path condition:</p>
+    <pre data-file="lib/ebpf_smt/src/verify/smt_prog.cc"><code class="language-cpp">  for (size_t i = 0; i &lt; blocks.size(); i++) {
+    unsigned int b = blocks[i];
+    // reset register version for different basic blocks, while memory tables
+    // don't need to be reset for being shared among basic blocks.
+    sv.set_new_node_id(b, g.nodes_in[b], path_con[b], post_reg_val);
+    /* ... */
+    gen_block_prog_logic(f_bl, f_mem, f_sc, sv, b, inst_lst);
+    f_block[b] = f_block[b] &amp;&amp; f_mem;
+    if (b == 0) {
+      /* ... */
+      f_block[0] = f_block[0] &amp;&amp; f_bl;
+    } else {
+      for (size_t j = 0; j &lt; g.nodes_in[b].size(); j++) {
+        // generate f_iv: the logic that the initial values are fed by the last basic block
+        expr f_iv = string_to_expr("true");
+        get_init_val(f_iv, sv, g.nodes_in[b][j], num_regs);
+        reg_iv[b][j] = f_iv; // store
+        // f_block[b] = f_block[b] &amp;&amp; f_mem &amp;&amp; implies(path_con[b][j], f_iv &amp;&amp; f_bl);
+        f_block[b] = f_block[b] &amp;&amp; implies(path_con[b][j], f_iv &amp;&amp; f_bl);
+        f_block_pc = f_block_pc || path_con[b][j];
+      }
+    }
+    p_sc = p_sc &amp;&amp; implies(f_block_pc, f_sc);
+    store_post_reg_val(sv, b, num_regs);
+    gen_post_path_con(sv, b, inst_lst[g.nodes[b]._end]);
+  }</code></pre>
+    <p>The branch condition itself comes from <code>smt_inst_jmp</code>. The taken edge gets
+    <code>c_in ∧ e</code> and the fall-through edge gets <code>c_in ∧ ¬e</code>. This function will come up again
+    under <a href="#limitations-measured">limitations</a>, so here it is in full:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">z3::expr inst::smt_inst_jmp(smt_var &amp; sv) const {
+  // If opcode is valid, then define curDst, curSrc, imm
+  if (get_opcode_type() != OP_COND_JMP) return string_to_expr("false");
+  z3::expr curDst = sv.get_cur_reg_var(_dst_reg);
+  z3::expr curSrc = sv.get_cur_reg_var(_src_reg);
+  int64_t imm = (int64_t)_imm;
+
+  switch (_opcode) {
+    case JEQXC: return (CURDST == IMM);
+    case JEQXY: return (CURDST == CURSRC);
+    case JGTXC: return (ugt(CURDST, IMM));
+    case JGTXY: return (ugt(CURDST, CURSRC));
+    case JGEXC: return (uge(CURDST, IMM));
+    case JGEXY: return (uge(CURDST, CURSRC));
+    case JNEXC: return (CURDST != IMM);
+    case JNEXY: return (CURDST != CURSRC);
+    case JSGTXC: return (CURDST &gt; IMM);
+    case JSGTXY: return (CURDST &gt; CURSRC);
+    case JEQ32XC: return (CURDST_L32 == IMM_L32);
+    case JEQ32XY: return (CURDST_L32 == CURSRC_L32);
+    case JNE32XC: return (CURDST_L32 != IMM_L32);
+    case JNE32XY: return (CURDST_L32 != CURSRC_L32);
+    default: return string_to_expr("false");
+  }
+}</code></pre>
+
+    <h3>Initial state</h3>
+    <p>The precondition fixes the starting registers. <code>r1</code> equals a symbolic <code>input</code>,
+    <code>r10</code> equals the top of a 512-byte stack, and for packet programs <code>r1</code> also equals the
+    packet's start address:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">z3::expr inst::smt_set_pre(z3::expr input, smt_var &amp; sv) {
+  z3::expr f = string_to_expr("true");
+  f = (sv.get_cur_reg_var(1) == input) &amp;&amp;
+      (sv.get_cur_reg_var(10) == sv.get_stack_bottom_addr()) &amp;&amp;
+      sv.mem_layout_constrain();
+  // add the relationship of r1 and address according to the program inpu type
+  int pgm_input_type = mem_t::get_pgm_input_type();
+  if ((pgm_input_type == PGM_INPUT_pkt) || (pgm_input_type == PGM_INPUT_skb)) {
+    f = f &amp;&amp; (sv.get_cur_reg_var(1) == sv.get_pkt_start_addr());
+  } else if (pgm_input_type == PGM_INPUT_pkt_ptrs) {
+    f = f &amp;&amp; (sv.get_cur_reg_var(1) == sv.get_pkt_start_ptr_addr());
+  }
+  return f;
+}</code></pre>
+    <p>The caller adds one more constraint. Remember it for later:</p>
+    <pre data-file="lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">void validator::smt_pre(expr&amp; pre, unsigned int prog_id, unsigned int num_regs,
+                        unsigned int input_reg, smt_input&amp; sin, smt_var&amp; sv) {
+  expr input = string_to_expr("input");
+  // TODO: set input limit, need to be generalized
+  expr p = (input &gt;= -1024) &amp;&amp; (input &lt;= 1024);
+  /* ... */</code></pre>
+    <p>The three input kinds match the program types. <code>pkt</code> makes <code>r1</code> point directly at
+    the packet bytes. The corpus's XDP programs are written that way (<code>__u8 *data = (__u8 *)ctx</code>),
+    which is a simplification of the real <code>struct xdp_md</code>. <code>pkt-ptrs</code> models a context
+    holding <code>data</code> and <code>data_end</code> pointers, which is what real XDP programs read.
+    <code>skb</code> models TC programs. Section-name inference never picks <code>pkt-ptrs</code>, so for a real
+    XDP program you have to pass <code>--smt-input-type pkt-ptrs</code> yourself. Measurements are below.</p>
+
+    <h3>Memory: tables of writes and reads</h3>
+    <p>Arrays would be the obvious encoding of memory, but they are slow in SMT solvers. K2 instead keeps a
+    separate table for each memory region (stack, packet, skb, packet-pointer context, each map's values). Each
+    table holds a list of writes, the "wt", with a validity condition (the path condition of the block that did
+    the write), an address or offset, and a byte. A load compares its address against every earlier write in the
+    table and takes the latest matching one. If none matches, the load reads the region's initial contents,
+    which are recorded in a second list (the "urt"). Every store becomes byte stores:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">  for (int i = 0; i &lt; ids.size(); i++) {
+    z3::expr is_valid = sv.update_is_valid();
+    z3::expr cond = path_cond &amp;&amp; info_list[i].path_cond;
+    f = f &amp;&amp; (is_valid == cond);
+    /* ... BPF_ST into the input packet is rejected ... */
+    if (is_addr_off_table) { // addr in the entry is offset
+      z3::expr addr_off = off + info_list[i].off;
+      sv.mem_var.add_in_mem_table_wt(ids[i], block, is_valid, addr_off, in.extract(7, 0));
+    } else {
+      sv.mem_var.add_in_mem_table_wt(ids[i], block, is_valid, addr + off, in.extract(7, 0));
+    }
+  }</code></pre>
+    <p>Pointer tracking (<code>add_ptr</code> above) lets the model use offsets within a region instead of
+    absolute addresses for the stack and packet (<code>enable_addr_off = true</code>). This is one of the
+    "domain-specific techniques" the K2 paper credits for speeding up equivalence checking "by 6 orders of
+    magnitude".</p>
+    <p>The same tables give the safety side condition. <code>smt_inst_safety_chk</code> emits, for each load and
+    store, a formula saying the access stays inside a modelled region.
+    <code>validator::safety_check</code> proves <code>pre ∧ PL ⇒ p_sc</code> for each program. If the original
+    fails, <code>set_orig</code> throws <code>"original program is unsafe"</code>. If the candidate fails,
+    <code>is_equal_to</code> returns <code>-2</code>. Both end as UNKNOWN in <code>smt_equiv.cc</code>. This is
+    the model's own sanity check, not the kernel verifier.</p>
+
+    <h3>Maps</h3>
+    <p>A map is modelled as a key-value table with the same kind of write and read lists.
+    <code>bpf_map_lookup_elem</code> returns either <code>NULL</code> or the address of a value in the map's memory
+    table, depending on whether the key is present. <code>update</code> and <code>delete</code> add entries with
+    the kernel's return codes. The interesting part is how the two programs see the <em>same</em> initial maps.
+    Their read lists are tied together: if both programs look up equal keys, then either both see the key absent
+    or both see it present with equal values:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">      z3::expr f_k_both_inexist = (addr_v1 == NULL_ADDR_EXPR) &amp;&amp; (addr_v2 == NULL_ADDR_EXPR);
+      z3::expr f_k_both_exist = (addr_v1 != NULL_ADDR_EXPR) &amp;&amp; (addr_v2 != NULL_ADDR_EXPR);
+      // set the constrains on addr_v1, addr_v2, v1, v2
+      f = f &amp;&amp; z3::implies((map1_urt.is_valid[i] == Z3_true) &amp;&amp;
+                           (map2_urt.is_valid[j] == Z3_true) &amp;&amp;
+                           (k1 == rhs_key),
+                           f_k_both_inexist ||
+                           (f_k_both_exist &amp;&amp; f_v1 &amp;&amp; f_v2[j] &amp;&amp; (v1 == v2[j])));</code></pre>
+    <p>Map contents are part of the output too. <code>smt_one_map_eq_chk</code> requires that, after both
+    programs run, every key either program touched has the same presence and value in both. So a rewrite that
+    keeps the return value but forgets a counter update is a FAIL. The front end reads map shapes from legacy
+    <code>struct bpf_map_def</code> sections and from libbpf's BTF <code>__uint</code>/<code>__type</code> form.
+    Modelled types are hash, array, LRU hash and their per-CPU variants, plus prog-array, stack-trace,
+    cgroup-array, ringbuf and perf-event-array, which are used only by the specific helpers that need them.
+    Per-CPU maps are modelled as the current CPU's view. Anything else, such as <code>BPF_MAP_TYPE_QUEUE</code>,
+    makes the loader throw <code>"unsupported map type: …"</code>, which becomes UNKNOWN. The corpus tests this.</p>
+
+    <h3>Helpers</h3>
+    <p>Most of the July commits model one helper each. The idea is the same every time: a helper result that
+    the program cannot predict becomes a fresh symbolic value, and both programs get the same value for their
+    k-th such call. The shared values are named variables, <code>rand_u32_0</code>, <code>rand_u32_1</code>, …,
+    created once and handed out in call order:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_var.cc"><code class="language-cpp">void smt_var::init_static_variables() {
+  randoms_u32.clear();
+  for (int i = 0; i &lt; mem_t::_layout._n_randoms_u32; i++) {
+    string name = "rand_u32_" + to_string(i);
+    randoms_u32.push_back(to_expr(name, 32));
+  }
+}
+
+z3::expr smt_var::get_next_random_u32() {
+  assert(rand_u32_cur_id &lt; randoms_u32.size());
+  z3::expr rand_u32 = randoms_u32[rand_u32_cur_id];
+  rand_u32_cur_id++;
+  return rand_u32;
+}</code></pre>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">z3::expr predicate_symbolic_u32_helper(z3::expr out, smt_var&amp; sv) {
+  z3::expr f = (out == z3::concat(to_expr((int32_t)0, 32), sv.get_next_random_u32()));
+  return f;
+}
+
+z3::expr predicate_symbolic_u64_helper(z3::expr out, smt_var&amp; sv) {
+  z3::expr low = sv.get_next_random_u32();
+  z3::expr high = sv.get_next_random_u32();
+  return out == z3::concat(high, low);
+}</code></pre>
+    <p>So <code>bpf_get_prandom_u32() &amp; 7</code> in both programs is equivalent, even though the value is
+    random. That is the corpus case <code>xdp_prandom_equivalent</code>. <code>docs/backend-contract.md</code> is
+    honest about what this leaves out: no monotonic clocks, no ranges, no stability between calls. Because values
+    are matched by call position, a rewrite that reorders two helper calls should come out as FAIL rather than
+    PASS. That is inferred from the code and was not tested. Helpers that write memory, such as
+    <code>bpf_get_current_comm</code>, <code>bpf_probe_read*</code>, <code>bpf_skb_load_bytes</code> and
+    <code>bpf_xdp_store_bytes</code>, write that many symbolic or copied bytes into the destination table. They
+    are only modelled when the size is a constant in a small range: exactly 4 bytes for <code>probe_read</code>,
+    and 1–16 bytes for most of the others. <code>raw_program_loader.cc</code> enforces this with a small constant
+    propagation pass that throws messages like <code>"unsupported bpf_probe_read size; expected constant 4"</code>.
+    An unknown helper ID gives <code>unsupported helper id</code>. <code>bpf_trace_printk</code> and
+    <code>bpf_redirect</code> are tested to produce that.</p>
+
+    <h3>Exits and tail calls</h3>
+    <p>An ordinary <code>exit</code> sets <code>ret_val = r0</code> and <code>pgm_exit_type = 0</code>. A
+    <code>bpf_tail_call</code> ends the program with <code>pgm_exit_type = tail_call</code> and records
+    <code>r1..r3</code> as the call's arguments. The final comparison handles both cases:</p>
+    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">z3::expr smt_pgm_eq_chk(smt_var&amp; sv1, smt_var&amp; sv2, bool is_win) {
+  z3::expr f = smt_pgm_mem_eq_chk(sv1, sv2, is_win);
+
+  smt_output&amp; out1 = sv1.smt_out, out2 = sv2.smt_out;
+  // registers equivalence check
+  z3::expr same_regs = Z3_true;
+  if (! is_win) {
+    same_regs = (out1.ret_val == out2.ret_val);
+  } else {
+    /* ... window mode: compare live-out registers ... */
+  }
+  if ( (! out1.pgm_has_tail_call) &amp;&amp; (! out2.pgm_has_tail_call) ) {
+    f = f &amp;&amp; same_regs;
+  } else {
+    z3::expr same_exit_type = (out1.pgm_exit_type == out2.pgm_exit_type);
+    z3::expr same_tail_call_paras = (out1.tail_call_args[0] == out2.tail_call_args[0]) &amp;&amp;
+                                    (out1.tail_call_args[1] == out2.tail_call_args[1]) &amp;&amp;
+                                    (out1.tail_call_args[2] == out2.tail_call_args[2]);
+    f = f &amp;&amp; same_exit_type &amp;&amp;
+        z3::implies(out1.pgm_exit_type == PGM_EXIT_TYPE_default, same_regs) &amp;&amp;
+        z3::implies(out1.pgm_exit_type == PGM_EXIT_TYPE_tail_call, same_tail_call_paras);
+  }
+  return f;
+}</code></pre>
+    <p>"Observable behaviour" is therefore defined as: the return value, or the tail-call target and arguments,
+    plus the final contents of maps, packet and skb memory. Stack contents at exit do not count, because they
+    are dead. Side effects outside this list do not count either, and that matters for helpers like
+    <code>bpf_perf_event_output</code>, which is not modelled and therefore yields UNKNOWN.</p>
+
+    <h3>The query and the solver</h3>
+    <p>With both program formulas built, <code>validator::is_equal_to</code> forms the implication and checks
+    whether it is valid:</p>
+    <pre data-file="lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">  expr pre_mem_same_mem = smt_pgm_set_same_input(_post_sv_orig, post_sv_candidate, _is_win);
+  expr post = string_to_expr("true");
+  smt_post(post, VLD_PROG_ID_ORIG, VLD_PROG_ID_CANDIDATE, post_sv_candidate);
+  expr smt = implies(pre_mem_same_mem &amp;&amp; _pre_orig &amp;&amp; pre_candidate &amp;&amp; _pl_orig &amp;&amp; pl_candidate, post);
+  /* ... */
+  int is_equal = is_smt_valid(smt, mdl);</code></pre>
+    <pre data-file="lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">    z3::tactic t = z3::tactic(smt_c, "bv");
+    z3::solver s = t.mk_solver();
+    Z3_set_ast_print_mode(s.ctx(), Z3_PRINT_SMTLIB2_COMPLIANT);
+    s.add(!smt);
+    // cout &lt;&lt; "Running the solver..." &lt;&lt; endl;
+    switch (s.check()) {
+      case z3::unsat: {
+        return 1;
+      }
+      case z3::sat: {
+        mdl = s.get_model();
+        return 0;
+      }
+      case z3::unknown: {
+        return -1;
+      }
+    }</code></pre>
+    <p>A formula is valid when its negation is unsatisfiable, so "unsat" means "equal". Z3's
+    <code>bv</code> tactic bit-blasts the bit-vector formula to SAT, which is usually the fastest approach for
+    fixed-width arithmetic. On <code>sat</code>, <code>gen_counterex</code> turns the model into a concrete input
+    and runs K2's interpreter on it. The wrapper currently reports only <code>"smt_counterexample"</code> and
+    does not print the input. Adding a counterexample to the JSON output would be a natural next step for
+    agent use.</p>
+    <p>The wrapper maps all of this to an exit code:</p>
+    <pre data-file="tools/smt_equiv.cc"><code class="language-cpp">      convert_bpf_pgm_to_smt_pgm(old_prog, old_len);
+      convert_bpf_pgm_to_smt_pgm(new_prog, new_len);
+
+      inst::max_prog_len = old_len;
+      validator vld(old_prog, old_len);
+      vld._enable_prog_eq_cache = false;
+      equal = vld.is_equal_to(old_prog, old_len, new_prog, new_len);
+      /* ... */
+    if (equal == 1) {
+      emit_result("PASS", "smt_equivalent", args, old_len, new_len);
+      return EXIT_PASS;
+    }
+    if (equal == 0) {
+      emit_result("FAIL", "smt_counterexample", args, old_len, new_len);
+      return EXIT_FAIL;
+    }
+
+    emit_result("UNKNOWN", "smt_unsupported_or_illegal_program", args, old_len,
+                new_len);
+    return EXIT_UNKNOWN;
+  } catch (const std::string&amp; error) {
+    /* ... */
+    emit_result("UNKNOWN", error, args, old_len, new_len);
+    return EXIT_UNKNOWN;</code></pre>
+    <p>K2 throws C++ <code>std::string</code> values for unsupported cases. Catching them all and returning
+    UNKNOWN is how the repository keeps its rule that missing evidence never turns into PASS. As the next sections
+    show, the rule holds whenever the model <em>notices</em> it is out of its depth.</p>
+
+    <h2>Reading a real formula</h2>
+    <p>To see the actual query, I built a scratch copy of <code>tools/smt_equiv.cc</code> with one extra line
+    printing <code>vld._pl_orig</code>, <code>vld._store_post</code> and <code>vld._store_f</code>, and linked it
+    against the object files from the normal build. That driver is not part of the repository. The output below
+    is real, for the XDP example's two programs in <code>constant</code> input mode:</p>
+    <pre><code class="language-lisp">PL_OLD: (and (= r_0_0_0_1 #x0000000000000001)
+     (= pgm_exit_type_0 #b0)
+     (= ret_val_0 r_0_0_0_1))
+POST: (and true true true (= ret_val_0 ret_val_1))
+F: (let ((a!1 (and (and true true true)
+                (and (bvsge input #xfffffffffffffc00)
+                     (bvsle input #x0000000000000400))
+                (= r_0_0_1_0 input)
+                (= r_0_0_10_0 (bvadd stack_start #x0000000000000200))
+                (and (distinct stack_start #x0000000000000000)
+                     (bvuge (bvsub #xffffffffffffffff #x00000000000001ff)
+                            stack_start))
+                (and (bvsge input #xfffffffffffffc00)
+                     (bvsle input #x0000000000000400))
+                (= r_1_0_1_0 input)
+                (= r_1_0_10_0 (bvadd stack_start #x0000000000000200))
+                (and (distinct stack_start #x0000000000000000)
+                     (bvuge (bvsub #xffffffffffffffff #x00000000000001ff)
+                            stack_start))
+                (= r_0_0_0_1 #x0000000000000001)
+                (= pgm_exit_type_0 #b0)
+                (= ret_val_0 r_0_0_0_1)
+                (= r_1_0_0_1 #x0000000000000000)
+                (= r_1_0_0_2 (bvadd #x0000000000000001 r_1_0_0_1))
+                (= pgm_exit_type_1 #b0)
+                (= ret_val_1 r_1_0_0_2))))
+  (=&gt; a!1 (and (and true true true) (= ret_val_0 ret_val_1))))</code></pre>
+    <p>Read it top to bottom. Both programs get <code>r1 = input</code> and the same
+    <code>stack_start</code>. The <code>-1024..1024</code> bound on <code>input</code> appears twice, once per
+    program. The old program's logic is <code>r0 = 1</code>, the new one's is <code>r0 = 0; r0 = 1 + r0</code>,
+    and the conclusion is <code>ret_val_0 = ret_val_1</code>. The three <code>true</code>s are the map, packet and
+    skb equalities, which are trivially true here because there are no maps and the input type is constant.
+    When a program branches, the formula grows one implication per incoming edge. Here is the old side of a
+    <code>JEQ</code> on <code>r1 == 5</code>:</p>
+    <pre><code class="language-lisp">PL_OLD: (and (= r_0_0_0_1 #x0000000000000000)
+     (or (= r_0_0_1_0 #x0000000000000005)
+         (and (= r_0_1_0_0 r_0_0_0_1)
+              ...
+              (= ret_val_0 r_0_1_0_0)))
+     (or (not (= r_0_0_1_0 #x0000000000000005))
+         (and (= r_0_2_0_0 r_0_0_0_1)
+              ...
+              (= r_0_2_0_1 #x0000000000000001)
+              (= ret_val_0 r_0_2_0_1))))</code></pre>
+    <p>The <code>(or (not c) body)</code> pairs are the <code>implies(path_con, f_iv ∧ f_bl)</code> from
+    <code>gen_smt</code>, after <code>simplify()</code>. Block 1 (fall-through, return 0) applies when
+    <code>r1 ≠ 5</code>, and block 2 (return 1) applies when <code>r1 = 5</code>. Against <code>r0 = 0; exit</code>
+    this pair correctly gives FAIL.</p>
+
+    <h2>The result contract</h2>
+    <p>The repository spends more words on its contract than on any other topic, and for an automated gate the
+    contract is the product. <code>docs/backend-contract.md</code> says backends "may be incomplete, but they must
+    never turn missing evidence into <code>PASS</code>." The combiner is four lines:</p>
+    <pre data-file="tools/ebpf_tv.cc"><code class="language-cpp">std::string combine(const std::vector&lt;StageResult&gt; &amp;stages) {
+  bool saw_unknown = false;
+  for (const auto &amp;stage : stages) {
+    if (stage.result == FAIL) {
+      return FAIL;
+    }
+    if (stage.result == UNKNOWN) {
+      saw_unknown = true;
+    }
+  }
+  return saw_unknown ? UNKNOWN : PASS;
+}</code></pre>
+    <table>
+      <tr><th>Result</th><th>Meaning</th><th>Typical reasons</th></tr>
+      <tr><td><code>PASS</code></td><td>Equivalent within the modelled semantics, and every rule command passed</td><td><code>smt_equivalence_pass</code>, <code>identity</code> byte match</td></tr>
+      <tr><td><code>FAIL</code></td><td>Malformed input, incompatible metadata, or a semantic counterexample</td><td><code>smt_equivalence_fail</code>, <code>program_type_mismatch</code>, <code>file_not_found</code>, <code>rule_fail</code></td></tr>
+      <tr><td><code>UNKNOWN</code></td><td>Outside the model, timed out, or not enough metadata. Treat as "do not merge"</td><td><code>unsupported helper id</code>, <code>unsupported map type</code>, loops, <code>non_identical_requires_equivalence_backend</code></td></tr>
+    </table>
+    <p>The README states the intended policy directly: "<code>UNKNOWN</code> is a rejection for automated merge or
+    deploy. It is still useful feedback for agents because it distinguishes unsupported modeling from a concrete
+    counterexample." Note that the CLI process exits 1 for both FAIL and UNKNOWN. You have to read the
+    <code>result</code> field in the JSON to tell them apart. The backend binary does use distinct codes 0/1/2.</p>
+    <p>Project-specific policy can be added after equivalence. A rule command might check the instruction count
+    went down, that the new object still loads on a target kernel, or that a bpftool dump matches a pattern:</p>
+    <pre><code class="language-bash">build/ebpf-tv check old.bpf.o new.bpf.o \
+  --section xdp \
+  --equiv-backend smt \
+  --smt-equiv build/smt_ebpf_equiv \
+  --rule-command 'my-rule --old {old} --new {new} --section {section}'</code></pre>
+    <p>(That command is from the README. <code>my-rule</code> is a placeholder for your own script.) A rule's exit
+    code 0, 1 or 2 maps to PASS, FAIL or UNKNOWN. Any other non-zero exit is UNKNOWN, because "the checker cannot
+    distinguish an infrastructure error from an unsupported rule case."</p>
+
+    <h2>The test suite</h2>
+    <p>Five CTest tests run, from the cheapest to the most realistic:</p>
+    <ul>
+      <li><strong><code>ebpf_tv_cli_smoke</code></strong>: result aggregation, missing tools, identity-backend
+      behaviour, rule commands, <code>doctor</code> and <code>capabilities</code> output. It also checks that the
+      help text hides removed names (<code>prevail</code>, <code>--k2</code>, <code>superopt</code>, …).</li>
+      <li><strong><code>ebpf_smt_inst_codegen_test</code></strong>: 190 checks that each instruction's
+      <code>compute_*</code> (concrete interpreter) and <code>predicate_*</code> (SMT) agree, for example
+      <code>check predicate_add match compute_add SUCCESS</code>. All 190 print SUCCESS. Note what this does and
+      does not prove: it shows the SMT model agrees with K2's interpreter, not with the kernel. If both make the
+      same mistake, the test still passes. One case below shows exactly that.</li>
+      <li><strong><code>smt_equiv_smoke</code></strong>: <code>--version</code> fields, <code>ret0</code> vs a
+      copy (PASS, exit 0), <code>ret0</code> vs <code>ret1</code> (FAIL, exit 1).</li>
+      <li><strong><code>ebpf_tv_smt_cli_integration</code></strong>: ELF section extraction, generated XDP
+      descriptions, legacy map extraction, section-type prechecks, <code>doctor</code>.</li>
+      <li><strong><code>ebpf_tv_real_app_corpus</code></strong>: 62 cases, each compiling an old and a new C file
+      with <code>clang -target bpf -O2</code> and asserting the result: 58 PASS, 1 FAIL and 3 UNKNOWN. This is the
+      slowest test (about 50 s here).</li>
+    </ul>
+    <p>The corpus cases are small, but they are real C compiled by a real clang. The packet-filter trio shows
+    the style:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="xdp_packet_filter_old.c"><pre data-file="tests/real_apps/xdp_packet_filter_old.c"><code class="language-c">#include "common.h"
+
+SEC("xdp")
+int prog(void *ctx) {
+  __u8 *data = (__u8 *)ctx;
+  __u8 first = data[0];
+
+  if (first == 0xff) {
+    return XDP_DROP;
+  }
+  return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="…_new.c (PASS)"><pre data-file="tests/real_apps/xdp_packet_filter_new.c"><code class="language-c">#include "common.h"
+
+SEC("xdp")
+int prog(void *ctx) {
+  __u8 first = *(__u8 *)ctx;
+  return first != 0xff ? XDP_PASS : XDP_DROP;
+}
+
+char _license[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="…_fail.c (FAIL)"><pre data-file="tests/real_apps/xdp_packet_filter_fail.c"><code class="language-c">#include "common.h"
+
+SEC("xdp")
+int prog(void *ctx) {
+  __u8 first = *(__u8 *)ctx;
+  return first == 0x7f ? XDP_DROP : XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";</code></pre></div>
+    </div>
+    <p><code>common.h</code> declares helpers the old way, as function pointers to fixed IDs
+    (<code>static __u32 (*bpf_get_prandom_u32)(void) = (void *)7;</code>), so the corpus needs no kernel
+    headers. A typical map case writes <code>value = 7</code> in one program and <code>value = 3 + 4</code> in the
+    other, or uses <code>if (!stored) return 0; return *stored;</code> against
+    <code>return stored ? *stored : 0;</code>. Often clang folds both versions to identical or nearly identical
+    bytecode. The corpus is good at exercising the metadata path (maps, BTF, relocations, helper preconditions).
+    It does less to stress the semantic model with rewrites that differ a lot.</p>
+
+    <h2>Limitations, measured</h2>
+    <p>The repository is careful about what it says it supports. To see how the model behaves at its edges, I
+    ran a set of small pairs whose correct answer is known from RFC 9669. The raw pairs were run through
+    <code>smt_ebpf_equiv</code> with a <code>constant</code> description, and the C pairs through
+    <code>ebpf-tv check --equiv-backend smt</code> with the orb's clang 14. All inputs were scratch files, and all
+    outputs are real.</p>
+    <table>
+      <tr><th>Old</th><th>New</th><th>Correct answer</th><th><code>ebpf-tv</code></th><th>Cause in the source</th></tr>
+      <tr><td><code>r0=r1; r0*=8</code></td><td><code>r0=r1; r0&lt;&lt;=3</code></td><td>equal</td><td>PASS ✓</td><td>—</td></tr>
+      <tr><td><code>r0=0; if r1==5 …r0=1</code></td><td><code>r0=0</code></td><td>differ</td><td>FAIL ✓</td><td>—</td></tr>
+      <tr><td><code>r0=0; if r1 s&gt; 500 …r0=1</code></td><td><code>r0=0</code></td><td>differ</td><td>FAIL ✓</td><td>—</td></tr>
+      <tr><td><code>r0=0; if r1 s&gt; 2000 …r0=1</code></td><td><code>r0=0</code></td><td>differ</td><td><strong>PASS ✗</strong></td><td><code>input</code> bounded to [-1024, 1024] in <code>validator::smt_pre</code></td></tr>
+      <tr><td><code>r0=0; if r1 &lt; 5 …r0=1</code> (<code>JLT</code>)</td><td><code>r0=0</code></td><td>differ</td><td><strong>PASS ✗</strong></td><td><code>JLT</code> not in the opcode table; the branch is treated as absent</td></tr>
+      <tr><td><code>r0=r1; r0-=5</code> (<code>SUB</code> imm)</td><td><code>r0=r1</code></td><td>differ</td><td><strong>PASS ✗</strong></td><td>opcode 0x17 not modelled; the instruction is silently dropped</td></tr>
+      <tr><td><code>r0=r1; r0/=r2</code> (<code>DIV</code> reg)</td><td><code>r0=r1</code></td><td>differ</td><td><strong>PASS ✗</strong></td><td>opcode 0x3f not modelled; dropped</td></tr>
+      <tr><td><code>r0=r1; r0/=2</code></td><td><code>r0=r1; r0&gt;&gt;=1</code></td><td>equal (BPF <code>DIV</code> is unsigned)</td><td><strong>FAIL ✗</strong></td><td><code>DIV_EXPR</code> uses Z3's <code>operator/</code>, which is <code>bvsdiv</code> (signed)</td></tr>
+      <tr><td><code>r0=r1; r0/=2</code></td><td>signed-halving idiom (<code>r2=r1; r2&gt;&gt;=63; r0+=r2; r0 s&gt;&gt;=1</code>)</td><td>differ at <code>r1 = -2</code></td><td><strong>PASS ✗</strong></td><td>same signed-division model</td></tr>
+      <tr><td>C: <code>return p[0] * p[1];</code></td><td>C: <code>return p[1];</code></td><td>differ</td><td><strong>PASS ✗</strong></td><td>clang emits <code>r0 *= r2</code> (0x2f, <code>MUL</code> reg), which is not modelled</td></tr>
+      <tr><td>C: <code>if (first &gt;= 5) return XDP_DROP;</code> (signed char), <code>-mcpu=v1</code>/<code>v2</code></td><td>C: <code>return XDP_PASS;</code></td><td>differ</td><td>FAIL ✓</td><td>64-bit <code>JSGT</code> is modelled</td></tr>
+      <tr><td>same, <code>-mcpu=v3</code></td><td>same</td><td>differ</td><td><strong>PASS ✗</strong></td><td>clang emits <code>if w1 s&gt; 4</code> (<code>JSGT</code> in <code>JMP32</code>), not modelled</td></tr>
+      <tr><td>C with <code>struct xdp_md</code> <code>data</code>/<code>data_end</code>, auto input type</td><td>equivalent rewrite</td><td>equal</td><td>UNKNOWN</td><td>auto inference picks <code>pkt</code>; real XDP needs <code>pkt-ptrs</code></td></tr>
+      <tr><td>same, <code>--smt-input-type pkt-ptrs</code></td><td>equivalent / changed constant</td><td>equal / differ</td><td>PASS ✓ / FAIL ✓</td><td>—</td></tr>
+    </table>
+
+    <div class="callout danger"><span class="label">Unsound cases</span><p>Several rows say PASS for programs that
+    behave differently. The cause is not Z3. It is the instruction model inherited from K2. The opcode table
+    (<code>opcode_2_idx</code> in <code>inst.cc</code>) covers ALU64 <code>ADD/OR/AND/LSH/RSH/XOR/MOV/ARSH</code>
+    (immediate and register), <code>SUB</code> register only, <code>MUL</code> and <code>DIV</code> immediate only,
+    <code>NEG</code>, the 32-bit <code>ADD/OR/AND/LSH/RSH/MOV/ARSH</code>, byte swaps, loads and stores, atomic
+    add, <code>JA</code>, <code>JEQ/JGT/JGE/JNE/JSGT</code> and the 32-bit <code>JEQ/JNE</code>. Everything else in
+    RFC 9669 is missing, including <code>MOD</code>, <code>SDIV</code>/<code>SMOD</code>, <code>MOVSX</code>,
+    sign-extending loads, <code>JSET</code>, <code>JLT/JLE/JSGE/JSLT/JSLE</code>, most <code>JMP32</code> compares
+    and BPF-to-BPF calls. A missing ALU opcode is not translated into any constraint, so the instruction is
+    silently skipped. A missing jump is not recognised as a branch. Neither raises an error, so neither becomes
+    UNKNOWN. Since LLVM 20 the default BPF CPU is <code>v3</code>, which emits <code>JMP32</code> compares
+    freely, so this affects ordinary default builds. Until this is fixed, treat a PASS as trustworthy only if
+    you have checked that both objects use only the opcodes listed above. One possible guard is to reject any
+    instruction for which <code>inst::is_valid_opcode</code> is false in <code>raw_program_loader.cc</code>,
+    turning it into UNKNOWN. That fix is a suggestion: it was not tested, and it does not address the
+    signed-division issue.</p></div>
+
+    <p>The input range deserves context. The bound applies to the symbolic value of <code>r1</code>. For packet
+    programs, <code>r1</code> is a pointer, and the packet <em>bytes</em> are separate, unconstrained symbolic
+    memory. So real programs that branch on packet or map contents are not affected. The bound bites only when a
+    program computes with <code>r1</code> itself, as in raw <code>constant</code>-mode inputs. The source marks it
+    <code>// TODO: set input limit, need to be generalized</code>.</p>
+
+    <p>Other limits come straight from the design and the docs:</p>
+    <ul>
+      <li><strong>No safety.</strong> PASS says nothing about whether the new object loads. Pair it with the kernel
+      verifier or PREVAIL (<a href="03-verifier.html">Chapter 03</a>).</li>
+      <li><strong>No loops, no subprograms.</strong> Back edges give UNKNOWN. So do programs that use
+      unmodelled helpers such as <code>bpf_loop</code>, through the helper check. BPF-to-BPF calls fall into the unmodelled-opcode
+      gap described above.</li>
+      <li><strong>One program at a time.</strong> The CLI compares one section. Multi-program objects need one run
+      per section (<code>--old-section</code>/<code>--new-section</code> help when names differ).</li>
+      <li><strong>Small packets.</strong> The packet is 64 bytes by default (<code>--smt-max-pkt-size</code>
+      changes it). Behaviour that depends on longer packets is outside the model.</li>
+      <li><strong>Partial helpers and maps.</strong> About 60 helpers are modelled, mostly as fresh symbolic values
+      with constant-argument preconditions. Hash-map capacity, LRU eviction, clocks that only move forward and
+      ringbuf output are not modelled. The support matrix lists the details.</li>
+      <li><strong>CO-RE.</strong> Objects whose behaviour depends on BTF relocations being applied at load time are
+      outside the model (README: "not yet a complete CO-RE-aware object equivalence checker").</li>
+      <li><strong>No counterexample in the output.</strong> FAIL carries a reason but not the input that triggered
+      it, although K2's <code>gen_counterex</code> computes one internally.</li>
+    </ul>
+
+    <h2>Benefits</h2>
+    <p>Even with those gaps, the repository gets several things right:</p>
+    <ul>
+      <li><strong>A precise interface.</strong> Two objects in, a JSON verdict out, with the command, exit code and
+      stderr of every stage. The FAIL/UNKNOWN distinction is the right shape for a CI gate or an agent's
+      feedback loop: "your rewrite is wrong" and "I cannot judge your rewrite" lead to different next actions.</li>
+      <li><strong>Conservative defaults.</strong> The identity backend never claims more than byte equality.
+      Missing tools, unsupported maps, helpers with dynamic sizes and loops all give UNKNOWN, and tests check
+      that they do.</li>
+      <li><strong>It reuses a published model.</strong> It does not invent a new eBPF semantics. It extracts K2's,
+      which has been through peer review and artifact evaluation, and deletes the parts it does not need.</li>
+      <li><strong>Bytecode level.</strong> Checking bytecode, not C, means the same checker works for clang flag
+      changes, hand edits, superoptimizers and Rust-compiled programs. It also checks the thing that actually
+      runs.</li>
+      <li><strong>Cheap to run.</strong> The corpus programs take well under a second each. The whole corpus,
+      including 124 clang compilations, finished in 50 s on a shared orb.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <h3>K2: where the model comes from (SIGCOMM 2021)</h3>
+    <p>K2, by Xu, Wong, Wagle, Narayana and Sivaraman, is "a program-synthesis-based compiler that automatically
+    optimizes BPF bytecode with formal correctness and safety guarantees." It runs a stochastic (MCMC) search over
+    candidate programs. Each promising candidate is checked against the original with the SMT encoding described
+    in this chapter, and also against K2's own safety model. A post-processing pass loads the best outputs into
+    the kernel to weed out any the real verifier rejects. The paper reports 6–26% smaller programs than the best
+    clang output. Its equivalence-checking optimizations (memory offsets, per-region tables, map modelling,
+    caching) made the check about six orders of magnitude faster. <code>ebpf-tv</code> keeps the checker and
+    throws away the search. In K2 the checker validates candidates the search produced. In <code>ebpf-tv</code>
+    it validates whatever you give it. That shift matters for the gaps above. K2's search only proposes
+    instructions from its own supported set, so an unmodelled opcode could reach the checker only from the
+    original program. A general validator has to cope with any opcode clang emits.</p>
+
+    <h3>Merlin (ASPLOS 2024)</h3>
+    <p>Merlin, by Mao, Ding, Zhai and Ma, optimizes eBPF in two tiers: custom LLVM IR passes (alignment,
+    macro-op fusion) and a bytecode rewriter that applies instruction merging and strength reduction before
+    verification. It is rule-based and fast. The authors report it is 106× faster than K2, with 73% fewer
+    instructions on their benchmarks. Its correctness rests on each rule being right, not on a per-program
+    proof. Merlin's output is exactly the kind of old/new pair <code>ebpf-tv</code> is meant for.</p>
+
+    <h3>EPSO (ASE 2025)</h3>
+    <p>EPSO, by Zhu, Liu, Zhu, Liu and Bu, sits between K2 and Merlin. It runs an expensive superoptimizer
+    offline to discover rewrite rules (795 in the arXiv version), caches them, and applies them cheaply to new
+    programs. The paper reports it beats K2 on all benchmarks and Merlin on most. A cached rule is proven once
+    and reused. Translation validation would still catch any context in which a rule's side conditions do not
+    actually hold.</p>
+
+    <h3>Jitterbug (OSDI 2020)</h3>
+    <p>Jitterbug, by Nelson, Van Geffen, Torlak and Wang, is the compiler-verification side of the picture. It
+    proves the kernel's BPF JITs correct for all inputs, one BPF instruction at a time, using Rosette and Serval.
+    It found and fixed 16 bugs in deployed JITs and added a verified RV32 JIT. Jitterbug covers the step after
+    loading (BPF → machine code). <code>ebpf-tv</code> covers rewrites before loading (BPF → BPF). The two
+    designs also show the trade-off from the start of this chapter. Jitterbug proves the translator once, at
+    great effort. <code>ebpf-tv</code> checks each output, cheaply, but only inside its model.</p>
+
+    <h3>Heimdall (arXiv 2026)</h3>
+    <p>The repository's <code>docs/heimdall-notes.md</code> discusses Heimdall (Dasu et al.), which uses LLMs to
+    translate libbpf C programs to Aya Rust and proves each translation equivalent at the bytecode level, using
+    angr-based symbolic execution of eBPF and Z3. It reports 109 of 115 programs proven equivalent. The notes
+    say <code>ebpf-tv</code> borrows Heimdall's framing (compare compiled bytecode, use one shared environment for
+    both programs, report unsupported cases), but not its pipeline (translation, repair, counterexample
+    feedback).</p>
+
+    <h3>Translation validation outside eBPF</h3>
+    <p>The term and the method come from Pnueli, Siegel and Singerman (TACAS 1998). Necula's validator for gcc
+    (PLDI 2000) showed it could keep up with a real optimizing compiler. Alive2 (PLDI 2021) does bounded
+    translation validation for LLVM IR with an SMT solver and has found dozens of LLVM bugs. Alive2 also makes
+    the same choice <code>ebpf-tv</code> makes about loops: unroll to a bound or give up, and say so.</p>
+
+    <h3>Chapters 03, 17 and 19</h3>
+    <p><a href="03-verifier.html">Chapter 03</a> covers the safety half of the problem: the kernel verifier, tnums
+    and range tracking, and PREVAIL's abstract interpretation. The verifier over-approximates <em>one</em>
+    program to prove it never misbehaves. <code>ebpf-tv</code> encodes <em>two</em> programs exactly, within its
+    model, to prove they behave alike. <a href="17-bpfix.html">Chapter 17</a> (bpfix) helps humans and LLMs get
+    rejected programs past the verifier. An LLM repair that gets a program accepted may still change what it
+    does, and that is the question this chapter's tool answers.
+    <a href="19-bpf-benchmark.html">Chapter 19</a> (bpf-benchmark and bpfperf) is the natural consumer: an
+    agent-driven loop that proposes eBPF optimizations and returns verifier, JIT and performance feedback, with a
+    <code>bpfopt</code> component that rewrites bytecode. At the commits studied, bpf-benchmark does not call
+    <code>ebpf-tv</code>: a search of that repository for <code>ebpf-tv</code> or
+    <code>correctness-verifier</code> finds nothing. The connection is architectural. <code>ebpf-tv</code>
+    supplies the "is it still the same program?" stage that a benchmark-driven loop otherwise lacks, and its
+    UNKNOWN verdicts tell the agent to try a rewrite the checker can judge.</p>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> The kernel verifier accepts both the old and the new object. What
+      has that established about their equivalence?</p>
+        <button class="opt">They are equivalent on all inputs the verifier explored</button>
+        <button class="opt" data-right>Nothing. The verifier proves safety of each program separately, not that they behave alike</button>
+        <button class="opt">They are equivalent if they have the same number of instructions</button>
+        <div class="why">The verifier checks memory safety, termination and helper usage for one program at a
+        time. A safe program can still return the wrong verdict. Equivalence needs a separate check.</div></div>
+      <div class="q"><p><strong>Q2.</strong> <code>smt_ebpf_equiv</code> adds <code>¬F</code> to Z3, where
+      <code>F = pre ∧ PL_old ∧ PL_new ⇒ post</code>. Z3 answers <code>unsat</code>. What does the tool report?</p>
+        <button class="opt" data-right>PASS: no modelled input makes the outputs differ</button>
+        <button class="opt">FAIL: Z3 found a counterexample</button>
+        <button class="opt">UNKNOWN: unsat means the solver gave up</button>
+        <div class="why">If ¬F has no satisfying assignment, F holds for every input, so the programs are equal
+        within the model. <code>sat</code> would give a counterexample. Z3's separate <code>unknown</code> answer
+        maps to UNKNOWN.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why do both programs get the same value when each calls
+      <code>bpf_get_prandom_u32()</code> once?</p>
+        <button class="opt">The model fixes the helper's return value to 0</button>
+        <button class="opt" data-right>Helper results are shared named variables (<code>rand_u32_0</code>, …) handed out by call order, so the k-th call in each program sees the same symbolic value</button>
+        <button class="opt">Z3 assumes random numbers are equal by default</button>
+        <div class="why"><code>smt_var::get_next_random_u32()</code> returns the next variable from a list built
+        once for both programs. The value is unconstrained but shared, so <code>x &amp; 7</code> in both programs is
+        provably equal.</div></div>
+      <div class="q"><p><strong>Q4.</strong> Where does PREVAIL run in the current <code>ebpf-tv check</code>
+      pipeline?</p>
+        <button class="opt">Before equivalence, as stages <code>prevail_old</code> and <code>prevail_new</code></button>
+        <button class="opt">Inside <code>smt_ebpf_equiv</code>, to bound register ranges</button>
+        <button class="opt" data-right>Nowhere. It was removed on 2026-07-02, and safety is now the caller's job</button>
+        <div class="why">The early Python design had PREVAIL stages. Commit <code>ec136b4</code> removed them, and
+        the README now says the tool does not prove safety. The GitHub description is out of date.</div></div>
+      <div class="q"><p><strong>Q5.</strong> An object compiled with <code>-mcpu=v3</code> contains
+      <code>if w1 s&gt; 4 goto …</code>. Based on the measurements in this chapter, what can a PASS on that object
+      be trusted for?</p>
+        <button class="opt">Fully, since the instruction is a standard RFC 9669 jump</button>
+        <button class="opt" data-right>Not on its own: 32-bit signed jumps are not in the model, and they are silently treated as non-branches instead of producing UNKNOWN</button>
+        <button class="opt">It is impossible, since the loader rejects JMP32 instructions with UNKNOWN</button>
+        <div class="why">The measured v3 case returned PASS for programs that differ. Missing opcodes are not
+        rejected, so you must check the opcodes yourself or add a guard that turns them into UNKNOWN.</div></div>
+      <div class="q"><p><strong>Q6.</strong> What is the main difference between Jitterbug and
+      <code>ebpf-tv</code>?</p>
+        <button class="opt">Jitterbug uses Z3 and ebpf-tv uses a SAT solver</button>
+        <button class="opt" data-right>Jitterbug verifies the JIT translator once for all inputs. ebpf-tv validates each individual old/new pair after the fact</button>
+        <button class="opt">Jitterbug checks safety and ebpf-tv checks performance</button>
+        <div class="why">This is compiler verification versus translation validation. Jitterbug proves the
+        BPF→machine-code JITs correct in general. ebpf-tv checks one BPF→BPF rewrite at a time and trusts nothing
+        about the tool that made it.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/ebpf-correctness-verifier">eunomia-bpf/ebpf-correctness-verifier</a> — repository studied at commit <code>59ca424</code> (2026-09-16); see <code>README.md</code>, <code>docs/backend-contract.md</code>, <code>docs/support-matrix.md</code>, <code>docs/backend-dev.md</code>.</li>
+      <li>Qiongwen Xu, Michael D. Wong, Tanvi Wagle, Srinivas Narayana, Anirudh Sivaraman. "Synthesizing Safe and Efficient Kernel Extensions for Packet Processing." ACM SIGCOMM 2021. <a href="https://doi.org/10.1145/3452296.3472929">doi:10.1145/3452296.3472929</a>; <a href="https://arxiv.org/abs/2103.00022">arXiv:2103.00022</a>; code <a href="https://github.com/smartnic/superopt">smartnic/superopt</a> (origin commit <code>f50ee1f</code>).</li>
+      <li>Jinsong Mao, Hailun Ding, Juan Zhai, Shiqing Ma. "Merlin: Multi-tier Optimization of eBPF Code for Performance and Compactness." ASPLOS 2024. <a href="https://doi.org/10.1145/3620666.3651387">doi:10.1145/3620666.3651387</a>; code <a href="https://github.com/4ar0nma0/Merlin">4ar0nma0/Merlin</a>.</li>
+      <li>Qian Zhu, Yuxuan Liu, Ziyuan Zhu, Shangqing Liu, Lei Bu. "EPSO: A Caching-Based Efficient Superoptimizer for BPF Bytecode." ASE 2025. <a href="https://arxiv.org/abs/2511.15589">arXiv:2511.15589</a>.</li>
+      <li>Luke Nelson, Jacob Van Geffen, Emina Torlak, Xi Wang. "Specification and verification in the field: Applying formal methods to BPF just-in-time compilers in the Linux kernel." OSDI 2020. <a href="https://www.usenix.org/conference/osdi20/presentation/nelson">USENIX</a>; code <a href="https://github.com/uw-unsat/jitterbug">uw-unsat/jitterbug</a>.</li>
+      <li>Vishnu Asutosh Dasu, Monika Santra, Md Rafi Ur Rashid, Ashish Kumar, Saeid Tizpaz-Niari, Gang Tan. "Heimdall: Formally Verified Automated Migration of Legacy eBPF Programs to Rust." arXiv 2026. <a href="https://arxiv.org/abs/2605.25411">arXiv:2605.25411</a>.</li>
+      <li>Amir Pnueli, Michael Siegel, Eli Singerman. "Translation Validation." TACAS 1998, LNCS 1384. <a href="https://doi.org/10.1007/BFb0054170">doi:10.1007/BFb0054170</a>.</li>
+      <li>George C. Necula. "Translation Validation for an Optimizing Compiler." PLDI 2000. <a href="https://doi.org/10.1145/358438.349314">doi:10.1145/358438.349314</a>.</li>
+      <li>Nuno P. Lopes, Juneyoung Lee, Chung-Kil Hur, Zhengyang Liu, John Regehr. "Alive2: Bounded Translation Validation for LLVM." PLDI 2021. <a href="https://doi.org/10.1145/3453483.3454030">doi:10.1145/3453483.3454030</a>.</li>
+      <li>D. Thaler (ed.). "BPF Instruction Set Architecture (ISA)." RFC 9669, 2024. <a href="https://www.rfc-editor.org/rfc/rfc9669.html">rfc-editor.org/rfc/rfc9669</a>.</li>
+      <li>Linux kernel documentation. "HOWTO interact with BPF subsystem" (LLVM <code>-mcpu</code> default changed to v3 in LLVM 20). <a href="https://docs.kernel.org/bpf/bpf_devel_QA.html">docs.kernel.org/bpf/bpf_devel_QA.html</a>.</li>
+      <li><a href="https://github.com/Z3Prover/z3">Z3 theorem prover</a> (Microsoft Research). Version 4.8.12 (Debian) used in this chapter's runs; CI pins 4.16.0.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="17-bpfix.html"><small>Previous</small>17 · bpfix</a>
+      <a class="next" href="19-bpf-benchmark.html"><small>Next</small>19 · bpf-benchmark and bpfperf</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

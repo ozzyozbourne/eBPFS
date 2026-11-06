@@ -42,7 +42,7 @@
       kernel's BTF, which the kernel provides only if it was built with <code>CONFIG_DEBUG_INFO_BTF=y</code>.</p>
     <p>Mainstream distributions turned that option on gradually. The BTFHub table of supported distributions shows,
       for example, that CentOS 8.0 and 8.1 (kernels <code>4.18.0-80</code> and <code>4.18.0-147</code>) have neither
-      BPF-ready settings nor BTF. From 8.2 on they have both. CentOS 7 kernels never have BTF. On those machines libbpf
+      BPF-ready settings nor BTF. From 8.2 on they have both. The CentOS 7 kernels are all listed without BTF. On those machines libbpf
       prints <code>kernel BTF is missing at '/sys/kernel/btf/vmlinux', was CONFIG_DEBUG_INFO_BTF enabled?</code>, and
       any object with CO-RE relocations fails to load. The relocation <em>mechanism</em> is in libbpf, in user space, so
       it works on those kernels. Only the type data is missing.</p>
@@ -711,7 +711,7 @@ cleanup:
       normal Rust library for Rust loaders. It works with <em>uncompressed</em> tar and needs a
       <code>package.json</code> inside, the format ecc produces. <code>bpf-compatible-sys</code> is for C programs. It
       handles <em>gzip</em> archives that are embedded or passed in, has no <code>package.json</code> requirement, and
-      reuses only the path builder from the first crate.</p>
+      reuses only the path builder (and the <code>tar</code> crate it re-exports) from the first crate.</p>
 
     <h2>Building and using it</h2>
     <h3>Manually, step by step (from the README)</h3>
@@ -832,8 +832,9 @@ ecc program.bpf.c --btfgen --btfhub-archive /path/to/btfhub</code></pre>
         } else if !vmlinux_btf_exists {
             bail!("All ways tried to find vmlinux BTF, but not found. /* ... */");
         };</code></pre>
-    <p>The order is: kernel BTF if readable; otherwise the archive entry; otherwise the file named by
-      <code>BTF_FILE_PATH</code>; otherwise an error. There is one sharp edge. The "archive entry exists" check runs
+    <p>The order is: if kernel BTF is not readable, the archive entry; otherwise, if <code>BTF_FILE_PATH</code>
+      is set, that file (it then overrides even a readable kernel BTF); otherwise kernel BTF if readable; otherwise an
+      error. There is one sharp edge. The "archive entry exists" check runs
       <em>before</em> the kernel BTF check. If a <code>.tar</code> package is run on a modern kernel that is not in the
       archive, loading fails with "BTF file not found for current system", even though
       <code>/sys/kernel/btf/vmlinux</code> would have worked. The C runtime checks kernel BTF first and does not have
@@ -873,7 +874,8 @@ $ tar tzf execsnoop-btf.tar.gz | grep -c '\.btf$'
 85</code></pre>
     <p>All 85 entries are 358 bytes. Only 12 are byte-distinct (checked with md5sum), because many kernel builds from
       the same series share their layout for these few fields. That redundancy, plus mostly empty tar headers, is why gzip squeezes 30,432 bytes of
-      BTF (more with tar headers) down to 2,012. Packing both objects gives 2,642 bytes, and the bootstrap archive is 2,056 bytes. The
+      BTF (more with tar headers) down to 2,012. (A rerun during review gave 2,004 bytes. The exact size varies by a
+      few bytes from run to run, presumably with the file timestamps stored in the tar.) Packing both objects gives 2,642 bytes, and the bootstrap archive is 2,056 bytes. The
       kept fields differ from distribution to distribution:</p>
     <table>
       <thead><tr><th>Kernel (trimmed file)</th><th><code>task_struct</code> size</th><th><code>tgid</code> bit offset</th><th><code>real_parent</code> bit offset</th></tr></thead>

@@ -411,7 +411,7 @@ Options:
 
     <p>Here is the injection from step 1, and the packing from step 7, as they appear in the source:</p>
     <div class="tabs">
-      <div class="tab-panel" data-label="Step 1: dummy pointers"><pre data-file="compiler/cmd/src/export_types.rs"><code class="language-rust">const REGEX_STRUCT_PATTERN: &amp;str = r#"struct\s+(\w+)\s*\{"#;
+      <div class="tab-panel" data-label="Step 1: dummy pointers"><pre data-file="eunomia-bpf/compiler/cmd/src/export_types.rs"><code class="language-rust">const REGEX_STRUCT_PATTERN: &amp;str = r#"struct\s+(\w+)\s*\{"#;
 
 // find all structs in event header
 pub fn find_all_export_structs(args: &amp;CompileArgs) -&gt; Result&lt;Vec&lt;String&gt;&gt; {
@@ -438,7 +438,7 @@ pub fn add_unused_ptr_for_structs(args: &amp;CompileArgs, file_path: impl AsRef&
     fs::write(file_path, content)?;
     Ok(())
 }</code></pre></div>
-      <div class="tab-panel" data-label="Step 7: pack_object_in_config"><pre data-file="compiler/cmd/src/bpf_compiler/mod.rs"><code class="language-rust">/// pack the object file into a package.json
+      <div class="tab-panel" data-label="Step 7: pack_object_in_config"><pre data-file="eunomia-bpf/compiler/cmd/src/bpf_compiler/mod.rs"><code class="language-rust">/// pack the object file into a package.json
 fn pack_object_in_config(args: &amp;Options) -&gt; Result&lt;()&gt; {
     info!("Generating package json..");
     let output_bpf_object_path = args.get_output_object_path();
@@ -457,7 +457,7 @@ fn pack_object_in_config(args: &amp;Options) -&gt; Result&lt;()&gt; {
     /* ... write package.yaml if -y, else package.json ... */
     Ok(())
 }</code></pre></div>
-      <div class="tab-panel" data-label="Step 5: filter BTF structs"><pre data-file="compiler/cmd/src/bpf_compiler/mod.rs"><code class="language-rust">fn get_export_types_json(
+      <div class="tab-panel" data-label="Step 5: filter BTF structs"><pre data-file="eunomia-bpf/compiler/cmd/src/bpf_compiler/mod.rs"><code class="language-rust">fn get_export_types_json(
     args: &amp;Options,
     output_bpf_object_path: impl AsRef&lt;Path&gt;,
 ) -&gt; Result&lt;String&gt; {
@@ -496,7 +496,7 @@ fn pack_object_in_config(args: &amp;Options) -&gt; Result&lt;()&gt; {
       "annotations" is really the set of keys the loader's serde schema (<code>bpf-loader-lib/src/meta/mod.rs</code>)
       understands. These are the ones the examples use:</p>
     <div class="tabs">
-      <div class="tab-panel" data-label="runqlat: @sample"><pre data-file="examples/bpftools/runqlat/runqlat.bpf.c"><code class="language-c">const volatile bool filter_cg = false;
+      <div class="tab-panel" data-label="runqlat: @sample"><pre data-file="eunomia-bpf/examples/bpftools/runqlat/runqlat.bpf.c"><code class="language-c">const volatile bool filter_cg = false;
 const volatile bool targ_per_process = false;
 const volatile bool targ_per_thread = false;
 const volatile bool targ_per_pidns = false;
@@ -515,7 +515,7 @@ struct {
           default); optional keys are <code>unit</code> (default <code>"(unit)"</code>) and <code>clear_map</code>.
           The six <code>bool</code>/<code>pid_t</code> globals become <code>--filter_cg</code>, … ,
           <code>--targ_tgid</code>.</p></div>
-      <div class="tab-panel" data-label="opensnoop: @cmdarg"><pre data-file="examples/bpftools/opensnoop/opensnoop.bpf.c"><code class="language-c">/// Process ID to trace
+      <div class="tab-panel" data-label="opensnoop: @cmdarg"><pre data-file="eunomia-bpf/examples/bpftools/opensnoop/opensnoop.bpf.c"><code class="language-c">/// Process ID to trace
 const volatile int pid_target = 0;
 /// Thread ID to trace
 const volatile int tgid_target = 0;
@@ -533,7 +533,7 @@ struct {
         <p>The comment text becomes the help string. <code>@cmdarg</code> overrides the long name, adds a short name
           and a default. Output here goes through a perf event array instead of a ring buffer; the runtime handles
           both.</p></div>
-      <div class="tab-panel" data-label="xdp: attach options"><pre data-file="examples/bpftools/xdp/xdp.bpf.c"><code class="language-c">/// @ifindex 1
+      <div class="tab-panel" data-label="xdp: attach options"><pre data-file="eunomia-bpf/examples/bpftools/xdp/xdp.bpf.c"><code class="language-c">/// @ifindex 1
 /// @flags 0
 /// @xdpopts {"old_prog_fd":0}
 SEC("xdp")
@@ -549,7 +549,7 @@ int xdp_pass(struct xdp_md* ctx) {
           land in the program's metadata (ifindex 1 is <code>lo</code> on most systems). In our build the resulting
           entry was <code>{"attach": "xdp", "flags": 0, "ifindex": 1, "link": true, "name": "xdp_pass",
           "xdpopts": {"old_prog_fd": 0}}</code>.</p></div>
-      <div class="tab-panel" data-label="tc: @tchook"><pre data-file="examples/bpftools/tc/tc.bpf.c"><code class="language-c">/// @tchook {"ifindex":1, "attach_point":"BPF_TC_INGRESS"}
+      <div class="tab-panel" data-label="tc: @tchook"><pre data-file="eunomia-bpf/examples/bpftools/tc/tc.bpf.c"><code class="language-c">/// @tchook {"ifindex":1, "attach_point":"BPF_TC_INGRESS"}
 /// @tcopts {"handle":1, "priority":1}
 SEC("tc")
 /* ... */</code></pre>
@@ -625,7 +625,7 @@ INFO [ecc_rs::bpf_compiler] Packing ebpf object and config into package.json...<
 }</code></pre>
     <p>The loader's side of the contract is a pair of serde types. The doc comment states the format and the
       deserializer enforces the size field:</p>
-    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/meta/mod.rs"><code class="language-rust">/// Describe a full eunomia json(with ebpf object inside)
+    <pre data-file="eunomia-bpf/bpf-loader-rs/bpf-loader-lib/src/meta/mod.rs"><code class="language-rust">/// Describe a full eunomia json(with ebpf object inside)
 /// The original json should be like:
 /// ```json
 /// {
@@ -665,7 +665,7 @@ pub struct ComposedObject {
     <h3>Phase 1: open, and pick the kernel BTF</h3>
     <p>The builder opens the decompressed ELF from memory with <code>bpf_object__open_mem</code>. Before that it
       decides where CO-RE should find the kernel's types. The order matters for old kernels:</p>
-    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/skeleton/builder.rs"><code class="language-rust">        let path_holder = if let Some(base_path) = self.btf_archive_path.as_ref() {
+    <pre data-file="eunomia-bpf/bpf-loader-rs/bpf-loader-lib/src/skeleton/builder.rs"><code class="language-rust">        let path_holder = if let Some(base_path) = self.btf_archive_path.as_ref() {
             let path = get_current_system_btf_file(PathBuf::from(base_path).as_path())?;
             /* ... bail if missing ... */
             Some(path)
@@ -705,7 +705,7 @@ pub struct ComposedObject {
     <p>Then it calls <code>load()</code> (libbpf performs CO-RE relocation and the kernel verifier runs) and tries
       libbpf's auto-attach on each program. Programs libbpf cannot auto-attach fail with <code>EOPNOTSUPP</code>; the
       loader catches exactly that error and attaches them itself:</p>
-    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/skeleton/preload/mod.rs"><code class="language-rust">        for prog_meta in self.meta.bpf_skel.progs.iter() {
+    <pre data-file="eunomia-bpf/bpf-loader-rs/bpf-loader-lib/src/skeleton/preload/mod.rs"><code class="language-rust">        for prog_meta in self.meta.bpf_skel.progs.iter() {
             /* ... */
             match bpf_prog.attach() {
                 Ok(link) =&gt; links.push(AttachLink::BpfLink(link)),
@@ -740,7 +740,7 @@ pub struct ComposedObject {
       single-export mode, is: walk the maps in order; a map with <code>sample</code> metadata is a sampled map;
       otherwise a <code>BPF_MAP_TYPE_RINGBUF</code> or <code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code> is an event stream.
       If several qualify, the last one wins (with a warning).</p>
-    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/skeleton/mod.rs"><code class="language-rust">        let mut export_map: Option&lt;(&amp;MapMeta, ExportMapType)&gt; = None;
+    <pre data-file="eunomia-bpf/bpf-loader-rs/bpf-loader-lib/src/skeleton/mod.rs"><code class="language-rust">        let mut export_map: Option&lt;(&amp;MapMeta, ExportMapType)&gt; = None;
         for map_meta in self.meta.bpf_skel.maps.iter() {
             /* ... look up bpf_map by name ... */
             if let Some(sample_meta) = &amp;map_meta.sample {
@@ -844,7 +844,7 @@ Commands:
       of the line to the program. The bare form <code>ecli &lt;prog&gt;</code> still works for compatibility. The
       reference is resolved by one function, which is worth reading because its fall-through order explains several
       confusing error messages:</p>
-    <pre data-file="ecli/ecli-lib/src/runner/helper.rs"><code class="language-rust">/// Load the binary of the given url, and guess its program type
+    <pre data-file="eunomia-bpf/ecli/ecli-lib/src/runner/helper.rs"><code class="language-rust">/// Load the binary of the given url, and guess its program type
 /// If failed to guess, will just return None
 /// It will try the following order
 /// - Test if the provided string is a local file. If matches, read it
@@ -900,7 +900,7 @@ pub async fn try_load_program_buf_and_guess_type(
     <h3>Pull, push and what lives in the registry</h3>
     <p>Registry access goes through the <a href="https://github.com/eunomia-bpf/bpf-oci">bpf-oci</a> crate, which wraps
       <code>oci-distribution</code>. The push subcommand takes a Wasm file and an image reference:</p>
-    <pre data-file="ecli/client/src/main.rs"><code class="language-rust">    #[clap(about = "Operations about pushing image to registry", after_help = AUTH_HELP)]
+    <pre data-file="eunomia-bpf/ecli/client/src/main.rs"><code class="language-rust">    #[clap(about = "Operations about pushing image to registry", after_help = AUTH_HELP)]
     Push {
         /// wasm module path
         #[arg(long, short, default_value_t = ("app.wasm").to_string(), help = "Path to the wasm module")]
@@ -963,7 +963,7 @@ pub async fn try_load_program_buf_and_guess_type(
     <p>The smallest such module is in the repository's GitHub Pages build script. It wraps any JSON package into a Wasm
       module that just prints every event, which is how a JSON tool becomes something you can
       <code>ecli push</code> to a registry:</p>
-    <pre data-file=".github/scripts/build-gh-pages-assets.sh"><code class="language-c">#include &lt;stdio.h&gt;
+    <pre data-file="eunomia-bpf/.github/scripts/build-gh-pages-assets.sh"><code class="language-c">#include &lt;stdio.h&gt;
 #include &lt;string.h&gt;
 
 #include "ewasm-skel.h"
@@ -1003,7 +1003,7 @@ int process_event(int ctx, char *event_json, int str_len)
       <a href="https://github.com/eunomia-bpf/c-struct-bindgen">c-struct-bindgen</a> tool to generate
       <code>sigsnoop.wasm.h</code>, so the Wasm code can read the event struct with the right layout, then builds with
       its <code>build.sh</code>. Its README shows:</p>
-    <pre data-file="examples/bpftools/sigsnoop/README.md"><code class="language-plaintext">$ sudo ./ecli run sigsnoop.wasm -p 1641
+    <pre data-file="eunomia-bpf/examples/bpftools/sigsnoop/README.md"><code class="language-plaintext">$ sudo ./ecli run sigsnoop.wasm -p 1641
 running and waiting for the ebpf events from perf event...
 {"pid":1641,"tpid":2368,"sig":23,"ret":0,"comm":"YDLive","sig_name":"SIGURG"}</code></pre>
 
@@ -1011,7 +1011,8 @@ running and waiting for the ebpf events from perf event...
     <p>The orb used for this curriculum runs Linux 6.1.189 on x86-64 with Debian clang 14.0.6 and has
       <code>/sys/kernel/btf/vmlinux</code>. We did not build the Rust workspaces; we downloaded the release binaries,
       which are small (v1.0.38: <code>ecc</code> 8,053,152 bytes, <code>ecli</code> 11,895,200 bytes). Both are
-      statically linked self-mounting executables (the CI packs them as AppImages with <code>cargo-appimage</code>).</p>
+      self-mounting AppImage executables that carry their own shared libraries, including a glibc (the CI packs them
+      with <code>cargo-appimage</code>). They are not statically linked, which matters below.</p>
     <pre><code class="language-bash"># from the README; aka.pw/bpf-ecli redirects to releases/latest/download/ecli
 wget https://github.com/eunomia-bpf/eunomia-bpf/releases/latest/download/ecli -O ecli &amp;&amp; chmod +x ./ecli
 wget https://github.com/eunomia-bpf/eunomia-bpf/releases/latest/download/ecc &amp;&amp; chmod +x ./ecc</code></pre>
@@ -1078,7 +1079,9 @@ INFO [bpf_loader_lib::skeleton] Running ebpf program...
           <code>ecc</code> compiles with <code>-D__TARGET_ARCH_&lt;build arch&gt;</code>, and
           <code>bpf_tracing.h</code> macros such as <code>PT_REGS_PARM1</code> for kprobes expand to architecture-specific
           register fields. A tracepoint-only tool like bootstrap is portable; a kprobe tool compiled on x86 reads x86
-          register names. The Wasm-bpf paper names this problem and describes extra relocation for it.</p></div>
+          register names. The Wasm-bpf paper names this problem and describes a CO-RE relocation pass for kprobe
+          <code>pt_regs</code> accesses; neither ecc nor the wasm-bpf runtime implements such a pass at the studied
+          commits (chapter <a href="12-wasm-bpf.html">12</a>).</p></div>
       <div class="card"><h4>Runner: per architecture</h4>
         <p><code>ecli</code> itself is native code. Releases ship <code>ecli</code> (x86-64) and
           <code>ecli-aarch64</code>. The package is portable; the runner is not.</p></div>

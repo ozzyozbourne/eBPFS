@@ -11,7 +11,7 @@
 <p class="lede">A chapter-wise guide: what the Berkeley Packet Filter and its extended form are, how they work
 inside the Linux kernel, and what every actively maintained <a href="https://github.com/eunomia-bpf">eunomia-bpf</a>
 project does, with diagrams, real code, papers and quizzes.</p>
-<div class="meta"><span>16 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
+<div class="meta"><span>23 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
 <h2>Part I · Foundations</h2>
 <div class="grid">
 <a class="card" href="chapters/01-what-is-bpf.html"><h4>01 · What is BPF? From packet filter to in-kernel VM</h4><p>How a 1993 packet filter became Linux&#x27;s safe in-kernel execution engine: classic BPF, seccomp-bpf, the 2014 eBPF rewrite, and a first hello world.</p></a>
@@ -36,5 +36,21 @@ project does, with diagrams, real code, papers and quizzes.</p>
 <a class="card" href="chapters/14-bpftime-architecture.html"><h4>14 · bpftime architecture: eBPF without the kernel round trip</h4><p>How bpftime runs unmodified eBPF tools in userspace: the LD_PRELOAD syscall server, shared-memory maps, the injected agent, inline-hook uprobes, zpoline-style syscall hooks, the VM and verifier options, kernel interop, and the OSDI &#x27;25 EIM paper.</p></a>
 <a class="card" href="chapters/15-bpftime-in-practice.html"><h4>15 · bpftime in practice: running eBPF tools in userspace</h4><p>How to install and drive bpftime: the load/start/attach/trace CLI, running unmodified libbpf tools (malloc, opensnoop, bashreadline, sslsniff, bpftrace) in userspace, bpftimetool, kernel-user mixed mode, CUDA kernel probes, XDP and nginx integrations, the repo&#x27;s own benchmark numbers, and the current limits.</p></a>
 <a class="card" href="chapters/16-llvmbpf.html"><h4>16 · llvmbpf: an LLVM JIT/AOT Compiler for eBPF</h4><p>How llvmbpf lifts eBPF bytecode to LLVM IR instruction by instruction, JIT-compiles it with ORC, AOT-compiles it to native ELF objects, emits PTX and SPIR-V for GPUs, and serves as bpftime&#x27;s default VM backend.</p></a>
+</div>
+<h2>Part IV · Verifier, correctness and performance</h2>
+<div class="grid">
+<a class="card" href="chapters/17-bpfix.html"><h4>17 · bpfix: explaining and fixing verifier errors</h4><p>How bpfix turns a raw eBPF verifier log into a Rust-style diagnostic by reconstructing where the required proof was established and lost, how its 235-case empirical corpus and 75-task LLM repair benchmark were built, and what the measured repair gains are.</p></a>
+<a class="card" href="chapters/18-ebpf-correctness-verifier.html"><h4>18 · ebpf-correctness-verifier: Translation Validation for eBPF Rewrites</h4><p>How ebpf-tv checks that a rewritten eBPF object behaves like the original: translation validation, the K2-derived Z3 encoding of registers, memory, maps and helpers, the PASS/FAIL/UNKNOWN contract, a real test run, and measured gaps in the model.</p></a>
+<a class="card" href="chapters/19-bpf-benchmark.html"><h4>19 · bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization</h4><p>How bpf-benchmark turns eBPF optimization into a closed-loop search for LLM agents over real applications, how its kinsn (BPF-Ext) modules give the kernel JIT verified native operations, how the bpfopt shim rewrites loaded bytecode on a stock kernel, and how bpfperf attributes LBR branch samples to BPF program counters.</p></a>
+</div>
+<h2>Part V · eBPF for GPUs and accelerators</h2>
+<div class="grid">
+<a class="card" href="chapters/20-gpu-ext.html"><h4>20 · gpu_ext: eBPF policies inside the GPU driver</h4><p>How gpu_ext adds struct_ops hooks and kfuncs to NVIDIA&#x27;s open UVM and RM driver so eBPF programs can choose GPU page prefetching, chunk eviction order and TSG timeslices, how its request-then-validate model keeps the driver in charge, how the device-side half (from eGPU, now in bpftime) runs eBPF inside CUDA kernels, and what the ASPLOS &#x27;27 paper and its artifact actually show.</p></a>
+<a class="card" href="chapters/21-nccl-ebpf.html"><h4>21 · NCCLbpf: verified eBPF policies inside NCCL</h4><p>How NCCLbpf runs verified eBPF policies inside NCCL&#x27;s tuner, profiler and net plugins through bpftime, how a policy picks algorithm, protocol and channels for each collective, and why a load-time check must stop policies that let ranks disagree.</p></a>
+<a class="card" href="chapters/22-xpu-perf.html"><h4>22 · xpu-perf: one flame graph for CPU and GPU</h4><p>Profiling fundamentals (sampling, stack unwinding, symbolization, flame graphs), then how xpu-perf combines perf_event eBPF sampling from a fork of the OpenTelemetry eBPF profiler with a CUPTI injection library and a correlation-ID uprobe to draw CPU stacks and GPU kernel time in one flame graph, plus how it compares with Parca, Pyroscope, iaprof and Nsight.</p></a>
+</div>
+<h2>Part VI · eBPF for AI agents</h2>
+<div class="grid">
+<a class="card" href="chapters/24-actplane.html"><h4>24 · ActPlane: information-flow enforcement for AI agents</h4><p>How ActPlane compiles a small information-flow policy language into an eBPF/BPF-LSM engine that tracks labels across an agent&#x27;s processes, files and sockets, and blocks, kills or explains rule violations.</p></a>
 </div>
 </main></div></body></html>

@@ -1,0 +1,1459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · bpfix: explaining and fixing verifier errors · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="17">
+<meta name="chapter-part" content="Part IV · Verifier, correctness and performance">
+<meta name="chapter-summary" content="How bpfix turns a raw eBPF verifier log into a Rust-style diagnostic by reconstructing where the required proof was established and lost, how its 235-case empirical corpus and 75-task LLM repair benchmark were built, and what the measured repair gains are.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpfix">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part IV · Verifier, correctness and performance › 17 · bpfix</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 17</div>
+      <h1>bpfix: explaining and fixing verifier errors</h1>
+      <p class="lede">When the eBPF verifier rejects a program, it reports the instruction where
+      it gave up, not the place where your program lost the fact it needed. bpfix reads the
+      verifier log you already have and rebuilds that story: which proof the verifier required,
+      where the proof was established, where it was lost, and what to change. It prints the result
+      as a Rust-style diagnostic. The same project ships a benchmark that measures whether that
+      diagnostic helps an LLM repair the program.</p>
+      <div class="meta"><span>Prerequisites: <a href="03-verifier.html">03 · verifier</a>, <a href="06-btf-core-libbpf.html">06 · BTF and libbpf</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/bpfix">eunomia-bpf/bpfix</a> at <code>4b9decaa</code> (v0.1.10)</span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p><a href="03-verifier.html">Chapter 03</a> explained how the verifier walks every path
+    through a program and tracks an abstract state for each register: a pointer type such as
+    <code>pkt</code> or <code>map_value_or_null</code>, a known offset, a range of possible
+    scalar values. If an instruction can't be proven safe from that state, the load fails, and
+    with <code>log_level=2</code> the kernel hands back a trace of every state it visited. The last
+    line is the <em>terminal error</em>, for example <code>R5 invalid mem access 'scalar'</code>.</p>
+
+    <p>The terminal error is accurate, but it is a symptom. It names the operation that needed a
+    proof (a load through <code>r5</code>) and the state that fell short (<code>r5</code> is a
+    plain number, not a packet pointer). It does not say <em>why</em> <code>r5</code> is a number at
+    that point, or which source line made it so. To find out, the developer reads the trace backwards
+    through branch points, register copies and spills, and matches instruction numbers to C lines by
+    hand. Experienced eBPF developers learn to do this. Everyone else, including LLM coding agents,
+    tends to guess: add another bounds check, cast something, try <code>-O1</code>.</p>
+
+    <p>bpfix's authors measured how big that gap is. In their study of 235 reproduced
+    rejections, 47% of rejections came back with the same errno, <code>EINVAL</code>. After
+    normalising registers and offsets, one terminal message, <code>R# invalid mem access
+    'scalar'</code>, covered 28 cases spread over nine different root causes
+    (<code>paper/sections/2-empirical-study.tex</code>, table <code>tab:fanout</code>). So the
+    message alone can't tell you which fix applies.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>A verifier rejection is a
+    missing proof. bpfix treats it as such: it maps the terminal error to a <em>required proof</em>
+    ("R1 must have packet range ≥ 14 bytes", "R5 must still be a packet pointer"), then searches the
+    logged abstract states for the instruction where that proof first held (<em>established</em>)
+    and the instruction where it stopped holding (<em>lost</em>). The gap between the loss point and
+    the rejection point is what a raw log leaves you to find by hand.</p></div>
+
+    <h2>What bpfix is, and what it is not</h2>
+    <p>The repository (created March 2026, MIT licensed, about 475 commits on <code>master</code>
+    when this chapter was written) contains four things that are easy to mix up:</p>
+
+    <div class="grid">
+      <div class="card"><h4><code>bpfix</code> CLI</h4><p>A Rust command-line tool (<code>crates/bpfix</code> on top of the
+      <code>crates/bpfanalysis</code> library) that reads a verifier, bpftool, libbpf, Aya or BCC log
+      and prints one plain-text diagnostic. Published on crates.io; v0.1.10 at the time of
+      writing.</p></div>
+      <div class="card"><h4>bpfix-empirical</h4><p>A corpus of 235 real verifier rejections from Stack Overflow, GitHub
+      issues, fix commits and kernel selftests, each rebuilt and replayed on one pinned
+      kernel/toolchain, with a hand-adjudicated label.</p></div>
+      <div class="card"><h4>bpfix-bench</h4><p>A frozen 75-task <em>LLM repair</em> benchmark. Each task has a
+      rejected C file, its raw log, the bpfix diagnostic, a reference fix and an executable oracle.
+      This is where "let an LLM fix it" is measured.</p></div>
+      <div class="card"><h4>Agent skill</h4><p><code>skills/ebpf-verifier-repair/</code>: a portable instruction
+      pack for coding agents (Codex, Claude Code, Copilot) that describes a repair workflow. It can
+      use bpfix output but does not require it.</p></div>
+    </div>
+
+    <p>The README lists explicit non-goals. bpfix is not a kernel patch, not a verifier
+    replacement, "not an automatic source-code repair tool", and not a checker for programs the
+    verifier accepts. The CLI never edits your code and never calls a model. Repair happens
+    elsewhere: in the benchmark runner, in the agent skill, or in your editor. The project tagline
+    ("let LLM fix it") refers to that loop, and the benchmark exists to test whether a better
+    diagnostic makes the loop succeed more often.</p>
+
+    <h2>Before and after: one real rejection</h2>
+    <p>The README's running example is Stack Overflow question 53136145, an XDP parser that
+    handles both IPv4 and IPv6. The source looks correct. It bounds-checks each header against
+    <code>data_end</code> and checks the UDP header before reading it:</p>
+
+    <pre data-file="bpfix-empirical/cases/stackoverflow-53136145/prog.c"><code class="language-c">    ethertype = __constant_ntohs(eth-&gt;h_proto);
+    if (ethertype == ETH_P_IP) {
+        ipv4_hdr = (void *)eth + ETH_HLEN;
+        if ((void *)(ipv4_hdr + 1) &gt; data_end)
+            return 1;
+        key-&gt;dst_ip.addr = ipv4_hdr-&gt;daddr;
+    } else if (ethertype == ETH_P_IPV6) {
+        ipv6_hdr = (void *)eth + ETH_HLEN;
+        if ((void *)(ipv6_hdr + 1) &gt; data_end)
+            return 1;
+        key-&gt;dst_ip.addr = 0;
+    } else {
+        return 2;
+    }
+
+    if (ipv4_hdr)
+        udph = (void *)ipv4_hdr + sizeof(*ipv4_hdr);
+    else
+        udph = (void *)ipv6_hdr + sizeof(*ipv6_hdr);
+    if (udph + sizeof(struct udphdr) &gt; data_end)
+        return 1;
+
+    dst_port = __constant_ntohs(((struct udphdr *)udph)-&gt;dest);</code></pre>
+
+    <p>The verifier still rejects it. The tabs below show the raw log tail, the bpfix output from
+    the same log, and the output when I loaded the same object on this orb's older kernel.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Raw verifier log (kernel 6.15)">
+<pre data-file="bpfix-empirical/cases/stackoverflow-53136145/replay-verifier.log (restored from empirical-fixtures.tar.gz)"><code class="language-plaintext">; if (ipv4_hdr) @ prog.c:263
+30: (07) r5 += 40                     ; R5_w=40
+31: (15) if r3 == 0x0 goto pc+2       ; R3=pkt(off=14,r=34)
+32: (07) r3 += 20                     ; R3_w=pkt(off=34,r=34)
+33: (bf) r5 = r3                      ; R3=pkt(off=34,r=34) R5=pkt(off=34,r=34)
+/* ... the fall-through path reaches pc 37 safely, then: ... */
+from 31 to 34: R0=map_value(map=globals_map,ks=4,vs=4) R1_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R2=pkt_end() R3=pkt(off=14,r=34) R4=pkt(off=34,r=34) R5_w=40 R6=1 R7=ctx() R8=1 R10=fp0 fp-8=0000????
+; if (udph + sizeof(struct udphdr) &gt; data_end) @ prog.c:267
+34: (bf) r3 = r5                      ; R3_w=40 R5_w=40
+35: (07) r3 += 8                      ; R3=48
+36: (2d) if r3 &gt; r2 goto pc+4         ; R2=pkt_end() R3=48
+; dst_port = __constant_ntohs(((struct udphdr *)udph)-&gt;dest); @ prog.c:270
+37: (69) r2 = *(u16 *)(r5 +2)
+R5 invalid mem access 'scalar'
+verification time 246 usec
+stack depth 8
+processed 68 insns (limit 1000000) max_states_per_insn 1 total_states 7 peak_states 7 mark_read 5
+-- END PROG LOAD LOG --
+libbpf: prog 'entry_point': failed to load: -EACCES</code></pre>
+      </div>
+      <div class="tab-panel" data-label="bpfix output (same log)">
+<pre><code class="language-plaintext">$ bpfix replay-verifier.log
+error[BPFIX-E006]: verifier-visible compiler lowering hides the required proof
+  = class: lowering_artifact
+  = confidence: medium
+  = diagnostic: supported, help: repair_hint, span: exact_pc
+  = next action: provenance
+  --&gt; prog.c:270
+   |
+263 | if (ipv4_hdr)
+    | ------------- nearby source context for pointer provenance
+267 | if (udph + sizeof(struct udphdr) &gt; data_end)
+    | -------------------------------------------- verifier state changes from pkt to scalar before the rejected access
+270 | dst_port = __constant_ntohs(((struct udphdr *)udph)-&gt;dest);
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rejected here: verifier sees a scalar where a pointer is required
+   |
+   = verifier[229]: R5 invalid mem access 'scalar'
+   = note: nearest BPF instruction pc 37
+   = note: parsed 60 verifier state snapshots
+   = note[lowering]: compiler-lowered control flow hides an established packet-pointer proof
+   = required proof: preserve a verifier-recognized pointer type at the operation that requires a pointer
+help: Reacquire a verifier-tracked pointer before the rejected dereference.
+help: Use the packet pointer that received the data_end proof, or rederive and recheck it before the load.
+help: Keep the final access on a verifier-tracked pointer; rederive it from a checked base after scalar work.</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Same object on Linux 6.1 (this orb)">
+<pre><code class="language-plaintext">$ sudo bpftool -d prog load examples/bpftool/quick-start.bpf.o /sys/fs/bpf/bpfix17-demo 2&gt;&amp;1 &gt; qs.log
+$ bpfix qs.log
+error[BPFIX-E006]: verifier-visible compiler lowering hides the required proof
+  = class: lowering_artifact
+  = confidence: medium
+  = diagnostic: supported, help: repair_hint, span: exact_pc
+  = next action: provenance
+  --&gt; &lt;verifier-log&gt;:180
+   |
+   |
+   = verifier[180]: R5 invalid mem access 'scalar'
+   = note: nearest BPF instruction pc 37
+   = note: parsed 60 verifier state snapshots
+   = note[lowering]: one verifier path reaches this shared instruction with a valid pointer proof, but another path reaches it after the proof is clobbered
+   = required proof: preserve a verifier-recognized pointer type at the operation that requires a pointer
+help: Reacquire a verifier-tracked pointer before the rejected dereference.
+help: Keep the checked pointer use on the path where the pointer proof is established, or split the shared instruction so the clobbered path cannot reach it.
+help: Keep the final access on a verifier-tracked pointer; rederive it from a checked base after scalar work.</code></pre>
+      </div>
+    </div>
+
+    <p>The first two tabs come from the 6.15 replay log shipped in the repository. I reproduced
+    the second tab byte for byte by running a locally built bpfix 0.1.10 on that log. The third tab
+    is my own run: I loaded the repo's <code>examples/bpftool/quick-start.bpf.o</code> (the same
+    object) on Linux 6.1 with bpftool v7.1.0 and passed the log to the same binary.</p>
+
+    <p>Here is what happened, read from the log. clang lowered the <code>if (ipv4_hdr) … else …</code>
+    into straight-line code. At pc 23 it set <code>r5 = 0</code> (the still-NULL <code>ipv6_hdr</code>).
+    At pc 30 it computed <code>r5 += 40</code>, which is <code>ipv6_hdr + sizeof(struct ipv6hdr)</code>.
+    At pc 31 it tested <code>ipv4_hdr</code> and, if non-NULL, replaced <code>r5</code> with the
+    real packet pointer. The verifier does not conclude that a packet pointer compared with zero
+    is non-NULL, so it also explores the jump "from 31 to 34". On that path <code>r5</code> is the
+    number 40. The <code>data_end</code> check at pc 36 then compares a number, which proves nothing
+    about memory, and the load at pc 37 is rejected. The program is safe at run time. The rejection
+    comes from compiler lowering combined with verifier precision. This is why the paper's
+    lowering-artifact table lists the upstream fix as "rederive the UDP pointer in each checked
+    branch" (<code>paper/tables/sec-5-lowering.tex</code>).</p>
+
+    <div class="callout warn"><span class="label">Kernel version matters for source spans</span>
+    <p>The third tab has no source lines. bpfix does not read DWARF or BTF from the object in its
+    default mode. It takes source locations from the comments the verifier writes into the log
+    using the program's BTF line info. Since Linux 6.9, <code>verbose_linfo()</code> in
+    <code>kernel/bpf/log.c</code> ends each comment with <code>" @ file:line"</code>. Linux 6.8 and
+    earlier print only the source text (on 6.1 the code is in <code>verifier.c</code> and prints
+    <code>"%s\n"</code>). bpfix's <code>parse_source_comment()</code> needs that suffix. On an older
+    kernel you still get the error ID, class, required proof and help, but the location is a line
+    in the log rather than in your C file.</p></div>
+
+    <h2>The empirical study behind it</h2>
+    <p>bpfix's design comes from a dataset, so it is worth knowing how the dataset was built.
+    <code>bpfix-empirical/</code> is the replayable corpus, and the paper draft in the
+    <code>paper/</code> submodule describes how it was collected.</p>
+
+    <h3>How the 235 cases were collected</h3>
+    <p>The authors gathered 936 candidate reports from four places: Stack Overflow questions,
+    GitHub issues, GitHub fix commits (Cilium, Aya, bcc, libbpf and others) and Linux kernel
+    selftests. Each candidate was rebuilt and loaded on one pinned environment
+    (<code>bpfix-empirical/environment.yaml</code>: kernel 6.15.11, clang 18.1.3, bpftool v7.7.0,
+    verifier log level 2). A candidate entered the corpus only if it rebuilt, loaded, was rejected
+    by the local verifier, and could be parsed again by the validator. 235 of the 936 qualified.
+    The paper's outcome table explains the rest:</p>
+
+    <table>
+      <thead><tr><th>Outcome for the 936 candidates</th><th>Count</th></tr></thead>
+      <tbody>
+        <tr><td>Reproduced and admitted</td><td>235</td></tr>
+        <tr><td>Not a verifier error</td><td>262</td></tr>
+        <tr><td>Needs a specific environment</td><td>197</td></tr>
+        <tr><td>Selftest candidate not admitted</td><td>115</td></tr>
+        <tr><td>Not reconstructable from a diff</td><td>45</td></tr>
+        <tr><td>Reproduced but accepted</td><td>32</td></tr>
+        <tr><td>Missing source</td><td>31</td></tr>
+        <tr><td>Missing verifier log</td><td>15</td></tr>
+        <tr><td>Rejected without a reported instruction</td><td>4</td></tr>
+      </tbody>
+    </table>
+    <p>Source: <code>paper/tables/sec-2-corpus-outcomes.tex</code>. The admitted cases break down
+    as 86 Stack Overflow, 85 kernel selftest, 46 GitHub commit and 18 GitHub issue
+    (<code>bpfix-empirical/README.md</code>). Raw material that did not make it in (736 external
+    records plus 201 selftest log fixtures) is kept under <code>bpfix-empirical/raw/</code> for
+    audit. Each case directory holds <code>prog.c</code>, a <code>Makefile</code> whose
+    <code>replay-verify</code> target loads the program, a <code>capture.yaml</code>, and a
+    <code>case.yaml</code> with the label. Compiled objects and replay logs are packed into
+    <code>empirical-fixtures.tar.gz</code> and restored with
+    <code>scripts/restore-empirical-fixtures.sh</code>.</p>
+
+    <h3>The five-class taxonomy</h3>
+    <p>Every case gets exactly one primary class. The rule in
+    <code>bpfix-empirical/taxonomy.yaml</code> is: "ask which layer must change to make the
+    failure disappear". The classes are checked in a fixed order: verifier false positive first,
+    then environment, verifier limit, lowering artifact, and finally source bug.</p>
+    <table>
+      <thead><tr><th>Class</th><th>Meaning</th><th>Cases</th></tr></thead>
+      <tbody>
+        <tr><td><code>source_bug</code></td><td>The program really lacks a proof the verifier rightly demands</td><td>191</td></tr>
+        <tr><td><code>lowering_artifact</code></td><td>Source intent is fine; clang emitted verifier-hostile bytecode</td><td>18</td></tr>
+        <tr><td><code>environment_or_configuration</code></td><td>Wrong kernel, program type, helper availability, privileges or BTF</td><td>14</td></tr>
+        <tr><td><code>verifier_false_positive</code></td><td>Safe program the verifier can't prove (later fixed in the verifier)</td><td>7</td></tr>
+        <tr><td><code>verifier_limit</code></td><td>Complexity, state or loop budget exceeded</td><td>5</td></tr>
+      </tbody>
+    </table>
+    <p>The paper groups these four ways (developer 191, compiler 18, environment 14, verifier 12)
+    and splits the 191 developer bugs into 12 root causes. The largest are unclamped scalars used as
+    an offset or length (24), corrupted or stale dynptrs (23), packet access without a bound on
+    every path (22), and missing NULL checks (19). It counts 10 of the 12 root causes as
+    eBPF-specific (<code>paper/tables/sec-2-mechanisms.tex</code>). The case file for the running
+    example records the label and the adjudicated root cause:</p>
+
+    <pre data-file="bpfix-empirical/cases/stackoverflow-53136145/case.yaml"><code class="language-yaml">label:
+  capture_id: stackoverflow-53136145__kernel-6.15.11-clang-18-log2
+  taxonomy_class: lowering_artifact
+  mechanism_tags:
+  - packet_bounds
+  - pointer_provenance
+  /* ... */
+  error_id: BPFIX-E006
+  confidence: low
+  label_source: adjudicated
+  root_cause_description: The parser builds `udph` by merging either the IPv4 or IPv6 header
+    branch into one pointer, and the lowered code loses the packet provenance for that merged
+    pointer before the `udph-&gt;dest` load, leaving `R0` as `inv` at the access site.
+  /* ... */
+  fix_direction: Keep the IPv4 and IPv6 UDP-pointer derivations in separate verifier-visible
+    branches, or rederive the UDP pointer from a checked base immediately before dereferencing
+    it.</code></pre>
+
+    <h3>Why the terminal message is too coarse</h3>
+    <p>To measure how ambiguous terminal messages are, the authors replaced register numbers and
+    offsets with placeholders. That collapsed 167 distinct strings into 82 templates. Fifteen
+    templates map to more than one root cause. The four most common:</p>
+    <table>
+      <thead><tr><th>Template</th><th>Cases</th><th>Distinct root causes</th></tr></thead>
+      <tbody>
+        <tr><td><code>R# invalid mem access 'scalar'</code></td><td>28</td><td>9</td></tr>
+        <tr><td><code>invalid access to packet</code></td><td>26</td><td>5</td></tr>
+        <tr><td><code>invalid access to map value</code></td><td>18</td><td>4</td></tr>
+        <tr><td><code>R# !read_ok</code></td><td>13</td><td>4</td></tr>
+      </tbody>
+    </table>
+    <p>Even the layer is ambiguous. Of the 28 <code>'scalar'</code> cases, 24 are source bugs and
+    4 are compiler-lowering artifacts whose upstream fix changed how the program was compiled
+    (<code>paper/tables/sec-3-rejection-classes.tex</code>, <code>sec-5-lowering.tex</code>). A
+    tool that matches only on the message string can't tell the two apart. It needs the state
+    history, and with <code>log_level=2</code> the verifier prints that history.</p>
+
+    <h2>How bpfix works</h2>
+    <p>The paper describes three stages: <em>log analysis</em>, <em>proof reconstruction</em> and
+    <em>diagnostic generation</em>. The code follows that split. <code>bpfanalysis</code> parses the
+    log into typed records, and the <code>bpfix</code> crate turns them into a required proof,
+    proof events and rendered text. The only required input is the log.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 400" role="img" aria-label="bpfix pipeline: log input, region extraction, terminal error, classifier, state parser, source comments, required proof, proof events, signals, renderer">
+        <style>
+          .f1-box{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .f1-hl{fill:var(--bg3);stroke:var(--accent);stroke-width:1.8}
+          .f1-hl2{fill:var(--bg3);stroke:var(--accent2);stroke-width:1.8}
+          .f1-t{fill:var(--fg);font:bold 13px sans-serif}
+          .f1-s{fill:var(--muted);font:11.5px sans-serif}
+          .f1-c{fill:var(--fg);font:11px monospace}
+          .f1-ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah171)}
+          .f1-band{fill:none;stroke:var(--border);stroke-dasharray:5 4}
+          .f1-lab{fill:var(--accent);font:bold 12px sans-serif}
+        </style>
+        <defs><marker id="ah171" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <rect class="f1-band" x="10" y="30" width="250" height="355" rx="10"/>
+        <text class="f1-lab" x="20" y="22">1 · Log analysis</text>
+        <rect class="f1-band" x="280" y="30" width="330" height="355" rx="10"/>
+        <text class="f1-lab" x="290" y="22">2 · Proof reconstruction</text>
+        <rect class="f1-band" x="630" y="30" width="260" height="355" rx="10"/>
+        <text class="f1-lab" x="640" y="22">3 · Diagnostic generation</text>
+
+        <rect class="f1-box" x="25" y="45" width="220" height="56" rx="8"/>
+        <text class="f1-t" x="35" y="66">Log text (file or stdin)</text>
+        <text class="f1-s" x="35" y="86">bpftool -d, libbpf, Aya, BCC, CI</text>
+        <rect class="f1-box" x="25" y="125" width="220" height="56" rx="8"/>
+        <text class="f1-t" x="35" y="146">load_input()</text>
+        <text class="f1-s" x="35" y="166">strip wrappers, keep last log</text>
+        <rect class="f1-box" x="25" y="205" width="220" height="56" rx="8"/>
+        <text class="f1-t" x="35" y="226">find_terminal_error()</text>
+        <text class="f1-s" x="35" y="246">message, pc, call target</text>
+        <rect class="f1-hl2" x="25" y="285" width="220" height="80" rx="8"/>
+        <text class="f1-t" x="35" y="306">bpfanalysis parser</text>
+        <text class="f1-c" x="35" y="326">VerifierInsn{pc, regs,</text>
+        <text class="f1-c" x="35" y="342">  stack, refs, frame}</text>
+        <text class="f1-s" x="35" y="358">+ "; src @ file:line" events</text>
+
+        <rect class="f1-box" x="295" y="45" width="300" height="56" rx="8"/>
+        <text class="f1-t" x="305" y="66">classify_with_context()</text>
+        <text class="f1-s" x="305" y="86">message patterns → BPFIX-E0xx + obligation</text>
+        <rect class="f1-hl" x="295" y="125" width="300" height="56" rx="8"/>
+        <text class="f1-t" x="305" y="146">instantiate_required_proof()</text>
+        <text class="f1-s" x="305" y="166">"R1 needs packet range ≥ 14, has 13"</text>
+        <rect class="f1-hl" x="295" y="205" width="300" height="70" rx="8"/>
+        <text class="f1-t" x="305" y="226">proof events</text>
+        <text class="f1-s" x="305" y="246">Established · Lost · Rejected</text>
+        <text class="f1-s" x="305" y="263">evidence: VerifierState / SourceComment</text>
+        <rect class="f1-box" x="295" y="295" width="300" height="70" rx="8"/>
+        <text class="f1-t" x="305" y="316">proof_signals()</text>
+        <text class="f1-s" x="305" y="336">73 signal kinds (lowering, dynptr,</text>
+        <text class="f1-s" x="305" y="352">IRQ, nullable…) may override class/help</text>
+
+        <rect class="f1-box" x="645" y="45" width="230" height="70" rx="8"/>
+        <text class="f1-t" x="655" y="66">build_diagnostic()</text>
+        <text class="f1-s" x="655" y="86">pick span, related spans,</text>
+        <text class="f1-s" x="655" y="102">span confidence, help list</text>
+        <rect class="f1-hl2" x="645" y="140" width="230" height="110" rx="8"/>
+        <text class="f1-t" x="655" y="161">render_text()</text>
+        <text class="f1-c" x="655" y="182">error[BPFIX-E006]: …</text>
+        <text class="f1-c" x="655" y="198">  --&gt; prog.c:270</text>
+        <text class="f1-c" x="655" y="214">267 | ---- lost here</text>
+        <text class="f1-c" x="655" y="230">270 | ^^^^ rejected</text>
+        <rect class="f1-box" x="645" y="275" width="230" height="90" rx="8"/>
+        <text class="f1-t" x="655" y="296">Consumers</text>
+        <text class="f1-s" x="655" y="316">developer · CI artifact</text>
+        <text class="f1-s" x="655" y="334">LLM prompt (bpfix-bench)</text>
+        <text class="f1-s" x="655" y="352">agent skill</text>
+
+        <path class="f1-ar" d="M135,101 V123"/>
+        <path class="f1-ar" d="M135,181 V203"/>
+        <path class="f1-ar" d="M135,261 V283"/>
+        <path class="f1-ar" d="M245,233 C270,233 270,73 293,73"/>
+        <path class="f1-ar" d="M445,101 V123"/>
+        <path class="f1-ar" d="M245,325 C270,325 270,240 293,240"/>
+        <path class="f1-ar" d="M445,181 V203"/>
+        <path class="f1-ar" d="M445,275 V293"/>
+        <path class="f1-ar" d="M595,330 C620,330 620,80 643,80"/>
+        <path class="f1-ar" d="M760,115 V138"/>
+        <path class="f1-ar" d="M760,250 V273"/>
+      </svg>
+      <figcaption>Figure 17.1 — The bpfix pipeline as implemented in <code>crates/bpfix/src/main.rs</code>
+      (<code>build_diagnostic</code>) and <code>diagnostic/analyzer.rs</code>. Only the log is
+      required. <code>--object prog.o</code> (behind the <code>object-analysis</code> Cargo feature) adds
+      CFG summaries from the compiled object.</figcaption>
+    </figure>
+
+    <h3>Stage 1a: find the rejection</h3>
+    <p>Real logs are messy. A <code>make</code> run prints compiler warnings, libbpf prints relocation
+    chatter, CI systems prefix timestamps, and some loaders retry and print several load logs.
+    <code>input.rs</code> normalises all of this. It strips ANSI escapes and ISO-8601 timestamp
+    prefixes, keeps the <em>last</em> <code>-- BEGIN PROG LOAD LOG --</code> region, and then scans
+    upward from the end for the first line that looks like a verifier error:</p>
+
+    <pre data-file="crates/bpfix/src/input.rs"><code class="language-rust">pub(crate) fn find_terminal_error(log: &amp;str) -&gt; Option&lt;TerminalError&gt; {
+    let lines = log.lines().collect::&lt;Vec&lt;_&gt;&gt;();
+    let mut idx = lines.len();
+    while idx &gt; 0 {
+        idx -= 1;
+        let line = lines[idx].trim();
+        if !is_verifier_error_line(line) {
+            continue;
+        }
+
+        let mut context_idx = idx;
+        let mut message_start = line;
+        while context_idx &gt; 0 {
+            let previous = lines[context_idx - 1].trim();
+            if !is_terminal_error_continuation(message_start, previous) {
+                break;
+            }
+            context_idx -= 1;
+            message_start = previous;
+        }
+        let message = lines[context_idx..=idx]
+            .iter()
+            .map(|line| line.trim())
+            .collect::&lt;Vec&lt;_&gt;&gt;()
+            .join("; ");
+        let pc = explicit_terminal_insn_pc(&amp;message)
+            .or_else(|| nearest_instruction_pc(&amp;lines, context_idx));
+        /* ... call_target, nearest_source_span ... */</code></pre>
+
+    <p><code>is_verifier_error_line()</code> in <code>bpfanalysis/src/verifier_log.rs</code> skips
+    libbpf lines, instruction lines, state lines and the <code>processed N insns</code> summary. It
+    accepts a line if it contains one of 54 lower-case markers (<code>"invalid "</code>,
+    <code>"unreleased reference"</code>, <code>"!read_ok"</code>, <code>"dynptr"</code>, …). Scanning
+    backwards matters. When I loaded a small tracepoint program of my own on 6.1, the log began with
+    an unrelated BTF complaint (<code>reg type unsupported for arg#0 function count_openat#17</code>)
+    long before the real rejection. Because bpfix searches from the end, it picked the real one.
+    Multi-line messages are joined with <code>"; "</code>. The packet case below shows
+    <code>invalid access to packet, off=12 size=2, R1(id=0,off=12,r=13); R1 offset is outside of the
+    packet</code>.</p>
+
+    <h3>Stage 1b: parse every abstract state</h3>
+    <p>The core of <code>bpfanalysis</code> is a line parser for the three shapes of state line
+    the verifier prints at log level 2. The module comment lists them:</p>
+
+    <pre data-file="crates/bpfanalysis/src/verifier_log.rs"><code class="language-rust">//! The verifier emits state snapshots in a few common forms:
+//! - `from &lt;prev&gt; to &lt;pc&gt;: R0=... R1=...`
+//! - `&lt;pc&gt;: R0=... R1=...`
+//! - `&lt;pc&gt;: (..insn..) ... ; R0=... R1=...`
+/* ... */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegState {
+    pub reg_type: String,
+    pub value_width: VerifierValueWidth,
+    pub precise: bool,
+    pub exact_value: Option&lt;u64&gt;,
+    pub tnum: Option&lt;Tnum&gt;,
+    pub range: ScalarRange,
+    pub packet_range: Option&lt;u32&gt;,
+    pub map_value_size: Option&lt;u32&gt;,
+    pub mem_size: Option&lt;u32&gt;,
+    pub offset: Option&lt;i32&gt;,
+    pub source_frame: Option&lt;usize&gt;,
+    pub id: Option&lt;u32&gt;,
+    pub ref_id: Option&lt;u32&gt;,
+}</code></pre>
+
+    <p>Each parsed line becomes a <code>VerifierInsn</code>: the PC, the log line it came from, the
+    call frame, an optional <code>from_pc</code> for branch states, and a map from register number
+    to <code>RegState</code>. Stack slots and live reference IDs are parsed too. The fields are the
+    same facts <a href="03-verifier.html#reading-the-state-in-a-log-line">chapter 03</a> taught you
+    to read by eye: <code>pkt(off=34,r=42)</code> becomes <code>reg_type = "pkt"</code>,
+    <code>offset = 34</code>, <code>packet_range = 42</code>, and
+    <code>scalar(umax=65535,var_off=(0x0; 0xffff))</code> becomes a <code>ScalarRange</code> plus a
+    <code>Tnum</code>. If a line looks like a state but doesn't parse, the parser fails with an error
+    and bpfix prints it as <code>= warning:</code> in the diagnostic. It does not skip the line
+    silently. The running example yields 60 snapshots on both kernels. Different kernel versions
+    print slightly different state syntax (for example <code>pkt(off=0,r=0,imm=0)</code> on 6.1 and
+    <code>pkt(r=0)</code> on 6.15), and the parser handles both.</p>
+
+    <h3>Stage 2a: classify the terminal message</h3>
+    <p>Classification is a table of substring patterns. It is intentionally simple and gives a
+    first guess that later stages can refine:</p>
+
+    <pre data-file="crates/bpfix/src/classifier.rs"><code class="language-rust">const REJECTION_PATTERNS: &amp;[RejectionPattern] = &amp;[
+    RejectionPattern::any(
+        VerifierRejectionKind::PacketBounds,
+        &amp;["invalid access to packet", "outside of the packet"],
+    ),
+    RejectionPattern::any(
+        VerifierRejectionKind::NullablePointer,
+        &amp;[
+            "map_value_or_null",
+            "ptr_or_null",
+            "mem_or_null",
+            "possibly null",
+        ],
+    ),
+    RejectionPattern::all(
+        VerifierRejectionKind::DynptrSafety,
+        &amp;["dynptr", "uninitialized"],
+    ),
+    /* ... StackInitialized, ReferenceLifecycle, Alignment, HelperArgument,
+           StructAccess, TypeContract, ... PointerProvenance, LoopBound, VerifierLimit ... */
+];</code></pre>
+
+    <p>Each kind maps to a stable error ID and a <code>ProofObligation</code>. The public catalog is
+    <code>docs/error-catalog.yaml</code>:</p>
+    <table>
+      <thead><tr><th>ID</th><th>Short name</th><th>Typical trigger</th></tr></thead>
+      <tbody>
+        <tr><td>E000</td><td>input_missing_verifier_rejection</td><td>No rejection in the input</td></tr>
+        <tr><td>E001</td><td>packet_bounds_missing</td><td><code>invalid access to packet</code></td></tr>
+        <tr><td>E002</td><td>nullable_pointer_unchecked</td><td><code>…'map_value_or_null'</code></td></tr>
+        <tr><td>E003</td><td>stack_or_register_uninitialized</td><td><code>!read_ok</code>, <code>invalid read from stack</code></td></tr>
+        <tr><td>E004</td><td>reference_lifecycle_violation</td><td><code>Unreleased reference</code></td></tr>
+        <tr><td>E005</td><td>scalar_or_map_value_range_missing</td><td>unbounded index, <code>invalid access to map value</code></td></tr>
+        <tr><td>E006</td><td>pointer_or_stack_region_proof_missing</td><td><code>invalid mem access 'scalar'</code></td></tr>
+        <tr><td>E007</td><td>alignment_proof_missing</td><td><code>misaligned</code></td></tr>
+        <tr><td>E008</td><td>verifier_type_contract_mismatch</td><td><code>R1 is of type … but … is expected</code></td></tr>
+        <tr><td>E009</td><td>environment_capability_unavailable</td><td>unknown func, helper not allowed for program type</td></tr>
+        <tr><td>E010</td><td>helper_or_subprogram_argument_contract</td><td><code>arg#</code>, invalid args</td></tr>
+        <tr><td>E011</td><td>invalid_pointer_or_context_access</td><td>bad context field, <code>access beyond struct</code></td></tr>
+        <tr><td>E012–E015</td><td>dynptr, kfunc, iterator, lock/RCU/IRQ protocols</td><td>modern BPF object lifecycles</td></tr>
+        <tr><td>E016</td><td>instruction_or_execution_context_unsupported</td><td>JIT/opcode support, sleepable calls</td></tr>
+        <tr><td>E018</td><td>loop_or_verifier_budget_limit</td><td><code>BPF program is too large</code>, back-edges</td></tr>
+      </tbody>
+    </table>
+    <p>A message that matches nothing gets <code>BPFIX-E099</code> (unsupported). The benchmark
+    gate <code>run-bpfix-eval.py --reject-fallback</code> fails if any of the 235 corpus cases
+    produces E000, E099 or an unknown ID. That gate is how the project shows coverage of its own
+    corpus.</p>
+
+    <h3>Stage 2b: instantiate the required proof</h3>
+    <p>A generic help text ("add a bounds check") is what developers already get from a quick web
+    search. bpfix tries to fill in the concrete parameters. For packet bounds it reads
+    <code>off</code>, <code>size</code> and <code>r</code> from the terminal message itself:</p>
+
+    <pre data-file="crates/bpfix/src/proof.rs"><code class="language-rust">fn packet_bounds_required_proof(message: &amp;str, register: Option&lt;u8&gt;) -&gt; RequiredProof {
+    let proven_range = parse_i64_after(message, "r=");
+    let required_end = packet_required_range(message).map(i64::from);
+    let description = match (register, required_end, proven_range) {
+        (Some(reg), Some(required), Some(range)) =&gt; format!(
+            "prove R{reg} has packet range at least {required} bytes before this access; verifier currently has range {range}"
+        ),
+        /* ... weaker variants when some parameters are missing ... */
+    };
+    /* ... rejection_detail built the same way ... */
+}
+
+pub(crate) fn packet_required_range(message: &amp;str) -&gt; Option&lt;u32&gt; {
+    let off = parse_i64_after(message, "off=")?;
+    let size = parse_i64_after(message, "size=")?;
+    u32::try_from(off.checked_add(size)?).ok()
+}</code></pre>
+
+    <p>For <code>invalid access to packet, off=12 size=2, R1(id=0,off=12,r=13)</code>, the required
+    end is 12 + 2 = 14 and the proven range is 13, so the diagnostic says "prove R1 has packet range
+    at least 14 bytes before this access; verifier currently has range 13". Other obligations have
+    similar instantiators for scalar ranges (from the register's logged bounds), nullable pointers,
+    stack initialisation, references, dynptrs and environment capability.</p>
+
+    <h3>Stage 2c: find where the proof was established and lost</h3>
+    <p>This is the step a raw log can't do for you. For each obligation, <code>proof_events.rs</code>
+    walks the parsed states and the source comments and emits <code>ProofEvent</code>s with a role
+    (<code>ProofEstablished</code>, <code>ProofLost</code> or <code>Rejected</code>) and an evidence
+    kind (<code>VerifierState</code>, <code>SourceComment</code> or <code>TerminalVerifier</code>).
+    The evidence kind records how strong the claim is. "The logged register type changed from
+    <code>pkt</code> to <code>scalar</code> at pc 34" is a fact read from the verifier's own output.
+    "There's an <code>if</code> on line 263 just above the rejected line" is a heuristic based on
+    source text. For pointer provenance, the state-based part is this function:</p>
+
+    <pre data-file="crates/bpfanalysis/src/verifier_log.rs"><code class="language-rust">pub fn reg_state_is_pointer_like(state: &amp;RegState) -&gt; bool {
+    state.reg_type != "scalar" &amp;&amp; state.reg_type != "fp"
+}
+
+pub fn latest_pointer_to_scalar_transition(
+    states: &amp;[VerifierInsn],
+    terminal_pc: Option&lt;usize&gt;,
+    reg: u8,
+) -&gt; Option&lt;(usize, String)&gt; {
+    let mut latest_pointer: Option&lt;(usize, String)&gt; = None;
+    let mut latest_loss = None;
+    for state in states {
+        if terminal_pc.is_some_and(|pc| state.pc &gt; pc) {
+            continue;
+        }
+        let Some(reg_state) = state.regs.get(&amp;reg) else {
+            continue;
+        };
+        if reg_state_is_pointer_like(reg_state) {
+            latest_pointer = Some((state.pc, reg_state.reg_type.clone()));
+        } else if reg_state.reg_type == "scalar" {
+            if let Some((_, pointer_kind)) = latest_pointer.as_ref() {
+                latest_loss = Some((state.pc, pointer_kind.clone()));
+            }
+        }
+    }
+    latest_loss
+}</code></pre>
+
+    <p>The register to track comes from the terminal message (<code>R5</code>). Across the 60
+    snapshots, <code>R5</code> is <code>pkt(off=34,r=34)</code> on the fall-through path at pc 33
+    and pc 34, and the number <code>40</code> in the <code>from 31 to 34</code> state. The last
+    pointer-to-scalar change before pc 37 is at pc 34, which bpfix reports as the loss point. Through
+    the source comments, pc 34 maps to line 267, the <code>data_end</code> check. That is the
+    secondary label "verifier state changes from pkt to scalar before the rejected access" in the
+    "after" tab. Figure 17.2 shows the whole lifecycle.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 330" role="img" aria-label="Proof lifecycle of R5 across pcs 30 to 37 on two verifier paths">
+        <style>
+          .f2-ok{fill:color-mix(in srgb,var(--accent2) 25%,var(--bg3));stroke:var(--accent2);stroke-width:1.5}
+          .f2-bad{fill:color-mix(in srgb,var(--accent) 25%,var(--bg3));stroke:var(--accent);stroke-width:1.5}
+          .f2-n{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .f2-t{fill:var(--fg);font:12px monospace}
+          .f2-h{fill:var(--fg);font:bold 13px sans-serif}
+          .f2-s{fill:var(--muted);font:11.5px sans-serif}
+          .f2-ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah172)}
+          .f2-ar2{stroke:var(--accent);stroke-width:1.8;fill:none;stroke-dasharray:6 4;marker-end:url(#ah172)}
+        </style>
+        <defs><marker id="ah172" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <text class="f2-h" x="20" y="24">Path A (fall-through at pc 31): proof established and kept</text>
+        <rect class="f2-n" x="20" y="40" width="150" height="52" rx="6"/>
+        <text class="f2-t" x="30" y="62">30: r5 += 40</text>
+        <text class="f2-s" x="30" y="80">R5 = 40 (scalar)</text>
+        <rect class="f2-n" x="195" y="40" width="160" height="52" rx="6"/>
+        <text class="f2-t" x="205" y="62">31: if r3 == 0</text>
+        <text class="f2-s" x="205" y="80">R3 = pkt(off=14)</text>
+        <rect class="f2-ok" x="380" y="40" width="160" height="52" rx="6"/>
+        <text class="f2-t" x="390" y="62">33: r5 = r3</text>
+        <text class="f2-s" x="390" y="80">R5 = pkt(off=34) ✓</text>
+        <rect class="f2-ok" x="565" y="40" width="150" height="52" rx="6"/>
+        <text class="f2-t" x="575" y="62">36: if r3 &gt; r2</text>
+        <text class="f2-s" x="575" y="80">R5 = pkt(off=34,r=42)</text>
+        <rect class="f2-ok" x="740" y="40" width="140" height="52" rx="6"/>
+        <text class="f2-t" x="750" y="62">37: load r5+2</text>
+        <text class="f2-s" x="750" y="80">safe</text>
+        <path class="f2-ar" d="M170,66 H193"/><path class="f2-ar" d="M355,66 H378"/>
+        <path class="f2-ar" d="M540,66 H563"/><path class="f2-ar" d="M715,66 H738"/>
+
+        <text class="f2-h" x="380" y="152">Path B ("from 31 to 34"): the proof never arrives</text>
+        <rect class="f2-bad" x="380" y="166" width="160" height="52" rx="6"/>
+        <text class="f2-t" x="390" y="188">34: r3 = r5</text>
+        <text class="f2-s" x="390" y="206">R5 = 40 ✗ (scalar)</text>
+        <rect class="f2-n" x="565" y="166" width="150" height="52" rx="6"/>
+        <text class="f2-t" x="575" y="188">36: if r3 &gt; r2</text>
+        <text class="f2-s" x="575" y="206">compares a number</text>
+        <rect class="f2-bad" x="740" y="166" width="140" height="52" rx="6"/>
+        <text class="f2-t" x="750" y="188">37: load r5+2</text>
+        <text class="f2-s" x="750" y="206">rejected: 'scalar'</text>
+        <path class="f2-ar2" d="M275,92 C275,150 330,192 378,192"/>
+        <path class="f2-ar" d="M540,192 H563"/><path class="f2-ar" d="M715,192 H738"/>
+
+        <text class="f2-s" x="20" y="255">Source mapping via "; … @ prog.c:N" comments:</text>
+        <text class="f2-t" x="20" y="275">pc 30–33 → prog.c:263  if (ipv4_hdr)</text>
+        <text class="f2-t" x="20" y="293">pc 34–36 → prog.c:267  if (udph + sizeof(struct udphdr) &gt; data_end)   ← loss point</text>
+        <text class="f2-t" x="20" y="311">pc 37    → prog.c:270  dst_port = … udph-&gt;dest                         ← rejection</text>
+      </svg>
+      <figcaption>Figure 17.2 — The proof lifecycle bpfix reconstructs for the running example. The
+      verifier explores both outcomes of the NULL test at pc 31. On path B, <code>r5</code> still holds
+      the scalar <code>ipv6_hdr + 40</code> computed at pc 30, so the later <code>data_end</code> check
+      proves nothing about memory. PCs and states are copied from the 6.15 replay log.</figcaption>
+    </figure>
+
+    <p>The source-comment heuristics fill in context around this. For pointer provenance, the
+    nearest earlier <code>if (</code> that doesn't mention <code>data_end</code> is labelled as
+    "nearby source context" (line 263), and the nearest <code>data_end</code> check is a candidate
+    establishment site. For packet bounds, bpfix looks for the latest state where the verifier
+    had proved enough packet range, and then for the point where that range disappeared. Similar
+    procedures exist for scalar ranges, nullable pointers, stack initialisation, references and
+    environment capability.</p>
+
+    <h3>Stage 2d: map PCs to source lines</h3>
+    <p>Source mapping is short code, and you need to understand it to know when it fails:</p>
+
+    <pre data-file="crates/bpfix/src/source.rs"><code class="language-rust">pub(crate) fn collect_source_events(log: &amp;str) -&gt; Vec&lt;SourceEvent&gt; {
+    let lines = log.lines().collect::&lt;Vec&lt;_&gt;&gt;();
+    let mut events = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(source) = parse_source_comment(line) else {
+            continue;
+        };
+        let pc = lines
+            .iter()
+            .skip(idx + 1)
+            .take(4)
+            .find_map(|next| parse_instruction_pc(next));
+        events.push(SourceEvent {
+            pc,
+            log_line: idx + 1,
+            source,
+        });
+    }
+    events
+}
+
+pub(crate) fn parse_source_comment(line: &amp;str) -&gt; Option&lt;SourceLocation&gt; {
+    let (source, tail) = line.rsplit_once(" @ ")?;
+    let (path, line_no) = tail.trim().rsplit_once(':')?;
+    Some(SourceLocation {
+        path: path.to_string(),
+        line: line_no.parse().ok()?,
+        text: source.trim().trim_start_matches(';').trim().to_string(),
+    })
+}</code></pre>
+
+    <p>The kernel writes these comments from the program's BTF line info (<code>.BTF.ext</code>,
+    produced when you compile with <code>-g</code>; see <a href="06-btf-core-libbpf.html">chapter
+    06</a>). A comment is bound to the first instruction PC printed within the next four log lines,
+    and any PC maps to the latest comment at or before it. This is the "BTF line info" route to source
+    mapping. bpfix does not read the object's DWARF and does not do its own line-table lookup in the
+    default build. Here is the kernel side that makes it possible:</p>
+
+    <pre data-file="linux: kernel/bpf/log.c (tag v6.9, verbose_linfo)"><code class="language-c">	btf = env-&gt;prog-&gt;aux-&gt;btf;
+	s = ltrim(btf_name_by_offset(btf, linfo-&gt;line_off));
+	verbose(env, "%s", s); /* source code line */
+
+	s = btf_name_by_offset(btf, linfo-&gt;file_name_off);
+	/* leave only file name */
+	fname = strrchr(s, '/');
+	fname = fname ? fname + 1 : s;
+	verbose(env, " @ %s:%u\n", fname, BPF_LINE_INFO_LINE_NUM(linfo-&gt;line_col));</code></pre>
+
+    <p>Two practical consequences follow. First, compile with <code>-g</code>, or there's no line
+    info at all. Second, on kernels before 6.9 the comments have no <code>@ file:line</code>, so
+    <code>parse_source_comment</code> returns <code>None</code> for every line and you get the
+    <code>&lt;verifier-log&gt;:N</code> fallback seen in the 6.1 tab. The 6.15 log also contains
+    an empty <code>;  @ prog.c:0</code> comment for compiler-generated instructions. One of the open
+    pull requests (#9, October 2026) teaches bpfix to ignore it.</p>
+
+    <h3>Stage 3: signals, spans and rendering</h3>
+    <p>After the generic events, <code>signal_pipeline.rs</code> runs a long list of named
+    predicates. Each looks for one specific mechanism: <code>SharedInstructionPointerMerge</code>,
+    <code>PointerShiftDropsProvenance</code>, <code>DynptrStackSlotWriteOverlap</code>,
+    <code>IrqRestoreOrderMismatch</code>, <code>NullablePointerUseWithoutProof</code>,
+    <code>SleepableCallInNonSleepableContext</code>, and so on. A matching signal can replace the
+    classifier's class, title, required proof and help. This is how the running example goes from
+    the classifier's <code>source_bug</code> guess for <code>'scalar'</code> to
+    <code>lowering_artifact</code>. Which signal fires depends on the available evidence. With
+    source comments (6.15), the packet-pointer signal fired ("compiler-lowered control flow hides an
+    established packet-pointer proof"). Without them (6.1), a different, state-only signal fired
+    ("one verifier path reaches this shared instruction with a valid pointer proof, but another path
+    reaches it after the proof is clobbered"). Both reached the same class.</p>
+
+    <p>The header line <code>span:</code> reports how trustworthy the location is:</p>
+
+    <pre data-file="crates/bpfix/src/main.rs"><code class="language-rust">fn span_confidence(
+    source_span: &amp;SourceSpan,
+    related_spans: &amp;[RelatedSpan],
+    proof_events: &amp;[diagnostic::ProofEvent],
+) -&gt; &amp;'static str {
+    let has_non_source_comment_pc = proof_events
+        .iter()
+        .any(|event| event.pc.is_some() &amp;&amp; event.evidence != ProofEventEvidence::SourceComment);
+    if source_span.instruction_pc.is_some() &amp;&amp; has_non_source_comment_pc {
+        return "exact_pc";
+    }
+    if !related_spans.is_empty() || source_span.source_text.is_some() {
+        return "nearest_source_comment";
+    }
+    if source_span.line_start.is_some() {
+        return "terminal_line_only";
+    }
+    "none"
+}</code></pre>
+
+    <p>The renderer in <code>output.rs</code> then prints the result in rustc style. The first
+    line is <code>error[ID]: title</code>. Four <code>=</code> header lines give the class, confidence,
+    support/help-safety/span quality and the "next action" routing word (<code>bounds</code>,
+    <code>null</code>, <code>provenance</code>, <code>release</code>, <code>environment</code>,
+    <code>budget</code>, <code>protocol</code>, …). Then come the <code>--&gt;</code> location, the
+    source block (<code>^^^</code> under the rejected line, <code>---</code> under related lines),
+    the raw terminal message as <code>= verifier[N]:</code>, notes, the required proof, and the
+    <code>help:</code> lines. The format is plain text only. A JSON mode existed and was removed on
+    2026-06-19, and the README says there's "no stable JSON output mode in 0.1.x".</p>
+
+    <h3>Walkthrough</h3>
+    <p>Step through what happens to the 6.15 log of the running example:</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Normalise and cut</h4><p><code>load_input()</code> strips wrappers and
+      keeps the text between the last <code>-- BEGIN PROG LOAD LOG --</code> and <code>-- END PROG LOAD
+      LOG --</code>. The libbpf lines after the END marker (<code>failed to load: -EACCES</code>) are
+      kept in <code>full_log</code> for signals that need them, but they are not the terminal error.</p></div>
+      <div class="step"><h4>2. Terminal error</h4><p>Scanning upward, <code>processed 68 insns</code>
+      and <code>verification time</code> are skipped. <code>R5 invalid mem access 'scalar'</code>
+      matches the <code>"invalid "</code> marker. The nearest instruction above it is pc 37,
+      <code>r2 = *(u16 *)(r5 +2)</code>.</p></div>
+      <div class="step"><h4>3. Classify</h4><p>The message matches the pointer-provenance pattern, which
+      gives <code>BPFIX-E006</code> and obligation <code>PointerProvenance</code>, with default
+      required proof "preserve a verifier-recognized pointer type at the operation that requires a
+      pointer". The register is parsed from <code>R5</code>.</p></div>
+      <div class="step"><h4>4. Parse states</h4><p>60 state snapshots (full states, per-instruction
+      deltas and <code>from X to Y</code> branch states) become <code>VerifierInsn</code> records.
+      Source comments become <code>SourceEvent</code>s bound to PCs: line 263 → pc 30, 267 → pc 34,
+      270 → pc 37.</p></div>
+      <div class="step"><h4>5. Lifecycle</h4><p><code>latest_pointer_to_scalar_transition(states, 37,
+      5)</code> finds <code>R5</code> last seen as <code>pkt</code> and then as <code>scalar</code> at
+      pc 34, giving a <code>ProofLost</code> event with <code>VerifierState</code> evidence, mapped to
+      line 267. A <code>SourceComment</code> event points at line 263, and a <code>Rejected</code>
+      event at pc 37 / line 270.</p></div>
+      <div class="step"><h4>6. Signals</h4><p>The lowering signal for a packet pointer whose proof is lost
+      after a bounds check fires. It overrides the class to <code>lowering_artifact</code>, sets the
+      title "verifier-visible compiler lowering hides the required proof", and inserts the help line
+      about using the packet pointer that received the <code>data_end</code> proof.</p></div>
+      <div class="step"><h4>7. Render</h4><p>The rejected event has a PC and a state-based event
+      exists, so span confidence is <code>exact_pc</code>. Spans are sorted by line and de-duplicated,
+      help lines are de-duplicated, and the text in the "after" tab is printed. The whole run took
+      about 3 ms on this orb.</p></div>
+    </div>
+
+    <h2>How the code is organised</h2>
+    <p>Directory map at commit <code>4b9decaa</code>:</p>
+    <table>
+      <thead><tr><th>Path</th><th>What lives there</th><th>Key files</th></tr></thead>
+      <tbody>
+        <tr><td><code>crates/bpfix/</code></td><td>The CLI and the diagnostic layer: classification, required proofs, proof events, signals, rendering</td><td><code>src/main.rs</code>, <code>input.rs</code>, <code>classifier.rs</code>, <code>proof.rs</code>, <code>family.rs</code>, <code>source.rs</code>, <code>output.rs</code>, <code>diagnostic/*.rs</code> (25 files: analyzer, signal pipeline, per-mechanism signals), <code>tests/cli.rs</code></td></tr>
+        <tr><td><code>crates/bpfanalysis/</code></td><td>Neutral analysis library: verifier-log parser and query helpers; behind features, bytecode decoding, basic-block CFG, object loading (the crate docs say these "are imported from the <code>bpfopt</code> project")</td><td><code>src/verifier_log.rs</code>, <code>verifier_log/terminal_error.rs</code>, <code>verifier_log/instruction_text.rs</code>, <code>analysis/bbprogram*.rs</code>, <code>object_file.rs</code>, <code>helper_abi.rs</code></td></tr>
+        <tr><td><code>bpfix-empirical/</code></td><td>The 235-case replay corpus, taxonomy, pinned environment, raw audit material, replay/validation tools</td><td><code>manifest.yaml</code>, <code>taxonomy.yaml</code>, <code>environment.yaml</code>, <code>cases/*/case.yaml</code>, <code>tools/validate_empirical.py</code>, <code>run-bpfix-eval.py</code>, <code>empirical-fixtures.tar.gz</code></td></tr>
+        <tr><td><code>bpfix-bench/</code></td><td>The frozen 75-task LLM repair benchmark, runner, audits, published summaries and full August 2026 cost/ablation artifacts</td><td><code>splits/main.txt</code>, <code>cases/*/{buggy,fixed}.bpf.c</code>, <code>tools/run_suite.py</code>, <code>tools/bpf_case.py</code>, <code>published-results/main75/</code>, <code>results/</code></td></tr>
+        <tr><td><code>skills/ebpf-verifier-repair/</code></td><td>Agent skill (also packaged as Codex and Claude Code plugins via <code>.codex-plugin/</code>, <code>.claude-plugin/</code>)</td><td><code>SKILL.md</code>, <code>references/*.md</code>, <code>scripts/extract_verifier_failure.py</code>, <code>scripts/run-bpfix-diagnostic.sh</code></td></tr>
+        <tr><td><code>examples/</code></td><td>Copyable integrations</td><td><code>bpftool/</code> (with <code>quick-start.bpf.o</code>), <code>libbpf-c/</code>, <code>libbpf-rs/</code>, <code>aya/</code>, <code>bcc/</code>, <code>make/</code>, <code>ci/github-actions.yml</code>, <code>editor/</code></td></tr>
+        <tr><td><code>docs/</code></td><td>User guide, CLI contract, error catalog, status/roadmap, evaluation methodology and results</td><td><code>user-guide.md</code>, <code>open-source-tool-design.md</code>, <code>error-catalog.yaml</code>, <code>evaluation/bpfix-bench-llm-repair-eval.md</code>, <code>ARTIFACT.md</code></td></tr>
+        <tr><td><code>paper/</code> (submodule)</td><td>The paper draft, <a href="https://github.com/yunwei37/ebpf27-bpfix">yunwei37/ebpf27-bpfix</a></td><td><code>main.tex</code>, <code>sections/*.tex</code>, <code>tables/*.tex</code></td></tr>
+        <tr><td><code>vendor/libbpf</code> (submodule)</td><td>libbpf, for the <code>object-analysis</code> feature and selftest loaders</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <p>The split between the two crates is deliberate. <code>docs/project-status.md</code> says
+    <code>bpfanalysis</code> "stays a neutral analysis library for verifier logs, bytecode, CFGs,
+    and low-level program facts", while <code>bpfix</code> "owns the product diagnostic layer". The
+    CLI depends on <code>bpfanalysis</code> with <code>default-features = false</code>, so a plain
+    <code>cargo install bpfix</code> builds without libbpf-sys or a C toolchain. On this orb a
+    release build of the CLI took 18 seconds.</p>
+
+    <h2>Building and using it</h2>
+    <h3>Install</h3>
+    <pre><code class="language-bash"># From crates.io (log-only diagnostics)
+cargo install bpfix
+
+# With compiled-object/CFG enrichment (pulls in libbpf-sys)
+cargo install bpfix --features object-analysis
+
+# From a checkout
+git clone https://github.com/eunomia-bpf/bpfix
+cd bpfix
+cargo build --release -p bpfix
+./target/release/bpfix --version      # bpfix 0.1.10</code></pre>
+
+    <h3>Get a log that bpfix can use</h3>
+    <p>bpfix needs the full verbose log, not only the final <code>Permission denied</code>. With
+    bpftool, <code>-d</code> turns on libbpf debug output and the verbose verifier log. With libbpf
+    in your own loader, set <code>kernel_log_level = 2</code> and save the buffer. The repository's
+    snippet:</p>
+
+    <pre data-file="examples/libbpf-c/loader-snippet.c"><code class="language-c">int load_with_bpfix_log(const char *object_path)
+{
+    static char verifier_log[1 &lt;&lt; 20];
+    struct bpf_object *obj;
+    int err;
+
+    LIBBPF_OPTS(bpf_object_open_opts, open_opts,
+        .kernel_log_buf = verifier_log,
+        .kernel_log_size = sizeof(verifier_log),
+        .kernel_log_level = 2,
+    );
+
+    obj = bpf_object__open_file(object_path, &amp;open_opts);
+    /* ... */
+    err = bpf_object__load(obj);
+    if (err) {
+        FILE *fp = fopen("verifier.log", "w");
+        if (fp) {
+            fputs(verifier_log, fp);
+            fclose(fp);
+        }
+        fprintf(stderr, "verifier rejected %s; run: bpfix verifier.log\n",
+                object_path);
+    }
+    /* ... */</code></pre>
+
+    <h3>A session on this orb</h3>
+    <p>To check the tool on something other than its own fixtures, I wrote a small program with the
+    most common beginner mistake (<a href="03-verifier.html#null-checks-after-a-map-lookup">chapter
+    03</a>): dereferencing a map lookup result without a NULL check. This program is mine, not from
+    the repository:</p>
+
+    <pre><code class="language-c">/* Illustrative (written for this chapter): nullmap.bpf.c */
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u64);
+} counts SEC(".maps");
+
+SEC("tracepoint/syscalls/sys_enter_openat")
+int count_openat(void *ctx)
+{
+    __u32 pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    __u64 *val = bpf_map_lookup_elem(&amp;counts, &amp;pid);
+
+    *val += 1;          /* BUG: val may be NULL */
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+
+    <pre><code class="language-plaintext">$ bpftool btf dump file /sys/kernel/btf/vmlinux format c &gt; vmlinux.h
+$ clang -target bpf -O2 -g -I. -D__TARGET_ARCH_x86 -c nullmap.bpf.c -o nullmap.o
+$ sudo bpftool -d prog load nullmap.o /sys/fs/bpf/bpfix17_null &gt; nullmap.log 2&gt;&amp;1   # exit 255
+$ bpfix nullmap.log
+error[BPFIX-E002]: nullable pointer is used before the verifier sees a non-null proof
+  = class: source_bug
+  = confidence: medium
+  = diagnostic: supported, help: repair_hint, span: exact_pc
+  = next action: null
+  --&gt; &lt;verifier-log&gt;:18
+   |
+   |
+   = verifier[18]: R0 invalid mem access 'map_value_or_null'
+   = note: nearest BPF instruction pc 8
+   = note: parsed 8 verifier state snapshots
+   = note[verifier-state]: verifier state shows the rejected pointer register is still a nullable helper result at the dereference, arithmetic, or helper-use site
+   = required proof: prove the nullable helper result is non-null in the same verifier-visible branch as this use
+help: Check the helper result for null and keep the dereference, pointer arithmetic, or helper argument inside the same verifier-visible non-null branch.</code></pre>
+
+    <p>On 6.1 there are again no source spans, but the routing is correct (<code>next action:
+    null</code>). The required proof also states the part beginners miss: the check must be in the
+    <em>same verifier-visible branch</em> as the use.</p>
+
+    <h3>Other options</h3>
+    <pre><code class="language-bash">bpfix verifier.log                      # file
+make load 2&gt;&amp;1 | bpfix -                 # stdin
+bpfix --fail-on-unsupported verifier.log # exit 2 if the input can't be diagnosed (CI)
+bpfix --object prog.o verifier.log       # needs --features object-analysis
+bpfix --doctor                           # checks clang, bpftool, llvm-objdump, BTF, sudo</code></pre>
+    <p>On non-log input, <code>--fail-on-unsupported</code> exited with status 2 after printing an
+    <code>E000</code> diagnostic. <code>--doctor</code> reported bpftool as "not found" here because
+    this orb installs it in <code>/usr/sbin</code>, which is only on root's <code>PATH</code>. That
+    doesn't matter for log-only use. <code>examples/ci/github-actions.yml</code> shows a CI job that
+    loads the object, runs <code>bpfix --fail-on-unsupported</code> when loading fails, and uploads
+    the diagnostic as an artifact.</p>
+
+    <h2>The LLM repair loop: BPFix-Bench</h2>
+    <p>bpfix makes no repair claims in its CLI. The claim lives in <code>bpfix-bench/</code>: given
+    a rejected program, does an LLM produce a <em>working</em> fix more often when it sees the bpfix
+    diagnostic than when it sees the raw log?</p>
+
+    <h3>What a task looks like</h3>
+    <p>Each of the 75 tasks in the frozen split <code>bpfix-bench/splits/main.txt</code> is a
+    directory with six files. <code>buggy.bpf.c</code> is the rejected source. <code>verifier.log</code>
+    is the raw log captured from it. <code>diagnostic.txt</code> is bpfix's output for that log.
+    <code>fixed.bpf.c</code> is a reference repair, never shown to the model. <code>test.py</code>
+    is the executable oracle, never shown either. <code>README.md</code> describes provenance. The
+    benchmark doc lists 40 tasks designed around one mechanism and 35 minimised from real
+    projects: Cilium (7), ActPlane (5), xdp-tools (5), AgentSight (4), bpf-developer-tutorial (4),
+    bpftime (3), eunomia.dev (3), DatRail (2), NCCL-eBPF (1) and Tetragon (1). The skew toward XDP
+    (62 of 75) is deliberate. XDP and TC programs can be run deterministically with
+    <code>bpftool prog run</code>, which makes functional oracles possible.</p>
+
+    <p>A small task shows the shape. <code>packet_eth_off_by_one_001</code> checks 13 bytes and reads
+    the 2-byte <code>h_proto</code> at offset 12. The reference fix changes <code>13</code> to
+    <code>14</code> and, further down, <code>20</code> to <code>21</code>. The oracle is a list of
+    packets and expected XDP return codes:</p>
+
+    <pre data-file="bpfix-bench/cases/packet_eth_off_by_one_001/test.py"><code class="language-python">if __name__ == "__main__":
+    raise SystemExit(
+        run_case(
+            argv=sys.argv[1:],
+            expected_reject_substrings=[
+                "invalid access to packet",
+            ],
+            functional_tests=[
+                ("ipv4_drops", lambda: frame(0x0800), 1),
+                ("ipv4_eth_header_only_drops", lambda: eth_header_only(0x0800), 1),
+                ("arp_passes", lambda: frame(0x0806), 2),
+                ("ipv6_udp_drops", lambda: ipv6_frame(17), 1),
+                ("ipv6_tcp_passes", lambda: ipv6_frame(6), 2),
+                ("thirteen_byte_packet_passes", thirteen_byte_packet, 2),
+                ("twenty_byte_ipv6_packet_passes", twenty_byte_ipv6_packet, 2),
+            ],
+        )
+    )</code></pre>
+
+    <p>A candidate passes only if every layer passes. It must compile with <code>clang -target bpf
+    -O2 -g</code>, load with <code>bpftool -d prog load</code>, return the expected value for every
+    <code>bpftool prog run</code> packet, and, where the case defines them, satisfy success-log
+    predicates and hidden source-semantics predicates. Those predicates block "fixes" that pass the
+    verifier by deleting behaviour, shrinking a copy window or weakening a helper protocol. I ran the
+    oracle against the reference fix on this orb's 6.1 kernel with
+    <code>run_suite.py --case packet_eth_off_by_one_001 --candidate …/fixed.bpf.c</code>, and it
+    passed. One check, the 13-byte packet, is recorded as <code>run_error_treated_as_pass</code>:
+    <code>bpftool prog run</code> on 6.1 refused the frame as too short (Invalid argument), and the
+    oracle counts that as a pass. bpfix's output for this case on 6.15 (from the checked-in
+    <code>diagnostic.txt</code>):</p>
+
+    <pre data-file="bpfix-bench/cases/packet_eth_off_by_one_001/diagnostic.txt"><code class="language-plaintext">error[BPFIX-E001]: packet bounds check is narrower than the later packet access
+  = class: source_bug
+  = confidence: medium
+  = diagnostic: supported, help: repair_hint, span: exact_pc
+  = next action: bounds
+  --&gt; buggy.bpf.c:36
+   |
+33 | if (data + 13 &gt; data_end)
+   | ------------------------- verifier only proves packet range 0 bytes on this path, but the rejected access requires 14 bytes
+36 | proto = *(__u16 *)(data + 12);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rejected here: verifier needs R1 packet range &gt;= 14, but only 13 bytes are proven
+   |
+   = verifier[35]: invalid access to packet, off=12 size=2, R1(id=0,off=12,r=13); R1 offset is outside of the packet
+   = note: nearest BPF instruction pc 7
+   = note: parsed 7 verifier state snapshots
+   = note[verifier-state]: source has a packet bounds check, but verifier state after that check proves only a shorter packet range than the rejected access needs
+   = required proof: prove R1 has packet range at least 14 bytes before this access; verifier currently has range 13
+help: Move the data_end check to the final pointer expression and include the access width, for example check pointer + size before dereferencing pointer.
+help: Add or move a packet bounds check immediately before the access or helper argument use.
+help: Check the exact pointer and byte length passed to the helper, not only an earlier header pointer.</code></pre>
+    <p>Running a locally built 0.1.10 on the checked-in <code>verifier.log</code> reproduced this file
+    exactly. Read it critically. The secondary label on line 33 says "0 bytes" while the primary label
+    and the required proof say 13. The 0 is the range before the branch, which is confusing next to
+    the correct numbers. The help lines are right, though: widen the check to include the access
+    width.</p>
+
+    <h3>The prompt and the retry</h3>
+    <p>The runner, <code>bpfix-bench/tools/run_suite.py</code>, talks to any OpenAI-compatible
+    <code>/chat/completions</code> endpoint. The system prompt is one sentence. The user prompt
+    holds the source and exactly one evidence block, whose label depends on the mode
+    (<code>raw verifier log</code>, <code>BPFix plain-text diagnostic</code>, nothing for
+    <code>source-only</code>, and so on):</p>
+
+    <pre data-file="bpfix-bench/tools/run_suite.py"><code class="language-python">SYSTEM_PROMPT = "You repair eBPF C verifier failures by returning a full corrected source file."
+# ...
+    return f"""You are fixing one eBPF verifier rejection.
+
+Return only one complete replacement C source file in a fenced ```c block.
+Do not explain. Do not output a diff. Preserve the intended packet/helper
+semantics; do not remove the program, maps, SEC() section, or license.
+{diagnostic_guidance}
+{skill_block}
+
+Source file:
+```c
+{source}
+```
+{diagnostic_block}
+"""</code></pre>
+
+    <p>With <code>--repair-attempts 2</code>, a failed candidate starts a second turn.
+    <code>oracle_retry_context()</code> appends "Previous repair attempt failed.", the failure stage,
+    the previous candidate source, and whichever outputs apply: compiler stderr, the new verifier
+    log, or the failed functional checks as JSON. Each is truncated in the middle to a fixed
+    character budget. The retry never includes the reference fix or the hidden source predicates,
+    and <code>audit_cases.py</code> checks generated prompts for leaked case IDs and oracle
+    snippets. The retry carries the <em>new</em> raw verifier log, not a new bpfix diagnostic,
+    in both modes.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 300" role="img" aria-label="BPFix-Bench repair loop: prompt, model, candidate, compile, load, functional and semantic oracle, retry context">
+        <style>
+          .f3-b{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .f3-m{fill:var(--bg3);stroke:var(--accent);stroke-width:1.8}
+          .f3-o{fill:var(--bg3);stroke:var(--accent2);stroke-width:1.6}
+          .f3-t{fill:var(--fg);font:bold 13px sans-serif}
+          .f3-s{fill:var(--muted);font:11.5px sans-serif}
+          .f3-ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah173)}
+          .f3-rt{stroke:var(--accent);stroke-width:1.6;fill:none;stroke-dasharray:6 4;marker-end:url(#ah173)}
+          .f3-ok{fill:var(--fg);font:bold 12px sans-serif}
+        </style>
+        <defs><marker id="ah173" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <rect class="f3-b" x="15" y="40" width="165" height="92" rx="8"/>
+        <text class="f3-t" x="25" y="62">Prompt</text>
+        <text class="f3-s" x="25" y="82">buggy.bpf.c +</text>
+        <text class="f3-s" x="25" y="99">raw log OR diagnostic.txt</text>
+        <text class="f3-s" x="25" y="116">(or source-only, ablations)</text>
+        <rect class="f3-m" x="205" y="40" width="130" height="92" rx="8"/>
+        <text class="f3-t" x="215" y="62">LLM</text>
+        <text class="f3-s" x="215" y="82">temperature 0</text>
+        <text class="f3-s" x="215" y="99">≤ 8192 out tokens</text>
+        <text class="f3-s" x="215" y="116">one ```c block</text>
+        <rect class="f3-o" x="360" y="40" width="110" height="92" rx="8"/>
+        <text class="f3-t" x="370" y="62">compile</text>
+        <text class="f3-s" x="370" y="82">clang -target</text>
+        <text class="f3-s" x="370" y="99">bpf -O2 -g</text>
+        <rect class="f3-o" x="490" y="40" width="110" height="92" rx="8"/>
+        <text class="f3-t" x="500" y="62">verifier</text>
+        <text class="f3-s" x="500" y="82">bpftool -d</text>
+        <text class="f3-s" x="500" y="99">prog load</text>
+        <rect class="f3-o" x="620" y="40" width="120" height="92" rx="8"/>
+        <text class="f3-t" x="630" y="62">functional</text>
+        <text class="f3-s" x="630" y="82">bpftool prog run</text>
+        <text class="f3-s" x="630" y="99">+ map checks</text>
+        <rect class="f3-o" x="760" y="40" width="125" height="92" rx="8"/>
+        <text class="f3-t" x="770" y="62">semantics</text>
+        <text class="f3-s" x="770" y="82">success-log and</text>
+        <text class="f3-s" x="770" y="99">hidden source</text>
+        <text class="f3-s" x="770" y="116">predicates</text>
+        <path class="f3-ar" d="M180,86 H203"/><path class="f3-ar" d="M335,86 H358"/>
+        <path class="f3-ar" d="M470,86 H488"/><path class="f3-ar" d="M600,86 H618"/>
+        <path class="f3-ar" d="M740,86 H758"/>
+        <text class="f3-ok" x="885" y="160" text-anchor="end">all pass → repaired</text>
+        <path class="f3-rt" d="M550,132 C550,240 270,240 270,134"/>
+        <rect class="f3-b" x="300" y="200" width="300" height="80" rx="8"/>
+        <text class="f3-t" x="310" y="222">Retry context (attempt 2 only)</text>
+        <text class="f3-s" x="310" y="242">previous candidate + failure stage +</text>
+        <text class="f3-s" x="310" y="259">compiler stderr / new verifier log / failed</text>
+        <text class="f3-s" x="310" y="276">functional checks — never fixed.bpf.c</text>
+      </svg>
+      <figcaption>Figure 17.3 — The repair loop as implemented by <code>bpfix-bench/tools/run_suite.py</code>
+      and <code>bpf_case.py</code>. Failures are charged to the first stage that fails.</figcaption>
+    </figure>
+
+    <h3>Results the repository reports</h3>
+    <p>All numbers below come from <code>docs/evaluation/bpfix-bench-llm-repair-eval.md</code>. I
+    checked them against the tracked <code>summary.json</code> files under
+    <code>bpfix-bench/published-results/main75/</code>. The models are Qwen3.6 27B (local GGUF via
+    llama.cpp on an RTX 5090), GLM 5.2 (Z.ai hosted endpoint, thinking disabled) and Qwen2.5 3B
+    (local), all at temperature 0. The host ran kernel 6.15.11, clang 18.1.3 and bpftool 7.7.0.</p>
+
+    <figure>
+      <div style="display:flex;gap:.5rem;margin-bottom:.5rem">
+        <button type="button" id="f17-one" style="background:var(--bg3);color:var(--fg);border:1px solid var(--accent);border-radius:6px;padding:.25rem .7rem;cursor:pointer">One attempt</button>
+        <button type="button" id="f17-two" style="background:var(--bg3);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:.25rem .7rem;cursor:pointer">Two attempts (one retry)</button>
+      </div>
+      <svg id="f17-bars" viewBox="0 0 900 300" role="img" aria-label="Bar chart of repaired cases out of 75 for raw log versus bpfix diagnostic, per model"></svg>
+      <figcaption>Figure 17.4 — Repaired tasks out of 75 on BPFix-Bench main75. Raw verifier log in the
+      muted bars, bpfix diagnostic in the accent bars. Source:
+      <code>bpfix-bench/published-results/main75/*/*/summary.json</code>.</figcaption>
+    </figure>
+
+    <table>
+      <thead><tr><th>Model</th><th>Raw, 1 attempt</th><th>bpfix, 1 attempt</th><th>Raw, 2 attempts</th><th>bpfix, 2 attempts</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.6 27B</td><td>22/75 (29.3%)</td><td>38/75 (50.7%)</td><td>30/75 (40.0%)</td><td>44/75 (58.7%)</td></tr>
+        <tr><td>GLM 5.2</td><td>28/75 (37.3%)</td><td>38/75 (50.7%)</td><td>47/75 (62.7%)</td><td>52/75 (69.3%)</td></tr>
+        <tr><td>Qwen2.5 3B</td><td>0/75</td><td>8/75 (10.7%)</td><td>0/75</td><td>10/75 (13.3%)</td></tr>
+      </tbody>
+    </table>
+
+    <p>The evaluation doc reads these numbers cautiously, and so should you. The one-shot gain holds
+    for all three models. With a retry, GLM 5.2's raw-log score rises from 28 to 47 and the gap
+    shrinks to 5 tasks, so the authors say one-shot and retry should be reported "as different
+    regimes". The 3B model fails at verifier load in most raw runs (62 of 75 one-shot). Three raw
+    prompts in the one-shot run failed with HTTP 400 because the logs were too long (the longest raw
+    prompt was 116,163 characters). The bpfix prompts are much shorter and never hit that limit.</p>
+
+    <p>The failure-stage breakdown shows where the gain comes from. For Qwen3.6 27B one-shot, raw
+    prompts fail as 3 compile / 19 verifier-load / 9 functional / 22 proof-or-semantic. bpfix prompts
+    fail as 1 / 10 / 10 / 16. The diagnostic mostly removes failures at the stage where the verifier
+    proof has to be restored.</p>
+
+    <h3>Is it just a shorter prompt? The August ablations</h3>
+    <p>The most recent experiments (commits <code>306f6dd3</code> to <code>098cc270</code>,
+    1–5 August 2026) address the obvious objection: maybe raw logs fail because they're long, and
+    any short prompt would do as well. The runner gained token accounting and three ablation modes.
+    <code>bpfix-no-help</code> drops the <code>help:</code> lines. <code>matched-raw-tail</code>
+    keeps only as many complete lines from the end of the raw log as fit the same token budget.
+    <code>source-only</code> sends no log at all. Results for Qwen3.6 27B, one attempt
+    (<code>bpfix-bench/results/ablation-main75-current-server/result-report.md</code>):</p>
+
+    <table>
+      <thead><tr><th>Condition</th><th>Repairs</th><th>Total tokens</th></tr></thead>
+      <tbody>
+        <tr><td>source-only (no verifier evidence)</td><td>24/75</td><td>102,456</td></tr>
+        <tr><td>matched-raw-tail (raw log tail, token-matched)</td><td>26/75</td><td>119,725</td></tr>
+        <tr><td>bpfix-no-help (diagnostic without <code>help:</code>)</td><td>29/75</td><td>113,974</td></tr>
+        <tr><td>bpfix-neutral (full diagnostic)</td><td>38/75</td><td>125,303</td></tr>
+      </tbody>
+    </table>
+
+    <p>Two results stand out. The no-help diagnostic beats a token-matched raw tail by 29 to 26, but
+    the report calls that "not statistically decisive" (exact McNemar p = 0.5078). Adding the
+    <code>help:</code> lines raises the count from 29 to 38 (p = 0.0117), so the repair guidance is
+    the clearest measured contributor. The source-only baseline (24/75) also does better than the
+    full raw log in the separate cost run, which repaired 21/75 with at least 399,578 total tokens
+    against bpfix's 38/75 with 117,159 (<code>cost-main75-current-server/result-report.md</code>). On
+    this benchmark, then, a full raw log does not help this model compared with no log at all,
+    probably because the relevant lines are buried in a long trace. The report is explicit about its
+    limits: one model, one deterministic run, a 32K-context server, and raw token totals that are lower
+    bounds because some calls were rejected before usage was reported.</p>
+
+    <h2>The agent skill</h2>
+    <p>The July 2026 commits turned the repair workflow into an agent skill,
+    <code>skills/ebpf-verifier-repair/</code>. It installs with
+    <code>gh skill install eunomia-bpf/bpfix ebpf-verifier-repair --agent codex --scope user</code>
+    or as a Claude Code plugin (<code>/plugin marketplace add eunomia-bpf/bpfix</code>). The skill
+    describes the job as "Repair verifier failures as missing proof obligations, not as
+    string-matched terminal errors". It gives an eight-step workflow: establish the failing load
+    path, choose the evidence path, route by proof evidence, freeze the semantic contract, form a
+    proof-obligation hypothesis, edit minimally and in a verifier-visible way, validate by reloading,
+    and report in proof terms. Reference files cover raw-log triage, repair patterns, semantic
+    preservation and failure-directed retries. It treats bpfix as optional: "A full verbose verifier
+    log plus source is sufficient evidence to start; use <code>bpfix</code> only when it is available
+    and helpful." <code>scripts/extract_verifier_failure.py</code> compacts oversized logs for the
+    model's context. The benchmark has a matching <code>--mode skills</code>. I found no published
+    results for that mode in the tree.</p>
+
+    <h2>Where the project is heading</h2>
+    <p>The commit history shows the project changing focus several times in eight months.</p>
+    <ul>
+      <li><strong>March 2026 — OBLIGE.</strong> The first commit is a research plan. The scaffold was
+      called OBLIGE ("Add OBLIGE project scaffold: taxonomy, schema, collectors, agent harness"), the
+      first corpus had 302 cases from three sources, and the implementation was in Python. It was
+      renamed BPFix on 19 March.</li>
+      <li><strong>April 2026 — corpus engineering.</strong> Raw backlog triage, reconstructing cases
+      from Cilium and libbpf commits, and a mutually exclusive taxonomy.</li>
+      <li><strong>May 2026 — Rust rewrite.</strong> "Add Rust BPFix workspace", "Render diagnostics in
+      rust style", "Instantiate required proofs". The Python implementation was removed from the
+      maintained tree, and the terminology changed from "proof obligation" to "required proof".</li>
+      <li><strong>June 2026 — the benchmark.</strong> 352 of the 475 commits. Dozens of "Harden …
+      case" commits tightened oracles so trivial verifier-only fixes fail, real-project seeds were
+      admitted, and the 75-task split was frozen. Model runs, the paper submodule and the crates.io
+      release pipeline followed, and the CLI contract was frozen at 0.1.x.</li>
+      <li><strong>July–August 2026 — cost and agents.</strong> <code>--doctor</code>, the published
+      skill, token and timing accounting, prompt ablations, and v0.1.10.</li>
+      <li><strong>Since then.</strong> No new commits on <code>master</code> after 5 August. Three
+      pull requests opened on 31 October (#8–#10) fix narrow diagnostic issues: whole-word matching
+      for NULL-check identifiers, ignoring the line-0 source comment, and a Rust-idiom cleanup in
+      instruction decoding.</li>
+    </ul>
+    <p><code>docs/project-status.md</code> states the scope plainly: "Repair synthesis,
+    verifier-oracle patch loops, and publication-only experiments are not part of the active product
+    scope." The README says "Full BTF source correlation is the next analysis layer", which would
+    remove the dependence on the 6.9+ <code>@ file:line</code> comments.</p>
+
+    <h3>The paper draft</h3>
+    <p>The <code>paper/</code> submodule (public repository <code>yunwei37/ebpf27-bpfix</code>,
+    last commit 2 July 2026) is titled <em>"Characterizing and Bridging the Diagnostic Gap in eBPF
+    Verifier Rejections"</em>. Its authors are Yusheng Zheng, Zhengjie Ji, Weichen Tao, Xiangyu Gao,
+    Jianchang Su, Wei Zhang, Andi Quinn and Dan Williams (UC Santa Cruz, eunomia-bpf, Virginia Tech,
+    Telecom Paris, University of Washington, University of Connecticut). It uses the ACM sigplan
+    template. A commented-out line names "eBPF '27, ACM SIGCOMM Workshop on eBPF and Kernel
+    Extensions", which matches the repository name, but the draft states no acceptance, so treat the
+    venue as <strong>unconfirmed</strong>. The abstract summarises the benchmark as "0–37% one-shot
+    success with the raw log" and an improvement of "11–21pp" with the bpfix localization. Those
+    figures match the table above (raw 0%, 29.3% and 37.3%; gains of 10.7, 21.4 and 13.4 points). The
+    paper's own diagnostic evaluation is two case studies, not an accuracy number. I found no
+    published per-case diagnostic accuracy for the 235-case corpus. <code>docs/evaluation/metrics.md</code>
+    defines such metrics but reports no values.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Fits existing workflows</h4><p>No kernel patch, no new loader, no re-run. It reads the log
+      your build or CI already produced, from any loader. It runs in milliseconds, and the default build
+      has no C dependencies.</p></div>
+      <div class="card"><h4>Evidence, not guesses</h4><p>Loss points come from the verifier's own logged states, and
+      each event records whether it came from state or source text. <code>span:</code> and
+      <code>confidence:</code> tell you how much to trust the location.</p></div>
+      <div class="card"><h4>Separates layers</h4><p>The same <code>'scalar'</code> message can come out as
+      <code>source_bug</code> or <code>lowering_artifact</code>. Knowing the compiler is involved
+      changes which fix you try.</p></div>
+      <div class="card"><h4>Measured, with oracles</h4><p>The repair claim is backed by executable oracles that reject
+      behaviour-deleting "fixes", frozen splits, published summaries and ablations against
+      length effects.</p></div>
+    </div>
+
+    <p>The limitations are just as concrete:</p>
+    <ul>
+      <li><strong>Source spans need Linux 6.9 or later.</strong> On older kernels you get IDs, classes
+      and required proofs but no C line numbers (shown on 6.1 above). Optional object analysis
+      correlates CFG sites, but README says full BTF source correlation is still future work. I did not
+      build the <code>object-analysis</code> feature.</li>
+      <li><strong>Needs log level 2 and <code>-g</code>.</strong> The whole method reads per-instruction
+      state. A log truncated by a small buffer, or a loader that prints only the last line, produces
+      <code>E000</code> or a weak diagnostic.</li>
+      <li><strong>Heuristics on source text.</strong> Several events come from matching source text
+      (<code>looks_like_null_check</code> tests for <code>"!ptr"</code>, <code>"== 0"</code>, …).
+      Open PR #8 exists because such matching was too loose. Labels can be confusing, like the
+      "0 bytes" span above.</li>
+      <li><strong>Coverage is corpus-driven.</strong> The 73 signal kinds were written against the 235-case
+      corpus, and the <code>--reject-fallback</code> gate checks support on that same corpus. New
+      verifier messages in future kernels will start out as <code>E099</code>.</li>
+      <li><strong>The benchmark is curated, not representative.</strong> Its own document says it is "not
+      a natural-frequency sample". It is 62/75 XDP, built on one kernel, and does not cover CO-RE
+      relocation failures, cross-kernel portability, or bugs in programs the verifier accepts.</li>
+      <li><strong>Narrow model matrix.</strong> Three models, one deterministic run each. Some 27B
+      and GLM runs were recorded from a dirty tree, which the doc discloses.</li>
+      <li><strong>Docs drift.</strong> <code>bpfix-empirical/README.md</code> still says the evaluation
+      driver calls <code>bpfix --format json</code>, but JSON output was removed and the driver parses
+      text.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <h3>Explaining verifier errors</h3>
+    <p><strong>Pretty Verifier</strong> (Rizza, Sisto and Valenza, IEEE CSR 2025) is the closest
+    prior tool. It post-processes the verifier log to connect the error to the C source and to
+    explain it in plainer language with a suggested fix. The bpfix paper describes it as using
+    regular expressions on the terminal error. The bpfix paper's
+    distinction is that Pretty Verifier maps the <em>terminal</em> error to a line and a hint, while
+    bpfix searches the trace for the <em>loss point</em>. <strong>bpfvv</strong>, the BPF Verifier
+    Visualizer in the libbpf GitHub organisation, is an interactive front-end for reading per-instruction
+    verifier state. It helps a human do the backward search but does not do it automatically. The
+    model for bpfix's output is rustc's diagnostic system (primary and secondary spans, notes, help,
+    stable error codes), documented in the rustc dev guide.</p>
+
+    <h3>Studies of eBPF development pain</h3>
+    <p>Deokar et al., <em>An Empirical Study on the Challenges of eBPF Application Development</em>
+    (eBPF '24), classified eBPF questions on Stack Overflow along several eBPF-specific dimensions.
+    "Error handling and verifier messages" is one of their categories. The bpfix paper cites this study
+    for the observation that, without a way to find where the proof was lost, developers fall back on
+    trial and error. bpfix's corpus goes further: each failure is reproduced on a pinned toolchain
+    and labelled with the layer that must change.</p>
+
+    <h3>LLMs that write eBPF</h3>
+    <p><strong>KEN</strong> (arXiv 2023), published as <strong>Kgent: Kernel Extensions Large
+    Language Model Agent</strong> at eBPF '24, comes from the same group (Zheng, Yang, Chen, Quinn).
+    It synthesises eBPF programs from English prompts and loops on failure: symbolic execution and the
+    real verifier check the candidate, and their error messages are fed back to the LLM. In Kgent the
+    raw verifier message was the feedback signal. bpfix asks whether a better signal makes such loops
+    succeed more often. Later work from the org on agent-driven optimisation is covered in
+    <a href="19-bpf-benchmark.html">chapter 19</a>, and the org's other LLM-for-kernel tools in
+    <a href="30-llm-kernel-tooling.html">chapter 30</a>.</p>
+
+    <h3>Checking or replacing the verifier</h3>
+    <p>These works ask a different question: is the verifier right, or can we avoid it? PREVAIL (PLDI
+    2019) re-proves eBPF safety with abstract interpretation. Agni (CAV 2023) verifies the soundness
+    of the verifier's range-analysis operators. State embedding (OSDI '24) found logic bugs in the
+    verifier by embedding concrete states as checks. <a href="03-verifier.html#research-checking-and-replacing-the-verifier">Chapter 03</a>
+    covers all three. Rex (USENIX ATC '25) moves safety into a safe Rust subset to close the
+    "language-verifier gap", the very gap that causes bpfix's lowering-artifact class.
+    <a href="18-ebpf-correctness-verifier.html">Chapter 18</a> covers the org's Z3 and PREVAIL
+    translation-validation project. None of these explains a rejection to the developer, which is
+    where bpfix fits.</p>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> In bpfix's terms, what is the "loss point" of a rejection?</p>
+        <button class="opt">The instruction printed just above the terminal error line</button>
+        <button class="opt" data-right>The instruction where the logged state stops satisfying the required proof, after an earlier state satisfied it</button>
+        <button class="opt">The source line with the last <code>data_end</code> check</button>
+        <button class="opt">The first instruction the verifier visited on the failing path</button>
+        <div class="why">The rejection location is where verification stopped (pc 37 in the running example). The loss point is the transition bpfix finds in the state history, such as R5 going from <code>pkt</code> to <code>scalar</code> at pc 34. A raw log gives you the first and leaves you to find the second.</div></div>
+
+      <div class="q"><p><strong>Q2.</strong> You run bpfix 0.1.10 on a log from Linux 6.1 and get <code>--&gt; &lt;verifier-log&gt;:180</code> with no source lines, even though you compiled with <code>-g</code>. Why?</p>
+        <button class="opt">bpfix needs the <code>--object</code> flag to read DWARF</button>
+        <button class="opt">The verifier on 6.1 doesn't print source lines at all</button>
+        <button class="opt" data-right>Before 6.9 the kernel's source comments lack the <code>@ file:line</code> suffix that bpfix's <code>parse_source_comment()</code> requires</button>
+        <button class="opt">bpftool v7.1 strips comments from the log</button>
+        <div class="why">The 6.1 log does contain <code>; if (udph + …)</code> comments, but without <code>@ prog.c:267</code>. <code>verbose_linfo()</code> began printing <code>" @ %s:%u"</code> in Linux 6.9's <code>kernel/bpf/log.c</code>.</div></div>
+
+      <div class="q"><p><strong>Q3.</strong> Why did the 6.15 diagnostic for SO 53136145 say <code>class: lowering_artifact</code> rather than <code>source_bug</code>?</p>
+        <button class="opt">Because the terminal message contains the word "scalar"</button>
+        <button class="opt" data-right>A lowering signal fired: the logged states show the packet-pointer proof held on one path and was replaced by a scalar from compiler-merged code on another</button>
+        <button class="opt">Because the corpus label for this case says so and bpfix looks it up</button>
+        <button class="opt">Because the program was compiled with -O0</button>
+        <div class="why">The classifier's first guess is based on the message. Signals in <code>signal_pipeline.rs</code> can override the class from state evidence. bpfix never reads corpus labels at run time. The same message appears in 24 source-bug cases.</div></div>
+
+      <div class="q"><p><strong>Q4.</strong> In BPFix-Bench, which of these would let a model's "fix" count as a pass?</p>
+        <button class="opt">It compiles and the verifier accepts it</button>
+        <button class="opt">It matches <code>fixed.bpf.c</code> textually</button>
+        <button class="opt" data-right>It compiles, loads, returns the expected value for every test packet, and meets any success-log and hidden source-semantics predicates</button>
+        <button class="opt">The bpfix diagnostic on the new log is <code>E000</code></button>
+        <div class="why">The oracle (<code>test.py</code> via <code>bpf_case.run_case</code>) is layered on purpose, so that deleting behaviour to satisfy the verifier fails. The reference fix only shows that the task is solvable.</div></div>
+
+      <div class="q"><p><strong>Q5.</strong> What did the August 2026 ablation suggest about why the bpfix prompt helps Qwen3.6 27B?</p>
+        <button class="opt">Only because it is shorter than the raw log</button>
+        <button class="opt">The help lines made no difference</button>
+        <button class="opt" data-right>The <code>help:</code> guidance had the clearest effect (29 → 38 repairs); proof content beat a token-matched raw tail only slightly (29 vs 26, not significant)</button>
+        <button class="opt">Raw logs always beat source-only prompts</button>
+        <div class="why">From <code>bpfix-bench/results/ablation-main75-current-server/result-report.md</code>. Source-only (24/75) did better than the earlier full-raw cost run (21/75).</div></div>
+
+      <div class="q"><p><strong>Q6.</strong> Which statement about the bpfix CLI is true?</p>
+        <button class="opt">It calls an LLM to produce a patch when given an API key</button>
+        <button class="opt">It re-runs the loader to capture a fresh log</button>
+        <button class="opt">It emits stable JSON with <code>--format json</code></button>
+        <button class="opt" data-right>It reads an existing log and prints plain text; repair happens in the benchmark runner, the agent skill, or the developer's hands</button>
+        <div class="why">The README's non-goals exclude automatic repair and running loader commands. JSON output was removed in June 2026, and 0.1.x has no stable JSON mode.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>eunomia-bpf/bpfix repository, commit <code>4b9decaa</code> (v0.1.10). <a href="https://github.com/eunomia-bpf/bpfix">https://github.com/eunomia-bpf/bpfix</a> — README, <code>docs/evaluation/bpfix-bench-llm-repair-eval.md</code>, <code>bpfix-empirical/README.md</code>, <code>docs/error-catalog.yaml</code>.</li>
+      <li>bpfix on crates.io. <a href="https://crates.io/crates/bpfix">https://crates.io/crates/bpfix</a></li>
+      <li>Y. Zheng, Z. Ji, W. Tao, X. Gao, J. Su, W. Zhang, A. Quinn, D. Williams. <em>Characterizing and Bridging the Diagnostic Gap in eBPF Verifier Rejections</em>. Paper draft (venue not confirmed), 2026. <a href="https://github.com/yunwei37/ebpf27-bpfix">https://github.com/yunwei37/ebpf27-bpfix</a></li>
+      <li>Linux kernel, <code>kernel/bpf/log.c</code> at v6.9 (<code>verbose_linfo</code> prints <code>@ file:line</code>). <a href="https://github.com/torvalds/linux/blob/v6.9/kernel/bpf/log.c">https://github.com/torvalds/linux/blob/v6.9/kernel/bpf/log.c</a>; compare v6.1 <a href="https://github.com/torvalds/linux/blob/v6.1/kernel/bpf/verifier.c">kernel/bpf/verifier.c</a>.</li>
+      <li>eBPF verifier documentation. <a href="https://docs.kernel.org/bpf/verifier.html">https://docs.kernel.org/bpf/verifier.html</a></li>
+      <li>R. Rizza, R. Sisto, F. Valenza. <em>Design and implementation of a tool to improve error reporting for eBPF code</em>. 2025 IEEE International Conference on Cyber Security and Resilience (CSR), pp. 214–219, 2025. <a href="https://doi.org/10.1109/CSR64739.2025.11130075">doi:10.1109/CSR64739.2025.11130075</a></li>
+      <li>libbpf/bpfvv — BPF Verifier Visualizer. <a href="https://github.com/libbpf/bpfvv">https://github.com/libbpf/bpfvv</a></li>
+      <li>M. Deokar, J. Men, L. Castanheira, A. Bhardwaj, T. A. Benson. <em>An Empirical Study on the Challenges of eBPF Application Development</em>. ACM SIGCOMM Workshop on eBPF and Kernel Extensions (eBPF '24), 2024. <a href="https://doi.org/10.1145/3672197.3673429">doi:10.1145/3672197.3673429</a></li>
+      <li>Y. Zheng, Y. Yang, M. Chen, A. Quinn. <em>Kgent: Kernel Extensions Large Language Model Agent</em>. eBPF '24, 2024. <a href="https://doi.org/10.1145/3672197.3673434">doi:10.1145/3672197.3673434</a>; code <a href="https://github.com/eunomia-bpf/KEN">eunomia-bpf/KEN</a>.</li>
+      <li>Y. Zheng, Y. Yang, M. Chen, A. Quinn. <em>KEN: Kernel Extensions using Natural Language</em>. arXiv:2312.05531, 2023. <a href="https://arxiv.org/abs/2312.05531">https://arxiv.org/abs/2312.05531</a></li>
+      <li>E. Gershuni et al. <em>Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions</em> (PREVAIL). PLDI 2019. <a href="https://doi.org/10.1145/3314221.3314590">doi:10.1145/3314221.3314590</a></li>
+      <li>H. Vishwanathan, M. Shachnai, S. Narayana, S. Nagarakatte. <em>Verifying the Verifier: eBPF Range Analysis Verification</em>. CAV 2023. <a href="https://doi.org/10.1007/978-3-031-37709-9_12">doi:10.1007/978-3-031-37709-9_12</a></li>
+      <li>H. Sun, Z. Su. <em>Validating the eBPF Verifier via State Embedding</em>. OSDI '24. <a href="https://www.usenix.org/conference/osdi24/presentation/sun-hao">usenix.org/conference/osdi24/presentation/sun-hao</a></li>
+      <li>J. Jia et al. <em>Rex: Closing the language-verifier gap with safe and usable kernel extensions</em>. USENIX ATC '25. <a href="https://www.usenix.org/conference/atc25/presentation/jia">usenix.org/conference/atc25/presentation/jia</a></li>
+      <li>Rust compiler development guide, "Errors and lints" (diagnostic structure). <a href="https://rustc-dev-guide.rust-lang.org/diagnostics.html">https://rustc-dev-guide.rust-lang.org/diagnostics.html</a></li>
+      <li>Stack Overflow question 53136145 (source of the running example). <a href="https://stackoverflow.com/questions/53136145">https://stackoverflow.com/questions/53136145</a></li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="16-llvmbpf.html"><small>Previous</small>16 · llvmbpf</a>
+      <a class="next" href="18-ebpf-correctness-verifier.html"><small>Next</small>18 · ebpf-correctness-verifier</a>
+    </div>
+  </main>
+</div>
+<script>
+/* Chapter 17 widget: toggle the BPFix-Bench bar chart between one and two attempts.
+   Numbers from bpfix-bench/published-results/main75/<model>/<mode>/summary.json. */
+(function () {
+  const data = {
+    one: [["Qwen3.6 27B", 22, 38], ["GLM 5.2", 28, 38], ["Qwen2.5 3B", 0, 8]],
+    two: [["Qwen3.6 27B", 30, 44], ["GLM 5.2", 47, 52], ["Qwen2.5 3B", 0, 10]]
+  };
+  const svg = document.getElementById("f17-bars");
+  const b1 = document.getElementById("f17-one");
+  const b2 = document.getElementById("f17-two");
+  if (!svg || !b1 || !b2) return;
+  const NS = "http://www.w3.org/2000/svg";
+  function el(name, attrs, text) {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    svg.appendChild(e);
+    return e;
+  }
+  function draw(key) {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const x0 = 140, w = 720, top = 30, rowH = 80, scale = w / 75;
+    for (let t = 0; t <= 75; t += 15) {
+      const x = x0 + t * scale;
+      el("line", { x1: x, y1: top - 10, x2: x, y2: top + rowH * 3 - 10, stroke: "var(--border)", "stroke-width": 1 });
+      el("text", { x: x, y: top + rowH * 3 + 8, fill: "var(--muted)", "font-size": 11, "text-anchor": "middle", "font-family": "sans-serif" }, String(t));
+    }
+    data[key].forEach((row, i) => {
+      const y = top + i * rowH;
+      el("text", { x: 10, y: y + 30, fill: "var(--fg)", "font-size": 13, "font-weight": "bold", "font-family": "sans-serif" }, row[0]);
+      [[row[1], "var(--muted)", "raw log"], [row[2], "var(--accent)", "bpfix"]].forEach((b, j) => {
+        const by = y + j * 28;
+        el("rect", { x: x0, y: by, width: Math.max(b[0] * scale, 2), height: 22, rx: 4, fill: b[1] });
+        el("text", { x: x0 + Math.max(b[0] * scale, 2) + 8, y: by + 16, fill: "var(--fg)", "font-size": 12, "font-family": "sans-serif" }, b[0] + "/75 · " + b[2]);
+      });
+    });
+    b1.style.borderColor = key === "one" ? "var(--accent)" : "var(--border)";
+    b2.style.borderColor = key === "two" ? "var(--accent)" : "var(--border)";
+  }
+  b1.addEventListener("click", () => draw("one"));
+  b2.addEventListener("click", () => draw("two"));
+  draw("one");
+})();
+</script>
+</body>
+</html>

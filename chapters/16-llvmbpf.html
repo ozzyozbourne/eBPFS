@@ -181,7 +181,7 @@
     promote the slots to SSA values, so the slots cost nothing after optimisation. The eBPF stack is another
     <code>alloca</code>, and <code>r10</code> is initialised to point at its top:</p>
 
-    <pre data-file="src/compiler.cpp"><code class="language-cpp">	// Stack used to save return address and saved registers
+    <pre data-file="llvmbpf/src/compiler.cpp"><code class="language-cpp">	// Stack used to save return address and saved registers
 	Value *callStack, *callItemCnt;
 	{
 		BasicBlock *setupBlock =
@@ -285,7 +285,7 @@
     <h3>Finding basic blocks</h3>
     <p>Before emitting anything, the lifter needs to know where control can enter. A block starts at instruction 0, after any jump
     (the fall-through), and at every jump target. That is one linear scan:</p>
-    <pre data-file="src/compiler.cpp"><code class="language-cpp">	std::vector&lt;bool&gt; blockBegin(insts.size(), false);
+    <pre data-file="llvmbpf/src/compiler.cpp"><code class="language-cpp">	std::vector&lt;bool&gt; blockBegin(insts.size(), false);
 	// Split the blocks
 	blockBegin[0] = true;
 	for (uint16_t i = 0; i &lt; insts.size(); i++) {
@@ -316,7 +316,7 @@
     <p>The heart of the lifter is a <code>for</code> loop over the program counter with a <code>switch</code> on the opcode.
     It looks a lot like the kernel's <code>do_jit()</code>. The difference is that each case calls <code>IRBuilder</code> rather than
     emitting bytes:</p>
-    <pre data-file="src/compiler.cpp"><code class="language-cpp">	// Iterate over instructions
+    <pre data-file="llvmbpf/src/compiler.cpp"><code class="language-cpp">	// Iterate over instructions
 	BasicBlock *currBB = instBlocks[0];
 	IRBuilder&lt;&gt; builder(currBB);
 	for (uint16_t pc = 0; pc &lt; codegen_end_pc; pc++) {
@@ -389,7 +389,7 @@
     <p>The ALU helpers in <code>compiler_utils.cpp</code> encode the eBPF rule that 32-bit operations zero the upper half
     of the destination. Operands are loaded as <code>i32</code> (via <code>trunc</code>) or <code>i64</code> depending on the
     class, and 32-bit results are zero-extended before being stored:</p>
-    <pre data-file="src/compiler_utils.cpp"><code class="language-cpp">void emitStoreALUResult(const ebpf_inst &amp;inst, llvm::Value **regs,
+    <pre data-file="llvmbpf/src/compiler_utils.cpp"><code class="language-cpp">void emitStoreALUResult(const ebpf_inst &amp;inst, llvm::Value **regs,
 			llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value *result)
 {
 	if ((inst.opcode &amp; 0x07) == EBPF_CLS_ALU64) {
@@ -416,13 +416,25 @@ void emitALUWithDstAndSrc(
     <p>The interesting cases are the ones where eBPF semantics differ from LLVM's. In LLVM, <code>udiv</code> by zero is
     undefined behaviour. In eBPF, division by zero yields 0 and modulo by zero leaves the destination unchanged. So the DIV
     case wraps the division in <code>select(src == 0, 0, dst / src)</code>. For signed division (the v4 <code>sdiv</code>,
-    flagged by <code>offset == 1</code>) it also handles <code>INT_MIN / -1</code>. Shifts are masked with <code>urem src, 64</code> (or 32),
+    flagged by <code>offset == 1</code>) it also tries to handle <code>INT_MIN / -1</code>. Shifts are masked with <code>urem src, 64</code> (or 32),
     because a shift by the full width or more is also undefined in LLVM. None of these guards is optional. Without them, LLVM's
     optimiser would be entitled to assume the bad case never happens and miscompile the program.</p>
 
+    <div class="callout danger"><span class="label">Observed bug (found in review)</span><p>The shift guard works, but the division
+    guards do not. A <code>select</code> picks between two values that have <em>both</em> already been computed. The
+    <code>udiv</code>/<code>sdiv</code>/<code>urem</code>/<code>srem</code> instruction therefore still executes when the divisor is 0
+    (or for <code>INT64_MIN / -1</code>), which is undefined behaviour in LLVM IR, and on x86-64 the <code>div</code>/<code>idiv</code>
+    instruction traps. Tested at <code>7e384db</code> with LLVM 15.0.6 and hand-assembled programs that read the operands from the context
+    buffer (illustrative, not from the repo): 64-bit unsigned divide by 0, unsigned modulo by 0, signed divide by 0 and
+    <code>INT64_MIN / -1</code> all killed the host process with <code>SIGFPE</code>, at the default <code>-O3</code> and at
+    <code>-O0</code>. With a non-zero divisor the same programs returned the right result. When the divisor is a constant 0 (as in
+    <code>mov r1, 0; div r0, r1</code>) LLVM folds the expression and the program returns 0. bpf_conformance's
+    <code>*-by-zero-reg</code> tests use constant zeros, so they pass. A correct lowering would branch around the division, or divide
+    by <code>select(src == 0, 1, src)</code>. Newer LLVM versions were not tested.</p></div>
+
     <h3>Memory: loads and stores without checks</h3>
     <p>Loads and stores are one <code>getelementptr i8</code> plus a <code>load</code> or <code>store</code> of the right width:</p>
-    <pre data-file="src/compiler_utils.cpp"><code class="language-cpp">llvm::Value *emitLDXLoadingAddr(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
+    <pre data-file="llvmbpf/src/compiler_utils.cpp"><code class="language-cpp">llvm::Value *emitLDXLoadingAddr(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
 				const ebpf_inst &amp;inst)
 {
 	// [rX + OFFSET]
@@ -468,7 +480,7 @@ void emitLoadX(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
       Otherwise it branches to <code>localFuncReturnBlock</code>, which pops the saved registers and does an <code>indirectbr</code>
       to the saved return block.</li>
     </ul>
-    <pre data-file="src/compiler.cpp"><code class="language-cpp">		case EBPF_OP_EXIT: {
+    <pre data-file="llvmbpf/src/compiler.cpp"><code class="language-cpp">		case EBPF_OP_EXIT: {
 			if (kernel_compatible_mode) {
 				builder.CreateBr(exitBlk);
 			} else {
@@ -492,8 +504,9 @@ void emitLoadX(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
     64 bytes below the caller's, not 512. I tested this at commit <code>7e384db</code> with an eight-instruction hand-assembled program
     (illustrative, not from the repo). The caller stores 7 at <code>r10-128</code> and calls a subprogram that stores 99 at its own
     <code>r10-64</code>. Back in the caller, <code>r10-128</code> is read. The JIT returned <strong>99</strong>; spec semantics (each frame owns
-    its own stack) give 7. Moving the callee's store to <code>r10-520</code> returned 7, as expected. The repository's
-    <code>call_local</code> conformance test does not use deep stack slots, so it does not catch this. Kernel-compatible mode is not affected,
+    its own stack) give 7. Moving the callee's store to <code>r10-520</code> returned 7, as expected. (Rerun during review with
+    LLVM 15.0.6: same results, 99 and 7.) The <code>call_local</code> and <code>rfc9669_call_local</code> tests in bpf_conformance
+    do not touch the stack at all, so they do not catch this. Kernel-compatible mode is not affected,
     because it lowers local calls to external symbols (see below).</p></div>
 
     <h3>Helper calls</h3>
@@ -501,7 +514,7 @@ void emitLoadX(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
     <code>_bpf_helper_ext_%04d</code>, so helper 1 is <code>_bpf_helper_ext_0001</code>. Every helper has the same LLVM type,
     <code>i64 (i64, i64, i64, i64, i64)</code>, and receives <code>r1</code>–<code>r5</code>. This matches the eBPF calling convention exactly,
     so no argument shuffling is needed:</p>
-    <pre data-file="src/compiler_utils.cpp"><code class="language-cpp">	auto funcNameToCall = ext_func_sym(inst.imm);
+    <pre data-file="llvmbpf/src/compiler_utils.cpp"><code class="language-cpp">	auto funcNameToCall = ext_func_sym(inst.imm);
 	auto itr = extFunc.find(funcNameToCall);
 	/* ... kernel-compatible mode may declare it on the fly ... */
 	if (itr != extFunc.end()) {
@@ -563,7 +576,7 @@ void emitLoadX(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
       </tbody>
     </table>
     <p>The JIT/AOT split for <code>src_reg = 2</code> is the important design point:</p>
-    <pre data-file="src/compiler.cpp"><code class="language-cpp">				if (patch_map_val_at_compile_time) {
+    <pre data-file="llvmbpf/src/compiler.cpp"><code class="language-cpp">				if (patch_map_val_at_compile_time) {
 					SPDLOG_DEBUG(
 						"map_val is required to be evaluated at compile time");
 					/* ... error if vm.map_val is null ... */
@@ -835,7 +848,7 @@ $L__BB0_1:
     <h3>JIT: ORC LLJIT and symbol binding</h3>
     <p>The JIT path uses LLVM's ORC <code>LLJIT</code>, the current recommended in-process JIT API
     (<a href="https://llvm.org/docs/ORCv2.html">LLVM ORC v2 docs</a>). <code>do_jit_compile()</code> is short:</p>
-    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">llvm::Error llvm_bpf_jit_context::do_jit_compile()
+    <pre data-file="llvmbpf/src/llvm_jit_context.cpp"><code class="language-cpp">llvm::Error llvm_bpf_jit_context::do_jit_compile()
 {
 	spin_lock_guard guard(compiling.get());
 	auto [jit, extFuncNames, definedLddwHelpers] =
@@ -874,7 +887,7 @@ $L__BB0_1:
     addresses become constants. Binding helpers happens in <code>create_and_initialize_lljit_instance()</code>. For each registered helper
     it defines an <em>absolute symbol</em> in the JIT's main dylib whose name is <code>_bpf_helper_ext_NNNN</code> and whose address is the
     C function pointer the embedder registered:</p>
-    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">	auto &amp;mainDylib = jit-&gt;getMainJITDylib();
+    <pre data-file="llvmbpf/src/llvm_jit_context.cpp"><code class="language-cpp">	auto &amp;mainDylib = jit-&gt;getMainJITDylib();
 	std::vector&lt;std::string&gt; extFuncNames;
 	// insert the helper functions
 	SymbolMap extSymbols;
@@ -908,7 +921,7 @@ $L__BB0_1:
     <h3>AOT: a native ELF object</h3>
     <p>The AOT path reuses the lifter with <code>patch_map_val_at_compile_time = false</code>, runs the same optimisation, and asks the host
     <code>TargetMachine</code> to emit an object file into memory:</p>
-    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">	if (auto module = generateModule(extFuncNames, lddwHelpers, false);
+    <pre data-file="llvmbpf/src/llvm_jit_context.cpp"><code class="language-cpp">	if (auto module = generateModule(extFuncNames, lddwHelpers, false);
 	    module) {
 		return module-&gt;withModuleDo([&amp;](auto &amp;module)
 						    -&gt; std::vector&lt;uint8_t&gt; {
@@ -956,7 +969,7 @@ $L__BB0_1:
     whose description now reads "This branch has been merged into https://github.com/eunomia-bpf/llvmbpf". It landed on <code>main</code> as
     <code>118919d</code> "feat: support generating PTX (#28)" on 21 May 2025: about 3,100 added lines, including a CUDA trampoline and a
     demo program. The mechanism is the same lifter plus a different <code>TargetMachine</code>:</p>
-    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">static std::unique_ptr&lt;llvm::TargetMachine&gt;
+    <pre data-file="llvmbpf/src/llvm_jit_context.cpp"><code class="language-cpp">static std::unique_ptr&lt;llvm::TargetMachine&gt;
 createNVPTXTargetMachine(const char *target_cpu)
 {
 #ifndef LLVMBPF_HAS_NVPTX
@@ -1030,7 +1043,7 @@ res = 0</code></pre>
     <h3>The library API</h3>
     <p>That example shows the whole embedding API in a dozen lines. A helper is any C function taking five <code>uint64_t</code> arguments. Index 2
     here is arbitrary: it just has to match the <code>call 2</code> instruction in the bytecode.</p>
-    <pre data-file="example/basic.cpp"><code class="language-cpp">uint64_t ffi_print_func(uint64_t a, uint64_t _b, uint64_t _c, uint64_t _d,
+    <pre data-file="llvmbpf/example/basic.cpp"><code class="language-cpp">uint64_t ffi_print_func(uint64_t a, uint64_t _b, uint64_t _c, uint64_t _d,
 			uint64_t _e)
 {
 	std::cout &lt;&lt; (const char *)a &lt;&lt; std::endl;
@@ -1176,8 +1189,9 @@ int main(void)
       <li><strong>ubpf-style data tests</strong> (<code>test/test_framework</code>, pytest, 132 <code>.data</code> files with assembly and expected results), carried over
       from uBPF.</li>
     </ul>
-    <p>As the call-frame bug above shows, the suites test instruction semantics thoroughly but not every multi-frame stack layout. A test that writes deep
-    into a callee's stack would catch it.</p>
+    <p>As the call-frame and division bugs above show, the suites test instruction semantics thoroughly but not every multi-frame stack layout, and
+    not divisors that are only known at run time. A test that writes deep into a callee's stack, and a division test that loads its zero divisor
+    from memory, would catch them.</p>
 
     <h2>How bpftime uses llvmbpf</h2>
     <p>In bpftime (<a href="14-bpftime-architecture.html">Chapter 14</a>), <code>vm/llvm-jit</code> is a git submodule pointing at llvmbpf. At bpftime commit
@@ -1284,7 +1298,8 @@ __attribute__((constructor(0))) void register_llvm_vm_factory()
     </table>
     <p>Two rows deserve emphasis. First, llvmbpf is the only one of these that can produce an object file and the only one that targets GPUs. Both
     follow from going through LLVM IR rather than being designed in. Second, llvmbpf gives up the interpreter and run-time checks that uBPF and rbpf
-    keep as a safety net. That trade is reasonable when a verifier is enforced first, as with bpftime in strict verifier mode. It is dangerous if you embed
+    keep as a safety net. That trade is reasonable when a verifier is enforced first, as with bpftime's kernel-verifier modes, or its strict userspace mode for the
+    program types that mode actually checks (<a href="14-bpftime-architecture.html">Chapter 14</a> explains why uprobe programs may bypass it). It is dangerous if you embed
     llvmbpf alone, or run bpftime with its default warning-only verifier, and feed it untrusted bytecode.</p>
 
     <h2>Benefits and limitations</h2>
@@ -1307,6 +1322,7 @@ __attribute__((constructor(0))) void register_llvm_vm_factory()
       <li><strong>LLVM is heavy.</strong> Binaries embedding it are tens of megabytes, even after #52 trimmed unused backends. Compilation runs the full
       LLVM pipeline at run time, which costs far more than a direct emitter. The cost amortises when a program runs many times, and AOT removes it.</li>
       <li><strong>Semantic gaps from LLVM's assumptions.</strong> The lifter must add guards (division, shifts) wherever eBPF defines behaviour that LLVM leaves undefined.
+      At the studied commit the division guards are ineffective for run-time zero divisors (SIGFPE on x86-64, see above).
       Alignment and data-race assumptions on plain loads and stores remain.</li>
       <li><strong>Hand-rolled calls in one function.</strong> BPF-to-BPF calls go through an IR-level call stack and <code>indirectbr</code>, with a 32-frame limit.
       As shown above, the frame offset is wrong at the studied commit.</li>
@@ -1385,7 +1401,7 @@ __attribute__((constructor(0))) void register_llvm_vm_factory()
         <button class="opt">It falls back to the interpreter</button>
         <button class="opt" data-right>The native code reads that host address; the result is whatever is there or a crash. Only an enforced verifier run beforehand prevents it</button>
         <div class="why"><code>emitLoadX</code> is a GEP plus a load with no checks, and llvmbpf has no interpreter. Safety is the embedder's job; bpftime's
-        verifier only rejects programs when it runs in strict mode.</div></div>
+        userspace verifier only rejects programs when it is built in, runs in strict mode and covers the program type.</div></div>
       <div class="q"><p><strong>Q6.</strong> How do you make bpftime use uBPF instead of llvmbpf for a run?</p>
         <button class="opt">Rebuild bpftime without LLVM</button>
         <button class="opt" data-right>Set <code>BPFTIME_VM_NAME=ubpf</code>; the runtime looks up the VM factory by that name (default <code>"llvm"</code>)</button>
