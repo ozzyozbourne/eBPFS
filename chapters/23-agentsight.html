@@ -1,0 +1,1695 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 · AgentSight: system-level observability for AI agents · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="23">
+<meta name="chapter-part" content="Part VI · eBPF for AI agents">
+<meta name="chapter-summary" content="How AgentSight uses uprobes on TLS libraries and kernel tracepoints to watch an AI coding agent from outside, capturing what it asks the model and what it then does on the machine, and how a Rust pipeline of runners and analyzers joins the two streams into one timeline.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/agentsight">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VI · eBPF for AI agents › 23 · AgentSight</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 23</div>
+      <h1>AgentSight: system-level observability for AI agents</h1>
+      <p class="lede">You start Claude Code or Codex, ask it to fix a failing test, and twenty
+      minutes later it reports success. What did it actually send to the model? Which
+      commands did it run, which files did it open, which hosts did it contact, and which of
+      those actions came from which model reply? The agent's own logs are written by the
+      agent. This chapter shows how AgentSight answers those questions from outside the
+      agent. It uses uprobes on TLS libraries to read the plaintext of every model call, and
+      kernel tracepoints to follow every process the agent spawns. A Rust pipeline then
+      joins the two streams into one timeline.</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="05-program-types-and-hooks.html">05</a>, <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: eunomia-bpf/agentsight @ <code>c1574366</code> (v1.0.35)</span><span>~60 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>An AI coding agent is a loop. It sends a prompt to a large language model (LLM) over
+    HTTPS, gets back text and <em>tool calls</em> ("run <code>npm test</code>", "edit
+    <code>src/auth.ts</code>"), carries those calls out on the local machine, and sends the
+    results back to the model. Claude Code, Codex, Gemini CLI and similar tools all work this
+    way, and so do agents built with frameworks such as LangChain or crewAI. Each tool call
+    can start arbitrary programs. A single "run the tests" step may fork a shell, which runs
+    <code>npm</code>, which starts <code>node</code>, which opens hundreds of files and maybe
+    a network connection.</p>
+
+    <p>When such a run fails, stalls, burns tokens or does something unsafe, you want two
+    views of it at once:</p>
+    <ul>
+      <li><strong>Intent.</strong> What the agent asked the model and what the model told it
+      to do: the prompts, the replies, the tool calls with their arguments, the token
+      counts.</li>
+      <li><strong>Action.</strong> What really happened on the system: which processes ran
+      with which arguments, which files were read or written, which sockets connected
+      where, how much CPU and memory it all took.</li>
+    </ul>
+
+    <p>Existing tools see one side. Application-level tracing (LangSmith, Langfuse, Phoenix,
+    or OpenTelemetry instrumentation inside the agent) sees intent, but only if you own and
+    instrument the agent's code. The trace stops at the process boundary: a
+    <code>bash -c</code> that the agent spawns is a black box. Gateways and proxies such as
+    Helicone see the model traffic when you can reroute it, but not the local effects.
+    System monitors (Falco, Tracee, or plain <code>strace</code>) see every
+    <code>execve</code> and <code>openat</code>, but they have no idea which model reply
+    caused them. To such a tool, an agent writing a test script and an agent writing a
+    malicious payload look the same.</p>
+
+    <p>The AgentSight paper calls this the <strong>semantic gap</strong>: "existing tools
+    observe either an agent's high-level intent (via LLM prompts) or its low-level actions
+    (e.g., system calls), but cannot correlate these two views"
+    (<a href="#ref-paper">Zheng et al., PACMI '25</a>). There is also a trust problem. An
+    agent that has been manipulated by a prompt injection, or that is simply buggy, can
+    skip, truncate or falsify its own logs. An observer that lives outside the agent and
+    reads from the kernel does not depend on the agent's cooperation.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Agent frameworks change
+    every week, but every agent must cross two stable boundaries: it talks to the model
+    through a TLS library, and it acts on the machine through system calls. AgentSight puts
+    eBPF probes on both: uprobes on <code>SSL_read</code>/<code>SSL_write</code> (and their
+    equivalents) for the decrypted <em>intent stream</em>, and tracepoints and fentry/fexit
+    hooks in the kernel for the <em>action stream</em>. A userspace engine then links the
+    two by process lineage, time and content. The paper calls this approach <em>boundary
+    tracing</em>.</p></div>
+
+    <div class="grid">
+      <div class="card"><h4>Application-level tracing</h4><p>SDKs or callbacks inside the
+      agent. Rich semantics: prompts, tools, tokens. Needs code changes, breaks when the
+      framework changes, cannot see subprocesses, and trusts the agent to report
+      itself.</p></div>
+      <div class="card"><h4>Proxies and gateways</h4><p>Route model traffic through an
+      endpoint you control. No agent changes, but you need the agent to honour a base URL or
+      a proxy, a TLS interception certificate, or both, and you still see nothing local.</p></div>
+      <div class="card"><h4>Generic system tracing</h4><p>Kernel-level, complete, and hard to
+      evade. But it has no notion of a "model reply" or a "tool call", so it cannot tell you
+      why a process ran.</p></div>
+      <div class="card"><h4>AgentSight</h4><p>Kernel-level capture of <em>both</em> streams,
+      no SDK, no proxy, no agent changes. Works for closed-source CLIs. The cost is Linux
+      only (for live capture), root for the probes, and per-runtime work to find the TLS
+      functions.</p></div>
+    </div>
+
+    <p>This chapter is about <em>observing</em> agents. Enforcing policies on them, by
+    tracking where data flows and blocking violations in a BPF-LSM hook, is the subject of
+    <a href="24-actplane.html">chapter 24, ActPlane</a>, which grew out of AgentSight's code
+    base. Measuring and limiting the OS resources an agent uses is
+    <a href="25-agentcgroup.html">chapter 25</a>.</p>
+
+    <h2>Boundary tracing: the design in one picture</h2>
+    <p>AgentSight was released in July 2025 (the GitHub repository was created on
+    2025-07-07) and described in a six-page workshop paper,
+    <a href="#ref-paper">"AgentSight: System-Level Observability for AI Agents Using
+    eBPF"</a> by Yusheng Zheng, Yanpeng Hu, Tong Yu and Andi Quinn, at PACMI '25 (the 4th
+    Workshop on Practical Adoption Challenges of ML for Systems, held with SOSP '25). Since
+    then the repository has grown from a research prototype into a product with a
+    <code>top</code>-style live view, background monitoring, saved sessions, reports, a
+    hosted web app and a crates.io library. The core architecture has stayed the same.</p>
+
+    <p>The paper bases the design on two properties of the boundaries:</p>
+    <ul>
+      <li><strong>Comprehensiveness.</strong> Every action an agent takes, from process
+      creation to file I/O, goes through the kernel, including actions of subprocesses that
+      no in-process SDK can see.</li>
+      <li><strong>Stability.</strong> "System call ABIs and network protocols evolve far more
+      slowly than agent frameworks." A probe on <code>SSL_write</code> keeps working when an
+      agent switches from one SDK to another.</li>
+    </ul>
+
+    <figure>
+      <svg viewBox="0 0 900 470" role="img" aria-label="AgentSight architecture: the agent process tree in user space, uprobes on its TLS library producing the intent stream, kernel tracepoints and fexit hooks producing the action stream, three C loader programs writing JSON lines to the Rust collector, which runs analyzers and a materialized view and writes to SQLite, OpenTelemetry, the terminal and the web UI">
+        <style>
+          .s23b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .s23k{fill:none;stroke:var(--accent);stroke-width:2}
+          .s23u{fill:none;stroke:var(--accent2);stroke-width:2}
+          .s23t{fill:var(--fg);font:13px sans-serif}
+          .s23m{fill:var(--fg);font:12px monospace}
+          .s23n{fill:var(--muted);font:12px sans-serif}
+          .s23a{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah23a)}
+          .s23i{stroke:var(--accent2);stroke-width:2;fill:none;marker-end:url(#ah23a)}
+          .s23x{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#ah23a)}
+          .s23l{stroke:var(--border);stroke-width:1;stroke-dasharray:5 4}
+        </style>
+        <defs><marker id="ah23a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="s23n" x="8" y="18">agent (unprivileged)</text>
+        <text class="s23n" x="8" y="186">AgentSight (user space, probes run as root)</text>
+        <text class="s23n" x="8" y="398">kernel</text>
+        <line class="s23l" x1="0" y1="170" x2="900" y2="170"/>
+        <line class="s23l" x1="0" y1="380" x2="900" y2="380"/>
+        <!-- agent -->
+        <rect class="s23b" x="30" y="28" width="330" height="125" rx="8"/>
+        <text class="s23t" x="44" y="50" style="font-weight:600">agent process (claude / codex / node)</text>
+        <text class="s23n" x="44" y="70">control loop, prompts, tool calls</text>
+        <rect class="s23u" x="44" y="84" width="300" height="55" rx="6"/>
+        <text class="s23m" x="56" y="104">TLS library: SSL_write / SSL_read</text>
+        <text class="s23n" x="56" y="124">OpenSSL, BoringSSL, GnuTLS, NSS, rustls</text>
+        <rect class="s23b" x="400" y="28" width="250" height="125" rx="8"/>
+        <text class="s23t" x="414" y="50" style="font-weight:600">child processes</text>
+        <text class="s23m" x="414" y="74">bash -c "npm test"</text>
+        <text class="s23m" x="414" y="94">  node, git, python, curl</text>
+        <text class="s23n" x="414" y="118">exec, open, write, connect,</text>
+        <text class="s23n" x="414" y="136">rename, unlink, exit</text>
+        <rect class="s23b" x="690" y="28" width="185" height="125" rx="8"/>
+        <text class="s23t" x="702" y="50" style="font-weight:600">LLM provider</text>
+        <text class="s23n" x="702" y="72">HTTPS, HTTP/2,</text>
+        <text class="s23n" x="702" y="90">SSE streaming</text>
+        <text class="s23n" x="702" y="116">sees only</text>
+        <text class="s23n" x="702" y="134">ciphertext on the wire</text>
+        <path class="s23a" d="M360,90 H398"/>
+        <path class="s23a" d="M344,60 C520,10 600,10 688,60"/>
+        <!-- kernel -->
+        <rect class="s23k" x="30" y="392" width="845" height="68" rx="8"/>
+        <text class="s23m" x="44" y="414">uprobe/uretprobe on TLS functions</text>
+        <text class="s23m" x="44" y="434">tp/sched/sched_process_exec, _exit, _fork</text>
+        <text class="s23m" x="44" y="452">fexit/security_file_open, tp/syscalls/sys_enter_*</text>
+        <text class="s23m" x="470" y="414">ring buffers: rb (16 MB for TLS)</text>
+        <text class="s23m" x="470" y="434">event_agg_map (in-kernel counts)</text>
+        <text class="s23m" x="470" y="452">tracked_pids, tracked_cgroups</text>
+        <path class="s23i" d="M190,139 C190,250 120,330 120,390"/>
+        <path class="s23x" d="M525,153 C525,250 420,330 420,390"/>
+        <!-- loaders -->
+        <rect class="s23b" x="30" y="200" width="200" height="60" rx="6"/>
+        <text class="s23m" x="44" y="222">sslsniff</text><text class="s23n" x="44" y="242">intent stream (JSONL)</text>
+        <rect class="s23b" x="250" y="200" width="200" height="60" rx="6"/>
+        <text class="s23m" x="264" y="222">process</text><text class="s23n" x="264" y="242">action stream (JSONL)</text>
+        <rect class="s23b" x="470" y="200" width="170" height="60" rx="6"/>
+        <text class="s23m" x="484" y="222">stdiocap</text><text class="s23n" x="484" y="242">MCP stdio (JSONL)</text>
+        <path class="s23a" d="M130,388 V262"/>
+        <path class="s23a" d="M350,388 V262"/>
+        <!-- rust -->
+        <rect class="s23u" x="30" y="282" width="610" height="84" rx="8"/>
+        <text class="s23t" x="44" y="304" style="font-weight:600">agentsight (Rust): runners → analyzers → AgentRunner (select_all)</text>
+        <text class="s23m" x="44" y="326">TimestampNormalizer, SSEProcessor, HTTPParser,</text>
+        <text class="s23m" x="44" y="344">HTTPDecompressor, AuthHeaderRemover → MaterializingAnalyzer</text>
+        <text class="s23n" x="44" y="360">plus SystemRunner (/proc samples) and agent-native session files</text>
+        <path class="s23a" d="M130,262 V280"/><path class="s23a" d="M350,262 V280"/><path class="s23a" d="M555,262 V280"/>
+        <rect class="s23b" x="680" y="200" width="195" height="166" rx="8"/>
+        <text class="s23t" x="694" y="222" style="font-weight:600">outputs</text>
+        <text class="s23m" x="694" y="246">agentsight-*.db</text>
+        <text class="s23n" x="694" y="264">(SQLite, report)</text>
+        <text class="s23m" x="694" y="290">:7395 web UI</text>
+        <text class="s23n" x="694" y="308">timeline, tree, logs</text>
+        <text class="s23m" x="694" y="334">OTLP gen_ai.*</text>
+        <text class="s23m" x="694" y="356">top (TUI)</text>
+        <path class="s23a" d="M640,320 H678"/>
+      </svg>
+      <figcaption>Figure 23.1 — The two boundaries and the two streams. Blue (accent2):
+      the intent stream, read by uprobes inside the agent's TLS library. Accent: the action
+      stream, read by kernel hooks on the agent's process tree. Three small C programs load
+      the probes and print JSON lines. The Rust collector parses, enriches and joins them.</figcaption>
+    </figure>
+
+    <p>Three facts about this picture are worth fixing in your head before looking at code.</p>
+    <ol>
+      <li><strong>Intent comes from user space, actions from the kernel.</strong> TLS
+      encryption happens inside the agent process. On the wire there is only ciphertext. The
+      last place the request exists in plaintext is the buffer the agent passes to
+      <code>SSL_write</code>, and the first place the reply exists in plaintext is the buffer
+      <code>SSL_read</code> fills. A uprobe (<a href="05-program-types-and-hooks.html">chapter
+      05</a>) on those functions reads the buffer with
+      <code>bpf_probe_read_user()</code>. No certificate, proxy or key logging is needed.</li>
+      <li><strong>The probes are separate programs.</strong> Each eBPF tool in
+      <code>bpf/</code> is a classic libbpf application: a <code>.bpf.c</code> kernel part
+      and a <code>.c</code> loader that prints one JSON object per event on stdout. The Rust
+      binary embeds the compiled loaders, writes them to a temporary directory at start-up,
+      and runs them as child processes (with <code>sudo -n</code> if it is not root). The
+      agent itself keeps running as your normal user.</li>
+      <li><strong>Correlation happens in user space.</strong> The kernel side does only
+      filtering and cheap aggregation. Parsing HTTP/2, reassembling Server-Sent Events,
+      pairing requests with responses, extracting tool calls and building the process tree
+      all happen in Rust.</li>
+    </ol>
+
+    <h2>The intent stream: reading TLS plaintext with uprobes</h2>
+    <p>The SSL probe lives in <code>bpf/sslsniff.bpf.c</code> (831 lines) and its loader
+    <code>bpf/sslsniff.c</code> (1,217 lines). The header credits the origin: it is "based on
+    sslsniff from BCC by Adrian Lopez &amp; Mark Drayton", rewritten for libbpf and CO-RE by
+    Yusheng Zheng in 2023 (the same tool is a lesson in
+    <a href="09-bpf-developer-tutorial.html">chapter 09's tutorial</a>). AgentSight has
+    since added several TLS libraries, a large-buffer event format, capture-loss counters
+    and byte-pattern attachment for stripped binaries.</p>
+
+    <h3>Which functions are hooked</h3>
+    <p>The loader attaches a uprobe at function entry and a uretprobe at function return for
+    each read/write function of each library it finds. The table lists what
+    <code>attach_openssl()</code>, <code>attach_boringssl()</code>,
+    <code>attach_gnutls()</code> and <code>attach_nss()</code> in <code>sslsniff.c</code>
+    attach, by symbol name:</p>
+    <table>
+      <thead><tr><th>Library</th><th>Write side</th><th>Read side</th><th>Other</th><th>Where it is found</th></tr></thead>
+      <tbody>
+        <tr><td>OpenSSL</td><td><code>SSL_write</code>, <code>SSL_write_ex</code></td><td><code>SSL_read</code>, <code>SSL_read_ex</code></td><td><code>SSL_do_handshake</code>, <code>SSL_free</code> (optional, marks close)</td><td>system <code>libssl.so</code> via <code>find_library_path()</code>, or <code>--binary-path</code> (Node.js links OpenSSL statically)</td></tr>
+        <tr><td>BoringSSL</td><td>same names</td><td>same names</td><td>same</td><td><code>--binary-path</code>; chosen when the ELF has the symbol <code>OPENSSL_is_boringssl</code>, otherwise by byte pattern (Bun / Claude Code)</td></tr>
+        <tr><td>GnuTLS</td><td><code>gnutls_record_send</code></td><td><code>gnutls_record_recv</code></td><td><code>gnutls_deinit</code></td><td><code>libgnutls.so</code></td></tr>
+        <tr><td>NSS / NSPR</td><td><code>PR_Write</code>, <code>PR_Send</code></td><td><code>PR_Read</code>, <code>PR_Recv</code></td><td><code>PR_Close</code></td><td><code>libnspr4.so</code></td></tr>
+        <tr><td>rustls</td><td colspan="2">plaintext write functions and <code>buffer_plaintext</code>, at offsets found by signature</td><td>&mdash;</td><td>Codex (<code>codex_offsets.h</code>) and Grok binaries only; the programs are disabled with <code>bpf_program__set_autoload(..., false)</code> otherwise</td></tr>
+      </tbody>
+    </table>
+
+    <p>The attach helper is a thin macro over libbpf's
+    <code>bpf_program__attach_uprobe_opts()</code> with <code>.func_name</code> set, so
+    libbpf resolves the symbol in the ELF for you. Every link is kept so that a partial
+    failure can be rolled back:</p>
+    <pre data-file="bpf/sslsniff.c"><code class="language-c">#define __ATTACH_UPROBE(skel, binary_path, sym_name, prog_name, is_retprobe)   \
+	do {                                                                       \
+	  LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts, .func_name = #sym_name,        \
+				  .retprobe = is_retprobe);                                    \
+	  int __err = keep_attach_link(bpf_program__attach_uprobe_opts(            \
+		  skel-&gt;progs.prog_name, env.pid, binary_path, 0, &amp;uprobe_opts));      \
+	  if (__err)                                                               \
+		return __err;                                                         \
+	} while (false)
+/* ... */
+int attach_openssl(struct sslsniff_bpf *skel, const char *lib) {
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write, probe_openssl_SSL_rw_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_write_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_read, probe_openssl_SSL_rw_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_read, probe_SSL_read_exit);
+
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write_ex,
+						probe_openssl_SSL_write_ex_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write_ex, probe_SSL_write_ex_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_read_ex,
+						probe_openssl_SSL_read_ex_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_read_ex, probe_SSL_read_ex_exit);
+
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_do_handshake,
+						probe_openssl_SSL_do_handshake_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_do_handshake,
+						   probe_SSL_do_handshake_exit);
+	ATTACH_UPROBE_OPTIONAL(skel, lib, SSL_free, probe_openssl_TLS_close);
+
+	return 0;
+}</code></pre>
+
+    <h3>Why both an entry probe and a return probe</h3>
+    <p><code>SSL_write(ssl, buf, num)</code> receives plaintext in <code>buf</code>, so the
+    entry probe could copy it right away. <code>SSL_read(ssl, buf, num)</code> is the
+    opposite: at entry, <code>buf</code> is an empty buffer, and only when the function
+    returns does it hold <code>ret</code> bytes of decrypted data. sslsniff treats both
+    directions the same way. The entry probe saves the arguments in hash maps keyed by
+    thread ID. The return probe reads the return value (the byte count), looks up the saved
+    buffer pointer, copies the bytes and submits the event. Using the thread ID as key is
+    safe because a thread can only be inside one <code>SSL_read</code> at a time.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Entry: stash arguments">
+    <pre data-file="bpf/sslsniff.bpf.c"><code class="language-c">static __always_inline int SSL_rw_enter(void *ssl, void *buf,
+                                        u8 tls_library)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid &gt;&gt; 32;
+    u32 tid = pid_tgid;
+    u32 uid = bpf_get_current_uid_gid();
+    u64 ts = bpf_ktime_get_ns();
+    u64 handle = (u64)ssl;
+
+    if (!trace_allowed(uid, pid)) {
+        return 0;
+    }
+
+    /* store arg info for later lookup */
+    bpf_map_update_elem(&amp;bufs, &amp;tid, &amp;buf, BPF_ANY);
+    bpf_map_update_elem(&amp;start_ns, &amp;tid, &amp;ts, BPF_ANY);
+    bpf_map_update_elem(&amp;transport_handles, &amp;tid, &amp;handle, BPF_ANY);
+    bpf_map_update_elem(&amp;tls_libraries, &amp;tid, &amp;tls_library, BPF_ANY);
+    return 0;
+}
+
+SEC("uprobe/openssl_SSL_rw")
+int BPF_UPROBE(probe_openssl_SSL_rw_enter, void *ssl, void *buf, int num)
+{
+    return SSL_rw_enter(ssl, buf, TLS_LIBRARY_OPENSSL);
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Return: copy plaintext">
+    <pre data-file="bpf/sslsniff.bpf.c"><code class="language-c">static int SSL_exit(struct pt_regs *ctx, int rw) {
+    /* ... pid/tid/uid/ts as above, trace_allowed() ... */
+    u64 *bufp = bpf_map_lookup_elem(&amp;bufs, &amp;tid);
+    if (bufp == 0)
+        return 0;
+
+    u64 *tsp = bpf_map_lookup_elem(&amp;start_ns, &amp;tid);
+    if (!tsp)
+        return 0;
+    u64 delta_ns = ts - *tsp;
+    /* ... */
+    int len = PT_REGS_RC(ctx);
+    if (len &lt;= 0) { // no data
+        /* ... delete the four map entries ... */
+        return 0;
+    }
+
+    /* reserve space in ring buffer */
+    struct probe_SSL_data_t *data = reserve_event();
+    /* ... fill pid, tid, uid, len, rw, tls_library, process_start_ns ... */
+    u32 buf_copy_size = clamp_probe_size((size_t)len, MAX_BUF_SIZE);
+
+    bpf_get_current_comm(&amp;data-&gt;comm, sizeof(data-&gt;comm));
+
+    if (bufp != 0)
+        ret = bpf_probe_read_user(&amp;data-&gt;buf, buf_copy_size, (char *)*bufp);
+    /* ... delete map entries, set buf_filled / buf_size ... */
+
+    /* submit to ring buffer */
+    bpf_ringbuf_submit(data, 0);
+    return 0;
+}
+
+SEC("uretprobe/SSL_read")
+int BPF_URETPROBE(probe_SSL_read_exit) {
+    return (SSL_exit(ctx, 0));
+}
+
+SEC("uretprobe/SSL_write")
+int BPF_URETPROBE(probe_SSL_write_exit) {
+    return (SSL_exit(ctx, 1));
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Event layout">
+    <pre data-file="bpf/sslsniff.h"><code class="language-c">#define MAX_BUF_SIZE (256 * 1024)
+#define RING_BUFFER_SIZE (16 * 1024 * 1024)  // 16MB ring buffer
+#define TASK_COMM_LEN 16
+
+enum tls_library_t {
+    TLS_LIBRARY_UNKNOWN = 0,
+    TLS_LIBRARY_OPENSSL = 1,
+    TLS_LIBRARY_GNUTLS = 2,
+    TLS_LIBRARY_NSS = 3,
+    TLS_LIBRARY_RUSTLS = 4,
+    TLS_LIBRARY_BORINGSSL = 5,
+};
+
+struct probe_SSL_data_t {
+    __u64 timestamp_ns;
+    __u64 delta_ns;
+    __u64 transport_handle; // SSL*, gnutls_session_t, PRFileDesc*, or Rustls connection
+    __u64 ringbuf_reserve_failures; // cumulative capture-loss counter
+    __u64 process_start_ns; // process-instance discriminator from task_struct
+    __u32 pid;
+    __u32 tid;
+    __u32 uid;
+    __u32 len;
+    __u32 buf_size;         // Actual bytes copied to buf
+    int buf_filled;
+    int rw;
+    char comm[TASK_COMM_LEN];
+    __u8 buf[MAX_BUF_SIZE];
+    int is_handshake;
+    __u8 tls_library;
+    __u8 connection_closed;
+};</code></pre>
+      </div>
+    </div>
+
+    <p>Several details in this code are lessons in practical eBPF.</p>
+    <ul>
+      <li><strong>Fixed-size ring-buffer records.</strong> <code>bpf_ringbuf_reserve()</code>
+      needs a size the verifier knows, so every event reserves the full
+      <code>sizeof(struct probe_SSL_data_t)</code>, about 256 KB, even for a 40-byte
+      write. The comment in <code>sslsniff.h</code> records why the numbers are what they
+      are: at an earlier 512 KB buffer, "a 2MB ring held only 3 concurrent events; the 4th
+      reserve returned NULL and the handler dropped the event silently". With 256 KB
+      records and a 16 MB ring, 63 worst-case events fit. Larger writes are truncated and
+      flagged (<code>truncated</code>, <code>bytes_lost</code>) instead of vanishing.</li>
+      <li><strong>Counting loss.</strong> <code>reserve_event()</code> increments a
+      <code>capture_loss</code> array entry when a reservation fails and copies the running
+      total into every later event (<code>ringbuf_reserve_failures</code>). A consumer can
+      therefore tell that it missed something even though the missed event itself never
+      existed.</li>
+      <li><strong>Placating the verifier.</strong> <code>clamp_probe_size()</code> masks the
+      length with <code>0x7ffff</code>, clamps it, and calls <code>barrier_var()</code>,
+      because "some 6.6 verifiers (including TencentOS 4) treat the size as
+      signed-unbounded and reject with 'R2 min value is negative'". This is the kind of
+      bounds-tracking issue explained in <a href="03-verifier.html">chapter 03</a>.</li>
+      <li><strong>Connection identity.</strong> The <code>SSL*</code> pointer is recorded as
+      <code>transport_handle</code>, and <code>process_start_ns</code> comes from the
+      thread-group leader's <code>start_boottime</code>. The pair (process instance, TLS
+      object) identifies one connection, even when the connection moves between threads.
+      The Rust side uses it to group the records of one HTTP exchange (commit
+      <code>33390661</code>, "correlate HTTP exchanges by TLS connection and stream").</li>
+    </ul>
+
+    <p>In user space, <code>handle_event()</code> calls <code>print_event()</code>, which
+    writes one JSON object per record: <code>function</code> (<code>READ</code>,
+    <code>WRITE</code> or <code>CLOSE</code>), <code>timestamp_ns</code>,
+    <code>capture_seq</code>, <code>comm</code>, <code>pid</code>, <code>tid</code>,
+    <code>len</code>, <code>buf_size</code>, <code>transport_handle</code>,
+    <code>tls_library</code>, <code>latency_ms</code>, the payload as both
+    <code>data</code> (text) and <code>data_hex</code> (exact bytes, needed for HTTP/2 HPACK
+    headers, per <code>docs/ssl-capture.md</code>), <code>truncated</code>, and container
+    fields when the process is in one.</p>
+
+    <h3>Static and stripped binaries</h3>
+    <p>The hard part of TLS capture is not the BPF code but finding the functions. Many
+    agent CLIs do not use the system <code>libssl.so</code>. The README FAQ explains:
+    Claude Code is a Bun application with BoringSSL linked in statically, and "OpenSSL for
+    <strong>all</strong> Node.js" builds (Gemini CLI, many others) is also statically
+    linked. Codex is written in Rust and uses rustls. Attaching to
+    <code>libssl.so</code> catches none of them.</p>
+
+    <p>For these, sslsniff takes <code>--binary-path</code> and tries, in order:</p>
+    <ol>
+      <li><strong>Symbols.</strong> If the ELF has <code>OPENSSL_is_boringssl</code> it
+      calls <code>attach_boringssl()</code>, else <code>attach_openssl()</code>, both by
+      symbol name. Node.js exports its OpenSSL symbols, so this works there.</li>
+      <li><strong>rustls signatures.</strong> If the binary carries Codex or Grok TLS
+      markers, it searches for rustls functions (<code>codex_find_rustls_offsets()</code>
+      and friends) and attaches the <code>probe_rustls_*</code> programs by file offset.
+      These programs read Rust ABI structures such as
+      <code>OutboundChunks</code>, so they depend on the compiled layout.</li>
+      <li><strong>BoringSSL byte patterns.</strong> For a stripped binary,
+      <code>find_boringssl_offsets()</code> reads the whole file and looks for the function
+      prologues of <code>SSL_read</code>, <code>SSL_write</code> and
+      <code>SSL_do_handshake</code>. The comment says the patterns "are derived from Bun
+      v1.3.x profile builds". The offsets are then passed to
+      <code>bpf_program__attach_uprobe_opts()</code> with no <code>func_name</code>.</li>
+    </ol>
+    <p>If all three fail, the loader refuses to start rather than report "no traffic":
+    "binary-path attach failed for %s; refusing to continue with partial SSL capture".</p>
+
+    <div class="callout warn"><span class="label">Thread names</span><p>A trap that cost
+    the project real debugging time, documented in <code>CLAUDE.md</code>:
+    <code>bpf_get_current_comm()</code> returns the <em>thread</em> name, not the process
+    name. Claude Code does its TLS on a thread called "HTTP Client", so filtering sslsniff
+    with <code>-c claude</code> drops every event. When <code>--binary-path</code> is set,
+    <code>build_trace_agent()</code> in <code>collector/src/cmd_trace.rs</code> therefore
+    passes the command filter only to the process tracer, not to sslsniff. The uprobe is
+    already scoped to one ELF file.</p></div>
+
+    <p>The top-level <code>record</code> command hides all of this. With
+    <code>record -- &lt;command&gt;</code> it resolves the launched executable itself. With
+    <code>record -c node</code> it runs <code>resolve_binary_path()</code> and adopts the
+    result only if <code>binary_embeds_ssl()</code> finds the string
+    <code>SSL_write</code> in the file. With <code>--binary-path docker://name</code> or
+    <code>k8s://ns/pod/container</code> it asks Docker or the CRI for the container's init
+    PID and walks the descendant tree in <code>/proc</code> until it finds a process whose
+    executable embeds TLS or maps <code>libssl.so</code>.</p>
+
+    <h2>The action stream: following the process tree in the kernel</h2>
+    <p>The second probe, <code>bpf/process.bpf.c</code> (472 lines) plus the headers in
+    <code>bpf/process_ext/</code>, watches what the agent's processes do. Its copyright line ("Copyright (c) 2020
+    Facebook") and structure suggest it began from the libbpf-bootstrap
+    <code>bootstrap</code> example (our inference; the repo does not say so), and it has
+    grown many hooks. Grouped by purpose:</p>
+
+    <table>
+      <thead><tr><th>Purpose</th><th>Hooks (<code>SEC()</code> names)</th><th>Source</th></tr></thead>
+      <tbody>
+        <tr><td>Process lifecycle</td><td><code>tp/sched/sched_process_exec</code>, <code>tp/sched/sched_process_exit</code>, <code>tp/sched/sched_process_fork</code></td><td><code>process.bpf.c</code>, <code>process_ext/bpf_signals.h</code></td></tr>
+        <tr><td>Interactive shell input</td><td><code>uretprobe//usr/bin/bash:readline</code></td><td><code>process.bpf.c</code></td></tr>
+        <tr><td>File opens</td><td><code>fexit/security_file_open</code> (resolved path), fallback <code>tp/syscalls/sys_enter_openat</code>, <code>sys_enter_open</code></td><td><code>process.bpf.c</code></td></tr>
+        <tr><td>File mutations</td><td><code>sys_enter_unlinkat</code>, <code>unlink</code>, <code>renameat2</code>, <code>renameat</code>, <code>rename</code>, <code>mkdirat</code>, <code>mkdir</code>, <code>ftruncate</code>, <code>chdir</code></td><td><code>process_ext/bpf_fs.h</code></td></tr>
+        <tr><td>Writes</td><td><code>sys_enter/exit_write</code>, <code>pwrite64</code>, <code>writev</code></td><td><code>process_ext/bpf_write.h</code></td></tr>
+        <tr><td>Network</td><td><code>sys_enter_connect</code>, <code>sys_enter_bind</code>, <code>sys_enter_listen</code>, <code>kprobe/inet_listen</code>, <code>fexit/inet_bind_sk</code>, <code>fexit/inet6_bind_sk</code>, <code>fexit/inet_csk_accept</code></td><td><code>process_ext/bpf_net.h</code></td></tr>
+        <tr><td>Sessions and signals</td><td><code>sys_enter_setpgid</code>, <code>sys_enter_setsid</code>, <code>sys_enter_kill</code></td><td><code>process_ext/bpf_signals.h</code></td></tr>
+        <tr><td>Memory</td><td><code>sys_enter_mmap</code> (shared mappings), <code>kprobe/do_wp_page</code> (copy-on-write faults)</td><td><code>process_ext/bpf_mem.h</code>, <code>bpf_cow.h</code></td></tr>
+      </tbody>
+    </table>
+
+    <p>All of these hook types are explained in
+    <a href="05-program-types-and-hooks.html">chapter 05</a>. The choice follows the usual
+    rules: static tracepoints where they exist (stable across kernels), fexit where the
+    program needs a function's return value and its kernel objects, and a kprobe only where
+    nothing else gives the data.</p>
+
+    <h3>Exec: who ran what</h3>
+    <p>The exec handler reads the parent through CO-RE, the executable name from the
+    tracepoint's dynamic <code>__data_loc</code> field, and the full command line straight
+    from the new process's memory:</p>
+    <pre data-file="bpf/process.bpf.c"><code class="language-c">SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	/* ... */
+	if (!is_scope_tracked())
+		return 0;
+
+	/* Get process info */
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	task = (struct task_struct *)bpf_get_current_task();
+
+	/* remember time exec() was executed for this PID */
+	ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&amp;exec_start, &amp;pid, &amp;ts, BPF_ANY);
+	/* ... */
+	e-&gt;type = EVENT_TYPE_PROCESS;
+	e-&gt;exit_event = false;
+	e-&gt;pid = pid;
+	e-&gt;ppid = BPF_CORE_READ(task, real_parent, tgid);
+	e-&gt;timestamp_ns = ts;
+	bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+
+	fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+	bpf_probe_read_str(&amp;e-&gt;filename, sizeof(e-&gt;filename), (void *)ctx + fname_off);
+
+	/* Capture full command line with arguments from mm-&gt;arg_start */
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	unsigned long arg_start = BPF_CORE_READ(mm, arg_start);
+	unsigned long arg_end = BPF_CORE_READ(mm, arg_end);
+	unsigned long arg_len = arg_end - arg_start;
+	/* ...
+	 * We always read exactly MAX_COMMAND_LEN-1 bytes (a compile-time
+	 * constant) so that BPF verifiers on all kernel versions can
+	 * prove the access is bounded.  This may read past arg_end into
+	 * environment variables, but userspace trims to arg_len.
+	 *
+	 * NO LOOPS in BPF -- all post-processing (\0-&gt;space, trimming)
+	 * is done in userspace to stay within the verifier instruction
+	 * limit on kernel 5.15 (1,000,000 insns).
+	 */
+	long ret = bpf_probe_read_user(e-&gt;full_command,
+				MAX_COMMAND_LEN - 1,
+				(void *)arg_start);
+	/* ... store arg_len in e-&gt;exit_code for userspace trimming ... */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}</code></pre>
+    <p>The argv trick is worth noticing. <code>argv</code> is a block of NUL-separated
+    strings, so <code>bpf_probe_read_user_str()</code> would stop after
+    <code>argv[0]</code>. The program reads a fixed 255 bytes instead and lets user space
+    replace the NULs with spaces and cut at <code>arg_len</code>. That keeps the BPF side
+    loop-free. The exit handler is the mirror image: it computes the process lifetime from
+    the <code>exec_start</code> map, reads <code>exit_code</code> and the peak RSS
+    (<code>signal-&gt;maxrss</code>), and ignores thread exits (<code>pid != tid</code>).</p>
+
+    <h3>File opens: resolved paths, not syscall arguments</h3>
+    <p>Hooking <code>sys_enter_openat</code> gives you the string the program passed, which
+    may be relative (<code>../config.json</code>), may fail, and misses opens done by
+    <code>execve</code>, the ELF interpreter or io_uring. Commit <code>95612527</code>
+    ("trace resolved file access in process probe", October 2026) added a better hook:
+    fexit on the LSM function <code>security_file_open</code>, which runs after path
+    resolution for every successful open.</p>
+    <pre data-file="bpf/process.bpf.c"><code class="language-c">/* security_file_open runs after path resolution for open/openat/openat2,
+ * io_uring and exec, including the ELF interpreter. fexit excludes denied
+ * opens. The old syscall hooks remain available on kernels lacking this hook
+ * or bpf_d_path. */
+SEC("fexit/security_file_open")
+int BPF_PROG(trace_file_open_exit, struct file *file)
+{
+	/* ... */
+	if (bpf_get_func_ret(ctx, &amp;ret) || (int)ret || !is_scope_tracked())
+		return 0;
+	task = (struct task_struct *)bpf_get_current_task();
+	if (BPF_CORE_READ(task, flags) &amp; PF_KTHREAD)
+		return 0;
+	inode = BPF_CORE_READ(file, f_inode);
+	if ((BPF_CORE_READ(inode, i_mode) &amp; S_IFMT) != S_IFREG)
+		return 0;
+	/* ... skip nsfs/pidfs, detect overlay layer opens ... */
+	mode = BPF_CORE_READ(file, f_mode);
+	flags = BPF_CORE_READ(file, f_flags);
+	if (mode &amp; FMODE_READ)
+		access |= FILE_ACCESS_READ;
+	if (mode &amp; FMODE_WRITE)
+		access |= FILE_ACCESS_WRITE;
+	/* ... FILE_ACCESS_EXEC, build dedup key from process+file+access ... */
+	if (bpf_map_update_elem(&amp;file_opens_seen, &amp;key, &amp;present, BPF_NOEXIST) == -EEXIST)
+		return 0;
+
+	e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+	/* ... */
+	path_len = bpf_d_path(&amp;file-&gt;f_path, e-&gt;file_op.filepath,
+			      sizeof(e-&gt;file_op.filepath));
+	/* ... */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}</code></pre>
+    <p>Three ideas are packed in here. <code>bpf_get_func_ret()</code> lets an fexit program
+    see the return value, so denied opens are dropped. <code>bpf_d_path()</code> turns the
+    <code>struct path</code> into an absolute path string; the kernel allows this helper only
+    in a short list of functions, which is why the hook is on
+    <code>security_file_open</code>. And the <code>file_opens_seen</code> LRU hash (65,536
+    entries) deduplicates: a build that opens the same header a thousand times produces one
+    event per process, file and access mode, not a thousand. If the hook or helper is
+    missing, the loader falls back to the syscall tracepoints and prints a notice, as
+    <code>bpf/README.md</code> documents.</p>
+
+    <h3>Aggregating in the kernel</h3>
+    <p>Writes, connects, renames and signals can be extremely frequent. Instead of one ring
+    buffer record per call, the <code>process_ext</code> handlers update a hash map
+    <code>event_agg_map</code> (16,384 entries) keyed by process, event type and a short
+    detail string, holding a count, a byte total and the last timestamp. User space flushes
+    the map periodically (<code>process_ext/map_flush.h</code>) and emits summary events
+    named <code>FILE_DELETE</code>, <code>FILE_RENAME</code>, <code>WRITE</code>,
+    <code>NET_CONNECT</code>, <code>NET_BIND</code>, <code>SIGNAL_SEND</code>,
+    <code>PROC_FORK</code>, <code>COW_FAULT</code> and so on. The connect handler shows the
+    pattern:</p>
+    <pre data-file="bpf/process_ext/bpf_net.h"><code class="language-c">SEC("tp/syscalls/sys_enter_connect")
+int trace_connect(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!trace_network)
+		return 0;
+	if (!is_event_tracked())
+		return 0;
+
+	struct agg_key key = {};
+	key.pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	key.event_type = EVENT_TYPE_NET_CONNECT;
+
+	u16 family = 0;
+	const void *user_addr = (const void *)ctx-&gt;args[1];
+	bpf_probe_read_user(&amp;family, sizeof(family), user_addr);
+
+	if (family == 2)
+		read_and_format_sockaddr(ctx, key.detail, sizeof(key.detail));
+	else
+		format_family(key.detail, sizeof(key.detail), family);
+
+	update_agg_map(&amp;key, 1, 0);
+	return 0;
+}</code></pre>
+
+    <h3>Following only the agent</h3>
+    <p>A machine runs many processes; you want the agent and everything it starts, nothing
+    else. The paper describes this as "an aggressive, dynamic in-kernel eBPF filter" that
+    tracks <code>fork</code> and <code>execve</code> to build "a complete lineage tree of the
+    agent's activity". In the code it has two layers:</p>
+    <ul>
+      <li><strong>Scope</strong> (<code>is_scope_tracked()</code> in
+      <code>process_ext/bpf_common.h</code>): an optional target PID namespace (the task must
+      be visible in it, which also covers sandboxes nested inside it) and an optional cgroup
+      (exact ID, or any ID in the <code>tracked_cgroups</code> map).</li>
+      <li><strong>Lineage</strong> (<code>is_pid_tracked()</code>): a <code>tracked_pids</code>
+      hash map. User space keeps a PID tracker (<code>process_filter.h</code>) and decides on
+      every exec event whether the new process belongs to the agent. In the default filter
+      mode a process is tracked if it is the target PID, if its parent is tracked, or if its
+      name matches a <code>-c</code> filter. Tracked PIDs are written into the BPF map with
+      <code>bpf_map_update_elem()</code>, so later high-volume events from untracked PIDs are
+      dropped in the kernel.</li>
+    </ul>
+    <pre data-file="bpf/process_filter.h"><code class="language-c">	/* Mode 2 (FILTER): selective tracking */
+	if (tracker-&gt;filter_mode == FILTER_MODE_FILTER) {
+		/* Check if specific PID was requested */
+		if (tracker-&gt;target_pid &gt; 0 &amp;&amp; pid == tracker-&gt;target_pid) {
+			return true;
+		}
+
+		/* Check if parent is tracked */
+		if (pid_tracker_is_tracked(tracker, ppid)) {
+			return true;
+		}
+
+		/* Check if command matches any filter */
+		if (tracker-&gt;command_filter_count &gt; 0 &amp;&amp;
+		    command_matches_any_filter(comm, tracker-&gt;command_filters, tracker-&gt;command_filter_count)) {
+			return true;
+		}
+	}</code></pre>
+    <p>Note the split: the lineage decision is made in user space, in ring-buffer order,
+    while the cheap membership test runs in the kernel. A comment in the fexit handler
+    explains why: it keeps "PID/comm filtering in the existing userspace tracker so an open
+    racing the process exec event is handled in ring-buffer order". Our reading of the
+    code: exec and resolved-open events are checked only against the scope in the kernel
+    and filtered by lineage in user space, so a child that execs and opens files before
+    its PID reaches <code>tracked_pids</code> is not lost. The aggregated events
+    (<code>is_event_tracked()</code>) do depend on the map.</p>
+
+    <p>A third, smaller probe, <code>bpf/stdiocap.bpf.c</code>, hooks
+    <code>sys_enter/exit_read</code> and <code>write</code> for one target PID and copies the
+    bytes on file descriptors 0–2 (or all FDs with <code>--all-fds</code>). That captures
+    Model Context Protocol (MCP) servers that talk JSON-RPC over stdio, which never touch
+    TLS. An experimental <code>browsertrace</code> probe for NSS and Chrome exists but is not
+    embedded in the collector.</p>
+
+    <h2>The Rust collector: runners and analyzers</h2>
+    <p>The three probes are ordinary libbpf loaders written in C. Each one prints one JSON
+    object per line on stdout and knows nothing about HTTP, LLMs or sessions. Everything
+    above that line lives in Rust: the <code>agentsight</code> binary built from
+    <code>collector/</code>, on top of the library crate <code>agentsight-capture</code>
+    (published on crates.io) and the analysis code in <code>ext/analysis</code>. The design
+    is a small stream-processing framework with two traits: a <strong>runner</strong>
+    produces a stream of events, an <strong>analyzer</strong> takes a stream and returns a
+    new one.</p>
+
+    <h3>One event type, two traits</h3>
+    <p>All data, whatever its origin, travels as the same struct. The interesting payload is
+    left as untyped JSON in <code>data</code>, so a new probe field does not need a Rust
+    change until some analyzer wants to read it.</p>
+    <pre data-file="agentsight-capture/src/event.rs"><code class="language-rust">/// Raw event structure flowing from runners through analyzers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Event {
+    pub timestamp: u64,
+    pub source: String,
+    pub pid: u32,
+    pub comm: String,
+    pub data: serde_json::Value,
+}</code></pre>
+    <p>The two traits are just as small. An <code>EventStream</code> is a pinned, boxed
+    asynchronous <code>Stream</code> (from the <code>futures</code> crate), so the whole
+    pipeline is lazy: nothing is parsed until the stream is polled, and back-pressure from
+    a slow sink propagates up to the pipe that reads the probe's stdout.</p>
+    <pre data-file="agentsight-capture/src/runners/mod.rs"><code class="language-rust">pub type EventStream = Pin&lt;Box&lt;dyn Stream&lt;Item = Event&gt; + Send&gt;&gt;;
+pub type RunnerError = Box&lt;dyn std::error::Error + Send + Sync&gt;;
+
+#[async_trait]
+pub trait Runner: Send + Sync {
+    async fn run(&amp;mut self) -&gt; Result&lt;EventStream, RunnerError&gt;;
+
+    fn add_analyzer(self, analyzer: Box&lt;dyn crate::analyzers::Analyzer&gt;) -&gt; Self
+    where
+        Self: Sized;
+}</code></pre>
+    <pre data-file="agentsight-capture/src/analyzers/mod.rs"><code class="language-rust">/// Stable processing boundary between native capture and extensions.
+#[async_trait]
+pub trait Analyzer: Send + Sync {
+    async fn process(&amp;mut self, stream: EventStream) -&gt; Result&lt;EventStream, AnalyzerError&gt;;
+}</code></pre>
+    <p>The doc comment "stable processing boundary between native capture and extensions"
+    is the point of the split. <code>agentsight-capture</code> owns the parts that touch
+    the kernel (spawning probes, reading their output, resolving binaries), and the
+    analyzers in <code>ext/analysis</code> can change freely on top of it.</p>
+
+    <h3>From a probe's stdout to an <code>Event</code></h3>
+    <p>The probe binaries are compiled ahead of time and baked into the Rust executable
+    with <code>include_bytes!</code> (<code>agentsight-capture/src/binary_extractor.rs</code>).
+    At start-up they are written to a temporary directory, made executable, and launched as
+    child processes. That is why a single ~25 MB release binary is all you install.
+    <code>BinaryExecutor</code> in <code>runners/common.rs</code> starts each one:</p>
+    <pre data-file="agentsight-capture/src/runners/common.rs"><code class="language-rust">        let mut cmd = if needs_sudo {
+            let mut c = TokioCommand::new("sudo");
+            c.arg("-n").arg(&amp;self.binary_path);
+            c
+        } else {
+            TokioCommand::new(&amp;self.binary_path)
+        };
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);</code></pre>
+    <p>Three details matter here. <code>sudo -n</code> is non-interactive, so if you are not
+    root and have no cached sudo ticket the probe fails right away instead of hanging on a
+    password prompt; the error message tells you to run with <code>sudo</code> or
+    <code>sudo -v</code> first. <code>kill_on_drop</code> and a separate process group
+    mean that when the collector exits, the loaders (and so their BPF links) go with
+    it. And because each probe is a separate process, a verifier rejection in one does
+    not crash the others.</p>
+    <p>Each stdout line is parsed into an <code>Event</code>. A line that lacks the
+    timestamp, <code>pid</code> or <code>comm</code> is not dropped silently; it becomes a
+    diagnostic event and increments an error counter:</p>
+    <pre data-file="agentsight-capture/src/runners/common.rs"><code class="language-rust">pub fn parse_json_event(
+    runner: &amp;'static str,
+    timestamp_field: &amp;'static str,
+    raw: serde_json::Value,
+    errors: &amp;AtomicU64,
+) -&gt; Event {
+    let Some(timestamp) = raw.get(timestamp_field).and_then(|v| v.as_u64()) else {
+        return parse_error_event(runner, raw, format!("missing {timestamp_field}"), errors);
+    };
+    let Some(pid) = raw.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32) else {
+        return parse_error_event(runner, raw, "missing pid", errors);
+    };
+    let Some(comm) = raw.get("comm").and_then(|v| v.as_str()).map(str::to_string) else {
+        return parse_error_event(runner, raw, "missing comm", errors);
+    };
+
+    Event::new_with_timestamp(timestamp, runner.to_string(), pid, comm, raw)
+}</code></pre>
+    <p>The constructors name the source and the timestamp field per probe:
+    <code>BinaryRunner::ssl(path)</code> is <code>("SSL", "ssl", "timestamp_ns")</code>
+    and <code>BinaryRunner::stdio(path)</code> is <code>("Stdio", "stdio",
+    "timestamp_ns")</code>. The process probe has its own <code>ProcessRunner</code>
+    (timestamp field <code>timestamp</code>), which also handles seed PIDs and the
+    <code>CLOCK_SYNC</code> and <code>PROBE_LIVENESS</code> records the loader emits. A
+    fourth runner, <code>SystemRunner</code> in <code>ext/analysis/src/runners/system.rs</code>,
+    has no BPF at all: it samples CPU and memory from <code>/proc</code> at an interval.</p>
+
+    <h3>A first analyzer: putting clocks in line</h3>
+    <p>The BPF side stamps events with <code>bpf_ktime_get_ns()</code>, nanoseconds since
+    boot. That is cheap and monotonic but useless for joining with an agent's own session
+    log, which uses wall-clock time. The first analyzer on every runner converts it. It is
+    also the simplest example of the <code>Analyzer</code> trait: map one stream into
+    another.</p>
+    <pre data-file="ext/analysis/src/analyzers/timestamp_normalizer.rs"><code class="language-rust">#[async_trait]
+impl Analyzer for TimestampNormalizer {
+    async fn process(
+        &amp;mut self,
+        stream: EventStream,
+    ) -&gt; Result&lt;EventStream, Box&lt;dyn std::error::Error + Send + Sync&gt;&gt; {
+        let normalized_stream = stream.map(|mut event| {
+            // Convert timestamp from nanoseconds since boot to milliseconds since UNIX epoch
+            let timestamp_ms = boot_ns_to_epoch_ms(event.timestamp);
+            event.timestamp = timestamp_ms;
+            event
+        });
+
+        Ok(Box::pin(normalized_stream))
+    }
+}</code></pre>
+    <pre data-file="agentsight-capture/src/time.rs"><code class="language-rust">pub fn boot_ns_to_epoch_ms(ns_since_boot: u64) -&gt; u64 {
+    let boot_time_secs = get_boot_time_secs();
+    let boot_time_ms = boot_time_secs * 1000;
+    let offset_ms = (ns_since_boot / 1_000_000) as i64;
+    (boot_time_ms + offset_ms) as u64
+}</code></pre>
+    <p>The boot time is a whole number of seconds (from the <code>sysinfo</code> crate's
+    <code>System::boot_time()</code>, cached once), so absolute times can be off by up to a second while the
+    <em>relative</em> order of events from all probes stays exact. Keep that in mind when
+    you compare AgentSight times with timestamps in an agent's JSONL transcript.</p>
+
+    <h3>The HTTP chain on the TLS runner</h3>
+    <p>The TLS runner gets the longest chain, because raw <code>SSL_read</code> chunks are
+    far from "an LLM call". <code>configure_ssl_runner()</code> adds the timestamp
+    normalizer and an optional <code>SSLFilter</code>, then this:</p>
+    <pre data-file="collector/src/cmd_trace.rs"><code class="language-rust">pub(crate) fn add_http_analyzers(
+    runner: BinaryRunner,
+    include_raw_data: bool,
+    http_filter: &amp;[String],
+    disable_auth_removal: bool,
+) -&gt; BinaryRunner {
+    let mut runner = runner.add_analyzer(Box::new(
+        SSEProcessor::new_with_timeout(30000).defer_transport_to_http(),
+    ));
+    let parser = if include_raw_data {
+        HTTPParser::new()
+    } else {
+        HTTPParser::new().disable_raw_data()
+    };
+    runner = runner.add_analyzer(Box::new(parser));
+    runner = runner.add_analyzer(Box::new(HTTPDecompressor::new()));
+    runner = runner.add_analyzer(Box::new(
+        SSEProcessor::new_with_timeout(30000).defer_transport_to_http(),
+    ));
+    if !http_filter.is_empty() {
+        runner = runner.add_analyzer(Box::new(HTTPFilter::with_patterns(http_filter.to_vec())));
+    }
+    if !disable_auth_removal {
+        runner = runner.add_analyzer(Box::new(AuthHeaderRemover::new()));
+    }
+    runner
+}</code></pre>
+    <p>Read it as a pipeline:</p>
+    <ul>
+      <li><strong><code>HTTPParser</code></strong> (about 4,400 lines, the biggest analyzer)
+      reassembles HTTP/1.1 messages and HTTP/2 frames from the plaintext chunks, keyed by
+      the TLS transport handle the BPF side reports, and decodes HPACK headers.</li>
+      <li><strong><code>HTTPDecompressor</code></strong> undoes gzip and similar
+      content-encodings so bodies are readable JSON.</li>
+      <li><strong><code>SSEProcessor</code></strong> handles server-sent events, the
+      <code>text/event-stream</code> format both Anthropic and OpenAI use to stream a
+      reply. It accumulates the deltas (Anthropic text and JSON blocks, OpenAI reasoning
+      and <code>tool_calls</code>) into one response with a 30 s timeout. It appears
+      twice for two input shapes. The first copy sees raw <code>ssl</code> events; with
+      <code>defer_transport_to_http()</code> it leaves alone any chunk that carries a TLS
+      transport identity, because, as its comment says, "exact-identity captures must be
+      reconstructed by HTTPParser first" or concurrent responses would collapse onto one
+      pid/tid key. The second copy, after the parser, assembles the streams of parsed
+      <code>http_parser</code> responses.</li>
+      <li><strong><code>AuthHeaderRemover</code></strong> strips headers such as
+      <code>authorization</code>, <code>x-api-key</code> and <code>cookie</code> before anything is stored, unless you disable it. The plaintext
+      of every request is visible to the probe, so this is the one thing standing between
+      your API key and a SQLite file.</li>
+    </ul>
+
+    <h3>Wiring it together</h3>
+    <p><code>AgentRunner</code> is itself a <code>Runner</code>. It runs its child runners,
+    merges their streams with <code>select_all</code>, and applies global analyzers to the
+    merged stream:</p>
+    <pre data-file="agentsight-capture/src/runners/agent.rs"><code class="language-rust">        let mut streams = Vec::new();
+        for runner in &amp;mut self.runners {
+            streams.push(runner.run().await?);
+        }
+        let mut stream = Box::pin(select_all(streams)) as EventStream;
+        for analyzer in &amp;mut self.analyzers {
+            stream = analyzer
+                .process(stream)
+                .await
+                .map_err(|error| format!("Global analyzer error: {error}"))?;
+        }
+        Ok(stream)</code></pre>
+    <p><code>build_trace_agent_with_view()</code> in <code>collector/src/cmd_trace.rs</code>
+    assembles the whole thing for <code>record</code> and <code>debug trace</code>: a TLS
+    runner (with the chain above), a stdio runner (only with <code>--pid</code>), a process
+    runner, a system runner, and finally one global analyzer that feeds the shared view and
+    its sinks:</p>
+    <pre data-file="collector/src/cmd_trace.rs"><code class="language-rust">    let mut materializer = MaterializingAnalyzer::with_view(view);
+    if let Some(path) = cfg.db_path.as_deref() {
+        materializer =
+            materializer.add_view_sink(Box::new(SqliteStore::open(path).map_err(|e| {
+                RunnerError::from(format!("failed to open SQLite database '{}': {}", path, e))
+            })?));
+    }
+    if let Some(otel_config) = &amp;cfg.otel {
+        materializer = materializer.add_view_sink(Box::new(OtelExporter::new(
+            otel_config.endpoint.clone(),
+            otel_config.capture_content,
+        )));
+    }
+    agent = agent.add_global_analyzer(Box::new(materializer));
+
+    Ok(agent)</code></pre>
+    <div class="callout tip"><span class="label">Tip</span><p><code>select_all</code>
+    interleaves events in arrival order, not timestamp order. A TLS chunk and an
+    <code>execve</code> that happened in the same millisecond may reach the view in either
+    order. That is one reason the view pairs things by identifiers (exchange id, PID,
+    TLS handle) wherever it can and treats time only as a fallback.</p></div>
+
+    <h2>Correlating intent with actions</h2>
+    <p>At this point the collector has two kinds of events in one stream: LLM exchanges
+    (from TLS) and system events (exec, exit, file, network, stdio, resource samples). The
+    whole point of AgentSight is to tie them together, so that "the model asked for
+    <code>bash -c 'npm test'</code>" and "PID 41822 ran <code>npm test</code>, opened 312
+    files and exited 1" end up on the same row of the timeline.</p>
+
+    <h3>What the paper proposes</h3>
+    <p>The paper describes a two-stage design. First, a real-time engine links events using
+    three signals:</p>
+    <ul>
+      <li><strong>Process lineage.</strong> The fork/execve tree from the process probe.
+      Every child an agent spawns, however deep, is attributed to that agent.</li>
+      <li><strong>Temporal proximity.</strong> Actions that start within a short window
+      after an LLM response are candidates for having been caused by it. The paper uses a
+      window of 100–500 ms.</li>
+      <li><strong>Argument matching.</strong> Filenames, URLs and commands that appear in
+      the model's reply are matched against the arguments of later syscalls
+      (<code>execve</code> argv, <code>openat</code> paths, <code>connect</code>
+      addresses).</li>
+    </ul>
+    <p>Second, the correlated, condensed trace is handed to a separate "observer" LLM (the
+    paper's phrase is using "AI to watch AI"), with a prompt that asks it to judge the
+    behaviour, for example whether a sequence looks like a prompt-injection attack. It
+    returns a natural-language explanation and a confidence score. The first stage cuts the
+    volume down so that the second, slower and costlier stage only sees a summary.</p>
+
+    <h3>What the code does today</h3>
+    <p>The repository has moved on since the paper, and the correlation logic now lives in a
+    <strong>materialized view</strong> (<code>ext/analysis/src/view/</code>). The
+    <code>MaterializingAnalyzer</code> hands each <code>Event</code> to the
+    <code>MaterializedView</code>, which turns it into a <code>CanonicalEvent</code> with a
+    kind (<code>LlmRequest</code>,
+    <code>LlmResponse</code>, <code>ProcessExec</code>, <code>ProcessExit</code>,
+    <code>FsOpen</code>, <code>FsWrite</code>, <code>FsMutation</code>,
+    <code>StdioRpc</code>, <code>ResourceSample</code>, …) and projects it into tables held
+    in <code>BTreeMap</code>s: LLM calls, token usage, tool calls, process nodes, audit
+    events, sessions, network targets and resource samples. Every row is also passed to the
+    sinks (SQLite, OpenTelemetry), and the web UI reads the same view.</p>
+
+    <p>The first join is request ↔ response. When the HTTP layer has a stable identity for
+    an exchange (HTTP/1.1 on a known TLS connection, or an HTTP/2 stream id), the pairing
+    is exact and carries a confidence close to 1:</p>
+    <pre data-file="ext/analysis/src/view/projection.rs"><code class="language-rust">    fn ingest_llm_response(&amp;mut self, event: &amp;CanonicalEvent) -&gt; ViewResult&lt;()&gt; {
+        let Some(pid) = event.pid else {
+            return Ok(());
+        };
+        if let Some(exchange_id) = event.http_exchange_id.as_deref()
+            &amp;&amp; let Some(req) = self.pending_by_exchange.remove(exchange_id)
+        {
+            let confidence = event.confidence.unwrap_or_else(|| {
+                if event.correlation_method.as_deref() == Some("h2_stream") {
+                    1.0
+                } else {
+                    0.98
+                }
+            });
+            return self.upsert_llm_pair(req, event, confidence);
+        }
+        // Explicit HTTP identity must never silently fall back to a different
+        // pending request on the same worker thread.
+        if event.http_exchange_id.is_some() || event.correlation_version == Some(2) {
+            return self.insert_orphan_llm_response(event);
+        }
+        if let Some(tid) = event.tid
+            &amp;&amp; let Some((req, confidence)) = self.take_matching_request(pid, tid, event)
+        {
+            return self.upsert_llm_pair(req, event, confidence);
+        }
+        self.insert_orphan_llm_response(event)
+    }</code></pre>
+    <p>Note the policy: a response that <em>has</em> an exchange identity but no matching
+    request is stored as an orphan (<code>correlation_status = "unlinked"</code>) rather
+    than guessed onto some other request from the same thread. Older captures without that
+    identity fall back to a PID/TID match. This was tightened in the most recent release
+    (commit <code>33390661</code>, "correlate HTTP exchanges by TLS connection and
+    stream").</p>
+
+    <p>The second join is response → tool call. Once a response is complete, the view
+    walks its body for tool requests in both vendor formats: OpenAI's
+    <code>tool_calls</code> array and Anthropic's SSE <code>content_block</code> of type
+    <code>tool_use</code>. Each becomes a <code>ToolCallRow</code> that records the PID that
+    made the call and inherits the exchange's confidence:</p>
+    <pre data-file="ext/analysis/src/view/projection.rs"><code class="language-rust">        for (idx, sse) in events.iter().enumerate() {
+            let Some(block) = sse.pointer("/parsed_data/content_block") else {
+                continue;
+            };
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = block.get("name").and_then(Value::as_str).unwrap_or("?");
+            let tool_call_id = block.get("id").and_then(Value::as_str);
+            let input_json = block.get("input").map(Value::to_string);
+            /* ... */
+            self.emit_tool_call(ToolCallRow {
+                id: format!("tool-{llm_call_id}-{tool_id}"),
+                /* ... */
+                tool_name: Some(name.to_string()),
+                tool_call_id: tool_call_id.map(str::to_string),
+                /* ... */
+                input: parse_optional_json(input_json.as_deref()),
+                output: Value::Null,
+                related_pid: Some(pid),
+                related_event_id: Some(event.event_id.clone()),
+                view_source: "view".to_string(),
+                confidence: Some(confidence),
+            })?;
+        }</code></pre>
+    <p>The third join is process lineage. Every <code>exec</code> creates a process node
+    with a stable id <code>process-{pid}-{timestamp}</code> (so PID reuse does not merge two
+    different processes), every <code>exit</code> closes it, and parent PIDs from the
+    probe link nodes into a tree. File and network events become audit rows tagged with the
+    PID and <code>comm</code>, which places them under the right node.</p>
+
+    <p>The fourth join is session ↔ process, and the design note
+    <code>docs/design/view-session-process-model.md</code> states the rule plainly:
+    "Session-to-process mapping is core, but it is not <code>Session == PID</code>. It is a
+    match between an agent session and a process tree, with evidence and confidence." An
+    agent session (as described by the agent's own transcript file, for example under
+    <code>~/.claude/projects/</code>) is matched to a live process tree by evidence types
+    such as <code>proc_fd</code> (the transcript path is open in
+    <code>/proc/&lt;pid&gt;/fd</code>), <code>ebpf_file</code> (eBPF saw the process touch
+    the transcript), <code>llm_traffic</code>, <code>command_match</code> and
+    <code>sticky</code> (a previous high-confidence binding still holds). The matcher's
+    entry point takes exactly those inputs:</p>
+    <pre data-file="ext/analysis/src/view/session_process_match.rs"><code class="language-rust">impl SessionProcessMatcher {
+    pub fn match_sessions(
+        &amp;mut self,
+        sessions: &amp;[SessionRow],
+        processes: &amp;[LiveProcessCandidate],
+        fd_paths_by_process: &amp;HashMap&lt;ProcessKey, BTreeSet&lt;PathBuf&gt;&gt;,
+        ebpf_path_by_process: &amp;HashMap&lt;ProcessKey, PathBuf&gt;,
+        now_ms: u64,
+    ) -&gt; SessionProcessMatches {
+        /* ... */
+    }
+}</code></pre>
+
+    <div class="callout warn"><span class="label">Paper vs. code</span><p>We did not find
+    the paper's temporal-window and argument-matching heuristics as a separate engine in
+    the current tree; the view joins by explicit identifiers (exchange id, PID lineage,
+    session evidence) and puts events on a common clock, which leaves temporal reading to
+    the timeline. The observer-LLM stage is not part of the runtime either. The closest
+    thing is <code>skills/</code> (<code>agent-interaction-insights</code>,
+    <code>agentsight-system-friction</code>, <code>evolve-agent-skills</code>, …), which
+    the repo itself calls "prototypes for a shareable skills pack, not AgentSight runtime
+    code". Treating these skills as the successor of the observer LLM is our reading, not a
+    statement from the project.</p></div>
+
+    <figure>
+      <svg viewBox="0 0 900 420" role="img" aria-label="Data flow: TLS chunks pass through HTTP parser and SSE processor into LLM request and response rows, which yield tool call rows; exec, exit, file and network events from the process probe become process nodes and audit rows; agent transcripts become session rows; the materialized view joins them by exchange id, PID lineage and session evidence and feeds SQLite, OTLP, the web UI and the TUI">
+        <style>
+          .s23f{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .s23fi{fill:none;stroke:var(--accent2);stroke-width:2}
+          .s23fx{fill:none;stroke:var(--accent);stroke-width:2}
+          .s23ft{fill:var(--fg);font:13px sans-serif}
+          .s23fm{fill:var(--fg);font:12px monospace}
+          .s23fn{fill:var(--muted);font:11px sans-serif}
+          .s23fa{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah23b)}
+          .s23fj{stroke:var(--accent2);stroke-width:1.5;fill:none;stroke-dasharray:5 3;marker-end:url(#ah23b)}
+        </style>
+        <defs><marker id="ah23b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <!-- column titles -->
+        <text class="s23fn" x="20" y="22">raw events (JSONL)</text>
+        <text class="s23fn" x="220" y="22">analyzers</text>
+        <text class="s23fn" x="430" y="22">view rows (projection.rs)</text>
+        <text class="s23fn" x="700" y="22">consumers</text>
+        <!-- intent row -->
+        <rect class="s23fi" x="20" y="40" width="170" height="54" rx="6"/>
+        <text class="s23fm" x="32" y="62">ssl READ/WRITE</text>
+        <text class="s23fn" x="32" y="82">transport_handle, data</text>
+        <rect class="s23f" x="220" y="40" width="180" height="54" rx="6"/>
+        <text class="s23fm" x="232" y="62">HTTPParser → SSE</text>
+        <text class="s23fn" x="232" y="82">exchange id / h2 stream</text>
+        <rect class="s23fi" x="430" y="34" width="230" height="30" rx="6"/>
+        <text class="s23fm" x="442" y="54">llm_calls (req ↔ resp)</text>
+        <rect class="s23fi" x="430" y="72" width="230" height="30" rx="6"/>
+        <text class="s23fm" x="442" y="92">tool_calls (related_pid)</text>
+        <path class="s23fa" d="M190,67 H218"/>
+        <path class="s23fa" d="M400,60 H428"/>
+        <path class="s23fa" d="M545,64 V70"/>
+        <!-- action row -->
+        <rect class="s23fx" x="20" y="150" width="170" height="70" rx="6"/>
+        <text class="s23fm" x="32" y="172">EXEC / EXIT</text>
+        <text class="s23fm" x="32" y="190">FILE_OPEN, NET_*</text>
+        <text class="s23fn" x="32" y="208">pid, ppid, argv, path</text>
+        <rect class="s23f" x="220" y="150" width="180" height="70" rx="6"/>
+        <text class="s23fm" x="232" y="172">TimestampNormalizer</text>
+        <text class="s23fn" x="232" y="192">boot ns → epoch ms</text>
+        <text class="s23fn" x="232" y="208">(all runners)</text>
+        <rect class="s23fx" x="430" y="146" width="230" height="30" rx="6"/>
+        <text class="s23fm" x="442" y="166">process_nodes (tree)</text>
+        <rect class="s23fx" x="430" y="184" width="230" height="30" rx="6"/>
+        <text class="s23fm" x="442" y="204">audit_events (file, net)</text>
+        <path class="s23fa" d="M190,185 H218"/>
+        <path class="s23fa" d="M400,180 H428"/>
+        <!-- session row -->
+        <rect class="s23f" x="20" y="270" width="170" height="54" rx="6"/>
+        <text class="s23fm" x="32" y="292">transcripts</text>
+        <text class="s23fn" x="32" y="312">~/.claude, ~/.codex, …</text>
+        <rect class="s23f" x="220" y="270" width="180" height="54" rx="6"/>
+        <text class="s23fm" x="232" y="292">agent_native source</text>
+        <text class="s23fn" x="232" y="312">no eBPF needed</text>
+        <rect class="s23f" x="430" y="270" width="230" height="54" rx="6"/>
+        <text class="s23fm" x="442" y="292">sessions</text>
+        <text class="s23fn" x="442" y="312">SessionProcessMatch + evidence</text>
+        <path class="s23fa" d="M190,297 H218"/>
+        <path class="s23fa" d="M400,297 H428"/>
+        <!-- joins -->
+        <path class="s23fj" d="M665,87 C690,110 690,150 665,160"/>
+        <text class="s23fn" x="672" y="128">pid lineage</text>
+        <path class="s23fj" d="M665,290 C700,260 700,210 665,200"/>
+        <text class="s23fn" x="676" y="252">session ↔ tree</text>
+        <!-- consumers -->
+        <rect class="s23f" x="740" y="40" width="140" height="284" rx="8"/>
+        <text class="s23fm" x="752" y="70">SqliteStore</text>
+        <text class="s23fn" x="752" y="88">agentsight-*.db</text>
+        <text class="s23fm" x="752" y="126">OtelExporter</text>
+        <text class="s23fn" x="752" y="144">OTLP gen_ai.*</text>
+        <text class="s23fm" x="752" y="182">web :7395</text>
+        <text class="s23fn" x="752" y="200">/api/v1/snapshot</text>
+        <text class="s23fm" x="752" y="238">top / report</text>
+        <text class="s23fn" x="752" y="256">TUI, CLI, JSON</text>
+        <path class="s23fa" d="M545,326 V362 H810 V328"/>
+        <text class="s23fn" x="430" y="392">MaterializingAnalyzer: one shared view, rows also pushed to view sinks</text>
+      </svg>
+      <figcaption>Figure 23.2 — Data flow inside the collector. Accent2 (blue) boxes are
+      intent (from TLS), accent (orange) boxes are actions (from the kernel). The dashed arrows are the
+      joins the view makes: PID lineage ties tool calls to process trees, and session
+      evidence ties agent transcripts to the same trees.</figcaption>
+    </figure>
+
+    <h2>The web UI and the timeline</h2>
+    <p><code>record</code> starts a small <code>hyper</code> web server
+    (<code>collector/src/server/web.rs</code>) on <code>127.0.0.1:7395</code> unless you
+    pass <code>--no-server</code>; <code>--server-port</code> changes the port. The
+    frontend is a Next.js app under <code>ext/web/</code> (built through
+    <code>frontend/</code>) whose static output is embedded in the binary, so there is
+    nothing else to install. The README lists its pages: <code>/</code> (overview),
+    <code>/timeline</code>, <code>/tree</code>, <code>/logs</code> and
+    <code>/metrics</code>.</p>
+    <p>The API surface is small and versioned: <code>GET /api/v1/info</code>,
+    <code>POST /api/v1/capabilities</code>, <code>GET /api/v1/snapshot</code>,
+    <code>GET /api/v1/overview</code>, <code>/api/v1/sessions/&lt;id&gt;</code> and
+    <code>POST /api/v1/sessions/&lt;id&gt;/messages</code>. The snapshot endpoint is
+    guarded by an <code>evidence.read</code> capability check and serves the materialized
+    view, the agent-native sessions and the SQLite database together. The browser client
+    asks for it with an audit limit (<code>/api/v1/snapshot?audit_limit=…</code>, in
+    <code>frontend/src/lib/nodeClient.ts</code>). <code>agentsight report export -o
+    snapshot.json</code> writes a snapshot to a file "for web dashboard" (README; the schema is in
+    <code>docs/snapshot-schema.md</code>), so a capture can be viewed away from the
+    machine that recorded it.</p>
+    <p>The timeline (<code>ext/web/components/timeline/</code>) draws one horizontal lane
+    per event source and lets you filter by source, <code>comm</code> and PID. The grouping
+    is literally this:</p>
+    <pre data-file="ext/web/components/timeline/Timeline.tsx"><code class="language-typescript">  // Group filtered events by source
+  const timelineGroups: TimelineGroupData[] = useMemo(() =&gt; {
+    const grouped: { [source: string]: DisplayEvent[] } = {};
+    filteredEvents.forEach(event =&gt; {
+      if (!grouped[event.source]) {
+        grouped[event.source] = [];
+      }
+      grouped[event.source].push(event);
+    });
+
+    return Object.entries(grouped).map(([source, events]) =&gt; ({
+      source,
+      events: events.sort((a, b) =&gt; a.timestamp - b.timestamp),
+      color: events[0]?.sourceColor || '#6B7280'
+    }));
+  }, [filteredEvents]);</code></pre>
+    <p>Because every runner went through the timestamp normalizer, the lanes share one
+    axis, and the temporal reading the paper describes ("this <code>execve</code> started
+    200 ms after that response") is something you do by eye: zoom into an LLM response on
+    the <code>ssl</code>/<code>http_parser</code> lane and look at what starts on the
+    <code>process</code> lane right after it. A minimap and zoom controls help on long
+    runs. The <code>/tree</code> page (<code>ext/web/components/process-tree/</code>) shows
+    the same data the other way round: the process tree with LLM calls, tool calls, file
+    and network events folded into each node.</p>
+    <p>There are also two text front ends. <code>agentsight top</code> is a live ranked view
+    of sessions (sortable by <code>cpu</code>, <code>rss</code>, <code>tokens</code>,
+    <code>execs</code>, <code>fail</code>, <code>files</code>, <code>net</code> or
+    <code>agent</code>), and <code>agentsight report</code> prints summaries, token usage,
+    audit trails or full prompts from a saved database.</p>
+
+    <h2>One agent action, end to end</h2>
+    <p>Here is a single step of a coding session followed through every layer: Claude Code
+    decides to run the test suite. The function names, probe names, fields and analyzer
+    names are the real ones from the sections above; the PIDs, paths and timings are
+    illustrative.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. The request leaves the agent</h4><p>Claude Code serialises
+      the conversation into a <code>POST /v1/messages</code> body and hands it to
+      BoringSSL. Its <code>SSL_write</code> is stripped, so <code>sslsniff</code> found it
+      by byte pattern and attached by offset. The entry probe stashes the buffer pointer
+      under the thread id of the "HTTP Client" thread; the return probe reads the
+      plaintext and submits a <code>WRITE</code> record to the ring buffer with
+      <code>timestamp_ns</code>, <code>pid</code>, <code>tid</code>,
+      <code>transport_handle</code> and the bytes.</p></div>
+      <div class="step"><h4>2. The reply streams back</h4><p>The API answers with
+      <code>text/event-stream</code>. Each chunk arrives through <code>SSL_read</code> and
+      becomes a <code>READ</code> record on the same transport handle. One of the events is
+      a <code>content_block_start</code> whose block has <code>"type": "tool_use"</code>,
+      <code>"name": "Bash"</code> and, in following deltas, the input
+      <code>{"command": "npm test"}</code>.</p></div>
+      <div class="step"><h4>3. The collector turns chunks into a call</h4><p>The
+      <code>SSL</code> runner parses each JSON line into an <code>Event</code>.
+      <code>TimestampNormalizer</code> moves it to epoch milliseconds,
+      <code>HTTPParser</code> rebuilds request and response on that connection,
+      <code>HTTPDecompressor</code> and <code>SSEProcessor</code> turn the stream into one
+      response, and <code>AuthHeaderRemover</code> drops the API key. In the view,
+      <code>ingest_llm_response</code> pairs it with the pending request by exchange id
+      (confidence 0.98 for HTTP/1.1, 1.0 for an HTTP/2 stream), and
+      <code>ingest_sse_tools</code> emits a <code>ToolCallRow</code>
+      <code>Bash</code> with <code>related_pid</code> = the agent's PID.</p></div>
+      <div class="step"><h4>4. The agent forks a shell</h4><p>Claude Code spawns
+      <code>bash -c "npm test"</code>. The kernel fires
+      <code>tp/sched/sched_process_exec</code>; the process probe records PID, parent
+      PID, filename and full argv. User space sees that the parent is tracked, so the
+      child is tracked too, and its PID goes into <code>tracked_pids</code> so in-kernel
+      filters accept its later events. The same happens for <code>npm</code> and the
+      <code>node</code> it starts.</p></div>
+      <div class="step"><h4>5. The tests touch the system</h4><p><code>node</code> opens
+      hundreds of files. <code>fexit/security_file_open</code> reports each resolved path
+      once (the LRU dedup map suppresses repeats). Writes, renames and
+      <code>connect</code> calls are counted per key in <code>event_agg_map</code> and
+      flushed by user space as summaries instead of one record per call.</p></div>
+      <div class="step"><h4>6. Exit codes close the loop</h4><p>Each process ends with
+      <code>tp/sched/sched_process_exit</code>, carrying exit code, duration and peak RSS.
+      The view closes the matching <code>process-{pid}-{ts}</code> nodes. A non-zero exit
+      from <code>npm</code> is now visible next to the tool call that caused it.</p></div>
+      <div class="step"><h4>7. One story on screen</h4><p>The next request the agent sends
+      contains the tool result (the test output), which closes the intent side. On
+      <code>/timeline</code> you see the LLM call, then the <code>bash</code>,
+      <code>npm</code> and <code>node</code> bars starting just after it, then the next
+      LLM call. On <code>/tree</code> the same processes hang under the agent node, and
+      <code>agentsight report audit --json</code> lists them. Every row has already been
+      written to <code>agentsight-*.db</code> and, with <code>--otel</code>, exported as
+      <code>gen_ai.*</code> spans.</p></div>
+    </div>
+
+    <h2>How the repository is organized</h2>
+    <p>The repository is a Cargo workspace plus C probes and a web frontend. The map below
+    covers what this chapter used (commit <code>c1574366</code>); the paths are relative to
+    the repository root.</p>
+    <table>
+      <thead><tr><th>Path</th><th>What it holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>bpf/</code></td><td>The eBPF side: <code>sslsniff.bpf.c</code> /
+        <code>sslsniff.c</code> (TLS uprobes), <code>process.bpf.c</code> /
+        <code>process.c</code> plus <code>process_ext/*.h</code> (exec, exit, file, net,
+        signals, mmap, CoW), <code>stdiocap</code> (MCP over stdio), experimental
+        <code>browsertrace</code>, the shared <code>jsonl.h</code> output helpers and a
+        <code>Makefile</code> with tests.</td></tr>
+        <tr><td><code>agentsight-capture/</code></td><td>Library crate: the
+        <code>Event</code> type, <code>Runner</code>/<code>Analyzer</code> traits,
+        <code>BinaryRunner</code>, <code>ProcessRunner</code>, <code>AgentRunner</code>,
+        the embedded-binary extractor and <code>binary_resolver.rs</code> (PATH, symlinks,
+        shebangs, <code>docker://</code>, <code>k8s://</code>).</td></tr>
+        <tr><td><code>ext/analysis/</code></td><td>Analyzers (HTTP parser, SSE, decompressor,
+        filters, auth removal, timestamp normalizer, materializer), the view
+        (<code>view/</code>), sinks (<code>sinks/sqlite.rs</code>,
+        <code>sinks/otel.rs</code>), sources (agent-native sessions, saved SQLite) and the
+        <code>/proc</code>-based <code>SystemRunner</code>.</td></tr>
+        <tr><td><code>ext/session</code>, <code>ext/runtime</code></td><td>Session-file
+        parsers (also as a WASM component) and a WASM component host that is not linked
+        into the binary yet.</td></tr>
+        <tr><td><code>ext/web/</code>, <code>frontend/</code></td><td>Next.js pages and
+        components (timeline, process tree, session views) and the build shell that
+        produces the embedded static assets.</td></tr>
+        <tr><td><code>collector/</code></td><td>The <code>agentsight</code> CLI:
+        <code>main.rs</code> (subcommands), <code>cmd_trace.rs</code> (pipeline assembly),
+        <code>cmd_monitor.rs</code>, <code>cmd_bind.rs</code>,
+        <code>server/web.rs</code> (HTTP API and static files).</td></tr>
+        <tr><td><code>agentsight-protocol/</code></td><td>The API contract shared with
+        the Node bindings and the hosted app.</td></tr>
+        <tr><td><code>skills/</code></td><td>Prototype agent skills that analyse AgentSight
+        evidence (interaction insights, system friction, flame graphs).</td></tr>
+        <tr><td><code>docs/</code></td><td>User docs (<code>agents.md</code>,
+        <code>build.md</code>, <code>installation.md</code>, <code>docker.md</code>) and
+        design notes (<code>docs/design/</code>).</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Building, installing and using it</h2>
+    <h3>Install</h3>
+    <div class="tabs">
+      <div class="tab-panel" data-label="cargo / release">
+        <p>From the README's quick start. Releases ship <code>agentsight-x86_64</code> and
+        <code>agentsight-aarch64</code>; the unsuffixed <code>agentsight</code> asset is an
+        x86_64 alias.</p>
+        <pre><code class="language-bash">cargo install agentsight
+# or: wget https://github.com/eunomia-bpf/agentsight/releases/latest/download/agentsight &amp;&amp; chmod +x agentsight</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Homebrew (Linux)">
+        <pre><code class="language-bash">brew tap eunomia-bpf/tap
+brew install eunomia-bpf/tap/agentsight
+agentsight --version</code></pre>
+        <p>The formula lives in <a href="https://github.com/eunomia-bpf/homebrew-tap">eunomia-bpf/homebrew-tap</a>
+        (<code>Formula/agentsight.rb</code>). It does not compile anything: it downloads the
+        prebuilt <code>agentsight-x86_64</code> release asset and rewrites its ELF
+        interpreter so it runs against Homebrew's own glibc. That also explains why it is
+        Linux x86-64 only.</p>
+        <pre data-file="eunomia-bpf/homebrew-tap: Formula/agentsight.rb"><code class="language-ruby">class Agentsight &lt; Formula
+  desc "System-wide AI agent tracing and monitoring with eBPF"
+  homepage "https://github.com/eunomia-bpf/agentsight"
+  url "https://github.com/eunomia-bpf/agentsight/releases/download/v1.0.31/agentsight-x86_64",
+      using: :nounzip
+  /* ... sha256, license ... */
+  depends_on "gcc" =&gt; :build
+  depends_on "patchelf" =&gt; :build
+  depends_on "glibc"
+  depends_on :linux
+
+  def install
+    bin.install "agentsight-x86_64" =&gt; "agentsight"
+    system formula_opt_bin("patchelf")/"patchelf",
+           "--set-interpreter", formula_opt_lib("glibc")/"ld-linux-x86-64.so.2",
+           "--set-rpath", formula_opt_lib("glibc"),
+           bin/"agentsight"
+  end
+end</code></pre>
+        <p>As of 2026-11-06 the formula pins v1.0.31 (last bumped 2026-09-16), while the
+        latest GitHub release is v1.0.35, so Homebrew users are four releases behind.</p>
+      </div>
+      <div class="tab-panel" data-label="from source">
+        <p>From <code>docs/build.md</code>. You need Rust 1.88.0+; the eBPF capture path
+        also needs Linux with eBPF, Node.js 18+, clang and LLVM, libelf and zlib headers,
+        make, and the <code>libbpf</code>/<code>bpftool</code> submodules (hence
+        <code>--recursive</code>). On Ubuntu/Debian <code>make install</code> installs the
+        system dependencies.</p>
+        <pre><code class="language-bash">git clone https://github.com/eunomia-bpf/agentsight.git --recursive
+cd agentsight
+make install          # Ubuntu/Debian system dependencies
+make build
+
+# or piece by piece
+make build-frontend   # frontend assets
+make build-bpf        # eBPF programs
+make build-rust       # Rust collector
+cargo build --release --manifest-path collector/Cargo.toml   # collector only
+
+make test
+make -C bpf debug     # README: "Build debug versions with AddressSanitizer"</code></pre>
+      </div>
+    </div>
+    <p>Requirements from the README: Linux with eBPF support, kernel 4.1 or newer (5.0+
+    recommended), and <code>sudo</code> or <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code>
+    for <code>record</code>. <code>top</code>, <code>vis</code>, <code>bind</code> and
+    <code>report</code> also work without eBPF, from the agents' own session files, on
+    Linux, macOS and Windows.</p>
+
+    <h3>Everyday commands</h3>
+    <p>These lines and their comments are copied from the README's usage block, plus
+    <code>agentsight vis</code>, which writes an animated replay of a Git worktree's
+    agent file activity to <code>output/agent-nebula.gif</code>:</p>
+    <pre><code class="language-bash">agentsight top                               # live ranked view; uses eBPF when sudo is already available
+sudo agentsight record -- claude             # record a command
+agentsight report                            # high-level latest-run summary (default)
+agentsight report list                       # recorded sessions in this directory
+agentsight report prompts --json             # full LLM request/response JSON
+agentsight report token --group-by dir       # token usage by session/process working directory
+agentsight report audit --json               # process spawns, file opens, API calls
+agentsight report serve                      # open the web UI for the latest session in this directory
+agentsight report export -o snapshot.json    # export for web dashboard; see docs/snapshot-schema.md
+agentsight report --local                    # summarize native Claude/Codex/Gemini sessions
+agentsight monitor install-service           # install/start the background monitor service
+agentsight vis</code></pre>
+    <p><code>record -- &lt;command&gt;</code> resolves the command through
+    <code>$PATH</code>, symlinks and shebang wrappers to the real ELF that contains the TLS
+    code, derives the <code>--comm</code> filter from the command name, runs the agent with
+    your terminal attached (as your user; only the probes are elevated), and stops when it
+    exits. For other cases:</p>
+    <pre><code class="language-bash"># Python tools (aider, open-interpreter, ...) and Node tools (Gemini CLI, ...)
+sudo ./agentsight record -c "python"
+sudo ./agentsight record -c node
+
+# an agent in a container or a Kubernetes pod
+sudo ./agentsight record -c node --binary-path docker://openclaw
+sudo ./agentsight record -c node --binary-path k8s://agents/openclaw/gateway
+
+# full trace with the web UI, exported as OpenTelemetry GenAI spans
+sudo ./agentsight debug trace --server
+sudo ./agentsight debug trace --otel --otel-endpoint http://localhost:4318
+
+# the probes on their own
+sudo ./bpf/sslsniff --binary-path ~/.local/share/claude/versions/2.1.39
+sudo ./bpf/process -c python
+sudo ./bpf/stdiocap -p 12345</code></pre>
+
+    <div class="callout warn"><span class="label">What happened when we tried it</span>
+    <p>On this curriculum's build machine (Debian 12, glibc 2.36, Linux 6.1) the v1.0.35
+    release binary started (<code>agentsight --version</code> printed
+    <code>agentsight 1.0.35</code> after a "<code>GLIBC_2.39</code> not found" warning),
+    and <code>agentsight top --once --plain</code> worked from session files. Live capture
+    did not: <code>sudo ./agentsight debug process -- -c python3</code> failed because the
+    embedded probe loaders need glibc 2.38 or newer. So we could not test the probes on
+    this kernel. On an older distribution, build from source or use the Homebrew formula,
+    which supplies its own glibc for the main binary; whether that also covers the
+    extracted probe loaders we did not verify.</p></div>
+
+    <h2>The paper</h2>
+    <p>AgentSight was published as <a href="#ref-paper">"AgentSight: System-Level
+    Observability for AI Agents Using eBPF"</a> by Yusheng Zheng (UC Santa Cruz), Yanpeng Hu
+    (ShanghaiTech University), Tong Yu (eunomia-bpf Community) and Andi Quinn (UC Santa
+    Cruz), in <em>PACMI '25</em>, the 4th Workshop on Practical Adoption Challenges of ML
+    for Systems, co-located with SOSP '25 in Seoul (pages 110–115, DOI
+    <a href="https://doi.org/10.1145/3766882.3767169">10.1145/3766882.3767169</a>). The
+    preprint is <a href="https://arxiv.org/abs/2508.02736">arXiv:2508.02736</a> (v1 2 August
+    2025, v2 15 August 2025). It is a six-page workshop paper: it argues for boundary tracing
+    and the two-stream model, sketches the correlation engine described above, and reports a
+    small evaluation. The paper describes a prototype of roughly 6,000 lines of Rust and C
+    plus a 3,000-line TypeScript frontend; the repository today is considerably larger.</p>
+
+    <h3>Overhead</h3>
+    <p>The authors measured Claude Code 1.0.62 (with Claude 4) on Ubuntu 22.04 and Linux
+    6.14.0, working on the <code>bpf-developer-tutorial</code> repository
+    (<a href="09-bpf-developer-tutorial.html">chapter 9</a>), three runs per task:</p>
+    <table>
+      <thead><tr><th>Task</th><th>Baseline (s)</th><th>With AgentSight (s)</th><th>Overhead</th></tr></thead>
+      <tbody>
+        <tr><td>Understand repo</td><td>127.98</td><td>132.33</td><td>3.4%</td></tr>
+        <tr><td>Code writing</td><td>22.54</td><td>23.64</td><td>4.9%</td></tr>
+        <tr><td>Repo compilation</td><td>92.40</td><td>92.72</td><td>0.4%</td></tr>
+      </tbody>
+    </table>
+    <p>The average is 2.9%. These are end-to-end task times, which are dominated by model
+    latency, so they say little about per-event probe cost; the paper does not report
+    micro-benchmarks. The README's "less than 3% CPU overhead" appears to come from this
+    table.</p>
+
+    <h3>Case studies</h3>
+    <ul>
+      <li><strong>Prompt injection.</strong> A README points the agent at a URL that hides
+      instructions; the agent then reads <code>/etc/passwd</code> and sends it out. The
+      correlation engine merged 521 raw events into 37, and the observer LLM flagged the
+      sequence as an attack with high confidence.</li>
+      <li><strong>Reasoning loop.</strong> A crewAI research agent on gpt-4o-mini kept
+      repeating a failing web search, a "try-fail-re-reason" loop that burns tokens and is
+      visible as a repeating pattern of identical LLM calls and failed tool runs.</li>
+      <li><strong>Multi-agent coordination.</strong> Six collaborating Claude Code subagents
+      produced 3,153 events after correlation, and the trace exposed contention on file
+      locks between them.</li>
+    </ul>
+
+    <h2>Recent development</h2>
+    <p>The last 30 commits on <code>master</code> (24 August to 23 October 2026, read with
+    <code>gh api repos/eunomia-bpf/agentsight/commits?per_page=30</code>) cover releases
+    1.0.28 to 1.0.35. Grouped by theme:</p>
+    <ul>
+      <li><strong>Exact HTTP correlation.</strong> "expose TLS transport identity and capture
+      metadata" (<code>34241a66</code>, #210), "correlate HTTP exchanges by TLS connection and
+      stream" (<code>33390661</code>, #216), "emit oversized and truncated HTTP/1.1 messages
+      with a truncation marker" (#245) and "Restore SSL readiness, exact bytes, HPACK safety"
+      (<code>3e51adc4</code>, #226). This is the work behind the exchange-id pairing shown
+      earlier.</li>
+      <li><strong>A richer process probe.</strong> "trace resolved file access in process
+      probe" (<code>95612527</code>, #227, the <code>security_file_open</code> fexit),
+      "extend process probe inbound socket evidence" (#229), "Complete process probe
+      liveness, file paths, and listener fields" (#234), and "load process probes on newer
+      kernels" (#231).</li>
+      <li><strong>Containers.</strong> "Scope sidecar process capture by PID namespace and
+      stream liveness" (#237), "keep events from PID namespaces nested inside the
+      <code>--pidns-of</code> target" (#244), and "follow children forked by any thread when
+      resolving <code>docker://</code> targets" (#246).</li>
+      <li><strong>More agents.</strong> "Add CodeBuddy CLI support and fix Codex rustls
+      plaintext capture" (<code>e81fb871</code>, #212) and "keep live Codex token usage
+      totals consistent" (#224). CI now runs against Ubuntu 26.04, Codex 0.164.0 and opencode
+      (#243).</li>
+      <li><strong>Product and docs.</strong> Homebrew instructions (#196), shared agent
+      skills (#206), audit-event provenance (#204), frontend fleet loading and mobile fixes
+      (#209), and a devcontainer matching CI toolchains (#230).</li>
+    </ul>
+    <p>The pattern is clear: the project is moving from "capture something" to "capture
+    exactly, and say how sure we are", with explicit identities, provenance and confidence on
+    every joined row.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h3>Benefits</h3><ul>
+        <li>No SDK, proxy or code change; works on closed-source, statically linked CLIs
+        such as Claude Code (Bun/BoringSSL) and Codex (rustls).</li>
+        <li>Sees both what the agent was told and what every descendant process did,
+        including work the agent's own logs leave out.</li>
+        <li>Tamper-resistant relative to the agent: a manipulated agent cannot switch off a
+        kernel hook it does not know about.</li>
+        <li>Stable hooks: <code>SSL_write</code> and <code>sched_process_exec</code> change far
+        more slowly than agent frameworks.</li>
+        <li>One binary, local-first storage (SQLite), standard export (OTel GenAI), and a
+        no-root fallback from session files on any OS.</li>
+      </ul></div>
+      <div class="card"><h3>Limitations</h3><ul>
+        <li>Linux only for live capture, and it needs root or
+        <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code>.</li>
+        <li>TLS capture depends on finding the right functions: stripped binaries rely on
+        byte patterns and per-version offsets, which break when a new Bun or Codex build
+        changes the code.</li>
+        <li>It recognizes LLM calls by JSON bodies; protobuf (Cursor's Connect protocol) or
+        unknown APIs yield no LLM rows. Electron IDE agents are out of reach for eBPF.</li>
+        <li>Observation only. It explains, it does not block; enforcement is ActPlane's job
+        (<a href="24-actplane.html">chapter 24</a>).</li>
+        <li>Plaintext prompts, file contents and possibly secrets end up on disk; header
+        stripping helps but bodies are stored as captured.</li>
+        <li>The semantic stage (observer LLM) is probabilistic and, in the current tree,
+        lives outside the runtime as skills.</li>
+        <li>Release probes are linked against a recent glibc (≥ 2.38 in v1.0.35), so older
+        distributions may need a source build.</li>
+      </ul></div>
+    </div>
+
+    <h2>Related work</h2>
+    <p><strong>Inside this curriculum.</strong> <a href="24-actplane.html">ActPlane</a>
+    turns AgentSight's question "what did the agent do?" into "what may it do?", tracking
+    information-flow labels with BPF-LSM and blocking violations.
+    <a href="26-reward-guard-and-safe-change.html">RewardGuard and safe change</a> uses
+    AgentSight and ActPlane as the evidence and enforcement layers for a runtime integrity
+    contract against reward hacking. <a href="27-actime-and-akeep.html">Actime and Akeep</a>
+    compose AgentSight and ActPlane into one command and one run record and back up the
+    session transcripts AgentSight reads. The uprobe and tracepoint mechanics are covered in
+    <a href="05-program-types-and-hooks.html">chapter 5</a>, and userspace uprobes in
+    <a href="14-bpftime-architecture.html">bpftime</a>.</p>
+    <p><strong>LLM observability.</strong> Langfuse, LangSmith and Helicone record prompts and
+    responses through an SDK or proxy, and the OpenTelemetry GenAI semantic conventions
+    standardize the <code>gen_ai.*</code> attributes AgentSight exports. AgentOps
+    (<a href="https://arxiv.org/abs/2411.05285">Dong et al., 2024</a>) proposes a taxonomy of
+    what to observe in agent systems; Watson
+    (<a href="https://arxiv.org/abs/2411.03455">Rombaut et al., 2024</a>) targets observability of agent
+    reasoning. All of these live inside the application and see intent but not system
+    effects.</p>
+    <p><strong>System security monitoring.</strong> Falco and Tracee use eBPF to watch
+    syscalls and raise alerts against rules. They see actions but have no idea which LLM reply
+    caused them.</p>
+    <p><strong>Agent attacks.</strong> InjecAgent
+    (<a href="https://arxiv.org/abs/2403.02691">Zhan et al., ACL Findings 2024</a>)
+    benchmarks indirect prompt injection in tool-using agents, and "Breaking Agents"
+    (<a href="https://arxiv.org/abs/2407.20859">Zhang et al., 2024</a>) studies malfunction
+    amplification. They motivate the paper's first two case studies.</p>
+
+    <h2>Quiz</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Why does AgentSight hook <code>SSL_write</code>
+      and <code>SSL_read</code> instead of capturing packets?</p>
+        <button class="opt">Packet capture needs a kernel module.</button>
+        <button class="opt" data-right>On the wire the data is encrypted; inside the TLS library it is still plaintext.</button>
+        <button class="opt">The model API does not use TCP.</button>
+        <div class="why">TLS encrypts everything below the library call. A uprobe on the
+        entry and return of <code>SSL_write</code>/<code>SSL_read</code> sees the buffer before
+        encryption or after decryption, with no proxy and no certificate tricks.</div></div>
+      <div class="q"><p><strong>Q2.</strong> What does an <code>Analyzer</code> do in the Rust
+      collector?</p>
+        <button class="opt">It loads one BPF object into the kernel.</button>
+        <button class="opt" data-right>It takes an <code>EventStream</code> and returns a new <code>EventStream</code>.</button>
+        <button class="opt">It writes rows to SQLite and nothing else.</button>
+        <div class="why"><code>Analyzer::process(stream) -&gt; Result&lt;EventStream, _&gt;</code>.
+        Runners produce streams, analyzers transform them, and <code>AgentRunner</code> merges
+        runner streams with <code>select_all</code> before global analyzers run.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does every runner start with
+      <code>TimestampNormalizer</code>?</p>
+        <button class="opt">To sort events by time.</button>
+        <button class="opt" data-right>BPF timestamps are nanoseconds since boot; it converts them to milliseconds since the Unix epoch so all sources share one clock.</button>
+        <button class="opt">To drop events older than 30 seconds.</button>
+        <div class="why"><code>bpf_ktime_get_ns()</code> is monotonic since boot. Adding the
+        boot time puts probe events on the same axis as session files and the timeline. It does
+        not reorder anything.</div></div>
+      <div class="q"><p><strong>Q4.</strong> An LLM response carries an HTTP exchange id but no
+      pending request has that id. What does the view do?</p>
+        <button class="opt">Pairs it with the latest request from the same thread.</button>
+        <button class="opt">Drops it.</button>
+        <button class="opt" data-right>Stores it as an orphan with correlation status "unlinked".</button>
+        <div class="why">"Explicit HTTP identity must never silently fall back to a different
+        pending request on the same worker thread." Only captures without an identity use the
+        older PID/TID match.</div></div>
+      <div class="q"><p><strong>Q5.</strong> Which three signals does the paper's real-time
+      correlation engine use?</p>
+        <button class="opt">CPU usage, memory usage, network bytes.</button>
+        <button class="opt" data-right>Process lineage, temporal proximity, argument matching.</button>
+        <button class="opt">Cgroup id, user id, session id.</button>
+        <div class="why">Lineage from fork/execve, a short time window after an LLM response,
+        and matching of filenames, URLs and commands in the reply against syscall arguments.
+        A second-stage observer LLM then judges the condensed trace.</div></div>
+      <div class="q"><p><strong>Q6.</strong> You want to <em>prevent</em> an agent from sending
+      a secret file to the network. Is AgentSight the right tool?</p>
+        <button class="opt">Yes, its uprobes can drop the <code>SSL_write</code>.</button>
+        <button class="opt" data-right>No, it only observes; enforcement belongs to a tool such as ActPlane (BPF-LSM).</button>
+        <button class="opt">Yes, with <code>--server</code>.</button>
+        <div class="why">AgentSight records and explains. Blocking needs hooks that can return
+        an error, such as BPF-LSM; see <a href="24-actplane.html">chapter 24</a>.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li id="ref-paper">Yusheng Zheng, Yanpeng Hu, Tong Yu, Andi Quinn. "AgentSight:
+      System-Level Observability for AI Agents Using eBPF." PACMI '25 (4th Workshop on
+      Practical Adoption Challenges of ML for Systems, with SOSP '25), ACM, 2025, pp. 110–115.
+      <a href="https://doi.org/10.1145/3766882.3767169">doi:10.1145/3766882.3767169</a>;
+      preprint <a href="https://arxiv.org/abs/2508.02736">arXiv:2508.02736</a>.</li>
+      <li>eunomia-bpf/agentsight repository, commit c1574366 (v1.0.35, 2026-10-23).
+      <a href="https://github.com/eunomia-bpf/agentsight">https://github.com/eunomia-bpf/agentsight</a></li>
+      <li>AgentSight docs: supported agents
+      (<a href="https://github.com/eunomia-bpf/agentsight/blob/master/docs/agents.md">docs/agents.md</a>),
+      build (<a href="https://github.com/eunomia-bpf/agentsight/blob/master/docs/build.md">docs/build.md</a>),
+      session/process model
+      (<a href="https://github.com/eunomia-bpf/agentsight/blob/master/docs/design/view-session-process-model.md">docs/design/view-session-process-model.md</a>).</li>
+      <li>Homebrew formula:
+      <a href="https://github.com/eunomia-bpf/homebrew-tap/blob/master/Formula/agentsight.rb">eunomia-bpf/homebrew-tap, Formula/agentsight.rb</a>.</li>
+      <li>Project site: <a href="https://eunomia.dev/agentsight/">https://eunomia.dev/agentsight/</a>;
+      product site <a href="https://agentsight.us/">https://agentsight.us/</a>.</li>
+      <li>Linux kernel documentation, "Uprobe-tracer: Uprobe-based Event Tracing."
+      <a href="https://docs.kernel.org/trace/uprobetracer.html">https://docs.kernel.org/trace/uprobetracer.html</a></li>
+      <li>BCC <code>sslsniff</code> tool, the origin of AgentSight's TLS probe.
+      <a href="https://github.com/iovisor/bcc/blob/master/tools/sslsniff.py">iovisor/bcc tools/sslsniff.py</a></li>
+      <li>OpenTelemetry semantic conventions for generative AI.
+      <a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/">https://opentelemetry.io/docs/specs/semconv/gen-ai/</a></li>
+      <li>Liming Dong et al. "AgentOps: Enabling Observability of LLM Agents." arXiv, 2024.
+      <a href="https://arxiv.org/abs/2411.05285">arXiv:2411.05285</a></li>
+      <li>Benjamin Rombaut et al. "Watson: A Cognitive Observability Framework for the Reasoning of LLM-Powered
+      Agents." arXiv, 2024. <a href="https://arxiv.org/abs/2411.03455">arXiv:2411.03455</a></li>
+      <li>Qiusi Zhan et al. "InjecAgent: Benchmarking Indirect Prompt Injections in
+      Tool-Integrated Large Language Model Agents." Findings of ACL, 2024.
+      <a href="https://arxiv.org/abs/2403.02691">arXiv:2403.02691</a></li>
+      <li>Boyang Zhang et al. "Breaking Agents: Compromising Autonomous LLM Agents Through
+      Malfunction Amplification." arXiv, 2024.
+      <a href="https://arxiv.org/abs/2407.20859">arXiv:2407.20859</a></li>
+      <li>Falco <a href="https://falco.org/">https://falco.org/</a> and Tracee
+      <a href="https://github.com/aquasecurity/tracee">https://github.com/aquasecurity/tracee</a>.</li>
+      <li>Langfuse <a href="https://langfuse.com/">https://langfuse.com/</a>, LangSmith
+      <a href="https://www.langchain.com/langsmith">https://www.langchain.com/langsmith</a>,
+      Helicone <a href="https://www.helicone.ai/">https://www.helicone.ai/</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="22-xpu-perf.html"><small>Previous</small>22 · xpu-perf</a>
+      <a class="next" href="24-actplane.html"><small>Next</small>24 · ActPlane</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

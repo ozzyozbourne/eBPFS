@@ -205,7 +205,7 @@ echo "eunomia.dev" &gt; docs/CNAME</code></pre>
       <figcaption>Figure 31.1 — A push to the tutorial repository ends as a deploy of eunomia.dev. The tutorial side builds the website as a test, then sends a <code>repository_dispatch</code> event. The website side re-fetches the tutorial, refuses stale or malformed requests, commits the copied docs, and deploys only if that commit is still the head of <code>main</code>.</figcaption>
     </figure>
 
-    <p>The tutorial side, in full except for comments:</p>
+    <p>The tutorial side, trimmed (the checkout and Node setup steps are elided):</p>
     <pre data-file="bpf-developer-tutorial/.github/workflows/trigger-sync.yml"><code class="language-yaml">name: Test and trigger downstream tutorial sync
 
 on:
@@ -288,7 +288,7 @@ on:
     <h3>What a skill is</h3>
     <p>An <em>agent skill</em> is a directory whose required file is <code>SKILL.md</code>. The format is an open specification published at <a href="https://agentskills.io/specification">agentskills.io</a> and supported by OpenAI Codex, Claude Code and other agents. The file starts with YAML frontmatter that has two required fields, followed by Markdown instructions:</p>
     <ul>
-      <li><code>name</code>: at most 64 characters, lowercase letters, digits and hyphens; it should match the directory name.</li>
+      <li><code>name</code>: at most 64 characters, lowercase letters, digits and hyphens; it must match the directory name.</li>
       <li><code>description</code>: at most 1024 characters; says what the skill does <em>and when to use it</em>.</li>
     </ul>
     <p>Optional sibling directories are <code>scripts/</code>, <code>references/</code> and <code>assets/</code>. Codex additionally reads an optional <code>agents/openai.yaml</code> for display metadata. The point of the format is <em>progressive disclosure</em>: at start-up the agent loads only the name and description of every installed skill. When a task matches a description, the agent loads the full body, and it opens reference files only when the body tells it to. So the description is effectively a trigger rule, which is why the eunomia-bpf descriptions are long and list both when to use and when <em>not</em> to use each skill.</p>
@@ -446,7 +446,7 @@ done</code></pre>
 
 - Verify at the final-artifact level: if the change deploys a site or docs, fetch the live URL and confirm the new content is actually served (mind CDN caches — check `cache-control`/`age` headers or a cache-busting query, and say so if propagation is pending); if it publishes a binary or package, install and smoke-test the published artifact, not the local build.
 - Every completion claim carries its evidence: command output, HTTP status, CI run link, or the published artifact's version string. If a step was not verified, say "pushed, not yet verified live" — never imply verification that did not happen.</code></pre>
-    <p>The community patrol builds on this. It runs daily at 09:00 America/Vancouver, must paginate every inventory to completion (commit <code>d9791c4</code>, "Require complete pagination of every inventory and sweep", added after the observation that one page of 100 can silently hide the other 126 items), and may merge a pull request only in a repository with fewer than 500 stars, checked live just before the merge and bound to the reviewed head with <code>gh pr merge --match-head-commit</code>. Repositories at or above 500 stars always leave the final merge to a human.</p>
+    <p>The community patrol builds on this. It runs daily at 09:00 America/Vancouver, must paginate every inventory to completion (commit <code>d9791c4</code>, "Require complete pagination of every inventory and sweep"; the skill's own example is a query with 100 results per page that reports only the first 100 of 226 items), and may merge a pull request only in a repository with fewer than 500 stars, checked live just before the merge and bound to the reviewed head with <code>gh pr merge --match-head-commit</code>. Repositories at or above 500 stars always leave the final merge to a human.</p>
     <p>Recent commits to agent-skills read like a changelog of lessons learned: <code>6f12639</code> "Check default-branch CI by commit and workflow outcome" (2026-10-04), <code>878d772</code> "Keep the approving review independent of the patrol's own commits", <code>cfccc53</code> "Require complete check-run and workflow-run sets for CI state" (both 2026-09-22), <code>e6695e4</code> "Check an approval against the head it covers", <code>1df81f8</code> "Read a blocked merge state as a missing required review", <code>4a69aa0</code> "Check that a new test is actually run by some build", <code>c2a48c2</code> "Add verification steps for dependency bumps" (2026-09-18).</p>
 
     <h2>research-skills: the research loop</h2>
@@ -667,7 +667,7 @@ Every rule below is a corollary of these three; apply them directly to cases no 
         <tr><td>backup-client-sdk</td><td>2026-08-02</td><td><a href="27-actime-and-akeep.html">27-actime-and-akeep.html</a></td></tr>
         <tr><td>namei_ext</td><td>2026-10-11</td><td><a href="28-namei-ext.html">28-namei-ext.html</a></td></tr>
         <tr><td>qwen3-ebpf</td><td>2026-10-28</td><td><a href="29-qwen3-ebpf.html">29-qwen3-ebpf.html</a></td></tr>
-        <tr><td>schedcp, MCPtrace, GPTtrace <em>(less active)</em></td><td>2026-02-12, 2026-02-12, 2026-03-07</td><td><a href="30-llm-kernel-tooling.html">30-llm-kernel-tooling.html</a></td></tr>
+        <tr><td>schedcp, MCPtrace, GPTtrace, GPTtrace-web <em>(less active)</em></td><td>2026-02-12, 2026-02-12, 2026-03-07, 2024-08-07</td><td><a href="30-llm-kernel-tooling.html">30-llm-kernel-tooling.html</a></td></tr>
         <tr><td>eunomia.dev</td><td>2026-11-05</td><td>31-org-meta.html (this chapter)</td></tr>
         <tr><td>agent-skills</td><td>2026-10-04</td><td>31-org-meta.html</td></tr>
         <tr><td>research-skills</td><td>2026-08-21</td><td>31-org-meta.html</td></tr>
@@ -675,10 +675,10 @@ Every rule below is a corollary of these three; apply them directly to cases no 
         <tr><td>.github</td><td>2026-10-04</td><td>31-org-meta.html</td></tr>
         <tr><td>basic-cuda-tutorial, cupti-tutorial</td><td>2026-07-19, 2026-07-22</td><td>31-org-meta.html</td></tr>
         <tr><td>nvbit-tutorial <em>(less active)</em></td><td>2026-03-02</td><td>31-org-meta.html</td></tr>
-        <tr><td>agentqos</td><td>2026-06-15</td><td>Not covered by a chapter. Per its README, a small Rust CLI (<code>cargo install agentqos</code>) that turns latency, error-rate, token and tool-call budgets into a pass/fail result and a 0–100 QoS score. It contains no eBPF.</td></tr>
+        <tr><td>agentqos</td><td>2026-06-15</td><td><a href="27-actime-and-akeep.html">27-actime-and-akeep.html</a> (short section "agentqos, briefly"). Per its README, a small Rust CLI (<code>cargo install agentqos</code>) that turns latency, error-rate, token and tool-call budgets into a pass/fail result and a 0–100 QoS score. It contains no eBPF.</td></tr>
       </tbody>
     </table>
-    <p>That is all 40 active repositories, plus four less active ones that still have a home. Background reading on BPF itself is in chapters <a href="01-what-is-bpf.html">01</a>–<a href="08-ecosystem.html">08</a>, and the glossary and paper list are in <a href="32-glossary-and-reading-list.html">32-glossary-and-reading-list.html</a>.</p>
+    <p>That is all 40 active repositories, plus five less active ones that still have a home. Background reading on BPF itself is in chapters <a href="01-what-is-bpf.html">01</a>–<a href="08-ecosystem.html">08</a>, and the glossary and paper list are in <a href="32-glossary-and-reading-list.html">32-glossary-and-reading-list.html</a>.</p>
 
     <h2>Benefits and limitations</h2>
     <p><strong>Benefits.</strong> Single sources plus generated copies mean a tutorial fix reaches the website within one CI run and never has to be made twice. Testing tutorial PRs against the website build catches rendering problems before merge. Writing procedures as skills makes maintainer expectations visible to outside contributors and portable across agent vendors, since the format is an open specification. The feasibility-review style, with labelled evidence classes, a stated search scope and a revision log, makes a negative or uncertain conclusion as easy to audit as a positive one.</p>

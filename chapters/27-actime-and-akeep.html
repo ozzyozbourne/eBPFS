@@ -962,7 +962,7 @@ refs/latest</code></pre>
 
     <p>The format makes four choices:</p>
     <ul>
-      <li><strong>Fixed-size 4 MiB chunks</strong>, not content-defined chunking. The docs
+      <li><strong>Fixed-size 4 MiB chunks</strong> (the default; <code>archive.chunk_size</code> accepts up to 64 MiB), not content-defined chunking. The docs
       explain: "coding-agent state is dominated by append-only JSONL and SQLite snapshots, it
       supports bounded memory, and it keeps the recovery implementation small enough to audit."
       An append-only JSONL file keeps the same leading chunks, so only its last chunk changes.
@@ -1579,7 +1579,7 @@ let _objects = client.objects();</code></pre>
         <button class="opt" data-right>One new object for the last (changed) chunk; the first two 4 MiB chunks already exist under the same BLAKE3 keys</button>
         <button class="opt">Only a binary diff against the previous manifest</button>
         <button class="opt">Nothing until <code>akeep add</code> is run</button>
-        <div class="why">Chunks are fixed 4 MiB pieces named by the BLAKE3 hash of their
+        <div class="why">Chunks are fixed-size pieces (4 MiB by default) named by the BLAKE3 hash of their
         uncompressed bytes. An append changes only the tail chunk, so earlier chunks
         deduplicate. The new manifest still lists all three chunk ids. There is no
         <code>add</code> command.</div></div>

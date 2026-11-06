@@ -571,7 +571,7 @@ impl McpServer {
       "type": "integer",
       "description": "Scheduling slice duration for over-utilized hosts, in microseconds",
       "default": 1000,
-      "range": [100, 100000]
+      "range": [100, 10000]
     }
     /* ... */
   },
@@ -778,7 +778,7 @@ int pid_filename_handle_exec(struct trace_event_raw_sched_process_exec *ctx)
     <p>Look at what the model was told to do. The generation prompt in
     <code>workloads/processing/scripts/prompt.md</code> says: "you are a experienced eBPF developer who
     already know what application you are going to run … you just need to make exact match for the
-    processes name … For python program, you should use the filename to check the application, not
+    processes in the scheduler … For python program, you should use the filename to check the application, not
     the comm name." So the agent's job in this experiment was <em>workload-specific</em> policy with
     known process names, not a general-purpose scheduler. The character-by-character comparison is
     what such code tends to look like when the author wants the verifier to accept it without loops.
@@ -881,7 +881,8 @@ pub fn create_cc_prompt(command: &amp;str) -&gt; String {
     <h3>Building and using it</h3>
     <p>Requirements from the README: Linux 6.12+ with sched_ext, a Rust toolchain, the dependencies of
     <a href="https://github.com/sched-ext/scx">scx</a> (meson, clang, libbpf), and Claude Code for the
-    agent path. These commands are from the README and <code>document/USAGE_GUIDE.md</code>:</p>
+    agent path. These commands are from the README and <code>document/USAGE_GUIDE.md</code>, regrouped,
+    with the comments shortened or added for this chapter:</p>
     <pre data-file="schedcp/README.md"><code class="language-bash"># Clone with submodules
 git clone https://github.com/eunomia-bpf/schedcp
 cd schedcp
@@ -1058,6 +1059,7 @@ let sudo_password = match std::env::var("BPFTRACE_PASSWD") {
 };</code></pre>
 
     <h3>Install and run</h3>
+    <p>Collected from several README sections; the comments are added for this chapter.</p>
     <pre data-file="MCPtrace/README.md"><code class="language-bash">sudo apt-get install bpftrace          # Ubuntu/Debian
 cargo install bpftrace-mcp-server      # or: cargo build --release from a clone
 
@@ -1301,7 +1303,8 @@ def construct_running_prompt(text: str) -&gt; str:
     function schema for the tool if one exists, or asks the model to write one from the tool's
     <code>--help</code> output, then calls the model with it and runs <code>sudo &lt;tool&gt; …</code>.
     The README also shows a run in which the tool chose <code>sudo memleak-bpfcc --trace</code> for "Trace allocations and
-    display each individual allocator function call".</p>
+    display each individual allocator function call". The commands below are from the README; the
+    <code>export</code> line and the comments are added for this chapter.</p>
     <pre data-file="GPTtrace/README.md"><code class="language-bash">pip install gpttrace
 export OPENAI_API_KEY=...            # or pass -k OPENAI_API_KEY
 python3 -m gpttrace -h               # options: -c CMD_NAME QUERY, -v, -k OPENAI_API_KEY

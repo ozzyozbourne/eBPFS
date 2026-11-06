@@ -107,7 +107,11 @@
     <p>The <strong>last</strong> component gets different handling, because what to do with it depends on the system
     call: <code>stat</code> wants the object, <code>open(O_CREAT)</code> may create it, <code>unlink</code> wants the
     parent. For <code>open</code>, the final step is <code>open_last_lookups()</code>, called from
-    <code>path_openat()</code>.</p>
+    <code>path_openat()</code>. Lookups such as <code>stat</code> and <code>access</code> hand the final
+    component to <code>walk_component()</code> as well, through <code>lookup_last()</code> with
+    <code>WALK_TRAILING</code>. Calls that create or remove a name (<code>unlink</code>, <code>mkdir</code>,
+    <code>rename</code>, …) instead resolve the parent with <code>filename_parentat()</code> and look the last
+    name up under the parent's lock (<code>start_dirop()</code>).</p>
 
     <h3>RCU-walk and ref-walk</h3>
     <p>Taking a reference count on every dentry along a path makes cache lines bounce between CPUs. So Linux first
@@ -264,7 +268,7 @@ b07117a3cb41 2026-08-01 namei_ext: expose stat-compatible parent device</code></
         <text class="m28" x="10" y="96">fs/namei.c</text>
         <rect class="b28" x="30" y="104" width="230" height="36" rx="6"/><text class="o28" x="42" y="127">path_openat / link_path_walk</text>
         <line class="r28" x1="145" y1="64" x2="145" y2="102"/>
-        <rect class="b28" x="30" y="166" width="230" height="56" rx="6"/><text class="o28" x="42" y="188">walk_component()</text><text class="m28" x="42" y="208">each non-final component</text>
+        <rect class="b28" x="30" y="166" width="230" height="56" rx="6"/><text class="o28" x="42" y="188">walk_component()</text><text class="m28" x="42" y="208">non-final; final one for stat etc.</text>
         <line class="r28" x1="145" y1="140" x2="145" y2="164"/>
         <rect class="b28" x="300" y="166" width="250" height="56" rx="6"/><text class="o28" x="312" y="188">open_last_lookups()</text><text class="m28" x="312" y="208">final component of open()</text>
         <line class="r28" x1="260" y1="122" x2="420" y2="164"/>
@@ -674,11 +678,11 @@ struct bpf_namei_ext_ctx {
     typedefs and a <code>SEC</code> macro, so policies build without <code>vmlinux.h</code> or libbpf headers). The
     kernel's <code>namei_ext_is_valid_access()</code> enforces the read/write split. Programs may read every field.
     <code>name[]</code> and <code>redirect_name[]</code> may only be read one byte at a time. Writes are allowed only to
-    <code>redirect_name_len</code>, <code>target_id</code> and bytes of <code>redirect_name[]</code>. The verifier's
+    <code>redirect_name_len</code>, <code>target_id</code> and <code>redirect_name[]</code> (1-, 2-, 4- or 8-byte stores). The verifier's
     return-range check, added in <code>verifier.c</code>, pins the return value to
     <code>[BPF_NAMEI_EXT_PASS, BPF_NAMEI_EXT_SELECT_TARGET]</code>. As a second line of defence, the run loop turns
     anything above 3 into <code>-EINVAL</code>. Helpers are the cgroup-common set plus
-    <code>bpf_perf_event_output</code> and the base protos (maps, atomics, and so on). There are no
+    <code>bpf_perf_event_output</code> and the base protos (map helpers, <code>bpf_ktime_get_ns</code> and so on). There are no
     filesystem-specific helpers or kfuncs: <strong>a policy cannot read file contents or walk dentries
     itself.</strong></p>
     <p>Names longer than 64 bytes are truncated in <code>name[]</code>, but <code>name_len</code> holds the true length,
@@ -1218,6 +1222,13 @@ make experiment-agent-workspace-rq2   # e.g. the ten-pair namei_ext vs FUSE life
           <li><strong>Selection only.</strong> No synthetic files or entries, no content transformation, no create
             redirection (<code>LOOKUP_CREATE</code> → <code>EOPNOTSUPP</code>), no symlink or special-file targets, and
             no cross-path transactions. The design document lists all of these.</li>
+          <li><strong>Directory-modifying calls are not hooked on their last name.</strong> By our reading of the
+            fork, <code>unlink</code>, <code>rmdir</code>, <code>mkdir</code>, <code>rename</code> and similar calls
+            resolve the final component through <code>filename_parentat()</code> and <code>start_dirop()</code> /
+            <code>lookup_one_qstr_excl()</code>, which the patch does not touch. Their intermediate components still go
+            through <code>walk_component()</code>, so a selected directory applies. But a policy that HIDEs
+            <code>secret</code> on LOOKUP and READDIR would not, as far as we can see, stop <code>unlink("secret")</code>
+            in that directory. We did not test this, and the repository's documents do not discuss it.</li>
           <li><strong>Consistency is the policy's job.</strong> The kernel does not stop a policy that hides on lookup
             but lists on readdir.</li>
           <li><strong>At-least-once execution</strong> across <code>-ECHILD</code> restarts, so side effects must be

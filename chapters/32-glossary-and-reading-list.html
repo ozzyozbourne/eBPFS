@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>32 · Glossary, reading list and learning paths · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="32">
+<meta name="chapter-part" content="Appendix">
+<meta name="chapter-summary" content="A searchable glossary of 148 terms linked to the chapters that explain them, every research paper the curriculum cites grouped by theme, and three suggested routes through the 32 chapters.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+<style>
+  .gloss-tools { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+  .gloss-tools input { flex: 1; min-width: 220px; padding: .5rem .8rem; background: var(--bg2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+  .gloss-tools .count { color: var(--muted); font-size: .85rem; }
+  dl.gloss { margin: 0; }
+  .gloss-entry { border-bottom: 1px solid var(--border); padding: .55rem 0; }
+  .gloss-entry dt { font-weight: 700; }
+  .gloss-entry dd { margin: .15rem 0 0; max-width: 78ch; }
+  .gloss-see { color: var(--muted); font-size: .88rem; }
+  .gloss-entry[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Appendix › 32 · Glossary and reading list</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 32</div>
+      <h1>Glossary, reading list and learning paths</h1>
+      <p class="lede">Thirty-one chapters bring in a lot of vocabulary and cite many papers. This appendix collects both in one place: each term gets a short definition and a link to the section that explains it, and each cited paper is listed once with the chapters that cite it. It ends with three routes through the curriculum and a short quiz that covers all of it.</p>
+      <div class="meta"><span>Prerequisites: none</span><span>Org: <a href="https://github.com/eunomia-bpf">eunomia-bpf</a></span><span>Reference chapter</span></div>
+    </section>
+
+    <h2>How to use this appendix</h2>
+    <p>This chapter only collects material from chapters 01–31. Each glossary definition is a short version of what a chapter says, and the link next to it goes to the section with the full explanation, code and diagrams. If a definition and its chapter seem to disagree, trust the chapter: it was written from the source code and documents, and this page was written from the chapters.</p>
+    <p>The reading list was built from the <em>References</em> sections of chapters 01–31. Kernel documentation, LWN articles, blog posts, mailing-list patches and conference talks without a paper are left out, because each chapter already links them in context. Papers that a chapter only mentions in passing, with no entry in its reference list, are also left out. The research notes for this chapter (<code>research/32-glossary-and-reading-list.md</code>) list those mentions by name.</p>
+    <div class="callout key"><span class="label">Key idea</span><p>The curriculum makes one argument across seven parts. eBPF is a <em>verified</em> extension mechanism: the verifier (<a href="03-verifier.html">03</a>) is what makes it safe to load other people's code into a privileged context. The eunomia-bpf projects then carry the same idea to new places: user-space processes (<a href="14-bpftime-architecture.html">14</a>), GPU drivers and kernels (<a href="20-gpu-ext.html">20</a>), collective-communication libraries (<a href="21-nccl-ebpf.html">21</a>), path lookup (<a href="28-namei-ext.html">28</a>) and the operating-system boundary of AI agents (<a href="24-actplane.html">24</a>). Many glossary terms are either a piece of the verifier's safety argument or a new hook where that argument is reused.</p></div>
+
+    <h2>Glossary</h2>
+    <p>The 148 terms are in alphabetical order. Type in the box to filter them: the filter matches the term, its definition and a few synonyms, so <code>loop</code> finds <code>bpf_loop</code>, <code>may_goto</code> and open-coded iterators, and <code>gpu</code> finds everything from CUPTI to UVM. Every term has an anchor, so another page can link to it as <code>32-glossary-and-reading-list.html#g-</code><em>slug</em> (for example <a href="#g-tnum-tristate-number"><code>#g-tnum-tristate-number</code></a>).</p>
+    <div class="gloss-tools">
+      <input id="gloss-filter" type="search" placeholder="Filter terms, e.g. verifier, ring, gpu, agent" aria-label="Filter glossary terms" autocomplete="off">
+      <span class="count" id="gloss-count" aria-live="polite">148 terms</span>
+    </div>
+    <dl class="gloss" id="gloss">
+      <div class="gloss-entry" id="g-512-byte-stack" data-k="512-byte stack stack frame r10">
+        <dt>512-byte stack</dt>
+        <dd>Each eBPF function has a stack frame of at most 512 bytes, addressed downward from the read-only frame pointer <code>R10</code>. Large buffers therefore live in maps (often a per-CPU array) instead. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#the-512-byte-stack">02 · The 512-byte stack</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-abstract-interpretation" data-k="abstract interpretation static analysis symbolic">
+        <dt>Abstract interpretation</dt>
+        <dd>Running a program over abstract values (types, ranges, tnums) instead of concrete ones, so that one analysis covers every possible input. The kernel verifier, PREVAIL and NCCLbpf's rank-agreement check all work this way. <span class="gloss-see">See <a href="03-verifier.html#pass-2-path-by-path-symbolic-execution">03 · Pass 2: path-by-path symbolic execution</a>; <a href="03-verifier.html#prevail-abstract-interpretation-done-properly-pldi-2019">03 · PREVAIL: abstract interpretation done &quot;properly&quot; (PLDI 2019)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-actime" data-k="actime agent runtime run directory">
+        <dt>Actime</dt>
+        <dd>A runner for agent sessions that starts ActPlane (policy), AgentSight (observability) and Akeep (backup) as child processes and gathers what they write into one run directory. Actime itself loads nothing into the kernel. <span class="gloss-see">See <a href="27-actime-and-akeep.html#the-three-planes">27 · The three planes</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-actplane" data-k="actplane information flow agents policy">
+        <dt>ActPlane</dt>
+        <dd>eunomia-bpf's information-flow enforcement engine for AI agent harnesses. eBPF programs put labels on processes and files, propagate them along fixed rules, and block or kill at sinks that a small rule language names. <span class="gloss-see">See <a href="24-actplane.html#the-architecture-in-one-picture">24 · The architecture in one picture</a>; <a href="24-actplane.html#the-policy-language">24 · The policy language</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-af-xdp" data-k="af_xdp xsk umem zero copy socket">
+        <dt>AF_XDP</dt>
+        <dd>A socket family that receives packets which an XDP program redirects into a memory area (UMEM) shared between kernel and user space, so user space gets packets without going through the normal network stack. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#af-xdp-packets-to-userspace-zero-copy">07 · AF_XDP: packets to userspace, zero-copy</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-agentcgroup" data-k="agentcgroup agent resources memory cgroup">
+        <dt>AgentCgroup</dt>
+        <dd>A characterization study and controller for the OS resources AI coding agents use. It gives each tool call its own cgroup and reacts to short memory and CPU bursts with <code>memcg_bpf_ops</code> and a sched_ext scheduler. <span class="gloss-see">See <a href="25-agentcgroup.html#architecture">25 · Architecture</a>; <a href="25-agentcgroup.html#three-mismatches">25 · Three mismatches</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-agentsight" data-k="agentsight agent observability tls">
+        <dt>AgentSight</dt>
+        <dd>Observability for AI agents that watches two boundaries: the plaintext of the agent's TLS traffic with the LLM (captured with uprobes) and its kernel-visible actions (processes, file opens). The two streams are correlated afterwards. <span class="gloss-see">See <a href="23-agentsight.html">23 · AgentSight: system-level observability for AI agents</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-agent-skill" data-k="agent skill skill.md agents procedures">
+        <dt>Agent skill</dt>
+        <dd>A directory with a <code>SKILL.md</code> file of instructions that a coding agent loads when a task matches it. eunomia-bpf keeps its maintenance and research procedures in this form. <span class="gloss-see">See <a href="31-org-meta.html#what-a-skill-is">31 · What a skill is</a>; <a href="17-bpfix.html#the-agent-skill">17 · The agent skill</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-agni" data-k="agni range analysis smt cav">
+        <dt>Agni</dt>
+        <dd>The CAV 2023 work that checks the soundness of the kernel verifier's range-analysis code by turning it into SMT formulas. <span class="gloss-see">See <a href="03-verifier.html#agni-verifying-the-range-analysis-cav-2023">03 · Agni: verifying the range analysis (CAV 2023)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-akeep" data-k="akeep backup agent history sessions">
+        <dt>Akeep</dt>
+        <dd>A version-control-style backup tool for agent session history. It reads provider-native session files and stores them as BLAKE3-named chunks and manifests in a content-addressed archive. <span class="gloss-see">See <a href="27-actime-and-akeep.html#akeep-version-control-for-agent-history">27 · Akeep: version control for agent history</a>; <a href="27-actime-and-akeep.html#the-archive-content-addressed-chunks">27 · The archive: content-addressed chunks</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-alu-alu64" data-k="alu / alu64 arithmetic instruction class">
+        <dt>ALU / ALU64</dt>
+        <dd>The two arithmetic instruction classes: <code>ALU</code> works on the low 32 bits (and zero-extends the result), <code>ALU64</code> on the full 64-bit register. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#alu-and-alu64">02 · ALU and ALU64</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-arena" data-k="arena bpf_map_type_arena heap shared memory">
+        <dt>Arena</dt>
+        <dd><code>BPF_MAP_TYPE_ARENA</code> (Linux 6.9): a sparse memory region of up to 4 GB that a BPF program and a user-space process both map, so pointer-based data structures can be shared. qwen3-ebpf keeps a 1.5 GB model in one. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#arena-a-heap-shared-with-user-space">04 · Arena: a heap shared with user space</a>; <a href="29-qwen3-ebpf.html#where-the-weights-live-a-1-5-gb-bpf-arena">29 · Where the weights live: a 1.5 GB BPF arena</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-atomic-operations" data-k="atomic operations bpf_atomic cmpxchg xchg fetch">
+        <dt>Atomic operations</dt>
+        <dd><code>BPF_ATOMIC</code> instructions that add, and, or, xor, exchange or compare-and-exchange a memory word, optionally returning the old value. ISA v4 adds load-acquire and store-release. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#atomic-operations">02 · Atomic operations</a>; <a href="04-maps-helpers-kfuncs.html#concurrency-atomics-per-cpu-data-and-spin-locks">04 · Concurrency: atomics, per-CPU data and spin locks</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bcc" data-k="bcc bpf compiler collection python">
+        <dt>BCC</dt>
+        <dd>BPF Compiler Collection. Its tools embed Clang and compile the BPF C on the target machine at run time against the local kernel headers, the approach that BTF and CO-RE replaced for portable tools. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#the-old-answer-compile-on-the-target-bcc">06 · The old answer: compile on the target (BCC)</a>; <a href="08-ecosystem.html#how-each-framework-builds-and-loads">08 · How each framework builds and loads</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-berkeley-packet-filter" data-k="bpf (berkeley packet filter) bsd packet filter mccanne jacobson 1993">
+        <dt>BPF (Berkeley Packet Filter)</dt>
+        <dd>The 1993 packet-filter design by McCanne and Jacobson: a small register-based virtual machine that runs a user-supplied filter on each packet in the kernel, so only matching packets are copied to user space. <span class="gloss-see">See <a href="01-what-is-bpf.html#the-origin-the-bsd-packet-filter-1993">01 · The origin: the BSD Packet Filter (1993)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-compatible" data-k="bpf-compatible old kernels btf archive">
+        <dt>bpf-compatible</dt>
+        <dd>A eunomia-bpf toolchain that fetches BTF for kernels without native BTF from BTFHub, trims it to what your programs use, embeds the archive in the executable, and picks the right one at run time. <span class="gloss-see">See <a href="13-bpf-compatible.html#what-bpf-compatible-is">13 · What bpf-compatible is</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-ext" data-k="bpf-ext kinsn native operations atc 26">
+        <dt>BPF-Ext</dt>
+        <dd>An ATC '26 paper and prototype that adds new native operations (kinsn) to the eBPF pipeline: the verifier checks an equivalent ordinary eBPF sequence, and the JIT emits native code instead. <span class="gloss-see">See <a href="19-bpf-benchmark.html#backend-2-kinsn-verified-native-operations-bpf-ext">19 · Backend 2: kinsn, verified native operations (BPF-Ext)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpffs" data-k="bpffs pin /sys/fs/bpf">
+        <dt>bpffs</dt>
+        <dd>The BPF pseudo-filesystem, usually mounted at <code>/sys/fs/bpf</code>. Pinning a map, program or link there keeps it alive after the loading process exits. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#pinning-maps-in-bpffs">04 · Pinning maps in bpffs</a>; <a href="06-btf-core-libbpf.html#bpf-links-and-pinning">06 · BPF links and pinning</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpfix" data-k="bpfix verifier errors diagnostic llm">
+        <dt>bpfix</dt>
+        <dd>A Rust command-line tool that reads a verifier log, finds where the proof the failing instruction needed was established and then lost, and prints a compiler-style diagnostic. The repository also contains a study of 235 real rejections and an LLM repair benchmark. <span class="gloss-see">See <a href="17-bpfix.html#what-bpfix-is-and-what-it-is-not">17 · What bpfix is, and what it is not</a>; <a href="17-bpfix.html#how-bpfix-works">17 · How bpfix works</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-link" data-k="bpf link bpf_link attachment">
+        <dt>BPF link</dt>
+        <dd>A kernel object, held through a file descriptor, that represents one attachment of a program to a hook. Closing the last reference detaches the program unless the link is pinned. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#bpf-links-and-pinning">06 · BPF links and pinning</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-loop" data-k="bpf_loop loop helper callback">
+        <dt>bpf_loop</dt>
+        <dd>A helper (Linux 5.17) that calls a callback up to <em>n</em> times. The verifier checks the callback body once, with the loop index as an unknown value, instead of unrolling the loop. <span class="gloss-see">See <a href="03-verifier.html#loops">03 · Loops</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-lsm" data-k="bpf lsm krsi security module lsm hooks">
+        <dt>BPF LSM</dt>
+        <dd>Programs of type <code>BPF_PROG_TYPE_LSM</code> attached to Linux Security Module hooks. A non-zero return (an error such as <code>-EPERM</code>) denies the operation. ActPlane and namei_ext's neighbours use it. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#bpf-lsm">05 · BPF LSM</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpfopt" data-k="bpfopt llvm round trip optimizer">
+        <dt>bpfopt</dt>
+        <dd>The bytecode-to-bytecode optimizer in bpf-benchmark: a command-line tool that lifts eBPF to LLVM IR, optimizes it, and lowers it back, without making BPF system calls itself. <span class="gloss-see">See <a href="19-bpf-benchmark.html#bpfopt-is-an-llvm-round-trip">19 · bpfopt is an LLVM round trip</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-system-call" data-k="bpf() system call bpf_prog_load bpf_map_create syscall">
+        <dt>bpf() system call</dt>
+        <dd>The single system call through which user space creates maps, loads programs and attaches them. A command argument such as <code>BPF_PROG_LOAD</code>, <code>BPF_MAP_CREATE</code> or <code>BPF_LINK_CREATE</code> selects the operation. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#underneath-the-bpf-syscall">06 · Underneath: the bpf() syscall</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpftime" data-k="bpftime userspace ebpf runtime osdi 25">
+        <dt>bpftime</dt>
+        <dd>eunomia-bpf's userspace eBPF runtime. It intercepts the loader's <code>bpf()</code> calls, keeps maps in shared memory, and runs uprobe and syscall programs inside the target process through binary rewriting. It is described in an OSDI '25 paper. <span class="gloss-see">See <a href="14-bpftime-architecture.html#what-bpftime-is">14 · What bpftime is</a>; <a href="15-bpftime-in-practice.html">15 · bpftime in practice</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-to-bpf-call" data-k="bpf-to-bpf call subprogram function call">
+        <dt>BPF-to-BPF call</dt>
+        <dd>A call from one BPF function to another inside the same program (a subprogram), with its own stack frame. It is distinct from a helper call, a kfunc call and a tail call. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#bpf-to-bpf-calls">02 · BPF-to-BPF calls</a>; <a href="04-maps-helpers-kfuncs.html#bpf-to-bpf-calls">04 · BPF-to-BPF calls</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-token" data-k="bpf token delegation container unprivileged bpffs">
+        <dt>BPF token</dt>
+        <dd>An object created from a specially mounted bpffs instance through which an administrator delegates a chosen subset of BPF permissions to a less privileged process, such as one inside a container. <span class="gloss-see">See <a href="03-verifier.html#privileged-and-unprivileged-loading">03 · Privileged and unprivileged loading</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpftool" data-k="bpftool inspection prog show gen skeleton">
+        <dt>bpftool</dt>
+        <dd>The kernel's own command-line tool for BPF: it lists and dumps programs and maps, generates <code>vmlinux.h</code> and skeletons, and trims BTF with <code>gen min_core_btf</code>. <span class="gloss-see">See <a href="08-ecosystem.html#the-kernel-s-own-tooling-bpftool-and-selftests">08 · The kernel&#x27;s own tooling: bpftool and selftests</a>; <a href="06-btf-core-libbpf.html#the-makefile-step-by-step">06 · The Makefile, step by step</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpftrace" data-k="bpftrace one-liner tracing language">
+        <dt>bpftrace</dt>
+        <dd>A high-level tracing language with awk-like one-liners that compiles to BPF. MCPtrace exposes it as MCP tools, and bpftime can run its programs in user space. <span class="gloss-see">See <a href="08-ecosystem.html#how-each-framework-builds-and-loads">08 · How each framework builds and loads</a>; <a href="15-bpftime-in-practice.html#bpftrace-in-userspace">15 · bpftrace in userspace</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-bpf-wq" data-k="bpf_wq workqueue process context">
+        <dt>bpf_wq</dt>
+        <dd>A BPF workqueue item (Linux 6.10) embedded in a map value. The callback runs later from a kernel workqueue in process context, so it can do longer work than the hook that started it. <span class="gloss-see">See <a href="29-qwen3-ebpf.html#which-hook-triggers-computation-xdp-then-bpf-wq">29 · Which hook triggers computation: XDP, then bpf_wq</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-btf" data-k="btf bpf type format debug info">
+        <dt>BTF</dt>
+        <dd>BPF Type Format: compact type information (structs, fields, function prototypes) for the kernel, modules and BPF objects. It enables CO-RE, kfuncs, typed tracing and pretty-printed maps. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#btf-the-bpf-type-format">06 · BTF: the BPF Type Format</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-btf-custom-path" data-k="btf_custom_path libbpf option external btf">
+        <dt>btf_custom_path</dt>
+        <dd>A libbpf open option that tells libbpf to read kernel BTF from a given file instead of <code>/sys/kernel/btf/vmlinux</code>; bpf-compatible uses it to supply trimmed BTF. <span class="gloss-see">See <a href="13-bpf-compatible.html#what-libbpf-does-with-btf-custom-path">13 · What libbpf does with btf_custom_path</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-btfhub" data-k="btfhub btf archive old kernels">
+        <dt>BTFHub</dt>
+        <dd>A community archive of BTF files for distribution kernels built without embedded BTF, used by tools that must run CO-RE programs on those kernels. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#kernels-without-btf-btfhub-and-minimized-btf">06 · Kernels without BTF: BTFHub and minimized BTF</a>; <a href="13-bpf-compatible.html#bpf-compatible-vs-btfhub">13 · bpf-compatible vs. BTFHub</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-causal-profiling" data-k="causal profiling coz virtual speedup">
+        <dt>Causal profiling</dt>
+        <dd>Profiling that estimates how much speeding up a piece of code would speed up the whole program by slowing down everything else running concurrently (Coz, SOSP '15). The megakernel feasibility notes study it for GPUs. <span class="gloss-see">See <a href="31-org-meta.html#the-two-ideas-being-combined">31 · The two ideas being combined</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cbpf-classic-bpf" data-k="cbpf (classic bpf) classic bpf two registers">
+        <dt>cBPF (classic BPF)</dt>
+        <dd>The original BPF: two 32-bit registers (A and X), a small scratch memory, and forward-only jumps. Linux still accepts it for socket filters and seccomp, and translates it to eBPF internally. <span class="gloss-see">See <a href="01-what-is-bpf.html#the-classic-bpf-machine">01 · The classic BPF machine</a>; <a href="01-what-is-bpf.html#classic-bpf-in-linux-socket-filters-a-jit-and-seccomp">01 · Classic BPF in Linux: socket filters, a JIT, and seccomp</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cfg-check" data-k="cfg check control flow graph unreachable back edge">
+        <dt>CFG check</dt>
+        <dd>The verifier's first pass: it walks the control-flow graph and rejects unreachable instructions, jumps out of range and (unless loops are allowed) back edges. <span class="gloss-see">See <a href="03-verifier.html#pass-1-the-control-flow-graph-check">03 · Pass 1: the control-flow graph check</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cgroup-programs" data-k="cgroup programs cgroup_skb sock_addr sysctl device">
+        <dt>cgroup programs</dt>
+        <dd>Program types attached to a cgroup v2 directory that apply to every task in it, for example packet filtering, socket address rewriting, sysctl access and device access. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#cgroup-programs">05 · cgroup programs</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cgroup-v2" data-k="cgroup v2 control group memory.max">
+        <dt>cgroup v2</dt>
+        <dd>The unified Linux control-group hierarchy: a tree of directories, each with controller files (CPU, memory, I/O, pids) that limit and account for the processes inside. <span class="gloss-see">See <a href="25-agentcgroup.html#a-tree-of-directories">25 · A tree of directories</a>; <a href="25-agentcgroup.html#the-four-controllers-that-matter-here">25 · The four controllers that matter here</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cilium" data-k="cilium kubernetes cni hubble">
+        <dt>Cilium</dt>
+        <dd>A Kubernetes networking, security and observability project whose datapath is built from tc, XDP and socket eBPF programs; Hubble is its flow-observability layer. <span class="gloss-see">See <a href="08-ecosystem.html#networking-cilium-and-hubble">08 · Networking: Cilium and Hubble</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cilium-ebpf" data-k="cilium/ebpf go library">
+        <dt>cilium/ebpf</dt>
+        <dd>A pure-Go library for loading and managing eBPF programs and maps, with a <code>bpf2go</code> code generator. <span class="gloss-see">See <a href="08-ecosystem.html#one-program-seven-frameworks">08 · One program, seven frameworks</a>; <a href="11-starter-templates.html#the-go-sibling-cilium-ebpf-starter-template">11 · The Go sibling: cilium-ebpf-starter-template</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-collective-nccl" data-k="collective (nccl) allreduce rank communicator">
+        <dt>Collective (NCCL)</dt>
+        <dd>A communication operation in which all ranks of a communicator take part, such as AllReduce or AllGather. NCCL implements collectives across GPUs. <span class="gloss-see">See <a href="21-nccl-ebpf.html#ranks-communicators-and-collectives">21 · Ranks, communicators and collectives</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-complexity-limit" data-k="complexity limit 1 million instructions too large">
+        <dt>Complexity limit</dt>
+        <dd>The verifier stops after processing 1,000,000 instructions across all explored paths (<code>BPF_COMPLEXITY_LIMIT_INSNS</code>) and rejects the program. Unprivileged programs are also limited to 4,096 instructions in size. <span class="gloss-see">See <a href="03-verifier.html#the-complexity-limits">03 · The complexity limits</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-constant-blinding" data-k="constant blinding jit spray immediate xor">
+        <dt>Constant blinding</dt>
+        <dd>A JIT hardening that XORs immediates from the program with a random value, so that attacker-chosen constants do not appear verbatim in executable memory (a defence against JIT spraying). <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#constant-blinding">02 · Constant blinding</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-co-re" data-k="co-re compile once run everywhere relocation">
+        <dt>CO-RE</dt>
+        <dd>Compile Once – Run Everywhere. Clang records each field access as a relocation against BTF types, and libbpf rewrites the offsets at load time to match the running kernel's BTF. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#co-re-relocations-recording-intent-at-compile-time">06 · CO-RE relocations: recording intent at compile time</a>; <a href="06-btf-core-libbpf.html#how-libbpf-applies-relocations-at-load-time">06 · How libbpf applies relocations at load time</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-cupti" data-k="cupti cuda profiling tools interface activity callback">
+        <dt>CUPTI</dt>
+        <dd>NVIDIA's CUDA Profiling Tools Interface. Its Activity and Callback APIs report kernel launches and timings. xpu-perf loads it as an injection library to collect GPU-side events. <span class="gloss-see">See <a href="22-xpu-perf.html#background-how-you-get-data-out-of-an-nvidia-gpu">22 · Background: how you get data out of an NVIDIA GPU</a>; <a href="22-xpu-perf.html#code-walkthrough-2-the-cupti-injection-library">22 · Code walkthrough 2: the CUPTI injection library</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-data-data-end" data-k="data / data_end packet bounds check">
+        <dt>data / data_end</dt>
+        <dd>The two context fields that point to the start and end of a packet in XDP and tc programs. The verifier only allows a packet access after a comparison against <code>data_end</code> proves it is in bounds. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#parsing-packets-safely-data-data-end-and-the-verifier">07 · Parsing packets safely: data, data_end and the verifier</a>; <a href="03-verifier.html#packet-bounds-data-and-data-end">03 · Packet bounds: data and data_end</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-dentry" data-k="dentry directory entry inode struct path">
+        <dt>Dentry</dt>
+        <dd>The kernel's cached record that links a name in a directory to an inode. The path walk moves from dentry to dentry; a <code>struct path</code> pairs a dentry with a mount. <span class="gloss-see">See <a href="28-namei-ext.html#dentries-inodes-mounts-and-struct-path">28 · Dentries, inodes, mounts and struct path</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-device-side-ebpf" data-k="device-side ebpf gpu kernel ptx bpftime">
+        <dt>Device-side eBPF</dt>
+        <dd>eBPF programs compiled to PTX and run inside CUDA kernels on the GPU (through bpftime and llvmbpf), used by gpu_ext to see warp-level behaviour that host hooks cannot see. <span class="gloss-see">See <a href="20-gpu-ext.html#the-device-side-ebpf-inside-cuda-kernels">20 · The device side: eBPF inside CUDA kernels</a>; <a href="15-bpftime-in-practice.html#gpu-and-cuda-probes">15 · GPU and CUDA probes</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-dynptr" data-k="dynptr dynamic pointer variable size">
+        <dt>Dynptr</dt>
+        <dd>A verifier-tracked pointer plus a run-time length, for memory whose size is only known at run time, for example variable-size ring-buffer records. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#variable-size-records-dynptrs">04 · Variable-size records: dynptrs</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ebpf" data-k="ebpf extended bpf">
+        <dt>eBPF</dt>
+        <dd>Extended BPF (Linux 3.15 onward): eleven 64-bit registers, a verifier, a JIT, maps, helpers, and many hook types beyond networking. Today "BPF" in kernel usage usually means eBPF. <span class="gloss-see">See <a href="01-what-is-bpf.html#2014-extended-bpf">01 · 2014: extended BPF</a>; <a href="01-what-is-bpf.html#ebpf-vs-bpf-what-the-names-mean-today">01 · &quot;eBPF&quot; vs &quot;BPF&quot;: what the names mean today</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ebpf-for-windows" data-k="ebpf for windows microsoft prevail">
+        <dt>eBPF for Windows</dt>
+        <dd>Microsoft's port of the eBPF toolchain to Windows. It verifies programs with PREVAIL instead of the Linux verifier, then either translates them to a signed native driver or JIT-compiles them with uBPF. <span class="gloss-see">See <a href="08-ecosystem.html#ebpf-for-windows-and-prevail">08 · eBPF for Windows and PREVAIL</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ecc" data-k="ecc eunomia compiler package">
+        <dt>ecc</dt>
+        <dd>The eunomia-bpf compiler. It builds a BPF C program with Clang and produces a package of the object plus JSON metadata (maps, globals, export types), which ecli can run without a hand-written loader. <span class="gloss-see">See <a href="10-eunomia-bpf-ecc-ecli.html#ecc-what-the-compiler-generates">10 · ecc: what the compiler generates</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ecli" data-k="ecli eunomia runner registry">
+        <dt>ecli</dt>
+        <dd>The eunomia-bpf runner. It loads a package from a file, a URL or an OCI registry, turns global variables into command-line options, attaches the programs and prints the exported events. <span class="gloss-see">See <a href="10-eunomia-bpf-ecc-ecli.html#ecli-running-from-a-file-a-url-or-a-registry">10 · ecli: running from a file, a URL or a registry</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-egpu" data-k="egpu gpu ebpf hcds">
+        <dt>eGPU</dt>
+        <dd>An HCDS '25 workshop prototype for running eBPF on GPUs, since merged into the gpu_ext/bpftime line of work. <span class="gloss-see">See <a href="20-gpu-ext.html#related-work">20 · Related work</a>; <a href="15-bpftime-in-practice.html#gpu-and-cuda-probes">15 · GPU and CUDA probes</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-eim-extension-interface-model" data-k="eim (extension interface model) capabilities extension entry osdi">
+        <dt>EIM (Extension Interface Model)</dt>
+        <dd>The OSDI '25 model in which an application developer declares which state, functions and hook points an extension may use as capabilities, and a deployer groups them into extension classes. bpftime enforces it. <span class="gloss-see">See <a href="14-bpftime-architecture.html#eim-concepts">14 · EIM concepts</a>; <a href="14-bpftime-architecture.html#how-the-paper-says-bpftime-enforces-eim">14 · How the paper says bpftime enforces EIM</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-fentry-fexit" data-k="fentry / fexit trampoline btf function entry exit">
+        <dt>fentry / fexit</dt>
+        <dd>Tracing programs that attach to the entry and exit of a kernel function through a BPF trampoline. Arguments are typed through BTF, and fexit also sees the return value. They are cheaper than kprobes. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#fentry-fexit-fmod-ret-the-bpf-trampoline">05 · fentry, fexit, fmod_ret: the BPF trampoline</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-flame-graph" data-k="flame graph folded stacks">
+        <dt>Flame graph</dt>
+        <dd>A visualization of sampled call stacks in which each box is a frame and its width is the share of samples passing through it. It is built from <em>folded</em> stacks: one semicolon-joined stack plus a count per line. xpu-perf adds GPU kernels as leaves. <span class="gloss-see">See <a href="22-xpu-perf.html#folded-stacks-and-flame-graphs">22 · Folded stacks and flame graphs</a>; <a href="22-xpu-perf.html#the-output-folded-stacks-with-gpu-leaves">22 · The output: folded stacks with GPU leaves</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-fmod-ret" data-k="fmod_ret modify return error injection">
+        <dt>fmod_ret</dt>
+        <dd>A trampoline program type that runs before a function and can make it return a chosen value without running its body. It is allowed only on functions marked for error injection. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#fentry-fexit-fmod-ret-the-bpf-trampoline">05 · fentry, fexit, fmod_ret: the BPF trampoline</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-gpttrace" data-k="gpttrace openai function calling bpftrace">
+        <dt>GPTtrace</dt>
+        <dd>The org's 2023 tool that asks an LLM (through OpenAI function calling) to write and run bpftrace programs from a natural-language request. MCPtrace is its successor. <span class="gloss-see">See <a href="30-llm-kernel-tooling.html#gpttrace-the-2023-prompt-pipeline">30 · GPTtrace: the 2023 prompt pipeline</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-gpu-ext" data-k="gpu_ext gpu driver uvm struct_ops">
+        <dt>gpu_ext</dt>
+        <dd>eunomia-bpf's extension of the NVIDIA open GPU kernel modules with struct_ops hooks for UVM prefetching, eviction and scheduling, plus device-side eBPF, so GPU memory and scheduling policy can be written in BPF. <span class="gloss-see">See <a href="20-gpu-ext.html#what-gpu-ext-is">20 · What gpu_ext is</a>; <a href="20-gpu-ext.html#how-the-driver-hooks-work">20 · How the driver hooks work</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-helper-function" data-k="helper function bpf_map_lookup_elem stable api">
+        <dt>Helper function</dt>
+        <dd>A kernel function with a fixed number that BPF programs call (for example <code>bpf_map_lookup_elem</code>). Helpers are a stable ABI and the list is frozen; new functionality is added as kfuncs. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#what-a-helper-is">04 · What a helper is</a>; <a href="04-maps-helpers-kfuncs.html#why-helpers-are-frozen">04 · Why helpers are frozen</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ifc-information-flow-control" data-k="ifc (information-flow control) taint label lattice denning">
+        <dt>IFC (information-flow control)</dt>
+        <dd>Security that tracks where data came from (its labels) as it flows through the system and checks policy where it leaves, instead of only checking who may open what. ActPlane applies it to AI agents. <span class="gloss-see">See <a href="24-actplane.html#information-flow-control-in-ten-minutes">24 · Information-flow control in ten minutes</a>; <a href="24-actplane.html#ifc-in-operating-systems">24 · IFC in operating systems</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-inline-hook" data-k="inline hook binary rewriting trampoline uprobe">
+        <dt>Inline hook</dt>
+        <dd>bpftime's way of running a uprobe handler: it overwrites the start of the target function with a jump into the handler instead of a trap instruction, so no kernel entry is needed. <span class="gloss-see">See <a href="14-bpftime-architecture.html#binary-rewriting-for-uprobes-inline-hooks-instead-of-traps">14 · Binary rewriting for uprobes: inline hooks instead of traps</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-jit-compiler" data-k="jit compiler just in time x86-64">
+        <dt>JIT compiler</dt>
+        <dd>Translates verified BPF bytecode into native machine code at load time, so programs run at close to native speed. On x86-64 it maps BPF registers directly to CPU registers. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#the-x86-64-jit">02 · The x86-64 JIT</a>; <a href="02-ebpf-isa-and-vm.html#controlling-the-jit">02 · Controlling the JIT</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-jit-spraying" data-k="jit spraying attack constant blinding">
+        <dt>JIT spraying</dt>
+        <dd>An attack that hides machine code in the constants of JIT-compiled code and then jumps into the middle of an instruction. Constant blinding is the BPF mitigation. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#constant-blinding">02 · Constant blinding</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-jmp-jmp32" data-k="jmp / jmp32 branch instruction class">
+        <dt>JMP / JMP32</dt>
+        <dd>The branch instruction classes: conditional and unconditional jumps, calls and exit. <code>JMP32</code> compares only the low 32 bits. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#jmp-and-jmp32">02 · JMP and JMP32</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-k2" data-k="k2 superoptimizer synthesis sigcomm 2021">
+        <dt>K2</dt>
+        <dd>A SIGCOMM 2021 program-synthesis optimizer for BPF that searches for shorter equivalent programs and checks equivalence and safety with an SMT solver. ebpf-correctness-verifier's encoding descends from its model. <span class="gloss-see">See <a href="18-ebpf-correctness-verifier.html#k2-where-the-model-comes-from-sigcomm-2021">18 · K2: where the model comes from (SIGCOMM 2021)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ken-kgent" data-k="ken / kgent natural language kernel extensions llm agent">
+        <dt>KEN / Kgent</dt>
+        <dd>The org's research prototype that turns a natural-language request into an eBPF program with an LLM agent and checks it with symbolic execution and the verifier (arXiv 2023 as KEN, eBPF '24 as Kgent). <span class="gloss-see">See <a href="30-llm-kernel-tooling.html#ken-published-as-kgent">30 · KEN, published as Kgent</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-kfunc" data-k="kfunc kernel function btf id">
+        <dt>kfunc</dt>
+        <dd>A kernel function exposed to BPF and identified by its BTF ID rather than a fixed number (Linux 5.13 onward). kfuncs are not a stable ABI, and flags such as acquire and release tell the verifier about ownership. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#kfuncs-kernel-functions-exposed-through-btf">04 · kfuncs: kernel functions exposed through BTF</a>; <a href="04-maps-helpers-kfuncs.html#the-flags-how-the-verifier-learns-ownership">04 · The flags: how the verifier learns ownership</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-kinsn" data-k="kinsn native instruction proof sequence">
+        <dt>kinsn</dt>
+        <dd>A BPF-Ext operation with two forms: an instantiated sequence of ordinary eBPF instructions that the verifier checks (the proof sequence), and native machine code that the JIT emits instead. <span class="gloss-see">See <a href="19-bpf-benchmark.html#one-operation-two-forms">19 · One operation, two forms</a>; <a href="19-bpf-benchmark.html#a-real-module-rotate-on-x86-64">19 · A real module: rotate on x86-64</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-kprobe-kretprobe" data-k="kprobe / kretprobe dynamic kernel probe">
+        <dt>kprobe / kretprobe</dt>
+        <dd>A dynamic probe on almost any kernel instruction (usually a function entry), or on function return for kretprobe. It is flexible, but tied to kernel internals that change between versions. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#kprobe-and-kretprobe-attach-anywhere">05 · kprobe and kretprobe: attach anywhere</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-kv-cache" data-k="kv cache key value attention cache">
+        <dt>KV cache</dt>
+        <dd>In transformer inference, the stored key and value vectors of earlier tokens, so each new token only computes its own. qwen3-ebpf keeps it in BPF maps. <span class="gloss-see">See <a href="29-qwen3-ebpf.html#the-kv-cache">29 · The KV cache</a>; <a href="29-qwen3-ebpf.html#attention-and-the-kv-cache-in-bpf">29 · Attention and the KV cache in BPF</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-label-ifc" data-k="label (ifc) source sink propagation taint">
+        <dt>Label (IFC)</dt>
+        <dd>A tag attached to data or a process that records its origin or sensitivity, such as SECRET or AGENT. Sources add labels, propagation rules move them, and sinks check them. <span class="gloss-see">See <a href="24-actplane.html#labels-sources-sinks-and-propagation">24 · Labels, sources, sinks and propagation</a>; <a href="24-actplane.html#label-state-in-maps">24 · Label state in maps</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-landlock" data-k="landlock unprivileged access control lsm">
+        <dt>Landlock</dt>
+        <dd>A Linux security module that lets unprivileged processes restrict their own file and network access. It is a neighbour of BPF LSM and namei_ext. <span class="gloss-see">See <a href="28-namei-ext.html#landlock-and-bpf-lsm-the-access-control-neighbours">28 · Landlock and BPF LSM: the access-control neighbours</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-lbr" data-k="lbr last branch record">
+        <dt>LBR</dt>
+        <dd>Last Branch Record: a CPU feature that records recent taken branches. bpfperf reads it with <code>bpf_get_branch_snapshot</code> to profile branches per BPF instruction. <span class="gloss-see">See <a href="19-bpf-benchmark.html#the-archived-design-an-fexit-sidecar-reading-lbr">19 · The archived design: an fexit sidecar reading LBR</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-lddw" data-k="lddw wide instruction 64-bit immediate map fd">
+        <dt>LDDW</dt>
+        <dd>The only 16-byte eBPF instruction. It loads a 64-bit immediate, and in special forms a map reference that the loader relocates. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#the-wide-instruction-lddw">02 · The wide instruction: lddw</a>; <a href="16-llvmbpf.html#lddw-how-maps-get-in">16 · LDDW: how maps get in</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-libbpf" data-k="libbpf loader library c">
+        <dt>libbpf</dt>
+        <dd>The kernel-maintained C library that opens BPF ELF objects, applies CO-RE relocations, creates maps, loads and attaches programs. Most modern tools are built on it. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#the-libbpf-object-lifecycle">06 · The libbpf object lifecycle</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ll-ll128-simple" data-k="ll / ll128 / simple nccl protocols">
+        <dt>LL / LL128 / Simple</dt>
+        <dd>NCCL's three wire protocols: LL and LL128 pack flags with data for low latency on small messages, and Simple uses larger chunks and fences for bandwidth. <span class="gloss-see">See <a href="21-nccl-ebpf.html#protocols-ll-ll128-simple">21 · Protocols: LL, LL128, Simple</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-llvmbpf" data-k="llvmbpf llvm jit aot ptx">
+        <dt>llvmbpf</dt>
+        <dd>eunomia-bpf's eBPF VM that lifts bytecode to LLVM IR and compiles it with LLVM, either at run time (JIT) or ahead of time to a native object, with PTX and SPIR-V GPU targets. bpftime uses it as a backend. <span class="gloss-see">See <a href="16-llvmbpf.html#what-llvmbpf-is-and-what-it-is-not">16 · What llvmbpf is, and what it is not</a>; <a href="16-llvmbpf.html#lifting-ebpf-to-llvm-ir">16 · Lifting eBPF to LLVM IR</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-map" data-k="map key value store kernel object">
+        <dt>Map</dt>
+        <dd>A kernel key/value object, referred to through a file descriptor, that BPF programs and user space share. It is the only place where state persists between program runs. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#what-a-map-is">04 · What a map is</a>; <a href="04-maps-helpers-kfuncs.html#the-map-type-zoo">04 · The map type zoo</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-may-goto" data-k="may_goto can_loop">
+        <dt>may_goto</dt>
+        <dd>An instruction (Linux 6.9) with a hidden run-time counter that bounds loop iterations, so the verifier need not prove termination. The <code>can_loop</code> macro wraps it. <span class="gloss-see">See <a href="03-verifier.html#loops">03 · Loops</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-mcp-model-context-protocol" data-k="mcp (model context protocol) json-rpc tools llm">
+        <dt>MCP (Model Context Protocol)</dt>
+        <dd>An open JSON-RPC protocol through which an LLM client discovers and calls tools that a server provides. schedcp and MCPtrace expose kernel tooling this way. <span class="gloss-see">See <a href="30-llm-kernel-tooling.html#the-model-context-protocol-in-one-section">30 · The Model Context Protocol in one section</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-mcptrace" data-k="mcptrace bpftrace mcp server">
+        <dt>MCPtrace</dt>
+        <dd>A Rust MCP server that exposes bpftrace through four tools, so an agent can list probes and run tracing scripts. <span class="gloss-see">See <a href="30-llm-kernel-tooling.html#mcptrace-bpftrace-as-four-mcp-tools">30 · MCPtrace: bpftrace as four MCP tools</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-memcg-bpf-ops" data-k="memcg_bpf_ops memory controller struct_ops rfc">
+        <dt>memcg_bpf_ops</dt>
+        <dd>A struct_ops type from an RFC kernel patch series that lets BPF callbacks influence memory-cgroup reclaim and throttling. AgentCgroup uses it to protect a high-priority session. <span class="gloss-see">See <a href="25-agentcgroup.html#memory-memcg-bpf-ops">25 · Memory: memcg_bpf_ops</a>; <a href="25-agentcgroup.html#the-kernel-side-rfc-patches">25 · The kernel side (RFC patches)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-memory-controller-limits" data-k="memory controller limits memory.min memory.low memory.high memory.max">
+        <dt>Memory controller limits</dt>
+        <dd>cgroup v2 memory files: <code>memory.min</code>/<code>low</code> protect memory from reclaim, <code>memory.high</code> throttles above a soft limit, and <code>memory.max</code> is the hard limit, past which the OOM killer runs. <span class="gloss-see">See <a href="25-agentcgroup.html#memory-min-low-high-max">25 · memory.min, low, high, max</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-merlin" data-k="merlin optimizer asplos 2024">
+        <dt>Merlin</dt>
+        <dd>An ASPLOS 2024 multi-tier optimizer for eBPF that works on LLVM IR and on bytecode. <span class="gloss-see">See <a href="18-ebpf-correctness-verifier.html#merlin-asplos-2024">18 · Merlin (ASPLOS 2024)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-mixed-mode-bpftime" data-k="mixed mode (bpftime) kernel user interop daemon">
+        <dt>Mixed mode (bpftime)</dt>
+        <dd>bpftime configurations in which userspace programs cooperate with real kernel eBPF: either maps and verification go to the kernel, or a daemon captures a kernel tracer's <code>bpf()</code> calls. <span class="gloss-see">See <a href="15-bpftime-in-practice.html#kernel-user-mixed-mode">15 · Kernel-user mixed mode</a>; <a href="14-bpftime-architecture.html#kernel-userspace-interop">14 · Kernel–userspace interop</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-namei-ext" data-k="namei_ext vfs path lookup redirect hide">
+        <dt>namei_ext</dt>
+        <dd>An experimental kernel patch that adds a cgroup-attached program type to pathname lookup. Its return value chooses one of four actions: pass, hide, redirect, or select a policy-provided target. <span class="gloss-see">See <a href="28-namei-ext.html#what-namei-ext-adds-to-the-kernel">28 · What namei_ext adds to the kernel</a>; <a href="28-namei-ext.html#policy-decision-one-function-four-actions">28 · Policy decision: one function, four actions</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-nccl" data-k="nccl nvidia collective communication library">
+        <dt>NCCL</dt>
+        <dd>NVIDIA's Collective Communication Library, which implements AllReduce and other collectives across GPUs and picks an algorithm, protocol and channel count for each call. <span class="gloss-see">See <a href="21-nccl-ebpf.html#nccl-background-a-programmer-needs">21 · NCCL background a programmer needs</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ncclbpf" data-k="ncclbpf nccl-ebpf tuner policy">
+        <dt>NCCLbpf</dt>
+        <dd>eunomia-bpf's NCCL plugins that run verified eBPF policies through bpftime to choose collective algorithm, protocol and channels, and to collect telemetry. <span class="gloss-see">See <a href="21-nccl-ebpf.html#what-ncclbpf-is">21 · What NCCLbpf is</a>; <a href="21-nccl-ebpf.html#the-architecture-at-a-glance">21 · The architecture at a glance</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-nvbit" data-k="nvbit binary instrumentation gpu">
+        <dt>NVBit</dt>
+        <dd>NVIDIA's dynamic binary instrumentation framework for GPU code (MICRO '19). It is a common baseline for bpftime's GPU probes. <span class="gloss-see">See <a href="15-bpftime-in-practice.html#gpu-probes-vs-nvbit">15 · GPU probes vs NVBit</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-open-coded-iterator" data-k="open-coded iterator bpf_for iter kfunc">
+        <dt>Open-coded iterator</dt>
+        <dd>Iterator kfuncs (Linux 6.4) with <code>new</code>/<code>next</code>/<code>destroy</code> functions that let a program write a normal loop, such as <code>bpf_for(i, 0, n)</code>. The verifier checks that the loop state converges. <span class="gloss-see">See <a href="03-verifier.html#loops">03 · Loops</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-operator-mode-event-mode" data-k="operator mode / event mode qwen3-ebpf inference">
+        <dt>Operator mode / event mode</dt>
+        <dd>qwen3-ebpf's two ways to run a model. In operator mode, user-space C calls BPF programs for each operator. In event mode, an XDP packet starts inference and BPF schedules every layer itself through a workqueue, with weights in an arena. <span class="gloss-see">See <a href="29-qwen3-ebpf.html#operator-mode-c-schedules-bpf-computes">29 · Operator mode: C schedules, BPF computes</a>; <a href="29-qwen3-ebpf.html#event-mode-xdp-a-bpf-arena-and-a-self-requeuing-workqueue">29 · Event mode: XDP, a BPF arena and a self-requeuing workqueue</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-per-cpu-map" data-k="per-cpu map percpu_array percpu_hash">
+        <dt>Per-CPU map</dt>
+        <dd>Map variants that keep a separate value per CPU, so programs update them without atomics. User space reads all the copies and sums them. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#per-cpu-variants">04 · Per-CPU variants</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-perf-buffer" data-k="perf buffer perf_event_array">
+        <dt>Perf buffer</dt>
+        <dd>The older event channel: one ring per CPU, written with <code>bpf_perf_event_output</code>. Events from different CPUs can arrive out of order. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#perf-buffer-one-ring-per-cpu">04 · Perf buffer: one ring per CPU</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-perf-event-program" data-k="perf_event program sampling cpu profiling">
+        <dt>perf_event program</dt>
+        <dd>A program attached to a perf event, such as a CPU clock, that runs on every sample. It is the basis of eBPF CPU profilers such as xpu-perf's. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#perf-event-sampling">05 · perf_event: sampling</a>; <a href="22-xpu-perf.html#code-walkthrough-1-cpu-sampling-with-perf-event-ebpf">22 · Code walkthrough 1: CPU sampling with perf_event eBPF</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-policy-domain" data-k="policy domain actplane sub-agent monotonic tightening">
+        <dt>Policy domain</dt>
+        <dd>In ActPlane, the policy boundary for one process tree. A child domain can add rules and narrow its scope, but never remove what it inherits (monotonic tightening). <span class="gloss-see">See <a href="24-actplane.html#policy-domains">24 · Policy domains</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-precision-tracking" data-k="precision tracking backtracking precise scalars">
+        <dt>Precision tracking</dt>
+        <dd>Verifier bookkeeping that marks which scalar registers' exact values mattered for safety. Other registers can then be ignored when comparing states, which makes pruning more effective. <span class="gloss-see">See <a href="03-verifier.html#precision-tracking">03 · Precision tracking</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-prevail" data-k="prevail abstract interpretation verifier pldi 2019">
+        <dt>PREVAIL</dt>
+        <dd>A BPF verifier based on abstract interpretation with numerical domains (PLDI 2019). It is used by eBPF for Windows, bpftime and NCCLbpf as an alternative to the kernel verifier. <span class="gloss-see">See <a href="03-verifier.html#prevail-abstract-interpretation-done-properly-pldi-2019">03 · PREVAIL: abstract interpretation done &quot;properly&quot; (PLDI 2019)</a>; <a href="08-ecosystem.html#ebpf-for-windows-and-prevail">08 · eBPF for Windows and PREVAIL</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-program-type" data-k="program type bpf_prog_type hook context">
+        <dt>Program type</dt>
+        <dd>The kind of a BPF program (XDP, kprobe, LSM, struct_ops, ...). It decides where the program attaches, what its context argument is, and which helpers and kfuncs it may call. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#the-map-hooks-on-the-kernel-user-stack">05 · The map: hooks on the kernel/user stack</a>; <a href="05-program-types-and-hooks.html#comparison-table">05 · Comparison table</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-psi-pressure-stall-information" data-k="psi (pressure stall information) memory pressure stall">
+        <dt>PSI (Pressure Stall Information)</dt>
+        <dd>Kernel accounting of how much time tasks spend stalled waiting for CPU, memory or I/O, reported system-wide and per cgroup. <span class="gloss-see">See <a href="25-agentcgroup.html#psi-measuring-the-pain">25 · PSI: measuring the pain</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ptx" data-k="ptx nvidia virtual isa">
+        <dt>PTX</dt>
+        <dd>NVIDIA's virtual GPU assembly language. llvmbpf can compile eBPF to PTX so that bpftime can run programs inside CUDA kernels. <span class="gloss-see">See <a href="16-llvmbpf.html#gpu-targets-ptx-and-spir-v">16 · GPU targets: PTX and SPIR-V</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-rank-agreement-check" data-k="rank-agreement check nccl deadlock divergent">
+        <dt>Rank-agreement check</dt>
+        <dd>NCCLbpf's load-time analysis that rejects a policy unless its decision depends only on inputs that are the same on every rank, since ranks that choose different algorithms would deadlock. <span class="gloss-see">See <a href="21-nccl-ebpf.html#why-divergent-choices-deadlock">21 · Why divergent choices deadlock</a>; <a href="21-nccl-ebpf.html#the-load-time-rank-agreement-check">21 · The load-time rank-agreement check</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-rcu-walk-ref-walk" data-k="rcu-walk / ref-walk path lookup lockless">
+        <dt>RCU-walk / ref-walk</dt>
+        <dd>The two modes of Linux pathname lookup. RCU-walk proceeds without taking references, under RCU; ref-walk is the slower fallback that takes references and locks. <span class="gloss-see">See <a href="28-namei-ext.html#rcu-walk-and-ref-walk">28 · RCU-walk and ref-walk</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-registers-r0-r10" data-k="registers r0–r10 register file r0 r10">
+        <dt>Registers R0–R10</dt>
+        <dd>eBPF's eleven 64-bit registers: R0 holds return values, R1–R5 hold arguments, R6–R9 are callee-saved, and R10 is the read-only frame pointer. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#the-register-file">02 · The register file</a>; <a href="02-ebpf-isa-and-vm.html#what-each-register-is-for">02 · What each register is for</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-register-state-types" data-k="register state types ptr_to_ctx ptr_to_map_value scalar_value">
+        <dt>Register state types</dt>
+        <dd>The verifier's type for each register, such as <code>SCALAR_VALUE</code>, <code>PTR_TO_CTX</code>, <code>PTR_TO_MAP_VALUE_OR_NULL</code> or <code>PTR_TO_PACKET</code>. The type decides which operations and memory accesses are allowed. <span class="gloss-see">See <a href="03-verifier.html#register-state-types">03 · Register state types</a>; <a href="03-verifier.html#reading-the-state-in-a-log-line">03 · Reading the state in a log line</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-reward-hacking" data-k="reward hacking benchmark evaluator tampering">
+        <dt>Reward hacking</dt>
+        <dd>An agent raising its benchmark score by gaming the evaluator (reading hidden tests, editing scorers) instead of solving the task. <span class="gloss-see">See <a href="26-reward-guard-and-safe-change.html#what-reward-hacking-is">26 · What reward hacking is</a>; <a href="26-reward-guard-and-safe-change.html#the-enforceability-taxonomy">26 · The enforceability taxonomy</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-reward-integrity-contract" data-k="reward integrity contract rewardguard manifest">
+        <dt>Reward integrity contract</dt>
+        <dd>RewardGuard's per-trial contract naming reward-private sources, reward-critical objects, reward-visible sinks and validation gates. It is enforced through AgentSight and ActPlane. <span class="gloss-see">See <a href="26-reward-guard-and-safe-change.html#the-reward-integrity-contract">26 · The reward-integrity contract</a>; <a href="26-reward-guard-and-safe-change.html#how-rewardguard-uses-agentsight-and-actplane">26 · How RewardGuard uses AgentSight and ActPlane</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-rfc-9669" data-k="rfc 9669 ietf standard isa">
+        <dt>RFC 9669</dt>
+        <dd>The IETF standard (October 2024) that defines the BPF instruction set: encoding, instruction classes and conformance groups. <span class="gloss-see">See <a href="02-ebpf-isa-and-vm.html#the-standard-rfc-9669">02 · The standard: RFC 9669</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ring-buffer" data-k="ring buffer bpf_map_type_ringbuf mpsc">
+        <dt>Ring buffer</dt>
+        <dd><code>BPF_MAP_TYPE_RINGBUF</code> (Linux 5.8): one multi-producer, single-consumer buffer shared by all CPUs. Programs reserve and commit records in place, and events keep their order across CPUs. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#bpf-ring-buffer-one-mpsc-ring-for-all-cpus">04 · BPF ring buffer: one MPSC ring for all CPUs</a>; <a href="04-maps-helpers-kfuncs.html#how-it-works-inside">04 · How it works inside</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-safe-change-agent-check-restore-safety" data-k="safe change (agent-check-restore-safety) history operation rule certificate">
+        <dt>Safe change (agent-check-restore-safety)</dt>
+        <dd>A runtime for agents whose external operations (such as a payment) may have taken effect when the reply never arrived. It decides from a hash-linked History which actions remain safe, with explicit Rules and Certificates. <span class="gloss-see">See <a href="26-reward-guard-and-safe-change.html#part-b-safe-change-after-external-operations">26 · Part B · Safe change after external operations</a>; <a href="26-reward-guard-and-safe-change.html#five-core-terms">26 · Five core terms</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-schedcp" data-k="schedcp mcp scheduler agent">
+        <dt>schedcp</dt>
+        <dd>An MCP control plane that lets an LLM agent choose, configure, generate and verify sched_ext schedulers for a workload. <span class="gloss-see">See <a href="30-llm-kernel-tooling.html#schedcp-an-mcp-control-plane-for-sched-ext">30 · schedcp: an MCP control plane for sched_ext</a>; <a href="30-llm-kernel-tooling.html#the-seven-mcp-tools">30 · The seven MCP tools</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-sched-ext" data-k="sched_ext extensible scheduler class scx">
+        <dt>sched_ext</dt>
+        <dd>The extensible scheduler class (Linux 6.12): a CPU scheduler written as a struct_ops BPF program. If the program misbehaves, the kernel falls back to the default scheduler. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#sched-ext-a-cpu-scheduler-written-in-bpf">05 · sched_ext: a CPU scheduler written in BPF</a>; <a href="09-bpf-developer-tutorial.html#lesson-44-a-cpu-scheduler-in-bpf">09 · Lesson 44: a CPU scheduler in BPF</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-scx-flatcg" data-k="scx_flatcg flattened cgroup scheduler">
+        <dt>scx_flatcg</dt>
+        <dd>A sched_ext example scheduler that flattens the cgroup hierarchy into one level of weighted shares. AgentCgroup uses it for CPU control. <span class="gloss-see">See <a href="25-agentcgroup.html#cpu-scx-flatcg-under-sched-ext">25 · CPU: scx_flatcg under sched_ext</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-sec" data-k="sec() section name attach libbpf">
+        <dt>SEC()</dt>
+        <dd>The libbpf macro that puts a function in an ELF section whose name, such as <code>SEC("kprobe/do_unlinkat")</code>, tells libbpf the program type and attach target. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#how-libbpf-names-hooks-sec">05 · How libbpf names hooks: SEC()</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-seccomp-bpf" data-k="seccomp-bpf system call filter">
+        <dt>seccomp-bpf</dt>
+        <dd>System-call filtering with classic BPF programs that inspect the syscall number and arguments (Linux 3.5). It is still cBPF, not eBPF. <span class="gloss-see">See <a href="01-what-is-bpf.html#seccomp-bpf-linux-3-5-bpf-beyond-networking">01 · seccomp-bpf (Linux 3.5): BPF beyond networking</a>; <a href="05-program-types-and-hooks.html#what-about-seccomp">05 · What about seccomp?</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-skeleton" data-k="skeleton bpftool gen skeleton .skel.h">
+        <dt>Skeleton</dt>
+        <dd>A header that <code>bpftool gen skeleton</code> generates from a BPF object, with typed open/load/attach/destroy functions and direct access to maps and global variables. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#bpf-skeletons-and-global-variables">06 · BPF skeletons and global variables</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-sk-lookup" data-k="sk_lookup socket lookup dispatch">
+        <dt>sk_lookup</dt>
+        <dd>A program type that chooses which listening socket receives a new connection or datagram, for example to serve many addresses from one socket. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#sk-lookup-choosing-the-listening-socket">07 · sk_lookup: choosing the listening socket</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-smt-solver-z3" data-k="smt solver / z3 satisfiability modulo theories">
+        <dt>SMT solver / Z3</dt>
+        <dd>A solver that decides whether logical formulas over bit-vectors, arrays and other theories can be satisfied. ebpf-correctness-verifier encodes two programs in Z3 and asks for an input on which they differ. <span class="gloss-see">See <a href="18-ebpf-correctness-verifier.html#inside-the-smt-encoding">18 · Inside the SMT encoding</a>; <a href="18-ebpf-correctness-verifier.html#the-query-and-the-solver">18 · The query and the solver</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-socket-filter" data-k="socket filter so_attach_filter">
+        <dt>Socket filter</dt>
+        <dd>The original Linux BPF use: a filter program attached to a socket (<code>SO_ATTACH_FILTER</code> or <code>SO_ATTACH_BPF</code>) that decides how much of each packet the socket receives. <span class="gloss-see">See <a href="01-what-is-bpf.html#linux-socket-filter">01 · Linux Socket Filter</a>; <a href="07-networking-xdp-tc.html#socket-filters">07 · Socket filters</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-sockops-sk-msg-sockmap" data-k="sockops / sk_msg / sockmap socket redirect">
+        <dt>sockops / sk_msg / sockmap</dt>
+        <dd>Socket-level program types: sockops reacts to TCP events, and sk_msg and sockmap redirect data between sockets inside the kernel without going through the full stack. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#sockops-sk-msg-and-sockmap">07 · sockops, sk_msg and sockmap</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-spectre-mitigations" data-k="spectre mitigations speculative execution sanitize">
+        <dt>Spectre mitigations</dt>
+        <dd>Verifier and JIT changes (pointer-arithmetic masking, speculation barriers, restricted unprivileged features) that stop BPF programs from being used as Spectre gadgets. <span class="gloss-see">See <a href="03-verifier.html#spectre-mitigations">03 · Spectre mitigations</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-speculative-rejit" data-k="speculative rejit bpf-benchmark shim rejit">
+        <dt>Speculative ReJIT</dt>
+        <dd>bpf-benchmark's bytecode-only optimization path. A preloaded shim intercepts program loads, runs optimization passes, and submits each candidate through the normal verifier, keeping the original program if the candidate is rejected. <span class="gloss-see">See <a href="19-bpf-benchmark.html#backend-1-bpfopt-and-the-shim-speculative-rejit">19 · Backend 1: bpfopt and the shim (speculative ReJIT)</a>; <a href="19-bpf-benchmark.html#the-candidate-loop">19 · The candidate loop</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-state-embedding" data-k="state embedding verifier testing osdi 2024">
+        <dt>State embedding</dt>
+        <dd>An OSDI 2024 technique for finding verifier bugs: it embeds the verifier's claimed abstract states into the program as run-time checks and executes it, so wrong claims show up. <span class="gloss-see">See <a href="03-verifier.html#testing-the-verifier-state-embedding-osdi-2024">03 · Testing the verifier: state embedding (OSDI 2024)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-state-pruning" data-k="state pruning explored states equivalence">
+        <dt>State pruning</dt>
+        <dd>The verifier optimization that stops exploring a path when its state at an instruction is covered by a state already proven safe there. <span class="gloss-see">See <a href="03-verifier.html#state-pruning">03 · State pruning</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-struct-ops" data-k="struct_ops kernel interface ops table">
+        <dt>struct_ops</dt>
+        <dd>A mechanism that lets a set of BPF programs implement a kernel ops table (TCP congestion control, sched_ext, HID-BPF, gpu_ext's UVM hooks, memcg_bpf_ops). <span class="gloss-see">See <a href="05-program-types-and-hooks.html#struct-ops-implementing-kernel-interfaces-in-bpf">05 · struct_ops: implementing kernel interfaces in BPF</a>; <a href="20-gpu-ext.html#registering-a-struct-ops-type-from-a-module">20 · Registering a struct_ops type from a module</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-tail-call" data-k="tail call bpf_tail_call prog_array">
+        <dt>Tail call</dt>
+        <dd>A jump from one BPF program into another through a program-array map, without returning. The chain is limited to 33 calls. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#tail-calls">04 · Tail calls</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-tc-cls-bpf" data-k="tc / cls_bpf traffic control direct action">
+        <dt>tc / cls_bpf</dt>
+        <dd>BPF programs attached to the traffic-control layer on ingress or egress, after the <code>sk_buff</code> exists. In direct-action mode the program's return code is the verdict. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#tc-cls-bpf-and-direct-action">07 · tc: cls_bpf and direct-action</a>; <a href="07-networking-xdp-tc.html#tc-return-codes">07 · tc return codes</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-tcx" data-k="tcx tcx link multi-program">
+        <dt>TCX</dt>
+        <dd>The link-based tc attachment (Linux 6.6) that offers a link-based alternative to qdisc-based cls_bpf. It supports ordered multi-program attachment and BPF links. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#tcx-link-based-tc-attachment-linux-6-6">07 · TCX: link-based tc attachment (Linux 6.6)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-tnum-tristate-number" data-k="tnum (tristate number) tristate value mask">
+        <dt>tnum (tristate number)</dt>
+        <dd>The verifier's bit-level abstract value: a value/mask pair in which each bit is known 0, known 1 or unknown. It tracks alignment and masked values alongside numeric ranges. <span class="gloss-see">See <a href="03-verifier.html#tristate-numbers">03 · Tristate numbers</a>; <a href="03-verifier.html#tristate-numbers-made-rigorous-cgo-2022">03 · Tristate numbers made rigorous (CGO 2022)</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-tracepoint-raw-tracepoint-tp-btf" data-k="tracepoint / raw tracepoint / tp_btf static kernel tracepoints">
+        <dt>Tracepoint / raw tracepoint / tp_btf</dt>
+        <dd>Stable trace points compiled into the kernel. Classic tracepoints pass a formatted record, raw tracepoints pass the raw arguments, and <code>tp_btf</code> passes typed arguments through BTF. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#static-tracepoints-raw-tracepoints-and-tp-btf">05 · Static tracepoints, raw tracepoints and tp_btf</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-trampoline-bpf-trampoline" data-k="trampoline (bpf trampoline) fentry fexit generated code">
+        <dt>Trampoline (BPF trampoline)</dt>
+        <dd>Machine code that the kernel generates on the fly at a function's entry to call fentry, fexit and fmod_ret programs with typed arguments. It is cheaper than the breakpoint behind a kprobe. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#fentry-fexit-fmod-ret-the-bpf-trampoline">05 · fentry, fexit, fmod_ret: the BPF trampoline</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-translation-validation" data-k="translation validation equivalence checking per run">
+        <dt>Translation validation</dt>
+        <dd>Instead of proving a compiler or optimizer correct once, checking each output against its input, for example with an SMT solver. ebpf-correctness-verifier does this for optimized eBPF. <span class="gloss-see">See <a href="18-ebpf-correctness-verifier.html#translation-validation-in-one-page">18 · Translation validation in one page</a>; <a href="18-ebpf-correctness-verifier.html#translation-validation-outside-ebpf">18 · Translation validation outside eBPF</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-tuner-plugin-nccl" data-k="tuner plugin (nccl) nccl_tuner_plugin">
+        <dt>Tuner plugin (NCCL)</dt>
+        <dd>An NCCL plugin interface that is asked, for each collective, which algorithm, protocol and channel count to use. NCCLbpf implements it with eBPF policies. <span class="gloss-see">See <a href="21-nccl-ebpf.html#how-nccl-picks-and-where-a-tuner-plugs-in">21 · How NCCL picks, and where a tuner plugs in</a>; <a href="21-nccl-ebpf.html#inside-the-tuner-adapter">21 · Inside the tuner adapter</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-ubpf-rbpf" data-k="ubpf / rbpf userspace vm">
+        <dt>uBPF / rbpf</dt>
+        <dd>Small userspace eBPF virtual machines (C and Rust respectively) with interpreters and simple JITs. bpftime can use uBPF as a backend. <span class="gloss-see">See <a href="08-ecosystem.html#userspace-vms-and-runtimes-ubpf-rbpf-bpftime">08 · Userspace VMs and runtimes: uBPF, rbpf, bpftime</a>; <a href="14-bpftime-architecture.html#the-vm-layer-ubpf-or-llvmbpf">14 · The VM layer: ubpf or llvmbpf</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-unprivileged-bpf-cap-bpf" data-k="unprivileged bpf / cap_bpf capabilities cap_perfmon">
+        <dt>Unprivileged BPF / CAP_BPF</dt>
+        <dd>Loading rules by privilege: <code>CAP_BPF</code> (plus <code>CAP_PERFMON</code> or <code>CAP_NET_ADMIN</code> for tracing or networking) grants BPF without full root. Since Linux 5.13, <code>CONFIG_BPF_UNPRIV_DEFAULT_OFF</code> makes <code>kernel.unprivileged_bpf_disabled</code> default to 2 (disabled, re-enablable by an administrator). <span class="gloss-see">See <a href="03-verifier.html#privileged-and-unprivileged-loading">03 · Privileged and unprivileged loading</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-uprobe-uretprobe" data-k="uprobe / uretprobe user space probe breakpoint">
+        <dt>uprobe / uretprobe</dt>
+        <dd>A dynamic probe on an instruction in a user-space binary or library. In the kernel it is a breakpoint trap, which bpftime replaces with an inline hook. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#what-a-uprobe-is">05 · What a uprobe is</a>; <a href="05-program-types-and-hooks.html#how-a-uprobe-works-inside-the-kernel">05 · How a uprobe works inside the kernel</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-usdt" data-k="usdt user statically defined tracing">
+        <dt>USDT</dt>
+        <dd>User Statically-Defined Tracing: probe points compiled into applications (as nops plus ELF notes) that uprobe-based tools can attach to by name. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#usdt-static-probes-in-user-space">05 · USDT: static probes in user space</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-uvm-unified-virtual-memory" data-k="uvm (unified virtual memory) unified memory page fault migration">
+        <dt>UVM (Unified Virtual Memory)</dt>
+        <dd>CUDA's single address space shared by CPU and GPU. Pages migrate on demand when the GPU faults, and the driver decides prefetching and eviction; gpu_ext adds BPF hooks for both. <span class="gloss-see">See <a href="20-gpu-ext.html#device-memory-and-unified-virtual-memory">20 · Device memory and unified virtual memory</a>; <a href="20-gpu-ext.html#gpu-page-faults-replay-and-migration">20 · GPU page faults, replay and migration</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-uxdp" data-k="uxdp userspace xdp dpdk">
+        <dt>uXDP</dt>
+        <dd>Running unmodified XDP programs in user space (for example under DPDK or AF_XDP) with bpftime; the subject of an eBPF '25 workshop paper. <span class="gloss-see">See <a href="15-bpftime-in-practice.html#xdp-programs-in-userspace">15 · XDP programs in userspace</a>; <a href="07-networking-xdp-tc.html#beyond-the-kernel-eunomia-bpf-s-userspace-xdp-work">07 · Beyond the kernel: eunomia-bpf&#x27;s userspace XDP work</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-verifier" data-k="verifier safety check load time">
+        <dt>Verifier</dt>
+        <dd>The kernel component that statically checks every program at load time: memory safety, termination, correct helper use and privilege rules. Programs it cannot prove safe are rejected. <span class="gloss-see">See <a href="03-verifier.html#where-the-verifier-sits">03 · Where the verifier sits</a>; <a href="03-verifier.html">03 · The eBPF verifier</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-verifier-log" data-k="verifier log log_level error messages">
+        <dt>Verifier log</dt>
+        <dd>The trace of the verifier's per-instruction register states and its final error, requested with a log buffer at load time. It is the input to bpfix. <span class="gloss-see">See <a href="03-verifier.html#reading-common-verifier-errors">03 · Reading common verifier errors</a>; <a href="17-bpfix.html#get-a-log-that-bpfix-can-use">17 · Get a log that bpfix can use</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-vmlinux-h" data-k="vmlinux.h bpftool btf dump format c">
+        <dt>vmlinux.h</dt>
+        <dd>One header with every type of the running kernel, generated from its BTF with <code>bpftool btf dump file /sys/kernel/btf/vmlinux format c</code>, so CO-RE programs need no kernel headers. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#vmlinux-h-one-header-with-every-kernel-type">06 · vmlinux.h: one header with every kernel type</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-wasm-bpf" data-k="wasm-bpf webassembly user space part">
+        <dt>Wasm-bpf</dt>
+        <dd>eunomia-bpf's runtime that runs the user-space half of an eBPF tool as a WebAssembly module, which reaches libbpf through a small host ABI. The kernel half stays ordinary eBPF. <span class="gloss-see">See <a href="12-wasm-bpf.html#architecture">12 · Architecture</a>; <a href="12-wasm-bpf.html#the-host-abi-seven-functions">12 · The host ABI: seven functions</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-xdp" data-k="xdp express data path driver hook">
+        <dt>XDP</dt>
+        <dd>eXpress Data Path: a hook in the network driver's receive path that runs a BPF program on each packet before the kernel allocates an <code>sk_buff</code>. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#xdp-in-depth">07 · XDP in depth</a>; <a href="07-networking-xdp-tc.html#xdp-in-the-driver-before-the-sk-buff">07 · XDP: in the driver, before the sk_buff</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-xdp-actions" data-k="xdp actions xdp_pass xdp_drop xdp_tx xdp_redirect xdp_aborted">
+        <dt>XDP actions</dt>
+        <dd>An XDP program's verdict: <code>XDP_PASS</code>, <code>XDP_DROP</code>, <code>XDP_TX</code> (send back out the same interface), <code>XDP_REDIRECT</code> or <code>XDP_ABORTED</code>. <span class="gloss-see">See <a href="07-networking-xdp-tc.html#the-five-actions">07 · The five actions</a>; <a href="07-networking-xdp-tc.html#xdp-tx-and-xdp-redirect-forwarding-without-the-stack">07 · XDP_TX and XDP_REDIRECT: forwarding without the stack</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-xpu-perf" data-k="xpu-perf cpu gpu profiler">
+        <dt>xpu-perf</dt>
+        <dd>eunomia-bpf's continuous profiler that combines eBPF CPU sampling with CUPTI GPU events and joins them into CPU→GPU flame graphs. <span class="gloss-see">See <a href="22-xpu-perf.html#xpu-perf-at-a-glance">22 · xpu-perf at a glance</a>; <a href="22-xpu-perf.html#architecture">22 · Architecture</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-zpoline" data-k="zpoline syscall hook binary rewriting address zero">
+        <dt>zpoline</dt>
+        <dd>A system-call hooking technique (USENIX ATC '23) that rewrites each <code>syscall</code> instruction into <code>call *%rax</code> and places a trampoline at virtual address zero. bpftime uses it for syscall tracepoints in user space. <span class="gloss-see">See <a href="14-bpftime-architecture.html#binary-rewriting-for-syscalls-a-zpoline-in-the-target">14 · Binary rewriting for syscalls: a zpoline in the target</a>.</span></dd>
+      </div>
+    </dl>
+    <p id="gloss-empty" hidden>No term matches. Try a shorter word.</p>
+
+    <h2>Paper reading list</h2>
+    <p>These are the 97 distinct papers cited in the reference lists of chapters 01–31, deduplicated across chapters. Each entry gives the venue and year as the citing chapter states them. The <em>Cited in</em> column links to every chapter that cites the paper, and that chapter explains why it matters. Preprints are marked, and so are the few drafts and reports that have not been peer reviewed, so you can weigh them accordingly. RFC 9669 is a standard rather than a paper, but it is the primary source for the ISA, so it is included and marked.</p>
+    <figure>
+      <svg viewBox="0 0 820 336" role="img" aria-label="Number of cited papers per theme">
+        <text x="300" y="37" text-anchor="end" font-size="13" fill="var(--fg)">BPF origins and the ISA</text><rect x="312" y="23" width="48" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="368" y="38" font-size="13" fill="var(--muted)">2</text>
+        <text x="300" y="71" text-anchor="end" font-size="13" fill="var(--fg)">Verifier and formal methods</text><rect x="312" y="57" width="363" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="683" y="72" font-size="13" fill="var(--muted)">15</text>
+        <text x="300" y="105" text-anchor="end" font-size="13" fill="var(--fg)">JIT, optimization and JIT security</text><rect x="312" y="91" width="193" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="513" y="106" font-size="13" fill="var(--muted)">8</text>
+        <text x="300" y="139" text-anchor="end" font-size="13" fill="var(--fg)">Networking</text><rect x="312" y="125" width="72" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="392" y="140" font-size="13" fill="var(--muted)">3</text>
+        <text x="300" y="173" text-anchor="end" font-size="13" fill="var(--fg)">Userspace runtimes, isolation and Wasm</text><rect x="312" y="159" width="217" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="537" y="174" font-size="13" fill="var(--muted)">9</text>
+        <text x="300" y="207" text-anchor="end" font-size="13" fill="var(--fg)">GPUs, collectives and accelerator profiling</text><rect x="312" y="193" width="314" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="634" y="208" font-size="13" fill="var(--muted)">13</text>
+        <text x="300" y="241" text-anchor="end" font-size="13" fill="var(--fg)">AI agents</text><rect x="312" y="227" width="387" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="707" y="242" font-size="13" fill="var(--muted)">16</text>
+        <text x="300" y="275" text-anchor="end" font-size="13" fill="var(--fg)">LLMs and ML in or for the kernel</text><rect x="312" y="261" width="290" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="610" y="276" font-size="13" fill="var(--muted)">12</text>
+        <text x="300" y="309" text-anchor="end" font-size="13" fill="var(--fg)">Adjacent systems: IFC, filesystems, memory, profiling</text><rect x="312" y="295" width="460" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="780" y="310" font-size="13" fill="var(--muted)">19</text>
+      </svg>
+      <figcaption>Figure 32.1 — Cited papers per theme. The adjacent-systems group is the largest because the agent and filesystem chapters build on older OS research (information-flow control, FUSE). The agent group is mostly 2025–2026 preprints.</figcaption>
+    </figure>
+    <div class="callout tip"><span class="label">Where to start reading</span><p>If you read only five papers: McCanne and Jacobson's BSD Packet Filter (1993) for the original design; the XDP paper (CoNEXT 2018) for eBPF in the data path; PREVAIL (PLDI 2019) for what a principled verifier looks like; Agni (CAV 2023) for how the kernel's own range analysis was checked; and the bpftime paper (OSDI '25) for how the org carries the model into user space.</p></div>
+    <h3>BPF origins and the ISA</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://www.tcpdump.org/papers/bpf-usenix93.pdf">The BSD Packet Filter: A New Architecture for User-level Packet Capture</a></td><td>S. McCanne, V. Jacobson</td><td>USENIX Winter Conference</td><td>1993</td><td><a href="01-what-is-bpf.html" title="What is BPF? From packet filter to in-kernel VM">01</a></td></tr>
+        <tr><td><a href="https://www.rfc-editor.org/rfc/rfc9669.html">BPF Instruction Set Architecture (ISA), RFC 9669</a> <small>(standard, not a research paper)</small></td><td>D. Thaler (ed.)</td><td>IETF Standards Track RFC</td><td>2024</td><td><a href="01-what-is-bpf.html" title="What is BPF? From packet filter to in-kernel VM">01</a>, <a href="02-ebpf-isa-and-vm.html" title="The eBPF Instruction Set and Virtual Machine">02</a>, <a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="16-llvmbpf.html" title="llvmbpf: an LLVM JIT/AOT Compiler for eBPF">16</a>, <a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a></td></tr>
+      </tbody>
+    </table>
+    <h3>Verifier and formal methods</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://doi.org/10.1007/BFb0054170">Translation Validation</a></td><td>A. Pnueli, M. Siegel, E. Singerman</td><td>TACAS (LNCS 1384)</td><td>1998</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/358438.349314">Translation Validation for an Optimizing Compiler</a></td><td>G. C. Necula</td><td>PLDI</td><td>2000</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi14/technical-sessions/presentation/wang_xi">Jitk: A Trustworthy In-Kernel Interpreter Infrastructure</a></td><td>X. Wang, D. Lazar, N. Zeldovich, A. Chlipala, Z. Tatlock</td><td>OSDI</td><td>2014</td><td><a href="02-ebpf-isa-and-vm.html" title="The eBPF Instruction Set and Virtual Machine">02</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3314221.3314590">Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions (PREVAIL)</a></td><td>E. Gershuni, N. Amit, A. Gurfinkel, N. Narodytska, J. A. Navas, N. Rinetzky, L. Ryzhyk, M. Sagiv</td><td>PLDI</td><td>2019</td><td><a href="03-verifier.html" title="The eBPF verifier">03</a>, <a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="14-bpftime-architecture.html" title="bpftime architecture">14</a>, <a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a>, <a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi20/presentation/nelson">Specification and verification in the field: Applying formal methods to BPF just-in-time compilers in the Linux kernel (Jitterbug)</a></td><td>L. Nelson, J. Van Geffen, E. Torlak, X. Wang</td><td>OSDI</td><td>2020</td><td><a href="02-ebpf-isa-and-vm.html" title="The eBPF Instruction Set and Virtual Machine">02</a>, <a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a>, <a href="19-bpf-benchmark.html" title="bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization">19</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1007/978-3-030-53291-8_29">Synthesizing JIT Compilers for In-Kernel DSLs</a></td><td>J. Van Geffen, L. Nelson, I. Dillig, X. Wang, E. Torlak</td><td>CAV</td><td>2020</td><td><a href="02-ebpf-isa-and-vm.html" title="The eBPF Instruction Set and Virtual Machine">02</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3453483.3454030">Alive2: Bounded Translation Validation for LLVM</a></td><td>N. P. Lopes, J. Lee, C.-K. Hur, Z. Liu, J. Regehr</td><td>PLDI</td><td>2021</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1109/CGO53902.2022.9741267">Sound, Precise, and Fast Abstract Interpretation with Tristate Numbers</a> <small>(also arXiv:2105.05398)</small></td><td>H. Vishwanathan, M. Shachnai, S. Narayana, S. Nagarakatte</td><td>CGO</td><td>2022</td><td><a href="03-verifier.html" title="The eBPF verifier">03</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1007/978-3-031-37709-9_12">Verifying the Verifier: eBPF Range Analysis Verification (Agni)</a></td><td>H. Vishwanathan, M. Shachnai, S. Narayana, S. Nagarakatte</td><td>CAV</td><td>2023</td><td><a href="03-verifier.html" title="The eBPF verifier">03</a>, <a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3672197.3673429">An Empirical Study on the Challenges of eBPF Application Development</a></td><td>M. Deokar, J. Men, L. Castanheira, A. Bhardwaj, T. A. Benson</td><td>eBPF &#x27;24 (SIGCOMM workshop)</td><td>2024</td><td><a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi24/presentation/sun-hao">Validating the eBPF Verifier via State Embedding</a></td><td>H. Sun, Z. Su</td><td>OSDI</td><td>2024</td><td><a href="03-verifier.html" title="The eBPF verifier">03</a>, <a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1109/CSR64739.2025.11130075">Design and implementation of a tool to improve error reporting for eBPF code</a></td><td>R. Rizza, R. Sisto, F. Valenza</td><td>IEEE CSR</td><td>2025</td><td><a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc25/presentation/jia">Rex: Closing the language-verifier gap with safe and usable kernel extensions</a></td><td>J. Jia et al.</td><td>USENIX ATC</td><td>2025</td><td><a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a></td></tr>
+        <tr><td><a href="https://github.com/yunwei37/ebpf27-bpfix">Characterizing and Bridging the Diagnostic Gap in eBPF Verifier Rejections (bpfix)</a> <small>(unpublished draft)</small></td><td>Y. Zheng, Z. Ji, W. Tao, X. Gao, J. Su, W. Zhang, A. Quinn, D. Williams</td><td>paper draft, venue not confirmed</td><td>2026</td><td><a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2605.25411">Heimdall: Formally Verified Automated Migration of Legacy eBPF Programs to Rust</a> <small>(preprint)</small></td><td>V. A. Dasu, M. Santra, M. R. U. Rashid, A. Kumar, S. Tizpaz-Niari, G. Tan</td><td>arXiv:2605.25411</td><td>2026</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a></td></tr>
+      </tbody>
+    </table>
+    <h3>JIT, optimization and JIT security</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://www.usenix.org/system/files/conference/woot18/woot18-paper-gawlik.pdf">SoK: Make JIT-Spray Great Again</a></td><td>R. Gawlik, T. Holz</td><td>USENIX WOOT</td><td>2018</td><td><a href="02-ebpf-isa-and-vm.html" title="The eBPF Instruction Set and Virtual Machine">02</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3452296.3472929">Synthesizing Safe and Efficient Kernel Extensions for Packet Processing (K2)</a> <small>(also arXiv:2103.00022)</small></td><td>Q. Xu, M. D. Wong, T. Wagle, S. Narayana, A. Sivaraman</td><td>ACM SIGCOMM</td><td>2021</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a>, <a href="19-bpf-benchmark.html" title="bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization">19</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3503222.3507769">Domain Specific Run Time Optimization for Software Data Planes (Morpheus)</a></td><td>S. Miano, A. Sanaee, F. Risso, G. Rétvári, G. Antichi</td><td>ASPLOS</td><td>2022</td><td><a href="19-bpf-benchmark.html" title="bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization">19</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc23/presentation/jin">EPF: Evil Packet Filter</a></td><td>D. Jin, V. Atlidakis, V. P. Kemerlis</td><td>USENIX ATC</td><td>2023</td><td><a href="02-ebpf-isa-and-vm.html" title="The eBPF Instruction Set and Virtual Machine">02</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3620666.3651387">Merlin: Multi-tier Optimization of eBPF Code for Performance and Compactness</a></td><td>J. Mao, H. Ding, J. Zhai, S. Ma</td><td>ASPLOS</td><td>2024</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a>, <a href="19-bpf-benchmark.html" title="bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization">19</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2511.15589">EPSO: A Caching-Based Efficient Superoptimizer for BPF Bytecode</a> <small>(arXiv:2511.15589)</small></td><td>Q. Zhu, Y. Liu, Z. Zhu, S. Liu, L. Bu</td><td>ASE</td><td>2025</td><td><a href="18-ebpf-correctness-verifier.html" title="ebpf-correctness-verifier: Translation Validation for eBPF Rewrites">18</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2606.24213">BPF-Ext: Safely Extending the eBPF Compilation Pipeline with Native Operations</a> <small>(proceedings not yet published when chapter 19 was written)</small></td><td>Y. Zheng, Z. Ji, W. Tao, H. Sun, W. Zhang, D. Williams, A. Quinn</td><td>ATC &#x27;26 (accepted)</td><td>2026</td><td><a href="19-bpf-benchmark.html" title="bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization">19</a></td></tr>
+        <tr><td><a href="https://github.com/yunwei37/ebpf27-bpfoptbench">bpf-bench / BPFOptBench (agent-driven eBPF optimization benchmark)</a> <small>(unpublished draft; numbers preliminary)</small></td><td>authors not given in chapter 19</td><td>paper draft (commit 17588bd)</td><td>draft</td><td><a href="19-bpf-benchmark.html" title="bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization">19</a></td></tr>
+      </tbody>
+    </table>
+    <h3>Networking</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="http://oldvger.kernel.org/lpc_net2018_talks/lpc18_paper_af_xdp_perf-v2.pdf">The Path to DPDK Speeds for AF_XDP</a></td><td>M. Karlsson, B. Töpel</td><td>Linux Plumbers Conference, Networking Track</td><td>2018</td><td><a href="07-networking-xdp-tc.html" title="eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs">07</a></td></tr>
+        <tr><td><a href="https://dl.acm.org/doi/10.1145/3281411.3281443">The eXpress Data Path: Fast Programmable Packet Processing in the Operating System Kernel</a></td><td>T. Høiland-Jørgensen, J. D. Brouer, D. Borkmann, J. Fastabend, T. Herbert, D. Ahern, D. Miller</td><td>ACM CoNEXT</td><td>2018</td><td><a href="07-networking-xdp-tc.html" title="eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs">07</a></td></tr>
+        <tr><td><a href="https://dl.acm.org/doi/10.1145/3748355.3748360">uXDP: Frictionless XDP Deployments in Userspace</a></td><td>Y. Zheng, P. Gavriil, M. Kogias</td><td>eBPF &#x27;25 (SIGCOMM workshop)</td><td>2025</td><td><a href="15-bpftime-in-practice.html" title="bpftime in practice">15</a></td></tr>
+      </tbody>
+    </table>
+    <h3>Userspace runtimes, isolation and Wasm</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://doi.org/10.1145/3062341.3062363">Bringing the Web up to Speed with WebAssembly</a></td><td>A. Haas et al.</td><td>PLDI</td><td>2017</td><td><a href="12-wasm-bpf.html" title="wasm-bpf: eBPF user space in WebAssembly">12</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/usenixsecurity19/presentation/vahldiek-oberwagner">ERIM: Secure, Efficient In-process Isolation with Protection Keys (MPK)</a></td><td>A. Vahldiek-Oberwagner et al.</td><td>USENIX Security</td><td>2019</td><td><a href="14-bpftime-architecture.html" title="bpftime architecture">14</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/usenixsecurity20/presentation/narayan">Retrofitting Fine Grain Isolation in the Firefox Renderer (RLBox)</a></td><td>S. Narayan et al.</td><td>USENIX Security</td><td>2020</td><td><a href="14-bpftime-architecture.html" title="bpftime architecture">14</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2312.03858">Empowering WebAssembly with Thin Kernel Interfaces (WALI)</a> <small>(preprint; year from the arXiv number)</small></td><td>A. Ramesh, T. Huang, B. L. Titzer, A. Rowe</td><td>arXiv:2312.03858</td><td>2023</td><td><a href="12-wasm-bpf.html" title="wasm-bpf: eBPF user space in WebAssembly">12</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2311.07923">bpftime: userspace eBPF Runtime for Uprobe, Syscall and Kernel-User Interactions</a> <small>(preprint)</small></td><td>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, A. Quinn</td><td>arXiv:2311.07923</td><td>2023</td><td><a href="12-wasm-bpf.html" title="wasm-bpf: eBPF user space in WebAssembly">12</a>, <a href="14-bpftime-architecture.html" title="bpftime architecture">14</a>, <a href="15-bpftime-in-practice.html" title="bpftime in practice">15</a>, <a href="16-llvmbpf.html" title="llvmbpf: an LLVM JIT/AOT Compiler for eBPF">16</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc23/presentation/yasukata">zpoline: a system call hook mechanism based on binary rewriting</a></td><td>K. Yasukata, H. Tazaki, P.-L. Aublin, K. Ishiguro</td><td>USENIX ATC</td><td>2023</td><td><a href="14-bpftime-architecture.html" title="bpftime architecture">14</a>, <a href="15-bpftime-in-practice.html" title="bpftime in practice">15</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc24/presentation/jia">Fast (Trapless) Kernel Probes Everywhere</a></td><td>J. Jia, M. V. Le, S. Ahmed, D. Williams, H. Jamjoom, T. Xu</td><td>USENIX ATC</td><td>2024</td><td><a href="14-bpftime-architecture.html" title="bpftime architecture">14</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2408.04856">Wasm-bpf: Streamlining eBPF Deployment in Cloud Environments with WebAssembly</a> <small>(preprint)</small></td><td>Y. Zheng, T. Yu, Y. Yang, A. Quinn</td><td>arXiv:2408.04856</td><td>2024</td><td><a href="10-eunomia-bpf-ecc-ecli.html" title="eunomia-bpf: ecc and ecli">10</a>, <a href="12-wasm-bpf.html" title="wasm-bpf: eBPF user space in WebAssembly">12</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">Extending Applications Safely and Efficiently (bpftime, EIM)</a></td><td>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn</td><td>OSDI</td><td>2025</td><td><a href="05-program-types-and-hooks.html" title="Program types and hooks">05</a>, <a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="14-bpftime-architecture.html" title="bpftime architecture">14</a>, <a href="15-bpftime-in-practice.html" title="bpftime in practice">15</a>, <a href="16-llvmbpf.html" title="llvmbpf: an LLVM JIT/AOT Compiler for eBPF">16</a>, <a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+      </tbody>
+    </table>
+    <h3>GPUs, collectives and accelerator profiling</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://doi.org/10.1145/3352460.3358307">NVBit: A Dynamic Binary Instrumentation Framework for NVIDIA GPUs</a></td><td>O. Villa, M. Stephenson, D. Nellans, S. W. Keckler</td><td>MICRO</td><td>2019</td><td><a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a>, <a href="22-xpu-perf.html" title="xpu-perf: CPU+GPU profiling with eBPF">22</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2007.09822">UVMBench: A Comprehensive Benchmark Suite for Researching Unified Virtual Memory in GPUs</a> <small>(preprint)</small></td><td>Y. Gu et al.</td><td>arXiv:2007.09822</td><td>2020</td><td><a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2109.06931">Measurement and Analysis of GPU-accelerated Applications with HPCToolkit</a></td><td>K. Zhou, L. Adhianto, J. Anderson, et al.</td><td>Parallel Computing 108</td><td>2021</td><td><a href="22-xpu-perf.html" title="xpu-perf: CPU+GPU profiling with eBPF">22</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/nsdi23/presentation/shah">TACCL: Guiding Collective Algorithm Synthesis using Communication Sketches</a></td><td>A. Shah et al.</td><td>NSDI</td><td>2023</td><td><a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/nsdi25/presentation/xu-guanbin">AutoCCL: Automated Collective Communication Tuning for Accelerating Distributed and Parallel DNN Training</a></td><td>G. Xu, Z. Le, Y. Chen, Z. Lin, Z. Jin, Y. Miao, C. Li</td><td>NSDI</td><td>2025</td><td><a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2507.04786">Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms</a></td><td>Z. Hu, S. Shen, T. Bonato, S. Jeaugey, C. Alexander, E. Spada, J. Dinan, J. Hammond, T. Hoefler</td><td>IEEE HOTI</td><td>2025</td><td><a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc25/presentation/fan">GPREEMPT: GPU Preemptive Scheduling Made General and Efficient</a></td><td>R. Fan et al.</td><td>USENIX ATC</td><td>2025</td><td><a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi25/presentation/shen-weihang">XSched: Preemptive Scheduling for Diverse XPUs</a></td><td>W. Shen et al.</td><td>OSDI</td><td>2025</td><td><a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3723851.3726984">eGPU: Extending eBPF Programmability and Observability to GPUs</a></td><td>Y. Yang, T. Yu, Y. Zheng, A. Quinn</td><td>HCDS &#x27;25 (workshop)</td><td>2025</td><td><a href="15-bpftime-in-practice.html" title="bpftime in practice">15</a>, <a href="16-llvmbpf.html" title="llvmbpf: an LLVM JIT/AOT Compiler for eBPF">16</a>, <a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2512.12615">gpu_ext: Extensible OS Policies for GPUs via eBPF</a> <small>(preprint)</small></td><td>Y. Zheng, T. Yu, Y. Yang, M. Jiang, X. Gao, J. Su, Y. Hu, W. Mao, W. Zhang, D. Williams, A. Quinn</td><td>arXiv:2512.12615</td><td>2025</td><td><a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="16-llvmbpf.html" title="llvmbpf: an LLVM JIT/AOT Compiler for eBPF">16</a>, <a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a>, <a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi26/presentation/cheng">MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs</a> <small>(also arXiv:2512.22219)</small></td><td>X. Cheng, Z. Zhang, Y. Zhou, J. Ji, et al.</td><td>OSDI</td><td>2026</td><td><a href="31-org-meta.html" title="The org behind the code: eunomia.dev, agent skills and research notes">31</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3837779.3838156">NCCLbpf: Verified, Composable Policy Execution for GPU Collective Communication</a> <small>(preprint arXiv:2603.11438)</small></td><td>Y. Zheng</td><td>eBPF &#x27;26 (workshop)</td><td>2026</td><td><a href="21-nccl-ebpf.html" title="NCCLbpf: eBPF policies inside NCCL">21</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3845814.3850045">Safe and Programmable OS-Level GPU Resource Management with eBPF</a></td><td>Y. Zheng et al.</td><td>ASPLOS &#x27;27</td><td>2027</td><td><a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a></td></tr>
+      </tbody>
+    </table>
+    <h3>AI agents</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://arxiv.org/abs/1908.04734">Reward Tampering Problems and Solutions in Reinforcement Learning: A Causal Influence Diagram Perspective</a></td><td>T. Everitt, M. Hutter, R. Kumar, V. Krakovna</td><td>arXiv:1908.04734</td><td>2019</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2209.13085">Defining and Characterizing Reward Hacking</a></td><td>J. Skalse, N. H. R. Howe, D. Krasheninnikov, D. Krueger</td><td>NeurIPS</td><td>2022</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3605764.3623985">Not What You&#x27;ve Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection</a></td><td>K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, M. Fritz</td><td>ACM AISec</td><td>2023</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2310.06770">SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</a></td><td>C. E. Jimenez et al.</td><td>ICLR</td><td>2024</td><td><a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2406.10162">Sycophancy to Subterfuge: Investigating Reward-Tampering in Large Language Models</a> <small>(year from the arXiv number)</small></td><td>C. Denison, M. MacDiarmid, F. Barez, D. Duvenaud, S. Kravec, S. Marks, N. Schiefer, R. Soklaski, A. Tamkin, J. Kaplan, B. Shlegeris, S. R. Bowman, E. Perez, E. Hubinger</td><td>arXiv:2406.10162</td><td>2024</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3766882.3767169">AgentSight: System-Level Observability for AI Agents Using eBPF</a> <small>(also arXiv:2508.02736; chapter 23 describes it in prose)</small></td><td>Y. Zheng, Y. Hu, T. Yu, A. Quinn</td><td>PACMI &#x27;25 (workshop, with SOSP &#x27;25)</td><td>2025</td><td><a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a>, <a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a>, <a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a>, <a href="27-actime-and-akeep.html" title="Actime and Akeep: one runtime for agent policy, observability and backup">27</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2503.18813">Defeating Prompt Injections by Design (CaMeL)</a> <small>(preprint)</small></td><td>E. Debenedetti et al.</td><td>arXiv:2503.18813</td><td>2025</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2511.21654">EvilGenie: A Reward Hacking Benchmark</a> <small>(preprint)</small></td><td>J. Gabor, J. Lynch, J. Rosenfeld</td><td>arXiv:2511.21654</td><td>2025</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2510.20270">ImpossibleBench: Measuring LLMs&#x27; Propensity of Exploiting Test Cases</a> <small>(preprint)</small></td><td>Z. Zhong, A. Raghunathan, N. Carlini</td><td>arXiv:2510.20270</td><td>2025</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2505.20411">SWE-rebench: An Automated Pipeline for Task Collection and Decontaminated Evaluation of Software Engineering Agents</a> <small>(preprint)</small></td><td>I. Badertdinov et al.</td><td>arXiv:2505.20411</td><td>2025</td><td><a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2505.23643">Securing AI Agents with Information-Flow Control (FIDES)</a> <small>(preprint)</small></td><td>M. Costa et al.</td><td>arXiv:2505.23643</td><td>2025</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2603.20625">ACRFence: Preventing Semantic Rollback Attacks in Agent Checkpoint-Restore</a> <small>(preprint)</small></td><td>Y. Zheng, Y. Yang, W. Zhang, A. Quinn</td><td>arXiv:2603.20625</td><td>2026</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2606.25189">ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses</a> <small>(preprint)</small></td><td>Y. Zheng, T. Wu, Q. Fu, T. Yu, W. Mao, T. Ma, D. Williams, W. Wang, A. Quinn</td><td>arXiv:2606.25189</td><td>2026</td><td><a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a>, <a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a>, <a href="27-actime-and-akeep.html" title="Actime and Akeep: one runtime for agent policy, observability and backup">27</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2602.09345">AgentCgroup: Understanding and Controlling OS Resources of AI Agents</a> <small>(preprint)</small></td><td>Y. Zheng, J. Fan, Q. Fu, Y. Yang, W. Zhang, A. Quinn</td><td>arXiv:2602.09345</td><td>2026</td><td><a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2603.11337">RewardHackingAgents: Benchmarking Evaluation Integrity for LLM ML-Engineering Agents</a> <small>(preprint)</small></td><td>Y. Atinafu, R. Cohen</td><td>arXiv:2603.11337</td><td>2026</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2608.22928">When Can Agents Safely Checkpoint, Fork, Restore, and Merge? Exact Checking for Execution Edits</a> <small>(preprint)</small></td><td>Y. Zheng, X. Song, Y. Hu, L. Cheng, Y. Huang, W. Zhang</td><td>arXiv:2608.22928</td><td>2026</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
+      </tbody>
+    </table>
+    <h3>LLMs and ML in or for the kernel</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://arxiv.org/abs/1805.02867">Online normalizer calculation for softmax</a></td><td>M. Milakov, N. Gimelshein</td><td>arXiv:1805.02867</td><td>2018</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3341302.3342080">Learning Scheduling Algorithms for Data Processing Clusters</a></td><td>H. Mao, M. Schwarzkopf, S. B. Venkatakrishnan, Z. Meng, M. Alizadeh</td><td>ACM SIGCOMM</td><td>2019</td><td><a href="30-llm-kernel-tooling.html" title="LLM agents for the kernel: schedcp, MCPtrace, GPTtrace">30</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2101.01321">I-BERT: Integer-only BERT Quantization</a></td><td>S. Kim et al.</td><td>ICML</td><td>2021</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2104.09864">RoFormer: Enhanced Transformer with Rotary Position Embedding</a></td><td>J. Su et al.</td><td>arXiv:2104.09864</td><td>2021</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3544216.3544229">LiteFlow: Towards High-Performance Adaptive Neural Networks for Kernel Datapath</a></td><td>J. Zhang et al.</td><td>ACM SIGCOMM</td><td>2022</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2305.13245">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></td><td>J. Ainslie et al.</td><td>EMNLP</td><td>2023</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2312.05531">KEN: Kernel Extensions using Natural Language</a> <small>(preprint)</small></td><td>Y. Zheng, Y. Yang, M. Chen, A. Quinn</td><td>arXiv:2312.05531</td><td>2023</td><td><a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a>, <a href="30-llm-kernel-tooling.html" title="LLM agents for the kernel: schedcp, MCPtrace, GPTtrace">30</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3575693.3575697">Towards a Machine Learning-Assisted Kernel with LAKE</a></td><td>H. Fingler et al.</td><td>ASPLOS</td><td>2023</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3672197.3673434">Kgent: Kernel Extensions Large Language Model Agent</a></td><td>Y. Zheng, Y. Yang, M. Chen, A. Quinn</td><td>eBPF &#x27;24 (SIGCOMM workshop)</td><td>2024</td><td><a href="17-bpfix.html" title="bpfix: explaining and fixing verifier errors">17</a>, <a href="30-llm-kernel-tooling.html" title="LLM agents for the kernel: schedcp, MCPtrace, GPTtrace">30</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2505.09388">Qwen3 Technical Report</a></td><td>A. Yang et al. (Qwen Team)</td><td>arXiv:2505.09388</td><td>2025</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2509.01245">Towards Agentic OS: An LLM Agent Framework for Linux Schedulers (schedcp)</a></td><td>Y. Zheng, Y. Hu, W. Zhang, A. Quinn</td><td>arXiv:2509.01245 (MLforSystem 2025)</td><td>2025</td><td><a href="30-llm-kernel-tooling.html" title="LLM agents for the kernel: schedcp, MCPtrace, GPTtrace">30</a></td></tr>
+        <tr><td><a href="https://github.com/eunomia-bpf/qwen3-ebpf/blob/main/paper/bpfllm.pdf">Can eBPF Run a Real Language Model? Lessons from a Kernel-Resident Qwen3 Forward Pass</a> <small>(not peer reviewed)</small></td><td>Y. Zheng</td><td>report in the qwen3-ebpf repository</td><td>2026</td><td><a href="29-qwen3-ebpf.html" title="qwen3-ebpf: an LLM forward pass inside eBPF">29</a></td></tr>
+      </tbody>
+    </table>
+    <h3>Adjacent systems: IFC, filesystems, memory, profiling</h3>
+    <table>
+      <thead><tr><th>Paper</th><th>Authors</th><th>Venue</th><th>Year</th><th>Cited in</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://doi.org/10.1145/360051.360056">A Lattice Model of Secure Information Flow</a></td><td>D. E. Denning</td><td>Communications of the ACM 19(5)</td><td>1976</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/292540.292561">JFlow: Practical Mostly-Static Information Flow Control</a></td><td>A. C. Myers</td><td>ACM POPL</td><td>1999</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/1095810.1095813">Labels and Event Processes in the Asbestos Operating System</a></td><td>P. Efstathopoulos, M. Krohn, S. VanDeBogart, C. Frey, D. Ziegler, E. Kohler, D. Mazières, F. Kaashoek, R. Morris</td><td>ACM SOSP</td><td>2005</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi-06/making-information-flow-explicit-histar">Making Information Flow Explicit in HiStar</a></td><td>N. Zeldovich, S. Boyd-Wickizer, E. Kohler, D. Mazières</td><td>OSDI</td><td>2006</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/1294261.1294293">Information Flow Control for Standard OS Abstractions (Flume)</a></td><td>M. Krohn, A. Yip, M. Brodsky, N. Cliffer, M. F. Kaashoek, E. Kohler, R. Morris</td><td>ACM SOSP</td><td>2007</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1109/MM.2010.68">Google-Wide Profiling: A Continuous Profiling Infrastructure for Data Centers</a></td><td>G. Ren, E. Tune, T. Moseley, Y. Shi, S. Rus, R. Hundt</td><td>IEEE Micro 30(4)</td><td>2010</td><td><a href="22-xpu-perf.html" title="xpu-perf: CPU+GPU profiling with eBPF">22</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/osdi10/taintdroid-information-flow-tracking-system-realtime-privacy-monitoring">TaintDroid: An Information-Flow Tracking System for Realtime Privacy Monitoring on Smartphones</a></td><td>W. Enck et al.</td><td>OSDI</td><td>2010</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/2815400.2815409">Coz: Finding Code that Counts with Causal Profiling</a> <small>(Best Paper; also arXiv:1608.03676 and CACM 2018)</small></td><td>C. Curtsinger, E. D. Berger</td><td>ACM SOSP</td><td>2015</td><td><a href="31-org-meta.html" title="The org behind the code: eunomia.dev, agent skills and research notes">31</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/2909476">The Flame Graph</a></td><td>B. Gregg</td><td>Communications of the ACM 59(6)</td><td>2016</td><td><a href="22-xpu-perf.html" title="xpu-perf: CPU+GPU profiling with eBPF">22</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc16/technical-sessions/presentation/min">Understanding Manycore Scalability of File Systems (FxMark)</a></td><td>C. Min et al.</td><td>USENIX ATC</td><td>2016</td><td><a href="28-namei-ext.html" title="namei_ext: BPF policy inside VFS path resolution">28</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1109/TCC.2015.2489211">CamFlow: Managed Data-Sharing for Cloud Services</a></td><td>T. Pasquier, J. Singh, D. Eyers, J. Bacon</td><td>IEEE Transactions on Cloud Computing 5(3)</td><td>2017</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/fast17/technical-sessions/presentation/vangoor">To FUSE or Not to FUSE: Performance of User-Space File Systems</a></td><td>B. K. R. Vangoor, V. Tarasov, E. Zadok</td><td>USENIX FAST</td><td>2017</td><td><a href="28-namei-ext.html" title="namei_ext: BPF policy inside VFS path resolution">28</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3243734.3243776">Runtime Analysis of Whole-System Provenance (CamQuery)</a></td><td>T. Pasquier, X. Han, T. Moyer, A. Bates, O. Hermant, D. Eyers, J. Bacon, M. Seltzer</td><td>ACM CCS</td><td>2018</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc19/presentation/bijlani">Extension Framework for File Systems in User space (ExtFUSE)</a></td><td>A. Bijlani, U. Ramachandran</td><td>USENIX ATC</td><td>2019</td><td><a href="28-namei-ext.html" title="namei_ext: BPF policy inside VFS path resolution">28</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/atc20/presentation/shahrad">Serverless in the Wild: Characterizing and Optimizing the Serverless Workload at a Large Cloud Provider</a></td><td>M. Shahrad et al.</td><td>USENIX ATC</td><td>2020</td><td><a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a></td></tr>
+        <tr><td><a href="https://www.usenix.org/conference/fast21/presentation/miller">High Velocity Kernel File Systems with Bento</a></td><td>S. Miller et al.</td><td>USENIX FAST</td><td>2021</td><td><a href="28-namei-ext.html" title="namei_ext: BPF policy inside VFS path resolution">28</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3503222.3507731">TMO: Transparent Memory Offloading in Datacenters</a></td><td>J. Weiner et al.</td><td>ASPLOS</td><td>2022</td><td><a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3731569.3764820">cache_ext: Customizing the Page Cache with eBPF</a></td><td>T. Zussman et al.</td><td>ACM SOSP</td><td>2025</td><td><a href="20-gpu-ext.html" title="gpu_ext: eBPF policies for GPU memory and scheduling">20</a></td></tr>
+        <tr><td><a href="https://github.com/eunomia-bpf/namei_ext">namei_ext: Programmable VFS Name Resolution without Filesystem Ownership</a> <small>(unpublished draft)</small></td><td>authors not given in chapter 28</td><td>paper draft in docs/paper/</td><td>draft</td><td><a href="28-namei-ext.html" title="namei_ext: BPF policy inside VFS path resolution">28</a></td></tr>
+      </tbody>
+    </table>
+
+    <h2>Learning paths</h2>
+    <p>The chapters are numbered in dependency order, but most readers do not need all 32. Here are three routes. Each node in the diagram links to its chapter. Chapters 01, 03 and 06 come up again and again because the rest of the curriculum assumes the lifecycle, the verifier and CO-RE.</p>
+    <figure>
+      <svg viewBox="0 0 900 330" role="img" aria-label="Three learning paths through the chapters">
+        <text x="20" y="75" font-size="14" font-weight="700" fill="var(--accent)">Newcomer to eBPF</text>
+        <line x1="250" y1="70" x2="756" y2="70" stroke="var(--accent)" stroke-width="3"/>
+        <polygon points="782,70 774,64 774,76" fill="var(--accent)"/>
+        <a href="01-what-is-bpf.html"><title>01 · What is BPF? From packet filter to in-kernel VM</title><circle cx="250" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="250" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">01</text></a>
+        <text x="250" y="104" text-anchor="middle" font-size="10" fill="var(--muted)">origins</text>
+        <a href="02-ebpf-isa-and-vm.html"><title>02 · The eBPF Instruction Set and Virtual Machine</title><circle cx="296" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="296" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">02</text></a>
+        <text x="296" y="44" text-anchor="middle" font-size="10" fill="var(--muted)">ISA</text>
+        <a href="03-verifier.html"><title>03 · The eBPF verifier</title><circle cx="342" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="342" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">03</text></a>
+        <text x="342" y="104" text-anchor="middle" font-size="10" fill="var(--muted)">verifier</text>
+        <a href="04-maps-helpers-kfuncs.html"><title>04 · Maps, helpers and kfuncs</title><circle cx="388" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="388" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">04</text></a>
+        <text x="388" y="44" text-anchor="middle" font-size="10" fill="var(--muted)">maps</text>
+        <a href="05-program-types-and-hooks.html"><title>05 · Program types and hooks</title><circle cx="434" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="434" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">05</text></a>
+        <text x="434" y="104" text-anchor="middle" font-size="10" fill="var(--muted)">hooks</text>
+        <a href="06-btf-core-libbpf.html"><title>06 · BTF, CO-RE and libbpf</title><circle cx="480" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="480" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">06</text></a>
+        <text x="480" y="44" text-anchor="middle" font-size="10" fill="var(--muted)">CO-RE</text>
+        <a href="07-networking-xdp-tc.html"><title>07 · eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs</title><circle cx="526" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="526" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">07</text></a>
+        <text x="526" y="104" text-anchor="middle" font-size="10" fill="var(--muted)">XDP/tc</text>
+        <a href="08-ecosystem.html"><title>08 · The eBPF ecosystem map</title><circle cx="572" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="572" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">08</text></a>
+        <text x="572" y="44" text-anchor="middle" font-size="10" fill="var(--muted)">ecosystem</text>
+        <a href="09-bpf-developer-tutorial.html"><title>09 · bpf-developer-tutorial</title><circle cx="618" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="618" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">09</text></a>
+        <text x="618" y="104" text-anchor="middle" font-size="10" fill="var(--muted)">tutorial</text>
+        <a href="11-starter-templates.html"><title>11 · Starter templates for libbpf and libbpf-rs</title><circle cx="664" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="664" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">11</text></a>
+        <text x="664" y="44" text-anchor="middle" font-size="10" fill="var(--muted)">templates</text>
+        <a href="10-eunomia-bpf-ecc-ecli.html"><title>10 · eunomia-bpf: ecc and ecli</title><circle cx="710" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="710" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">10</text></a>
+        <text x="710" y="104" text-anchor="middle" font-size="10" fill="var(--muted)">ecc/ecli</text>
+        <a href="15-bpftime-in-practice.html"><title>15 · bpftime in practice</title><circle cx="756" cy="70" r="17" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/><text x="756" y="75" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">15</text></a>
+        <text x="756" y="44" text-anchor="middle" font-size="10" fill="var(--muted)">bpftime use</text>
+        <text x="20" y="185" font-size="14" font-weight="700" fill="var(--accent2)">Systems researcher</text>
+        <line x1="250" y1="180" x2="848" y2="180" stroke="var(--accent2)" stroke-width="3"/>
+        <polygon points="874,180 866,174 866,186" fill="var(--accent2)"/>
+        <a href="01-what-is-bpf.html"><title>01 · What is BPF? From packet filter to in-kernel VM</title><circle cx="250" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="250" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">01</text></a>
+        <text x="250" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">origins</text>
+        <a href="03-verifier.html"><title>03 · The eBPF verifier</title><circle cx="296" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="296" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">03</text></a>
+        <text x="296" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">verifier</text>
+        <a href="14-bpftime-architecture.html"><title>14 · bpftime architecture</title><circle cx="342" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="342" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">14</text></a>
+        <text x="342" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">bpftime</text>
+        <a href="16-llvmbpf.html"><title>16 · llvmbpf: an LLVM JIT/AOT Compiler for eBPF</title><circle cx="388" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="388" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">16</text></a>
+        <text x="388" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">llvmbpf</text>
+        <a href="17-bpfix.html"><title>17 · bpfix: explaining and fixing verifier errors</title><circle cx="434" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="434" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">17</text></a>
+        <text x="434" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">bpfix</text>
+        <a href="18-ebpf-correctness-verifier.html"><title>18 · ebpf-correctness-verifier: Translation Validation for eBPF Rewrites</title><circle cx="480" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="480" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">18</text></a>
+        <text x="480" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">TV / Z3</text>
+        <a href="19-bpf-benchmark.html"><title>19 · bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization</title><circle cx="526" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="526" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">19</text></a>
+        <text x="526" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">bpf-bench</text>
+        <a href="20-gpu-ext.html"><title>20 · gpu_ext: eBPF policies for GPU memory and scheduling</title><circle cx="572" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="572" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">20</text></a>
+        <text x="572" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">gpu_ext</text>
+        <a href="21-nccl-ebpf.html"><title>21 · NCCLbpf: eBPF policies inside NCCL</title><circle cx="618" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="618" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">21</text></a>
+        <text x="618" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">NCCLbpf</text>
+        <a href="24-actplane.html"><title>24 · ActPlane: information-flow enforcement for AI agents</title><circle cx="664" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="664" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">24</text></a>
+        <text x="664" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">ActPlane</text>
+        <a href="25-agentcgroup.html"><title>25 · AgentCgroup: OS resources of AI agents</title><circle cx="710" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="710" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">25</text></a>
+        <text x="710" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">AgentCgroup</text>
+        <a href="28-namei-ext.html"><title>28 · namei_ext: BPF policy inside VFS path resolution</title><circle cx="756" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="756" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">28</text></a>
+        <text x="756" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">namei_ext</text>
+        <a href="29-qwen3-ebpf.html"><title>29 · qwen3-ebpf: an LLM forward pass inside eBPF</title><circle cx="802" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="802" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">29</text></a>
+        <text x="802" y="214" text-anchor="middle" font-size="10" fill="var(--muted)">qwen3-ebpf</text>
+        <a href="30-llm-kernel-tooling.html"><title>30 · LLM agents for the kernel: schedcp, MCPtrace, GPTtrace</title><circle cx="848" cy="180" r="17" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/><text x="848" y="185" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">30</text></a>
+        <text x="848" y="154" text-anchor="middle" font-size="10" fill="var(--muted)">schedcp</text>
+        <text x="20" y="295" font-size="14" font-weight="700" fill="var(--ok)">Tools practitioner</text>
+        <line x1="250" y1="290" x2="710" y2="290" stroke="var(--ok)" stroke-width="3"/>
+        <polygon points="736,290 728,284 728,296" fill="var(--ok)"/>
+        <a href="06-btf-core-libbpf.html"><title>06 · BTF, CO-RE and libbpf</title><circle cx="250" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="250" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">06</text></a>
+        <text x="250" y="324" text-anchor="middle" font-size="10" fill="var(--muted)">CO-RE</text>
+        <a href="09-bpf-developer-tutorial.html"><title>09 · bpf-developer-tutorial</title><circle cx="296" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="296" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">09</text></a>
+        <text x="296" y="264" text-anchor="middle" font-size="10" fill="var(--muted)">tutorial</text>
+        <a href="10-eunomia-bpf-ecc-ecli.html"><title>10 · eunomia-bpf: ecc and ecli</title><circle cx="342" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="342" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">10</text></a>
+        <text x="342" y="324" text-anchor="middle" font-size="10" fill="var(--muted)">ecc/ecli</text>
+        <a href="11-starter-templates.html"><title>11 · Starter templates for libbpf and libbpf-rs</title><circle cx="388" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="388" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">11</text></a>
+        <text x="388" y="264" text-anchor="middle" font-size="10" fill="var(--muted)">templates</text>
+        <a href="12-wasm-bpf.html"><title>12 · wasm-bpf: eBPF user space in WebAssembly</title><circle cx="434" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="434" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">12</text></a>
+        <text x="434" y="324" text-anchor="middle" font-size="10" fill="var(--muted)">wasm-bpf</text>
+        <a href="13-bpf-compatible.html"><title>13 · bpf-compatible: CO-RE on kernels without BTF</title><circle cx="480" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="480" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">13</text></a>
+        <text x="480" y="264" text-anchor="middle" font-size="10" fill="var(--muted)">bpf-compat</text>
+        <a href="15-bpftime-in-practice.html"><title>15 · bpftime in practice</title><circle cx="526" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="526" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">15</text></a>
+        <text x="526" y="324" text-anchor="middle" font-size="10" fill="var(--muted)">bpftime use</text>
+        <a href="22-xpu-perf.html"><title>22 · xpu-perf: CPU+GPU profiling with eBPF</title><circle cx="572" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="572" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">22</text></a>
+        <text x="572" y="264" text-anchor="middle" font-size="10" fill="var(--muted)">xpu-perf</text>
+        <a href="23-agentsight.html"><title>23 · AgentSight: system-level observability for AI agents</title><circle cx="618" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="618" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">23</text></a>
+        <text x="618" y="324" text-anchor="middle" font-size="10" fill="var(--muted)">AgentSight</text>
+        <a href="27-actime-and-akeep.html"><title>27 · Actime and Akeep: one runtime for agent policy, observability and backup</title><circle cx="664" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="664" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">27</text></a>
+        <text x="664" y="264" text-anchor="middle" font-size="10" fill="var(--muted)">Actime</text>
+        <a href="30-llm-kernel-tooling.html"><title>30 · LLM agents for the kernel: schedcp, MCPtrace, GPTtrace</title><circle cx="710" cy="290" r="17" fill="var(--bg3)" stroke="var(--ok)" stroke-width="2"/><text x="710" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="var(--fg)">30</text></a>
+        <text x="710" y="324" text-anchor="middle" font-size="10" fill="var(--muted)">schedcp</text>
+      </svg>
+      <figcaption>Figure 32.2 — Three routes through the curriculum, read left to right. Click a node to open its chapter. The newcomer path covers Parts I–II and ends with a runtime. The researcher path follows the papers. The practitioner path follows the tools you can install today.</figcaption>
+    </figure>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Newcomer to eBPF">
+        <p>For a C programmer who has never loaded a BPF program. Read the chapters in order and run the examples as you go. By the end you can write, build and debug a CO-RE tool, and you know which hook fits which question.</p>
+        <ol>
+          <li><a href="01-what-is-bpf.html">01 · What is BPF? From packet filter to in-kernel VM</a>: where BPF came from and what the kernel gained</li>
+          <li><a href="02-ebpf-isa-and-vm.html">02 · The eBPF Instruction Set and Virtual Machine</a>: the instruction set and the JIT</li>
+          <li><a href="03-verifier.html">03 · The eBPF verifier</a>: how the verifier decides; read the loops and errors sections twice</li>
+          <li><a href="04-maps-helpers-kfuncs.html">04 · Maps, helpers and kfuncs</a>: maps, ring buffer, helpers and kfuncs</li>
+          <li><a href="05-program-types-and-hooks.html">05 · Program types and hooks</a>: which hook to use for which question</li>
+          <li><a href="06-btf-core-libbpf.html">06 · BTF, CO-RE and libbpf</a>: BTF, CO-RE and the libbpf skeleton workflow</li>
+          <li><a href="07-networking-xdp-tc.html">07 · eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs</a>: XDP, tc/TCX and sockets</li>
+          <li><a href="08-ecosystem.html">08 · The eBPF ecosystem map</a>: the frameworks and projects you will meet</li>
+          <li><a href="09-bpf-developer-tutorial.html">09 · bpf-developer-tutorial</a>: 50+ runnable lessons; do a few now</li>
+          <li><a href="11-starter-templates.html">11 · Starter templates for libbpf and libbpf-rs</a>: start your own project from a template</li>
+          <li><a href="10-eunomia-bpf-ecc-ecli.html">10 · eunomia-bpf: ecc and ecli</a>: ecc/ecli as a shortcut that skips writing a loader</li>
+          <li><a href="15-bpftime-in-practice.html">15 · bpftime in practice</a>: the same programs running in user space</li>
+        </ol>
+      </div>
+      <div class="tab-panel" data-label="Systems researcher">
+        <p>For a reader who wants the open problems. This route keeps the background short and spends its time on the verifier, runtimes, correctness and new hook points. Pair each chapter with the papers in its theme group above.</p>
+        <ol>
+          <li><a href="01-what-is-bpf.html">01 · What is BPF? From packet filter to in-kernel VM</a>: the original design and its constraints</li>
+          <li><a href="03-verifier.html">03 · The eBPF verifier</a>: abstract interpretation, tnums and the verifier research line</li>
+          <li><a href="14-bpftime-architecture.html">14 · bpftime architecture</a>: an OSDI '25 runtime and the EIM model</li>
+          <li><a href="16-llvmbpf.html">16 · llvmbpf: an LLVM JIT/AOT Compiler for eBPF</a>: lifting eBPF to LLVM IR; GPU targets</li>
+          <li><a href="17-bpfix.html">17 · bpfix: explaining and fixing verifier errors</a>: an empirical study of 235 verifier rejections</li>
+          <li><a href="18-ebpf-correctness-verifier.html">18 · ebpf-correctness-verifier: Translation Validation for eBPF Rewrites</a>: translation validation with Z3</li>
+          <li><a href="19-bpf-benchmark.html">19 · bpf-benchmark and bpfperf: Agent-Driven eBPF Optimization</a>: BPF-Ext / kinsn and agent-driven optimization</li>
+          <li><a href="20-gpu-ext.html">20 · gpu_ext: eBPF policies for GPU memory and scheduling</a>: struct_ops for GPU memory and scheduling</li>
+          <li><a href="21-nccl-ebpf.html">21 · NCCLbpf: eBPF policies inside NCCL</a>: verified policies inside NCCL; the rank-agreement analysis</li>
+          <li><a href="24-actplane.html">24 · ActPlane: information-flow enforcement for AI agents</a>: information-flow control for agents</li>
+          <li><a href="25-agentcgroup.html">25 · AgentCgroup: OS resources of AI agents</a>: OS resource characterization of agents</li>
+          <li><a href="28-namei-ext.html">28 · namei_ext: BPF policy inside VFS path resolution</a>: a new program type inside VFS path lookup</li>
+          <li><a href="29-qwen3-ebpf.html">29 · qwen3-ebpf: an LLM forward pass inside eBPF</a>: how far eBPF can be pushed: an LLM forward pass</li>
+          <li><a href="30-llm-kernel-tooling.html">30 · LLM agents for the kernel: schedcp, MCPtrace, GPTtrace</a>: LLM agents that write and tune kernel extensions</li>
+        </ol>
+      </div>
+      <div class="tab-panel" data-label="Tools practitioner">
+        <p>For a practitioner who wants to ship something with the org's tools. It assumes you can already read a short libbpf program; if you cannot, read <a href="01-what-is-bpf.html">01</a> and <a href="05-program-types-and-hooks.html">05</a> first.</p>
+        <ol>
+          <li><a href="06-btf-core-libbpf.html">06 · BTF, CO-RE and libbpf</a>: what CO-RE buys you and how a skeleton is built</li>
+          <li><a href="09-bpf-developer-tutorial.html">09 · bpf-developer-tutorial</a>: the lesson set to copy from</li>
+          <li><a href="10-eunomia-bpf-ecc-ecli.html">10 · eunomia-bpf: ecc and ecli</a>: compile with ecc, run with ecli, pull from a registry</li>
+          <li><a href="11-starter-templates.html">11 · Starter templates for libbpf and libbpf-rs</a>: libbpf and libbpf-rs templates with CI</li>
+          <li><a href="12-wasm-bpf.html">12 · wasm-bpf: eBPF user space in WebAssembly</a>: the user-space half in WebAssembly</li>
+          <li><a href="13-bpf-compatible.html">13 · bpf-compatible: CO-RE on kernels without BTF</a>: running CO-RE tools on kernels without BTF</li>
+          <li><a href="15-bpftime-in-practice.html">15 · bpftime in practice</a>: bpftime's CLI, attach modes and examples</li>
+          <li><a href="22-xpu-perf.html">22 · xpu-perf: CPU+GPU profiling with eBPF</a>: CPU+GPU flame graphs</li>
+          <li><a href="23-agentsight.html">23 · AgentSight: system-level observability for AI agents</a>: watching what an AI agent does</li>
+          <li><a href="27-actime-and-akeep.html">27 · Actime and Akeep: one runtime for agent policy, observability and backup</a>: one runner for agent policy, observability and backup</li>
+          <li><a href="30-llm-kernel-tooling.html">30 · LLM agents for the kernel: schedcp, MCPtrace, GPTtrace</a>: MCPtrace, schedcp and GPTtrace for LLM-assisted tracing</li>
+        </ol>
+      </div>
+    </div>
+    <div class="callout warn"><span class="label">Maturity varies</span><p>Several projects in the researcher path are prototypes or depend on patched kernels: gpu_ext needs a modified NVIDIA driver, namei_ext a patched kernel, and AgentCgroup's memory control uses an RFC patch series. Each chapter's <em>Benefits and limitations</em> section says what runs on a stock system. Read that section before you plan to depend on a project.</p></div>
+
+    <h2>How the section links were made</h2>
+    <p>The table of contents and the heading anchors on every page are generated in the browser by the shared script. A heading's id is its text in lower case, with each run of non-alphanumeric characters replaced by a hyphen and leading and trailing hyphens removed:</p>
+    <pre data-file="assets/app.js"><code class="language-javascript">const heads = [...document.querySelectorAll("main h2, main h3")];
+/* ... */
+heads.forEach((h, i) =&gt; {
+  if (!h.id) h.id = h.textContent.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "s" + i;
+  /* ... */
+});</code></pre>
+    <p>The glossary links in this chapter were computed with the same rule from each chapter's actual headings, and every target was checked to exist. If you rename a heading in another chapter, rerun that check. Chapter 23 was being written while this appendix was assembled, so its terms link to the chapter as a whole, not to a section.</p>
+
+    <h2>Check your understanding</h2>
+    <p>These questions each draw on two or more parts of the curriculum.</p>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> A CO-RE tool must run on an old distribution kernel with no <code>/sys/kernel/btf/vmlinux</code>. What does bpf-compatible do?</p>
+        <button class="opt">It recompiles the BPF C on the target, like BCC</button>
+        <button class="opt" data-right>It embeds trimmed BTF for many kernels from BTFHub and passes the matching file to libbpf through <code>btf_custom_path</code></button>
+        <button class="opt">It disables CO-RE relocations and uses fixed offsets</button>
+        <div class="why">CO-RE needs the running kernel's types (<a href="06-btf-core-libbpf.html">06</a>). bpf-compatible ships them for you: it fetches BTFHub archives, trims them with <code>bpftool gen min_core_btf</code>, embeds them, and picks one at run time (<a href="13-bpf-compatible.html">13</a>).</div></div>
+      <div class="q"><p><strong>Q2.</strong> How does bpftime implement a <code>sys_enter_openat</code> tracepoint inside an ordinary process?</p>
+        <button class="opt">It asks the kernel to deliver the tracepoint to user space</button>
+        <button class="opt">It single-steps the process with ptrace</button>
+        <button class="opt" data-right>It rewrites each <code>syscall</code> instruction into <code>call *%rax</code> and places a trampoline at address zero (zpoline)</button>
+        <div class="why">A syscall can come from libc, a static binary or inline assembly, so hooking one function is not enough. bpftime rewrites every <code>syscall</code> instruction, as zpoline (ATC '23) does (<a href="14-bpftime-architecture.html#binary-rewriting-for-syscalls-a-zpoline-in-the-target">14</a>).</div></div>
+      <div class="q"><p><strong>Q3.</strong> NCCLbpf runs PREVAIL on every policy and then a second, rank-agreement analysis. Why is PREVAIL not enough?</p>
+        <button class="opt">PREVAIL cannot check memory safety</button>
+        <button class="opt" data-right>A policy can be memory-safe yet choose different algorithms on different ranks, and ranks that disagree deadlock</button>
+        <button class="opt">The rank check makes policies run faster</button>
+        <div class="why">Safety here has a distributed part that per-program verification cannot see. The second pass is again an abstract interpretation (<a href="03-verifier.html">03</a>), but it tracks where each value came from rather than its range (<a href="21-nccl-ebpf.html#why-divergent-choices-deadlock">21</a>).</div></div>
+      <div class="q"><p><strong>Q4.</strong> A register's tnum is value <code>0b0100</code>, mask <code>0b0011</code>. Which concrete values can it hold?</p>
+        <button class="opt">Only 4</button>
+        <button class="opt" data-right>4, 5, 6 and 7</button>
+        <button class="opt">0 to 7</button>
+        <div class="why">Mask bits are unknown, and the other bits are known to equal <code>value</code>: bit 2 is 1, bit 3 and above are 0, bits 0 and 1 are free (<a href="03-verifier.html#tristate-numbers">03</a>).</div></div>
+      <div class="q"><p><strong>Q5.</strong> What does ebpf-correctness-verifier prove about an optimizer such as K2 or bpfopt?</p>
+        <button class="opt">That the optimizer is correct for every possible input program</button>
+        <button class="opt" data-right>For one optimized program, that it behaves the same as the original, checked with Z3; this is translation validation</button>
+        <button class="opt">That the optimized program passes the kernel verifier</button>
+        <div class="why">Translation validation checks each output against its input instead of proving the transformer correct once (<a href="18-ebpf-correctness-verifier.html#translation-validation-in-one-page">18</a>). That fits optimizers that are themselves untrusted, such as an LLM agent (<a href="19-bpf-benchmark.html">19</a>).</div></div>
+      <div class="q"><p><strong>Q6.</strong> gpu_ext and sched_ext add hooks with struct_ops. What does namei_ext add?</p>
+        <button class="opt">Another struct_ops type for the VFS</button>
+        <button class="opt">A set of kfuncs that LSM programs call</button>
+        <button class="opt" data-right>A new program type with a cgroup attach type, whose return value (0–3) chooses the lookup action</button>
+        <div class="why">namei_ext follows the model of cgroup/sysctl: <code>BPF_PROG_TYPE_NAMEI_EXT</code>, attached to a cgroup v2 directory, with pass, hide, redirect or select-target as its result (<a href="28-namei-ext.html#what-namei-ext-adds-to-the-kernel">28</a>). Compare it with struct_ops in <a href="05-program-types-and-hooks.html#struct-ops-implementing-kernel-interfaces-in-bpf">05</a>.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>Chapters 01–31 of this curriculum: their <em>References</em> sections are the source of every paper above, and their headings are the source of every glossary link.</li>
+      <li><a href="https://github.com/eunomia-bpf">eunomia-bpf on GitHub</a>, the organisation whose active repositories Parts II–VII cover; chapter 31 maps each repository to its chapter (<a href="31-org-meta.html#map-of-the-whole-org">31 · Map of the whole org</a>).</li>
+      <li><a href="https://docs.kernel.org/bpf/">BPF Documentation</a>, Linux kernel documentation: the primary reference for most Part I terms.</li>
+      <li>D. Thaler (ed.), <a href="https://www.rfc-editor.org/rfc/rfc9669.html">BPF Instruction Set Architecture (ISA), RFC 9669</a>, IETF, October 2024.</li>
+      <li><a href="https://docs.ebpf.io/">eBPF Docs (docs.ebpf.io)</a>: per-helper, per-kfunc and per-map-type reference pages, useful alongside the glossary.</li>
+      <li><a href="https://ebpf.io/what-is-ebpf/">ebpf.io, "What is eBPF?"</a>: a short overview, the community's own glossary-style introduction.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="31-org-meta.html"><small>Previous</small>31 · The org behind the code</a>
+      <a class="next" href="../index.html"><small>Back to</small>Curriculum index</a>
+    </div>
+  </main>
+</div>
+<script>
+(function () {
+  var input = document.getElementById("gloss-filter");
+  var count = document.getElementById("gloss-count");
+  var empty = document.getElementById("gloss-empty");
+  var entries = Array.prototype.slice.call(document.querySelectorAll("#gloss .gloss-entry"));
+  var hay = entries.map(function (e) { return (e.getAttribute("data-k") + " " + e.textContent).toLowerCase(); });
+  function apply() {
+    var words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+    var shown = 0;
+    entries.forEach(function (e, i) {
+      var ok = words.every(function (w) { return hay[i].indexOf(w) !== -1; });
+      e.hidden = !ok; if (ok) shown++;
+    });
+    count.textContent = shown === entries.length ? entries.length + " terms" : shown + " of " + entries.length + " terms";
+    empty.hidden = shown !== 0;
+  }
+  input.addEventListener("input", apply);
+  input.addEventListener("keydown", function (ev) { if (ev.key === "Escape") { input.value = ""; apply(); } });
+})();
+</script>
+</body>
+</html>

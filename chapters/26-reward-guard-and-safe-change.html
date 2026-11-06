@@ -259,7 +259,8 @@ def _parse_asset(raw: dict[str, Any]) -&gt; Asset:
     if action not in {"block", "notify", "kill"}:
         raise ManifestError(f"rule {rule_id!r} has invalid action {action!r}")</code></pre>
 
-    <p>The example manifest covers most of the taxonomy in one file:</p>
+    <p>The example manifest covers most of the taxonomy in one file. It is shown here
+    reformatted with two lines per entry, and some assets and rules are elided:</p>
     <pre data-file="examples/minimal-task/rewardguard.json"><code class="language-json">{
   "task": "minimal-coding-eval",
   "assets": [
@@ -818,7 +819,9 @@ python3 scripts/audit_manifest_sketches.py --out results/2026-07-03/manifest-ske
     <ul>
       <li><strong>History</strong>: "the append-only, hash-linked execution record". A separate
       <em>head anchor</em> is stored outside the restore domain, so restoring an older copy of
-      History can be detected (my reading of "restore-domain-external head anchor").</li>
+      History can be detected. The top-level README calls it a "restore-domain-external head
+      anchor", and <code>runtime/README.md</code> describes "an external History-head anchor
+      that detects restoration of an older valid" History.</li>
       <li><strong>Requirement</strong>: results that must remain achievable, plus resource
       limits that every possible outcome must respect.</li>
       <li><strong>Operation</strong>: "one stable external action across retries and
@@ -834,13 +837,21 @@ python3 scripts/audit_manifest_sketches.py --out results/2026-07-03/manifest-ske
     <h3>Does it use eBPF or CRIU?</h3>
     <div class="callout warn"><span class="label">Verified in source</span><p><strong>No eBPF,
     and no CRIU.</strong> The runtime is Go: <code>runtime/cmd/*</code> and
-    <code>runtime/internal/*</code>. Searching the code for <code>bpf</code> finds only the Go
-    module path <code>github.com/eunomia-bpf/…</code>. <code>docs/implementation.md</code>
+    <code>runtime/internal/*</code>. Searching the code for <code>bpf</code> finds the Go
+    module path <code>github.com/eunomia-bpf/…</code> and one use of <em>classic</em> BPF:
+    <code>runtime/internal/agentguest/codex_child_linux.go</code> installs a seccomp filter
+    (<code>SECCOMP_SET_MODE_FILTER</code>, built from <code>unix.SockFilter</code>
+    instructions) on the Codex child inside the Firecracker guest. That filter kills
+    non-x86-64 callers and returns <code>EPERM</code> for x32 syscalls,
+    <code>io_uring_*</code>, and <code>socket</code>/<code>socketpair</code> with
+    <code>AF_VSOCK</code>. This is seccomp-BPF (<a href="01-what-is-bpf.html">chapter 01</a>),
+    not eBPF. <code>docs/implementation.md</code>
     lists, under "Not implemented", an "eBPF effect receipt mechanism". It also states:
     "Optional hooks can prototype event capture, but they are not the trusted boundary unless
     all bypasses are closed. eBPF inference is lower priority than an explicit, proof-aligned
     dispatch path." CRIU appears only in planning notes (<code>docs/experiments.md</code>
-    calls "Python <code>deepcopy</code>" a stand-in for "CRIU / Podman / VM Snapshot") and in
+    calls "Python <code>deepcopy</code>" a stand-in for "CRIU / Podman / VM Snapshot", and
+    <code>poc/README.md</code> lists real CRIU checkpoint-restore as a to-do) and in
     the legacy ACRFence paper, which says "We use Claude Code's built-in checkpoint-restore
     rather than OS-level mechanisms such as CRIU". The checkpoint/restore backends that
     actually run are <strong>QEMU full-VM snapshots</strong> and <strong>Firecracker microVM
@@ -1209,6 +1220,9 @@ jq -e '.deliveries == 3 and .commits == 2 and .paths["/v1/charge"] == 2 and .pat
     └── tmp/bootstrap/                 retained step evidence</code></pre>
 
     <h3>Build and run</h3>
+    <p>A selection of the README's targets. The <code>KEEP_STATE=1</code> line comes from
+    <code>runtime/README.md</code>, and the comments are mine, checked against the
+    <code>Makefile</code>:</p>
     <pre data-file="README.md"><code class="language-bash">make safe-change-demo                 # = runtime-microservice-demo (Docker Compose)
 KEEP_STATE=1 make runtime-microservice-demo   # keep results/ for inspection
 make runtime-build                    # cd runtime &amp;&amp; go build ./...
@@ -1352,11 +1366,11 @@ make runtime-firecracker-kvm-test     # needs /dev/kvm</code></pre>
       <li id="ref-impossible">Z. Zhong, A. Raghunathan, N. Carlini, <a href="https://arxiv.org/abs/2510.20270">"ImpossibleBench: Measuring LLMs' Propensity of Exploiting Test Cases"</a>, arXiv:2510.20270 [cs.LG], October 2025.</li>
       <li id="ref-rhb">islo-labs, <a href="https://github.com/islo-labs/reward-hack-bench">reward-hack-bench</a> (RewardHackBench), GitHub repository, as cited in RewardGuard's <code>docs/background-related-work.md</code>. No paper found.</li>
       <li id="ref-skalse">J. Skalse, N. H. R. Howe, D. Krasheninnikov, D. Krueger, <a href="https://arxiv.org/abs/2209.13085">"Defining and Characterizing Reward Hacking"</a>, arXiv:2209.13085, 2022 (NeurIPS 2022).</li>
-      <li id="ref-everitt">T. Everitt, M. Hutter, R. Kumar, V. Krakovna, <a href="https://arxiv.org/abs/1908.04734">"Reward Tampering Problems and Solutions in Reinforcement Learning: A Causal Influence Diagram Perspective"</a>, arXiv:1908.04734, 2019 (v5 2021).</li>
+      <li id="ref-everitt">T. Everitt, M. Hutter, R. Kumar, V. Krakovna, <a href="https://arxiv.org/abs/1908.04734">"Reward Tampering Problems and Solutions in Reinforcement Learning: A Causal Influence Diagram Perspective"</a>, arXiv:1908.04734, 2019; published in <em>Synthese</em> 198, 2021 (<a href="https://doi.org/10.1007/s11229-021-03141-4">DOI</a>).</li>
       <li id="ref-denison">C. Denison, M. MacDiarmid, F. Barez, D. Duvenaud, S. Kravec, S. Marks, N. Schiefer, R. Soklaski, A. Tamkin, J. Kaplan, B. Shlegeris, S. R. Bowman, E. Perez, E. Hubinger, <a href="https://arxiv.org/abs/2406.10162">"Sycophancy to Subterfuge: Investigating Reward-Tampering in Large Language Models"</a>, arXiv:2406.10162 [cs.AI], 2024.</li>
       <li id="ref-actplane">Y. Zheng, T. Wu, Q. Fu, T. Yu, W. Mao, T. Ma, D. Williams, W. Wang, A. Quinn, <a href="https://arxiv.org/abs/2606.25189">"ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses"</a>, arXiv:2606.25189 [cs.OS], June 2026. See <a href="24-actplane.html">chapter 24</a>.</li>
       <li id="ref-agentsight">Y. Zheng, Y. Hu, T. Yu, A. Quinn, <a href="https://arxiv.org/abs/2508.02736">"AgentSight: System-Level Observability for AI Agents Using eBPF"</a>, arXiv:2508.02736, 2025; ACM <a href="https://doi.org/10.1145/3766882.3767169">10.1145/3766882.3767169</a>. See <a href="23-agentsight.html">chapter 23</a>.</li>
-      <li id="ref-acrfence">Y. Zheng, Y. Yang, W. Zhang, A. Quinn, <a href="https://arxiv.org/abs/2603.20625">"ACRFence: Preventing Semantic Rollback Attacks in Agent Checkpoint-Restore"</a>, arXiv:2603.20625 [cs.CR], March 2026.</li>
+      <li id="ref-acrfence">Y. Zheng, Y. Yang, W. Zhang, A. Quinn, <a href="https://arxiv.org/abs/2603.20625">"ACRFence: Preventing Semantic Rollback Attacks in Agent Checkpoint-Restore"</a>, arXiv:2603.20625 [cs.CR], March 2026 (arXiv journal reference: CoDAIM workshop 2026).</li>
       <li id="ref-exact">Y. Zheng, X. Song, Y. Hu, L. Cheng, Y. Huang, W. Zhang, <a href="https://arxiv.org/abs/2608.22928">"When Can Agents Safely Checkpoint, Fork, Restore, and Merge? Exact Checking for Execution Edits"</a>, arXiv:2608.22928 [cs.PL], August 2026.</li>
       <li><a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>, Linux kernel documentation (the hook type ActPlane's <code>block</code> uses).</li>
       <li><a href="https://criu.org/Main_Page">CRIU</a> and <a href="https://firecracker-microvm.github.io/">Firecracker</a> project sites, for the checkpoint/restore mechanisms discussed.</li>

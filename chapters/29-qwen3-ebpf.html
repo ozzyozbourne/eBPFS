@@ -91,7 +91,9 @@
 
     <h3>The shape of Qwen3-0.6B</h3>
     <p>These are the constants hard-coded in <code>src/infer.c</code> and
-    <code>include/qwen3_tile.h</code>. They match the model's published configuration:</p>
+    <code>include/qwen3_tile.h</code>. They match the model's Hugging Face <code>config.json</code>. Two rows
+    differ from the technical report's summary, which lists a 32K context length and a tokenizer
+    vocabulary of 151,669 tokens; the embedding matrix is padded to 151,936 rows:</p>
     <table>
       <thead><tr><th>Quantity</th><th>Value</th><th>Where it shows up in the repo</th></tr></thead>
       <tbody>
@@ -100,8 +102,8 @@
         <tr><td>Query heads / key-value heads</td><td>16 / 8</td><td><code>QWEN3_Q_HEADS</code>, <code>QWEN3_KV_HEADS</code></td></tr>
         <tr><td>Head dimension</td><td>128 (so Q is 2,048 wide)</td><td><code>QWEN3_TILE_WIDTH</code>, <code>QWEN3_ATTENTION_WIDTH</code></td></tr>
         <tr><td>MLP intermediate width</td><td>3,072</td><td><code>QWEN3_INTERMEDIATE</code></td></tr>
-        <tr><td>Vocabulary</td><td>151,936 tokens</td><td><code>QWEN3_VOCAB</code></td></tr>
-        <tr><td>Position limit</td><td>40,960</td><td><code>QWEN3_CONTEXT_LIMIT</code></td></tr>
+        <tr><td>Vocabulary (embedding rows)</td><td>151,936 (<code>vocab_size</code>; the tokenizer itself has 151,669)</td><td><code>QWEN3_VOCAB</code></td></tr>
+        <tr><td>Position limit</td><td>40,960 (<code>max_position_embeddings</code>; the report says 32K)</td><td><code>QWEN3_CONTEXT_LIMIT</code></td></tr>
         <tr><td>RoPE base θ</td><td>1,000,000</td><td><code>pow(1000000.0, -i/64)</code> in <code>kernel_rope</code></td></tr>
         <tr><td>Output head</td><td>tied to the embedding matrix</td><td>logits use <code>model.embed_tokens.weight</code></td></tr>
         <tr><td>Weight file</td><td>BF16 safetensors, 1,503,300,328 bytes</td><td><code>docs/experiments.md</code></td></tr>
@@ -1233,7 +1235,7 @@ int qwen3_arena_allocate_model(void *ctx)
             <tr><td>Tile driver, file read with <code>lseek</code>/<code>read</code></td><td>143,667 (+ 496,730 lseek, 291,467 read)</td><td>2.912 s</td></tr>
             <tr><td>Weight file memory-mapped</td><td>143,667</td><td>2.695 s</td></tr>
             <tr><td>4 → 16 rows per matrix call</td><td>50,667</td><td>1.605 s</td></tr>
-            <tr><td>One call per RMSNorm</td><td>43,171</td><td>within noise</td></tr>
+            <tr><td>One call per RMSNorm</td><td>43,171</td><td>1.20 → 1.28 s (no gain)</td></tr>
             <tr><td>128 rows per call</td><td>16,043</td><td>no stable gain</td></tr>
             <tr><td>Fused argmax</td><td>12,482</td><td>no stable gain</td></tr>
             <tr><td>Whole-vector add/multiply, RoPE, SiLU per call</td><td>9,205 → 7,217 → 5,229</td><td>no stable gain</td></tr>
@@ -1275,7 +1277,8 @@ int qwen3_arena_allocate_model(void *ctx)
 
     <h2 id="build-and-run">Build and run</h2>
     <h3>The documented commands</h3>
-    <p>From <code>README.md</code> and <code>docs/usage.md</code> (Ubuntu 24.04 packages):</p>
+    <p>From <code>README.md</code> and <code>docs/usage.md</code> (Ubuntu 24.04 packages). The commands
+    are collected from several sections of <code>docs/usage.md</code>, and the comment is added here:</p>
 <pre data-file="docs/usage.md"><code class="language-bash">sudo apt-get install build-essential clang libbpf-dev libelf-dev zlib1g-dev \
   libjson-c-dev libonig-dev
 make
@@ -1484,6 +1487,10 @@ processed 52325 insns (limit 1000000) max_states_per_insn 4 total_states 447 pea
       High-Performance Adaptive Neural Networks for Kernel Datapath</a>. ACM SIGCOMM 2022.</li>
       <li>H. Fingler et al. <a href="https://doi.org/10.1145/3575693.3575697">Towards a Machine
       Learning-Assisted Kernel with LAKE</a>. ASPLOS 2023.</li>
+      <li>I. U. Akgun et al. <a href="https://arxiv.org/abs/2111.11554">KML: Using Machine Learning to
+      Improve Storage Systems</a>. arXiv:2111.11554, 2021.</li>
+      <li>M. Bachl, J. Fabini, T. Zseby. <a href="https://arxiv.org/abs/2102.09980">A flow-based IDS
+      using Machine Learning in eBPF</a>. arXiv:2102.09980, 2021.</li>
       <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/verifier.html">eBPF
       verifier</a>.</li>
       <li>Linux v6.1 <a href="https://github.com/torvalds/linux/blob/v6.1/kernel/bpf/verifier.c"><code>kernel/bpf/verifier.c</code></a>,
@@ -1491,8 +1498,8 @@ processed 52325 insns (limit 1000000) max_states_per_insn 4 total_states 447 pea
       <li>J. Corbet, <a href="https://lwn.net/Articles/877062/">A different approach to BPF loops</a>
       (<code>bpf_loop</code>), LWN, 2021.</li>
       <li>A. Starovoitov, <a href="https://lwn.net/Articles/961128/">bpf: Introduce BPF arena</a>
-      (patch series), and <a href="https://lwn.net/Articles/961941/">A proposal for shared memory in
-      BPF programs</a>, LWN, 2024.</li>
+      (patch series, LWN, 2024), and D. Alden, <a href="https://lwn.net/Articles/961941/">A proposal for
+      shared memory in BPF programs</a>, LWN, 2024-02-21.</li>
       <li><a href="https://docs.ebpf.io/linux/kfuncs/bpf_wq_start/">KFunc <code>bpf_wq_start</code></a>,
       eBPF Docs (since v6.10).</li>
     </ol>

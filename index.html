@@ -11,7 +11,7 @@
 <p class="lede">A chapter-wise guide: what the Berkeley Packet Filter and its extended form are, how they work
 inside the Linux kernel, and what every actively maintained <a href="https://github.com/eunomia-bpf">eunomia-bpf</a>
 project does, with diagrams, real code, papers and quizzes.</p>
-<div class="meta"><span>30 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
+<div class="meta"><span>32 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
 <h2>Part I · Foundations</h2>
 <div class="grid">
 <a class="card" href="chapters/01-what-is-bpf.html"><h4>01 · What is BPF? From packet filter to in-kernel VM</h4><p>How a 1993 packet filter became Linux&#x27;s safe in-kernel execution engine: classic BPF, seccomp-bpf, the 2014 eBPF rewrite, and a first hello world.</p></a>
@@ -51,6 +51,7 @@ project does, with diagrams, real code, papers and quizzes.</p>
 </div>
 <h2>Part VI · eBPF for AI agents</h2>
 <div class="grid">
+<a class="card" href="chapters/23-agentsight.html"><h4>23 · AgentSight: system-level observability for AI agents</h4><p>How AgentSight uses uprobes on TLS libraries and kernel tracepoints to watch an AI coding agent from outside, capturing what it asks the model and what it then does on the machine, and how a Rust pipeline of runners and analyzers joins the two streams into one timeline.</p></a>
 <a class="card" href="chapters/24-actplane.html"><h4>24 · ActPlane: information-flow enforcement for AI agents</h4><p>How ActPlane compiles a small information-flow policy language into an eBPF/BPF-LSM engine that tracks labels across an agent&#x27;s processes, files and sockets, and blocks, kills or explains rule violations.</p></a>
 <a class="card" href="chapters/25-agentcgroup.html"><h4>25 · AgentCgroup: understanding and controlling the OS resources of AI agents</h4><p>What a measurement study of 144 SWE-rebench tasks says about the CPU and memory behaviour of AI coding agents, and how AgentCgroup puts each tool call in its own cgroup and enforces priority with sched_ext and the proposed memcg_bpf_ops struct_ops.</p></a>
 <a class="card" href="chapters/26-reward-guard-and-safe-change.html"><h4>26 · RewardGuard and safe change after external operations</h4><p>How RewardGuard turns reward hacking in agent benchmarks into a runtime integrity contract enforced with AgentSight and ActPlane, and how agent-check-restore-safety keeps an external operation such as a payment from running twice or moving to a new destination when software is changed or restored.</p></a>
@@ -65,5 +66,6 @@ project does, with diagrams, real code, papers and quizzes.</p>
 <h2>Appendix</h2>
 <div class="grid">
 <a class="card" href="chapters/31-org-meta.html"><h4>31 · The org behind the code: eunomia.dev, agent skills and research notes</h4><p>How eunomia.dev is built and synced, what the org&#x27;s agent-skills and research-skills encode, what the megakernel causal-profiling feasibility notes conclude, and a map of every active eunomia-bpf repo to its chapter.</p></a>
+<a class="card" href="chapters/32-glossary-and-reading-list.html"><h4>32 · Glossary, reading list and learning paths</h4><p>A searchable glossary of 148 terms linked to the chapters that explain them, every research paper the curriculum cites grouped by theme, and three suggested routes through the 32 chapters.</p></a>
 </div>
 </main></div></body></html>

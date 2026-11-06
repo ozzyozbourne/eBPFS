@@ -131,7 +131,7 @@
       cannot help, "the OOM killer is invoked in the cgroup".</li>
     </ul>
     <p><code>memory.peak</code> is the high-water mark for the cgroup and its descendants
-    since it was created, which is exactly what you want for a cgroup that lives as long as
+    since it was created (or since the last reset), which is exactly what you want for a cgroup that lives as long as
     one command. <code>memory.events</code> counts how often each boundary was hit (for
     example <code>high</code>, <code>max</code>, <code>oom_kill</code>).
     <code>memory.oom.group</code> makes the OOM killer treat the cgroup as one unit.
@@ -190,7 +190,7 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0</code></pre>
         <text class="mo25" x="54" y="138">session_high/</text>
         <text class="mu25" x="54" y="158">cpu.weight = 150 · subtree_control: +memory +cpu</text>
         <text class="mu25" x="54" y="176">memcg: high_mcg_ops (below_low, below_min)</text>
-        <text class="mu25" x="54" y="194">agent framework (Node.js), ~185 MB baseline</text>
+        <text class="mu25" x="54" y="194">no processes of its own (no-internal-process rule)</text>
         <rect class="l25" x="530" y="115" width="330" height="92" rx="6"/>
         <text class="mo25" x="544" y="138">session_low/</text>
         <text class="mu25" x="544" y="158">cpu.weight = 50</text>
@@ -214,7 +214,9 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=0</code></pre>
       </svg>
       <figcaption>Figure 25.1 — The cgroup tree that <code>agentcgroupd.py</code> and
       <code>bash_wrapper.sh</code> build. Values are the defaults in the code at
-      <code>551ca168</code>.</figcaption>
+      <code>551ca168</code>. Because <code>session_high</code> enables controllers for its
+      children, cgroup v2 lets processes live only in its <code>tool_*</code> leaves. The code
+      does not say where the agent framework itself should run.</figcaption>
     </figure>
 
     <h2>The characterization study</h2>
@@ -509,14 +511,20 @@ exit $EXIT_CODE</code></pre>
     <div class="callout warn"><span class="label">Read the clean-up carefully</span><p>The
     clean-up moves the wrapper's PID back into <code>session_high</code>. But the daemon has
     enabled <code>+memory +cpu</code> in <code>session_high/cgroup.subtree_control</code>, and
-    the no-internal-process rule forbids processes in such a non-root cgroup. By our reading,
-    that write should fail, so the <code>rmdir</code> runs while the wrapper is still inside
-    <code>tool_…/</code> and also fails, leaving an empty directory behind when the wrapper
-    exits. The repo's 14 wrapper tests run against simulated directories
+    the no-internal-process rule forbids processes in such a non-root cgroup. The kernel
+    enforces this on migration: <code>cgroup_migrate_vet_dst()</code> in
+    <code>kernel/cgroup/cgroup.c</code> returns <code>-EBUSY</code> when the destination has
+    a domain controller such as <code>memory</code> in its <code>subtree_control</code>. So the
+    write fails (silently, because of <code>2&gt;/dev/null</code>). The <code>rmdir</code> then
+    runs while the wrapper is still inside <code>tool_…/</code>, and the kernel refuses to
+    remove a populated cgroup, so it fails too. An empty directory is left behind when the
+    wrapper exits. The repo's 14 wrapper tests run against simulated directories
     (<code>bash_wrapper_local.sh</code> uses a tmpdir and <code>/proc</code>), so they would
-    not show this. We did not run the wrapper on a real cgroup v2 system, so treat this as
-    unverified. If you deploy it, check for leftover <code>tool_*</code> directories, which
-    the daemon's own scanner (<code>_manage_tool_cgroups</code>) would also see.</p></div>
+    not show this. We confirmed the rule in the kernel source but did not run the wrapper on a
+    real cgroup v2 system. If you deploy it, check for leftover <code>tool_*</code>
+    directories, which the daemon's own scanner (<code>_manage_tool_cgroups</code>) would
+    also see. The same rule means that no process can ever sit directly in
+    <code>session_high</code> once the daemon has set it up.</p></div>
 
     <p>The daemon's process monitor is not involved in placing processes. The comment in
     <code>handle_event</code> says it plainly: "With bash wrapper, tool-call processes
@@ -820,21 +828,30 @@ struct memcg_bpf_ops low_mcg_ops = {
     <p>Two details are worth noticing when reading this program. The page-fault item number
     is hard-coded (<code>ctx-&gt;item != 23</code>, "PGFAULT = 23 in the kernel enum"), so it
     depends on the exact <code>vm_event_item</code> layout of the patched kernel. And the
-    filter matches only <code>session_high</code>'s own id. As far as we can tell from
-    reading the code, faults charged to a <code>tool_*</code> child carry the child's id, so
-    whether tool-call faults trigger protection when the wrapper is in use depends on how
-    the tracepoint reports them. We did not test this. In the paper's evaluation the replayed
-    workloads ran directly in the HIGH and LOW cgroups.</p>
+    filter matches only <code>session_high</code>'s own id. The upstream tracepoint
+    (<code>include/trace/events/memcg.h</code>) records
+    <code>cgroup_id(memcg-&gt;css.cgroup)</code>, and a page fault is counted against the
+    faulting task's own memcg (<code>count_memcg_event_mm()</code> uses
+    <code>mem_cgroup_from_task()</code>). Faults in a <code>tool_*</code> child therefore
+    carry the child's id. As shown in the wrapper section, no process can live directly in
+    <code>session_high</code> after the daemon sets it up. Taken together, this means that in
+    the daemon-plus-wrapper configuration the filter can never match, so the protection window
+    never opens. This is our reading of the source. We did not run it. In the paper's
+    evaluation the replayed workloads ran directly in the HIGH and LOW cgroups, without the
+    wrapper, so the evaluation does not exercise this path.</p>
 
     <h2>CPU: scx_flatcg under sched_ext</h2>
     <p>The CPU side reuses <code>scx_flatcg</code>, the "flattened cgroup hierarchy
     scheduler" that ships with the kernel in <code>tools/sched_ext/</code>
-    (<a href="#ref-flatcg-up">upstream source</a>). A diff against torvalds/master shows the
-    copy in <code>agentcg/scheduler/</code> is the same algorithm. The differences are
-    compatibility changes (for example <code>__COMPAT_scx_bpf_task_cgroup()</code> and a
-    one-argument <code>scx_bpf_dsq_move_to_local()</code>), a <code>-d</code> option to dump
-    cgroups, and using online rather than possible CPUs for <code>nr_cpus</code>. Its header
-    comment explains the idea:</p>
+    (<a href="#ref-flatcg-up">upstream source</a>). The copy in
+    <code>agentcg/scheduler/</code> is the same algorithm, taken from an older version of the
+    upstream file. A diff against torvalds/master (checked 2026-11-06) shows that it still uses
+    <code>__COMPAT_scx_bpf_task_cgroup()</code> and the older one-argument
+    <code>scx_bpf_dsq_move_to_local()</code>, and that it lacks upstream fixes made in 2026,
+    among them "expire cached hweights on weight changes" (<code>94c20e1fb334</code>) and a
+    <code>cvtime_delta</code> race fix (<code>a5cc43414b38</code>). The loader adds a
+    <code>-d</code> option to dump cgroups and uses online rather than possible CPUs for
+    <code>nr_cpus</code>. Its header comment explains the idea:</p>
     <pre data-file="agentcg/scheduler/scx_flatcg.bpf.c"><code class="language-c">/*
  * A demo sched_ext flattened cgroup hierarchy scheduler. It implements
  * hierarchical weight-based cgroup CPU control by flattening the cgroup
@@ -936,7 +953,8 @@ SCX_OPS_DEFINE(flatcg_ops,
       <div class="step"><h4>5. Reclaim protects the agent</h4><p>When memory runs short,
       reclaim walks the cgroups. For <code>session_high</code> and its children,
       <code>below_low</code> returns true during the protection window, so reclaim takes
-      memory from elsewhere first.</p></div>
+      memory from elsewhere first. (This is the design intent. As explained in the memcg
+      section, with the wrapper in use the window may never open.)</p></div>
       <div class="step"><h4>6. The command ends</h4><p>The wrapper reads
       <code>memory.peak</code> and <code>memory.current</code>. If the exit code is 137, it
       prints the <code>[Resource] …</code> lines to stderr. It appends one JSON line to
@@ -1150,9 +1168,10 @@ sudo ./run_overhead_experiment.sh</code></pre>
       for its own call, a lying agent mostly hurts itself, but the scheme does not protect
       against a hostile one.</li>
       <li><strong>Fragile details</strong> found by reading: the hard-coded
-      <code>PGFAULT = 23</code>, the HIGH-only id filter versus faults in tool children, and
-      the move-back-then-<code>rmdir</code> sequence under the no-internal-process rule (all
-      unverified on a live kernel).</li>
+      <code>PGFAULT = 23</code>; the HIGH-only id filter, which by our reading never matches
+      once processes can live only in tool children; and the move-back-then-<code>rmdir</code>
+      sequence, which the kernel's no-internal-process check rejects. The last two were checked
+      against kernel source but not run on a live kernel.</li>
       <li><strong>Study scope.</strong> One agent framework (Claude Code), one benchmark,
       1-second container-level sampling, and a parser bug under review (PR #11). The paper
       says so itself: "the characterization covers one agent framework and one
