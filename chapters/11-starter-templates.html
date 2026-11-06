@@ -118,7 +118,7 @@ $ gh repo create my-execsnoop --template eunomia-bpf/libbpf-starter-template --p
       (<code>7553497</code> "fix compile and docker name"); later commits are a Dependabot bump and a CI action pin.</p>
 
     <h2>libbpf-starter-template (C)</h2>
-    <h3>Directory map</h3>
+    <h3>Directory map (C template)</h3>
     <pre><code class="language-plaintext">libbpf-starter-template/                     (commit 6e572b6, 2026-09-16)
 ├── Makefile                 build → make -C src; clean; install (apt-get the toolchain)
 ├── src/
@@ -830,7 +830,7 @@ jobs:
       logic. Cargo and a build script do everything. The example is not <code>bootstrap</code> but
       <code>runqslower</code>, originally from the libbpf-rs repository (the crate's author field is still Daniel Xu, one of
       the libbpf-rs authors), which reports tasks that waited on a CPU run queue for longer than a threshold.</p>
-    <h3>Directory map</h3>
+    <h3>Directory map (Rust template)</h3>
     <pre><code class="language-plaintext">libbpf-rs-starter-template/                  (commit 8927eea, 2026-09-16)
 ├── Cargo.toml          package "runqslower"; libbpf-rs 0.20, libbpf-cargo 0.20 (build-dep), clap 3.1, time, plain, anyhow
 ├── Cargo.lock          pins libbpf-rs 0.20.1, libbpf-cargo 0.20.1, libbpf-sys 1.4.3+v1.4.5

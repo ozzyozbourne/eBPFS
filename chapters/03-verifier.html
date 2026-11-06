@@ -993,7 +993,7 @@ regs=1 stack=0 before 9: (85) call bpf_get_prandom_u32#7</code></pre>
       <tr><td>Program size, unprivileged</td><td>4,096 insns</td><td><code>BPF_MAXINSNS</code></td><td><code>-E2BIG</code></td></tr>
       <tr><td>Pending branches on the stack</td><td>8,192</td><td><code>BPF_COMPLEXITY_LIMIT_JMP_SEQ</code></td><td><code>The sequence of 8193 jumps is too complex.</code></td></tr>
       <tr><td>Stack per frame</td><td>512 bytes</td><td><code>MAX_BPF_STACK</code> (include/linux/filter.h; master adds <code>MAX_BPF_STACK_JIT</code> 2048 for JITs that support it)</td><td><code>combined stack size of N calls is M. Too large</code></td></tr>
-      <tr><td>Call frames</td><td>16 on master (8 in older kernels)</td><td><code>MAX_CALL_FRAMES</code></td><td>call stack too deep</td></tr>
+      <tr><td>Call frames</td><td>16 since v7.2 (8 in older kernels)</td><td><code>MAX_CALL_FRAMES</code></td><td>call stack too deep</td></tr>
     </table>
     <p>Note the difference between the first two rows. The 1M figure (raised to 1M in Linux 5.2 by commit <code>c04c0d2b968a</code>,
       which also lifted the privileged program-size limit from 4k instructions) limits <em>work</em>, not size. A 200-instruction
@@ -1039,6 +1039,235 @@ static inline bool bpf_bypass_spec_v1(const struct bpf_token *token)
       (<code>08389d888287</code>). With it, the sysctl <code>kernel.unprivileged_bpf_disabled</code>
       defaults to 2, which means "disabled, but an administrator may re-enable it". The value 1
       means "disabled until reboot". The orb used for this chapter reports 2.</p>
+
+    <h3>BPF tokens (Linux 6.9)</h3>
+    <p>The table above has a gap. <code>CAP_BPF</code> only counts in the <em>initial</em> user
+      namespace, so a container running as root inside its own user namespace has no BPF rights at all.
+      Giving the container real <code>CAP_BPF</code> would hand it every program type, including tracing
+      programs that can read any kernel memory. A <strong>BPF token</strong> closes the gap. Andrii Nakryiko
+      wrote it over many revisions in 2023 (LWN covered the first design in June 2023 and the bpffs-based
+      design in October 2023), and it first shipped in Linux 6.9. <code>kernel/bpf/token.c</code> exists at
+      the v6.9 tag and not at v6.8. The uapi comment for <code>BPF_TOKEN_CREATE</code> says the token is
+      "associated" with the user namespace that owns the bpffs instance it came from. Later capability checks
+      (<code>CAP_BPF</code>, <code>CAP_PERFMON</code>, <code>CAP_NET_ADMIN</code>, <code>CAP_SYS_ADMIN</code>)
+      are then made in that namespace. A token does not grant anything by itself. It lets the kernel run
+      <code>ns_capable()</code> instead of <code>capable()</code>, and only for the commands and types the
+      administrator delegated.</p>
+    <p>The administrator delegates through four bpffs mount options, parsed in
+      <code>kernel/bpf/inode.c</code>:</p>
+    <pre data-file="linux/kernel/bpf/inode.c"><code class="language-c">static const struct fs_parameter_spec bpf_fs_parameters[] = {
+	fsparam_u32	("uid",				OPT_UID),
+	fsparam_u32	("gid",				OPT_GID),
+	fsparam_u32oct	("mode",			OPT_MODE),
+	fsparam_string	("delegate_cmds",		OPT_DELEGATE_CMDS),
+	fsparam_string	("delegate_maps",		OPT_DELEGATE_MAPS),
+	fsparam_string	("delegate_progs",		OPT_DELEGATE_PROGS),
+	fsparam_string	("delegate_attachs",		OPT_DELEGATE_ATTACHS),
+	{}
+};
+/* ... */
+		str = param-&gt;string;
+		while ((p = strsep(&amp;str, ":"))) {
+			if (strcmp(p, "any") == 0) {
+				msk |= ~0ULL;
+			} else if (find_btf_enum_const(info.btf, enum_t, enum_pfx, p, &amp;val)) {
+				msk |= 1ULL &lt;&lt; val;
+			} else {
+				err = kstrtou64(p, 0, &amp;msk);
+				if (err)
+					return err;
+			}
+		}
+
+		/* Setting delegation mount options requires privileges */
+		if (msk &amp;&amp; !capable(CAP_SYS_ADMIN))
+			return -EPERM;</code></pre>
+    <p>Each option is a bit mask over one uapi enum. It is written as colon-separated names, the word
+      <code>any</code>, or a number. Names are matched without case and without the enum prefix, which is
+      <code>BPF_</code> for <code>delegate_cmds</code> and <code>delegate_attachs</code>,
+      <code>BPF_MAP_TYPE_</code> for <code>delegate_maps</code> and <code>BPF_PROG_TYPE_</code> for
+      <code>delegate_progs</code>. So <code>delegate_cmds=prog_load:map_create:btf_load</code> and
+      <code>delegate_progs=xdp:socket_filter</code> are valid. Setting a non-zero mask needs
+      <code>CAP_SYS_ADMIN</code> in the initial namespace. A container cannot delegate to itself.</p>
+    <p><code>bpf_token_create()</code> then adds the namespace rules:</p>
+    <pre data-file="linux/kernel/bpf/token.c"><code class="language-c">	if (path.dentry != sb-&gt;s_root)
+		return -EINVAL;
+	if (sb-&gt;s_op != &amp;bpf_super_ops)
+		return -EINVAL;
+/* ... */
+	userns = sb-&gt;s_user_ns;
+	/*
+	 * Enforce that creators of BPF tokens are in the same user
+	 * namespace as the BPF FS instance. This makes reasoning about
+	 * permissions a lot easier and we can always relax this later.
+	 */
+	if (current_user_ns() != userns)
+		return -EPERM;
+	if (!ns_capable(userns, CAP_BPF))
+		return -EPERM;
+
+	/* Creating BPF token in init_user_ns doesn't make much sense. */
+	if (current_user_ns() == &amp;init_user_ns)
+		return -EOPNOTSUPP;
+
+	mnt_opts = sb-&gt;s_fs_info;
+	if (mnt_opts-&gt;delegate_cmds == 0 &amp;&amp;
+	    mnt_opts-&gt;delegate_maps == 0 &amp;&amp;
+	    mnt_opts-&gt;delegate_progs == 0 &amp;&amp;
+	    mnt_opts-&gt;delegate_attachs == 0)
+		return -ENOENT; /* no BPF token delegation is set up */
+/* ... */
+	err = security_bpf_token_create(token, attr, &amp;path);</code></pre>
+    <p>The bpffs instance must therefore be <em>owned by the container's user namespace</em> and also
+      carry delegation options that only the host may set. A plain <code>mount -t bpf -o delegate_...</code>
+      on the host does not work. That superblock belongs to <code>init_user_ns</code>, so a token made
+      from it fails with <code>-EOPNOTSUPP</code>. The kernel selftest
+      (<code>tools/testing/selftests/bpf/prog_tests/token.c</code>) shows the intended handoff using the new
+      mount API:</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Container: new user and mount namespaces</h4>
+        <p>The child calls <code>unshare(CLONE_NEWUSER)</code>, maps its uid and gid to 0 through
+        <code>/proc/self/uid_map</code> and <code>gid_map</code>, then calls
+        <code>unshare(CLONE_NEWNS)</code>. Then it calls <code>fsopen("bpf", 0)</code>. bpffs is
+        <code>FS_USERNS_MOUNT</code>, so this fs context belongs to the container's namespace. The test
+        checks that setting <code>delegate_*</code> from here fails with <code>-EPERM</code>.</p></div>
+      <div class="step"><h4>2. Hand the fs context to the host</h4>
+        <p>The child sends the fs-context fd to the privileged parent over a Unix socket
+        (<code>SCM_RIGHTS</code>).</p></div>
+      <div class="step"><h4>3. Host: set the delegation and create the superblock</h4>
+        <p>The parent calls <code>fsconfig(fs_fd, FSCONFIG_SET_STRING, "delegate_cmds", ...)</code> and
+        the same for maps, programs and attach types, then <code>fsconfig(..., FSCONFIG_CMD_CREATE, ...)</code>.
+        Creating a bpffs owned by a non-initial namespace also needs host <code>CAP_SYS_ADMIN</code>
+        (<code>bpf_fill_super()</code>).</p></div>
+      <div class="step"><h4>4. Container: mount and derive a token</h4>
+        <p>The child calls <code>fsmount()</code>, opens the mount root, and calls
+        <code>bpf(BPF_TOKEN_CREATE)</code> with that fd (<code>bpf_token_create(bpffs_fd, NULL)</code> in
+        libbpf). Trying to add delegation later through <code>fspick()</code> fails with
+        <code>-EPERM</code>.</p></div>
+      <div class="step"><h4>5. Use the token</h4>
+        <p>The token fd goes in <code>prog_token_fd</code>, <code>map_token_fd</code> or
+        <code>btf_token_fd</code>, with <code>BPF_F_TOKEN_FD</code> set in the command's flags. Every check
+        then goes through <code>bpf_token_capable()</code>, which you can see in the
+        <code>bpf_check()</code> excerpt above. Commands, map types and program/attach types outside the
+        masks are refused.</p></div>
+    </div>
+    <p>Applications built on libbpf usually need no token code. When an object is prepared for
+      loading (<code>bpf_object_prepare_token()</code>, called from <code>bpf_object_prepare()</code>),
+      libbpf tries to create a token from <code>/sys/fs/bpf</code> on its own and quietly skips the step when that mount has
+      no delegation (<code>-ENOENT</code>). The <code>bpf_token_path</code> open option, or the
+      <code>LIBBPF_BPF_TOKEN_PATH</code> environment variable, names a different bpffs and makes the token
+      mandatory. An empty string turns the automatic attempt off. LSMs see tokens through
+      <code>security_bpf_token_create</code>, <code>security_bpf_token_cmd</code> and
+      <code>security_bpf_token_capable</code>, so a policy can narrow a delegation further. The selftest
+      attaches such a BPF LSM before it enters the namespace. For a hands-on lesson, see the
+      <code>features/bpf_token</code> example in <a href="09-bpf-developer-tutorial.html">Chapter 09</a>.</p>
+
+    <h3>Signed BPF programs (Linux 6.18)</h3>
+    <p>Kernel modules have been signable for a long time. BPF programs had nothing comparable: any
+      sufficiently privileged process could load any program that passed the verifier. The obstacle was
+      relocation. The bytes the kernel finally verifies are not the bytes the developer built. libbpf patches
+      map fds into <code>ld_imm64</code> instructions, rewrites CO-RE field offsets for the running kernel
+      (<a href="06-btf-core-libbpf.html">Chapter 06</a>), and resolves kfunc and ksym ids. A signature over
+      the <code>.o</code> file therefore cannot match what reaches <code>BPF_PROG_LOAD</code>. Two competing
+      designs were posted in 2025 (LWN, "Possible paths for signing BPF programs"). KP Singh's series
+      "Signed BPF programs" was merged for 6.18. The LWN merge-window summary adds that "security
+      policies that can take advantage of this are still in progress".</p>
+    <p><strong>The design: sign the loader, chain the hash.</strong> The cover letter calls it a
+      <em>trusted hash chain</em>. The program is not signed directly. libbpf's <code>gen_loader</code> (the
+      "light skeleton", <code>bpftool gen skeleton -L</code>) produces a small
+      <code>BPF_PROG_TYPE_SYSCALL</code> <em>loader</em> program. Its body makes the <code>bpf()</code> calls
+      that create maps, apply relocations and load the real programs. Everything it installs (programs,
+      relocation records, initial map values) sits in one array map, the <em>metadata map</em>
+      (<code>__loader.map</code>). In 6.18:</p>
+    <ol>
+      <li>At build time bpftool computes <code>H_meta = SHA256(metadata)</code>. It embeds that hash as
+        immediates in the first loader instructions (load map word, compare with immediate, bail on
+        mismatch), then signs the loader instructions. The signature therefore covers
+        <code>I_loader || H_meta</code>.</li>
+      <li>At load time user space creates the metadata map as an <strong>exclusive map</strong>. A new
+        <code>BPF_MAP_CREATE</code> field, <code>excl_prog_hash</code>, carries the SHA-256 of the one
+        program allowed to use the map. To make this possible, the program tag
+        (<code>bpf_prog_calc_tag()</code>) moved from SHA-1 to SHA-256. User space then fills the map and
+        <strong>freezes</strong> it.</li>
+      <li><code>BPF_PROG_LOAD</code> of the loader passes the signature. The kernel checks a PKCS#7
+        signature over the loader instructions against the selected keyring. The verifier refuses to bind
+        the exclusive map to any program whose digest does not match.</li>
+      <li>The now-trusted loader runs and compares the frozen map with its embedded hash before doing
+        anything else.</li>
+    </ol>
+    <p>The uapi change is three fields at the end of the <code>BPF_PROG_LOAD</code> part of
+      <code>union bpf_attr</code>:</p>
+    <pre data-file="linux/include/uapi/linux/bpf.h"><code class="language-c">		/* Pointer to a buffer containing the signature of the BPF
+		 * program.
+		 */
+		__aligned_u64   signature;
+		/* Size of the signature buffer in bytes. */
+		__u32 		signature_size;
+		/* ID of the kernel keyring to be used for signature
+		 * verification.
+		 */
+		__s32		keyring_id;</code></pre>
+    <p><code>keyring_id</code> chooses a system keyring (builtin, secondary or platform) or the serial of
+      a user or session keyring. In v6.18 the check is <code>bpf_prog_verify_signature()</code> in
+      <code>kernel/bpf/syscall.c</code>. It runs on <code>prog-&gt;insnsi</code> before the
+      <code>security_bpf_prog_load</code> LSM hook, so an LSM can decide using the result. A signature does
+      not replace anything. A signed load still needs the usual capabilities and still goes through the
+      verifier.</p>
+    <p><strong>bpftool.</strong> 6.18 adds <code>-S</code>/<code>--sign</code> with
+      <code>-k &lt;private_key.pem&gt;</code> and <code>-i &lt;certificate.x509&gt;</code> to
+      <code>bpftool gen</code> and <code>bpftool prog</code>. In both, <code>--sign</code> implies
+      <code>--use-loader</code>. The signing code is <code>tools/bpf/bpftool/sign.c</code>, which builds a
+      detached OpenSSL CMS (PKCS#7) signature with SHA-256.</p>
+    <pre><code class="language-bash"># from the kernel docs (Documentation/bpf/signing.rst)
+bpftool gen skeleton -L -S -k &lt;private_key.pem&gt; -i &lt;certificate.x509&gt; \
+        obj.bpf.o &gt; obj.lskel.h</code></pre>
+    <p><strong>What changed after 6.18.</strong> The LSM and integrity developers kept objecting that in
+      the 6.18 scheme the kernel never checks the metadata itself; the BPF loader does. A 2026 series by the
+      same name, "Verify BPF signed loader at load time" (LWN, June–July 2026), moves that check into the
+      kernel without new uapi. When a signature is present, the verifier appends the frozen contents of each
+      exclusive map in <code>fd_array</code> to the instructions. It then verifies the signature over
+      <code>insns || metadata_0 || ...</code>. Afterwards it refuses to bind any map the signature does not
+      cover. At the commit this chapter studied (<code>d68ce4e71248</code>) the code reads:</p>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">		if (!READ_ONCE(map-&gt;frozen)) {
+			verbose(env, "signed program metadata map '%s' must be frozen\n",
+				map-&gt;name);
+			err = -EPERM;
+			goto out;
+		}
+/* ... */
+		if (!map-&gt;excl_prog_sha) {
+			verbose(env, "signed program metadata map '%s' must be exclusive\n",
+				map-&gt;name);
+			err = -EPERM;
+			goto out;
+		}
+/* ... */
+	err = bpf_verify_pkcs7_signature((struct bpf_dynptr *)&amp;data_ptr,
+					 (struct bpf_dynptr *)&amp;sig_ptr, key);
+	if (err) {
+		verbose(env, "signature verification failed: %d\n", err);
+	} else {
+		verbose(env, "signature verification passed\n");
+		prog-&gt;aux-&gt;sig.keyring_serial = bpf_key_serial(key);
+		prog-&gt;aux-&gt;sig.keyring_type = bpf_classify_keyring(attr-&gt;keyring_id);
+		prog-&gt;aux-&gt;sig.verdict = BPF_SIG_VERIFIED;
+	}</code></pre>
+    <p>The result is recorded in <code>prog-&gt;aux-&gt;sig</code>. The verdict is
+      <code>BPF_SIG_UNSIGNED</code> or <code>BPF_SIG_VERIFIED</code>, with nothing in between, and it comes
+      with the keyring type and serial. A BPF LSM program on <code>lsm/bpf_prog_load</code> can read these
+      fields and, for example, deny every unsigned load. <code>Documentation/bpf/signing.rst</code> has
+      complete examples. Version notes: the <code>enum bpf_sig_verdict</code> first appears in
+      <code>include/linux/bpf.h</code> at v7.2. The metadata-folding checks above are in
+      <code>verifier.c</code> at v7.3. A dedicated, sealed <code>.bpf</code> keyring
+      (<code>KEY_SPEC_BPF_KEYRING</code>, <code>kernel/bpf/keys.c</code>, boot parameter
+      <code>bpf.keyring_unsealed</code>) exists on master but not at the v7.3 tag. The docs note that no
+      in-tree policy LSM (IPE, for example) enforces signatures yet.</p>
+    <div class="callout warn"><span class="label">What a signature does not give you</span>
+      <p>A signature proves where the bytes came from and that nobody changed them. It does not prove the
+      program is safe. That is still the verifier's job. Protection also ends once loading succeeds: a
+      signed program can be detached or unloaded like any other. At LSFMM+BPF 2026, Christian Brauner
+      described the work systemd needs to keep its BPF LSM programs and their maps from being tampered with
+      after load (LWN, "Securing BPF LSMs against tampering").</p></div>
 
     <h2>Spectre mitigations</h2>
     <p>The verifier proves that an access is in bounds on every <em>architectural</em> path. A CPU
@@ -1097,6 +1326,38 @@ static inline bool bpf_bypass_spec_v1(const struct bpf_token *token)
       unsigned type or by checking <code>&gt;= 0</code>. Privileged loaders with
       <code>CAP_PERFMON</code>, and systems booted with <code>mitigations=off</code>, skip all of
       this (<code>bypass_spec_v1/v4</code>).</p>
+
+    <h3>eBPF itself as an attack surface</h3>
+    <p>This chapter has already covered most of the defences: loading without privilege is off by
+      default (<code>kernel.unprivileged_bpf_disabled</code>, <a href="#privileged-and-unprivileged-loading">above</a>),
+      Spectre sanitation applies to anyone without <code>CAP_PERFMON</code>, and
+      <a href="#verifier-bugs-in-the-wild">"Verifier bugs in the wild"</a> below shows the main threat
+      they guard against. Those bugs are mistakes in bounds tracking that let a verified program read or
+      write kernel memory. A few more mechanisms complete the picture:</p>
+    <ul>
+      <li><strong>The <code>bpf()</code> LSM hooks.</strong> <code>include/linux/lsm_hook_defs.h</code>
+        defines eight checking hooks for BPF. <code>bpf</code> runs on every syscall command,
+        <code>bpf_map</code> and <code>bpf_prog</code> run when an fd is handed out,
+        <code>bpf_map_create</code> and <code>bpf_prog_load</code> run at creation, and the three
+        <code>bpf_token_*</code> hooks cover tokens. SELinux and BPF LSM programs use these hooks to
+        control who may load what. They are also where a signature policy would be enforced.</li>
+      <li><strong>Lockdown.</strong> <code>enum lockdown_reason</code> in
+        <code>include/linux/security.h</code> lists <code>LOCKDOWN_BPF_WRITE_USER</code> before
+        <code>LOCKDOWN_INTEGRITY_MAX</code>, and <code>LOCKDOWN_BPF_READ_KERNEL</code> before
+        <code>LOCKDOWN_CONFIDENTIALITY_MAX</code>. Integrity lockdown therefore removes
+        <code>bpf_probe_write_user</code>. Confidentiality lockdown also removes
+        <code>bpf_probe_read_kernel</code> and its <code>_str</code> and legacy variants. In both cases the
+        helper's <code>func_proto</code> returns <code>NULL</code> (<code>kernel/bpf/helpers.c</code>,
+        <code>kernel/trace/bpf_trace.c</code>), so the verifier rejects any program that calls it.</li>
+      <li><strong>BPF in the attacker's hands.</strong> A privileged attacker gets the same powers as a
+        legitimate tracer. That means reading kernel and user memory, changing user memory with
+        <code>bpf_probe_write_user</code> (which needs <code>CAP_SYS_ADMIN</code>; see
+        <a href="05-program-types-and-hooks.html">Chapter 05</a>), and interfering with other BPF programs.
+        LWN's 2026 summit report points out that a program can often be steered by changing the data it
+        keeps in its maps, and that an attached program goes away when its last reference is closed. The
+        tools for fencing BPF itself are the hooks above, tokens, signatures and exclusive maps. No single
+        one of them makes a loaded program tamper-proof.</li>
+    </ul>
 
     <h2>Reading common verifier errors</h2>
     <p>Every rejection comes with the log of the path that failed. The last line is the error; the
@@ -1437,6 +1698,9 @@ sudo sysctl kernel.unprivileged_bpf_disabled=1</code></pre>
       <li>Kernel commits (GitHub): <a href="https://github.com/torvalds/linux/commit/17a5267067f3">17a5267067f3</a> verifier core (2014); <a href="https://github.com/torvalds/linux/commit/f1174f77b50c">f1174f77b50c</a> and <a href="https://github.com/torvalds/linux/commit/b03c9f9fdc37">b03c9f9fdc37</a> value tracking (4.14); <a href="https://github.com/torvalds/linux/commit/3f50f132d840">3f50f132d840</a> ALU32 bounds; <a href="https://github.com/torvalds/linux/commit/c04c0d2b968a">c04c0d2b968a</a> 1M limit (5.2); <a href="https://github.com/torvalds/linux/commit/2589726d12a1">2589726d12a1</a> bounded loops (5.3); <a href="https://github.com/torvalds/linux/commit/b5dc0163d8fd">b5dc0163d8fd</a> precision tracking (5.3); <a href="https://github.com/torvalds/linux/commit/e6f2dd0f8067">e6f2dd0f8067</a> bpf_loop (5.17); <a href="https://github.com/torvalds/linux/commit/06accc8779c1">06accc8779c1</a> open-coded iterators (6.4); <a href="https://github.com/torvalds/linux/commit/011832b97b31">011832b97b31</a> may_goto (6.9); <a href="https://github.com/torvalds/linux/commit/05924717ac70">05924717ac70</a> tnum_mul (5.14); <a href="https://github.com/torvalds/linux/commit/256f0071f9b6">256f0071f9b6</a> circular numbers (7.2); <a href="https://github.com/torvalds/linux/commit/6ccf49f79327">6ccf49f79327</a> SCEV widening (7.4-rc1); <a href="https://github.com/torvalds/linux/commit/b2157399cc98">b2157399cc98</a>, <a href="https://github.com/torvalds/linux/commit/979d63d50c0c">979d63d50c0c</a>, <a href="https://github.com/torvalds/linux/commit/af86ca4e3088">af86ca4e3088</a> Spectre mitigations; <a href="https://github.com/torvalds/linux/commit/08389d888287">08389d888287</a> unprivileged-off Kconfig (5.13).</li>
       <li>NVD entries: <a href="https://nvd.nist.gov/vuln/detail/CVE-2017-16995">CVE-2017-16995</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2020-8835">CVE-2020-8835</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-3490">CVE-2021-3490</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-31440">CVE-2021-31440</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2022-23222">CVE-2022-23222</a>; Manfred Paul, <a href="https://www.zerodayinitiative.com/blog/2020/4/8/cve-2020-8835-linux-kernel-privilege-escalation-via-improper-ebpf-program-verification">CVE-2020-8835: Linux kernel privilege escalation via improper eBPF program verification</a> (ZDI blog, 2020).</li>
       <li>Tools: <a href="https://github.com/libbpf/veristat">veristat</a>; <a href="https://github.com/libbpf/bpftool">bpftool</a>; <a href="https://github.com/microsoft/ebpf-for-windows">eBPF for Windows</a> (uses PREVAIL).</li>
+      <li>BPF tokens, source: <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/token.c">kernel/bpf/token.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/inode.c">kernel/bpf/inode.c</a> (delegation mount options), <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/include/uapi/linux/bpf.h">include/uapi/linux/bpf.h</a> (<code>BPF_TOKEN_CREATE</code>), <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/testing/selftests/bpf/prog_tests/token.c">selftests prog_tests/token.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/lib/bpf/libbpf.h">tools/lib/bpf/libbpf.h</a> (<code>bpf_token_path</code>); first release <a href="https://github.com/torvalds/linux/blob/v6.9/kernel/bpf/token.c">v6.9</a>. LWN: J. Corbet, <a href="https://lwn.net/Articles/935195/">Delegating privilege with BPF tokens</a> (June 2023); J. Corbet, <a href="https://lwn.net/Articles/947173/">Finer-grained BPF tokens</a> (October 2023); A. Nakryiko, <a href="https://lwn.net/Articles/959350/">[PATCH v2 bpf-next 00/30] BPF token</a> (2024).</li>
+      <li>Signed programs: KP Singh, <a href="https://lwn.net/Articles/1038961/">[PATCH v5 00/12] Signed BPF programs</a> (LWN, September 2025); <a href="https://lwn.net/Articles/1031854/">Possible paths for signing BPF programs</a> (LWN, 2025); <a href="https://lwn.net/Articles/1040203/">6.18 merge window, part 1</a> (LWN, 2025); <a href="https://lwn.net/Articles/1081000/">[PATCH bpf-next v3 0/6] Verify BPF signed loader at load time</a> (LWN, July 2026); kernel docs <a href="https://docs.kernel.org/bpf/signing.html">BPF signing</a> (Documentation/bpf/signing.rst); source <a href="https://github.com/torvalds/linux/blob/v6.18/kernel/bpf/syscall.c">kernel/bpf/syscall.c at v6.18</a> (<code>bpf_prog_verify_signature()</code>), <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/keys.c">kernel/bpf/keys.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/bpf/bpftool/sign.c">tools/bpf/bpftool/sign.c</a>, <a href="https://github.com/torvalds/linux/blob/v6.18/tools/bpf/bpftool/Documentation/bpftool-gen.rst">bpftool-gen.rst</a> and <a href="https://github.com/torvalds/linux/blob/v6.18/tools/bpf/bpftool/Documentation/bpftool-prog.rst">bpftool-prog.rst</a> at v6.18.</li>
+      <li>Attack surface: <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/include/linux/lsm_hook_defs.h">include/linux/lsm_hook_defs.h</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/include/linux/security.h">include/linux/security.h</a> (<code>enum lockdown_reason</code>), <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/trace/bpf_trace.c">kernel/trace/bpf_trace.c</a>; D. Alden, <a href="https://lwn.net/Articles/1082111/">Securing BPF LSMs against tampering</a> (LWN, July 2026); kernel docs <a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>.</li>
     </ol>
 
     <div class="chapter-nav">

@@ -30,7 +30,7 @@ Local sparse clone: /home/user/workspace/src/agentsight
 - collector/src/main.rs CLI: top, monitor, record, report (summary, token, audit, prompts, export, list), debug (ssl, process, stdio, trace, system). collector/src/server: hyper web server, /api/events.
 - Builder: `SslRunner::new().with_args(&args).add_analyzer(Box::new(HTTPParser::new())).run().await`; AgentRunner orchestrates via RunnerOrchestrator.
 - Timestamps: ns since boot (bpf_ktime_get_ns); Event::datetime() uses boot time from /proc/stat.
-- --comm NOT passed to sslsniff when --binary-path set: bpf_get_current_comm returns thread name; Claude's SSL on "HTTP Client" thread. Logic in build_trace_agent() collector/src/cmd_trace.rs.
+- --comm NOT passed to sslsniff when --binary-path set: bpf_get_current_comm returns thread name; Claude's SSL on "HTTP Client" thread. Logic in build_ssl_args() collector/src/cmd_trace.rs.
 - Auto-discovery: resolve_binary_path(comm), adopted only if binary_embeds_ssl() (contains "SSL_write" string).
 - docker://name, k8s://ns/pod/container: resolve_container_binary_path() in binary_resolver.rs; docker inspect State.Pid; walk /proc/<pid>/task/*/children.
 - Port 7395 default, --server-port.

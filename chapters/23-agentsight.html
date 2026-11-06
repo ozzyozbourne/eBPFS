@@ -460,24 +460,26 @@ struct probe_SSL_data_t {
     linked. Codex is written in Rust and uses rustls. Attaching to
     <code>libssl.so</code> catches none of them.</p>
 
-    <p>For these, sslsniff takes <code>--binary-path</code> and tries, in order:</p>
+    <p>For these, sslsniff takes <code>--binary-path</code> and tries symbols first, then
+    one of two offset-based fallbacks:</p>
     <ol>
       <li><strong>Symbols.</strong> If the ELF has <code>OPENSSL_is_boringssl</code> it
       calls <code>attach_boringssl()</code>, else <code>attach_openssl()</code>, both by
       symbol name. Node.js exports its OpenSSL symbols, so this works there.</li>
-      <li><strong>rustls signatures.</strong> If the binary carries Codex or Grok TLS
-      markers, it searches for rustls functions (<code>codex_find_rustls_offsets()</code>
-      and friends) and attaches the <code>probe_rustls_*</code> programs by file offset.
-      These programs read Rust ABI structures such as
-      <code>OutboundChunks</code>, so they depend on the compiled layout.</li>
-      <li><strong>BoringSSL byte patterns.</strong> For a stripped binary,
+      <li><strong>rustls signatures.</strong> If the symbols are missing and the binary
+      carries Codex or Grok TLS markers, it searches for rustls functions
+      (<code>codex_find_rustls_offsets()</code> and friends) and attaches the
+      <code>probe_rustls_*</code> programs by file offset. These programs read Rust ABI
+      structures such as <code>OutboundChunks</code>, so they depend on the compiled
+      layout.</li>
+      <li><strong>BoringSSL byte patterns.</strong> Otherwise, for a stripped binary,
       <code>find_boringssl_offsets()</code> reads the whole file and looks for the function
       prologues of <code>SSL_read</code>, <code>SSL_write</code> and
       <code>SSL_do_handshake</code>. The comment says the patterns "are derived from Bun
       v1.3.x profile builds". The offsets are then passed to
       <code>bpf_program__attach_uprobe_opts()</code> with no <code>func_name</code>.</li>
     </ol>
-    <p>If all three fail, the loader refuses to start rather than report "no traffic":
+    <p>If symbols and the chosen fallback both fail, the loader refuses to start rather than report "no traffic":
     "binary-path attach failed for %s; refusing to continue with partial SSL capture".</p>
 
     <div class="callout warn"><span class="label">Thread names</span><p>A trap that cost
@@ -485,8 +487,9 @@ struct probe_SSL_data_t {
     <code>bpf_get_current_comm()</code> returns the <em>thread</em> name, not the process
     name. Claude Code does its TLS on a thread called "HTTP Client", so filtering sslsniff
     with <code>-c claude</code> drops every event. When <code>--binary-path</code> is set,
-    <code>build_trace_agent()</code> in <code>collector/src/cmd_trace.rs</code> therefore
-    passes the command filter only to the process tracer, not to sslsniff. The uprobe is
+    <code>build_ssl_args()</code> in <code>collector/src/cmd_trace.rs</code> therefore
+    passes the command filter only to the process tracer, not to sslsniff
+    (<code>CLAUDE.md</code> still names the older <code>build_trace_agent()</code>). The uprobe is
     already scoped to one ELF file.</p></div>
 
     <p>The top-level <code>record</code> command hides all of this. With
@@ -513,7 +516,7 @@ struct probe_SSL_data_t {
         <tr><td>File opens</td><td><code>fexit/security_file_open</code> (resolved path), fallback <code>tp/syscalls/sys_enter_openat</code>, <code>sys_enter_open</code></td><td><code>process.bpf.c</code></td></tr>
         <tr><td>File mutations</td><td><code>sys_enter_unlinkat</code>, <code>unlink</code>, <code>renameat2</code>, <code>renameat</code>, <code>rename</code>, <code>mkdirat</code>, <code>mkdir</code>, <code>ftruncate</code>, <code>chdir</code></td><td><code>process_ext/bpf_fs.h</code></td></tr>
         <tr><td>Writes</td><td><code>sys_enter/exit_write</code>, <code>pwrite64</code>, <code>writev</code></td><td><code>process_ext/bpf_write.h</code></td></tr>
-        <tr><td>Network</td><td><code>sys_enter_connect</code>, <code>sys_enter_bind</code>, <code>sys_enter_listen</code>, <code>kprobe/inet_listen</code>, <code>fexit/inet_bind_sk</code>, <code>fexit/inet6_bind_sk</code>, <code>fexit/inet_csk_accept</code></td><td><code>process_ext/bpf_net.h</code></td></tr>
+        <tr><td>Network</td><td><code>sys_enter_connect</code>, <code>sys_enter_bind</code>, <code>sys_enter_listen</code>, <code>kprobe/inet_listen</code> and <code>kretprobe/inet_listen</code>, <code>fexit/inet_bind_sk</code>, <code>fexit/inet6_bind_sk</code> (and the older <code>fexit/inet_bind</code>, <code>fexit/inet6_bind</code>), <code>fexit/inet_csk_accept</code></td><td><code>process_ext/bpf_net.h</code></td></tr>
         <tr><td>Sessions and signals</td><td><code>sys_enter_setpgid</code>, <code>sys_enter_setsid</code>, <code>sys_enter_kill</code></td><td><code>process_ext/bpf_signals.h</code></td></tr>
         <tr><td>Memory</td><td><code>sys_enter_mmap</code> (shared mappings), <code>kprobe/do_wp_page</code> (copy-on-write faults)</td><td><code>process_ext/bpf_mem.h</code>, <code>bpf_cow.h</code></td></tr>
       </tbody>
@@ -1074,12 +1077,15 @@ impl Analyzer for TimestampNormalizer {
     "Session-to-process mapping is core, but it is not <code>Session == PID</code>. It is a
     match between an agent session and a process tree, with evidence and confidence." An
     agent session (as described by the agent's own transcript file, for example under
-    <code>~/.claude/projects/</code>) is matched to a live process tree by evidence types
-    such as <code>proc_fd</code> (the transcript path is open in
-    <code>/proc/&lt;pid&gt;/fd</code>), <code>ebpf_file</code> (eBPF saw the process touch
-    the transcript), <code>llm_traffic</code>, <code>command_match</code> and
-    <code>sticky</code> (a previous high-confidence binding still holds). The matcher's
-    entry point takes exactly those inputs:</p>
+    <code>~/.claude/projects/</code>) is matched to a live process tree by evidence. The
+    design note lists five evidence types: <code>proc_fd</code> (the transcript path is
+    open in <code>/proc/&lt;pid&gt;/fd</code>), <code>ebpf_file</code> (eBPF saw the
+    process touch the transcript), <code>llm_traffic</code>, <code>command_match</code>
+    and <code>sticky</code> (a previous high-confidence binding still holds). The Rust
+    code at this commit defines constants only for <code>proc_fd</code>,
+    <code>ebpf_file</code> and <code>sticky</code> (<code>ext/session/src/lib.rs</code>),
+    and the matcher's entry point takes the inputs for the first two, the open fd paths
+    and the eBPF-observed paths per process:</p>
     <pre data-file="ext/analysis/src/view/session_process_match.rs"><code class="language-rust">impl SessionProcessMatcher {
     pub fn match_sessions(
         &amp;mut self,
@@ -1239,6 +1245,19 @@ impl Analyzer for TimestampNormalizer {
     <code>execs</code>, <code>fail</code>, <code>files</code>, <code>net</code> or
     <code>agent</code>), and <code>agentsight report</code> prints summaries, token usage,
     audit trails or full prompts from a saved database.</p>
+    <p>The public product site is a separate repository,
+    <a href="https://github.com/eunomia-bpf/agentsight-website">eunomia-bpf/agentsight-website</a>.
+    Its README describes it as "the public product, use-case, comparison, guide,
+    integration, release, and security site for AgentSight": a Next.js static export
+    served at <a href="https://agentsight.us/">agentsight.us</a>, while "the interactive
+    application remains at <a href="https://app.agentsight.us/">app.agentsight.us</a>"
+    (the hosted app that <code>agentsight bind</code> opens). It contains no capture code.
+    You develop it with <code>npm ci</code> and <code>npm run dev</code>, and
+    <code>npm run verify</code> checks its 23-page content catalog, the TypeScript, the
+    static build and its routes, titles, canonical URLs and sitemap. Its README says the
+    product commands and compatibility facts on the site "come from the AgentSight product
+    repository", so for anything in this chapter the main repository stays the
+    source.</p>
 
     <h2>One agent action, end to end</h2>
     <p>Here is a single step of a coding session followed through every layer: Claude Code
@@ -1661,7 +1680,8 @@ sudo ./bpf/stdiocap -p 12345</code></pre>
       <li>Homebrew formula:
       <a href="https://github.com/eunomia-bpf/homebrew-tap/blob/master/Formula/agentsight.rb">eunomia-bpf/homebrew-tap, Formula/agentsight.rb</a>.</li>
       <li>Project site: <a href="https://eunomia.dev/agentsight/">https://eunomia.dev/agentsight/</a>;
-      product site <a href="https://agentsight.us/">https://agentsight.us/</a>.</li>
+      product site <a href="https://agentsight.us/">https://agentsight.us/</a>, built from
+      <a href="https://github.com/eunomia-bpf/agentsight-website">eunomia-bpf/agentsight-website</a>.</li>
       <li>Linux kernel documentation, "Uprobe-tracer: Uprobe-based Event Tracing."
       <a href="https://docs.kernel.org/trace/uprobetracer.html">https://docs.kernel.org/trace/uprobetracer.html</a></li>
       <li>BCC <code>sslsniff</code> tool, the origin of AgentSight's TLS probe.

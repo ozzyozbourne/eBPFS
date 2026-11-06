@@ -1336,6 +1336,97 @@ int BPF_PROG(test_task_acquire_release_argument, struct task_struct *task, u64 c
         and annotated with flags.</figcaption>
     </figure>
 
+    <h2>BPF exceptions: bpf_throw and bpf_assert</h2>
+    <p>One kfunc changes control flow. <code>bpf_throw(u64 cookie)</code>, added by Kumar Kartikeya
+      Dwivedi in Linux 6.7, ends the program at once and unwinds every BPF frame on the stack. It is in
+      <code>kernel/bpf/helpers.c</code> at the v6.7 tag and not at v6.6. LWN explained why it exists:
+      the verifier must prove every path safe, so a program often carries checks for "impossible" cases.
+      Each one needs an error path that frees resources and returns through every caller. With
+      <code>bpf_throw</code> such a path is one call. A thrown exception cannot be caught. If the
+      program does nothing else, it returns the cookie. The kernel side is short. It walks the stack to the
+      outermost BPF frame and jumps into an exception callback that the verifier generated or the
+      program supplied:</p>
+    <pre data-file="linux/kernel/bpf/helpers.c"><code class="language-c">__bpf_kfunc void bpf_throw(u64 cookie)
+{
+	struct bpf_throw_ctx ctx = {};
+
+	arch_bpf_stack_walk(bpf_stack_walker, &amp;ctx);
+	WARN_ON_ONCE(!ctx.aux);
+	if (ctx.aux)
+		WARN_ON_ONCE(!ctx.aux-&gt;exception_boundary);
+/* ... */
+	ctx.aux-&gt;bpf_exception_cb(cookie, ctx.sp + ctx.aux-&gt;stack_arg_sp_adjust, ctx.bp, 0, 0);
+	WARN(1, "A call to BPF exception callback should never return\n");
+}</code></pre>
+    <p>The program-side declarations are in the selftests header
+      <code>tools/testing/selftests/bpf/bpf_experimental.h</code>, not in libbpf's
+      <code>bpf_helpers.h</code>. Copy them, or include that header. With the default callback the cookie
+      becomes the return value, so it must pass the same return-value checks as R0 at <code>exit</code>.
+      A program can name its own callback with the <code>__exception_cb()</code> declaration tag. The
+      callback then gets the cookie, and its return value is the one checked. The same header also
+      defines assertion macros on top of <code>bpf_throw</code>:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/bpf_experimental.h"><code class="language-c">#define __exception_cb(name) __attribute__((btf_decl_tag("exception_callback:" #name)))
+/* ... */
+#define bpf_assert(cond) if (!(cond)) bpf_throw(0);
+/* ... */
+#define bpf_assert_with(cond, value) if (!(cond)) bpf_throw(value);
+
+/* Description
+ *	Assert that LHS is in the range [BEG, END] (inclusive of both). This
+ *	statement updates the known bounds of LHS during verification. Note
+ *	that both BEG and END must be constant values, and must fit within the
+ *	data type of LHS.
+ * Returns
+ *	Void.
+ * Throws
+ *	An exception with the value zero when the assertion fails.
+ */
+#define bpf_assert_range(LHS, BEG, END)					\
+	({								\
+		_Static_assert(BEG &lt;= END, "BEG must be &lt;= END");	\
+		barrier_var(LHS);					\
+		__bpf_assert_op(LHS, &gt;=, BEG, 0, false);		\
+		__bpf_assert_op(LHS, &lt;=, END, 0, false);		\
+	})</code></pre>
+    <p><code>bpf_assert_range()</code> and <code>bpf_assert_range_with()</code> are the interesting
+      ones. They expand to inline assembly, a compare followed by <code>call bpf_throw</code>, so the
+      verifier sees a real branch. On the path that continues, it narrows the register's bounds just as
+      after an ordinary <code>if</code> (<a href="03-verifier.html">Chapter 03</a>). The kernel's own test
+      shows a custom callback:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/exceptions.c"><code class="language-c">__noinline int exception_cb_mod(u64 cookie)
+{
+	return exception_cb_mod_global(cookie) + cookie + 10;
+}
+
+SEC("tc")
+__exception_cb(exception_cb_mod)
+int exception_ext_mod_cb_runtime(struct __sk_buff *ctx)
+{
+	bpf_throw(25);
+	return 0;
+}</code></pre>
+    <p>The rules, as enforced in <code>kernel/bpf/verifier.c</code> at the commit studied:</p>
+    <ul>
+      <li><strong>No resources may be held at the throw.</strong> <code>check_resource_leak()</code> runs on
+        the exceptional exit with the prefix <code>"bpf_throw"</code>. A held reference fails with
+        <code>bpf_throw would lead to reference leak</code>. A held spin lock, RCU read lock, disabled
+        preemption or saved IRQ state fails with <code>bpf_throw cannot be used inside ...</code>. A
+        2024 series ("Exceptions - Resource Cleanup", LWN) proposed releasing such resources during the
+        unwind, but the current code still rejects them.</li>
+      <li><strong>Callbacks cannot throw.</strong> A <code>bpf_throw</code> reachable from a callback
+        subprogram, such as the body passed to <code>bpf_loop</code>, is rejected with <code>bpf_throw kfunc (insn N) cannot be called from callback
+        subprog M</code>.</li>
+      <li><strong>The JIT must support it.</strong> Otherwise the verifier reports <code>JIT does not
+        support calling kfunc bpf_throw#N</code>. On master, x86-64 supports exceptions only with
+        <code>CONFIG_UNWINDER_ORC</code>. arm64, s390 and powerpc also implement
+        <code>bpf_jit_supports_exceptions()</code>, and RISC-V does not. A LoongArch patch was posted in
+        June 2026.</li>
+    </ul>
+    <div class="callout tip"><span class="label">When to use it</span>
+      <p>Exceptions are for conditions that should never happen, or for facts (such as a bound) that the
+      verifier cannot otherwise be convinced of. They are not a general
+      error-handling mechanism. Ordinary failures should still return an error code.</p></div>
+
     <h2>BPF-to-BPF calls</h2>
     <p>Before 4.16 every function in a BPF program had to be <code>__always_inline</code>. BPF-to-BPF
       calls added a real <code>call</code> to another function inside the same program
@@ -1681,6 +1772,7 @@ int BPF_PROG2(test1, int, a)
       <li>Andrii Nakryiko, <a href="https://lwn.net/Articles/806328/">"Add code-generated BPF object skeleton support"</a>, LWN announcement, Dec 2019.</li>
       <li>Kumar Kartikeya Dwivedi, <a href="https://lwn.net/Articles/914833">"Allocated objects, BPF linked lists"</a>, LWN announcement, Nov 2022.</li>
       <li>Mykyta Yatsenko, <a href="https://lwn.net/Articles/1076648/">"bpf: Introduce resizable hash map"</a>, LWN announcement, Jun 2026.</li>
+      <li>BPF exceptions: Jonathan Corbet, <a href="https://lwn.net/Articles/938435/">"Exceptions in BPF"</a>, LWN, 21 Jul 2023; Kumar Kartikeya Dwivedi, <a href="https://lwn.net/Articles/944372/">"[PATCH bpf-next v3 00/17] Exceptions - 1/2"</a>, LWN announcement, Sep 2023; <a href="https://lwn.net/Articles/960488/">"Exceptions - Resource Cleanup"</a>, LWN announcement, 2024; <a href="https://lwn.net/Articles/1078487/">"LoongArch: BPF: arena instruction gating, private stack and exceptions"</a>, LWN announcement, Jun 2026. Source at <code>d68ce4e7</code>: <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/helpers.c">kernel/bpf/helpers.c</a> (<code>bpf_throw</code>), <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/verifier.c">kernel/bpf/verifier.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/testing/selftests/bpf/bpf_experimental.h">tools/testing/selftests/bpf/bpf_experimental.h</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/testing/selftests/bpf/progs/exceptions.c">progs/exceptions.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/arch/x86/net/bpf_jit_comp.c">arch/x86/net/bpf_jit_comp.c</a>; first release <a href="https://github.com/torvalds/linux/blob/v6.7/kernel/bpf/helpers.c">v6.7</a>.</li>
       <li>iovisor/bcc, <a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">"BPF Features by Linux Kernel Version"</a>.</li>
       <li><a href="https://docs.ebpf.io/linux/map-type/">eBPF Docs: map types</a> and <a href="https://docs.ebpf.io/linux/concepts/kfuncs">kfuncs</a>, Isovalent / community.</li>
     </ol>

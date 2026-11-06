@@ -1276,6 +1276,385 @@ bpf_link__destroy(link);      /* the pin keeps the attachment alive; rm the file
     <p>Pinning is how long-running systems such as Cilium (<a href="08-ecosystem.html">08</a>) keep data-plane programs and
       maps in place across agent restarts and upgrades.</p>
 
+    <h2>Debugging and measuring eBPF programs</h2>
+    <p>Once a program loads, two new questions come up: <em>what is it doing</em> and <em>what does it cost</em>. The
+      kernel and bpftool answer both without a debugger. This section walks through the tools in the order you usually
+      reach for them. Each command was run on this curriculum's orb unless it is marked otherwise. The orb runs Linux
+      6.1.189 with BTF, <code>bpftool v7.1.0</code> (Debian package, "using libbpf v1.1"), bpftrace v0.17.0, and
+      <strong>no BPF JIT</strong>: every program runs in the kernel's interpreter, so <code>bpftool prog show</code>
+      prints <code>not jited</code>. That last point limits some tools, as the outputs below show.</p>
+    <p>The examples use one small XDP program written for this section. It is illustrative, not from a repository. It
+      logs the packet length with <code>bpf_printk()</code> and passes the packet:</p>
+    <pre><code class="language-c">/* Illustrative (written for this section): hello.bpf.c */
+#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+SEC("xdp")
+int xdp_hello(struct xdp_md *ctx)
+{
+	long len = ctx-&gt;data_end - ctx-&gt;data;
+
+	bpf_printk("xdp_hello: %ld bytes", len);
+	return len &lt; 14 ? XDP_DROP : XDP_PASS;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+    <pre><code class="language-bash">$ clang -g -O2 -target bpf -I/usr/include/x86_64-linux-gnu -c hello.bpf.c -o hello.bpf.o
+$ sudo bpftool prog load hello.bpf.o /sys/fs/bpf/xdp_hello
+$ sudo bpftool prog show pinned /sys/fs/bpf/xdp_hello
+741: xdp  name xdp_hello  tag 15ce14bb99593c1d  gpl
+	loaded_at 2026-11-06T01:45:52+0000  uid 0
+	xlated 120B  not jited  memlock 4096B  map_ids 1011
+	btf_id 970</code></pre>
+    <p><code>bpftool prog load</code> loads every program in the object through libbpf and pins the first one, so the
+      program stays loaded after bpftool exits (see pinning above). Map 1011 is <code>hello.rodata</code>, the read-only
+      global-data map that holds the format string.</p>
+
+    <figure>
+      <svg viewBox="0 0 880 300" role="img" aria-label="Where debugging data comes from. A BPF program writes bpf_printk lines into the global ftrace buffer, read by bpftool prog tracelog or cat trace_pipe; on Linux 6.17 and later bpf_stream_printk writes to a per-program stream read by bpftool prog tracelog stdout or stderr. The verifier log is returned by BPF_PROG_LOAD to libbpf. bpftool prog dump reads the translated and JITed instructions. BPF_PROG_TEST_RUN runs the program on supplied input. kernel.bpf_stats_enabled adds run_time_ns and run_cnt to bpftool prog show. bpftool prog profile attaches fentry and fexit programs that read perf counters.">
+        <defs>
+          <marker id="arrD" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="arrE" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <text x="16" y="22" fill="var(--muted)" font-size="12" font-family="sans-serif">KERNEL</text>
+        <text x="610" y="22" fill="var(--muted)" font-size="12" font-family="sans-serif">USER SPACE (what you run)</text>
+        <rect x="16" y="110" width="170" height="70" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="101" y="140" text-anchor="middle" fill="var(--fg)" font-size="14" font-family="monospace">xdp_hello</text>
+        <text x="101" y="160" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">loaded BPF program</text>
+
+        <rect x="250" y="34" width="300" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="400" y="56" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">global ftrace buffer (shared by everyone)</text>
+        <rect x="250" y="78" width="300" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)" stroke-dasharray="5 3"/>
+        <text x="400" y="100" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">per-program stdout/stderr stream (6.17+)</text>
+        <rect x="250" y="122" width="300" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="400" y="144" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">verifier log (returned by BPF_PROG_LOAD)</text>
+        <rect x="250" y="166" width="300" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="400" y="188" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">xlated / JITed instructions</text>
+        <rect x="250" y="210" width="300" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="400" y="232" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">run_time_ns, run_cnt (bpf_stats_enabled)</text>
+        <rect x="250" y="254" width="300" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="400" y="276" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">perf counters via fentry/fexit (needs JIT)</text>
+
+        <path d="M186,130 L248,52" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrD)" fill="none"/>
+        <path d="M186,138 L248,95" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#arrD)" fill="none"/>
+        <path d="M186,160 L248,228" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrD)" fill="none"/>
+        <path d="M186,172 L248,270" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrD)" fill="none"/>
+
+        <text x="606" y="56" fill="var(--fg)" font-size="12" font-family="monospace">bpftool prog tracelog</text>
+        <text x="606" y="100" fill="var(--fg)" font-size="12" font-family="monospace">bpftool prog tracelog stdout ID</text>
+        <text x="606" y="144" fill="var(--fg)" font-size="12" font-family="monospace">bpftool -d / LIBBPF_LOG_LEVEL</text>
+        <text x="606" y="188" fill="var(--fg)" font-size="12" font-family="monospace">bpftool prog dump xlated|jited</text>
+        <text x="606" y="232" fill="var(--fg)" font-size="12" font-family="monospace">bpftool prog show</text>
+        <text x="606" y="276" fill="var(--fg)" font-size="12" font-family="monospace">bpftool prog profile</text>
+        <path d="M552,51 L600,51" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+        <path d="M552,95 L600,95" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+        <path d="M552,139 L600,139" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+        <path d="M552,183 L600,183" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+        <path d="M552,227 L600,227" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+        <path d="M552,271 L600,271" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+        <text x="101" y="230" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">BPF_PROG_TEST_RUN</text>
+        <text x="101" y="246" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">(bpftool prog run) feeds</text>
+        <text x="101" y="262" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">it input on demand</text>
+        <path d="M101,216 L101,182" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrE)" fill="none"/>
+      </svg>
+      <figcaption>Figure 06.3 — Where each kind of debugging data lives and which command reads it. The dashed path
+        (BPF streams) needs Linux 6.17 or later and was not available on the orb.</figcaption>
+    </figure>
+
+    <h3>Printing from a program: bpf_printk and the trace pipe</h3>
+    <p><code>bpf_printk()</code> is a macro in libbpf's <code>bpf_helpers.h</code>. With three or fewer arguments it
+      calls the <code>bpf_trace_printk()</code> helper; with more it switches to <code>bpf_trace_vprintk()</code>:</p>
+    <pre data-file="libbpf/src/bpf_helpers.h"><code class="language-c">/* Use __bpf_printk when bpf_printk call has 3 or fewer fmt args
+ * Otherwise use __bpf_vprintk
+ */
+#define ___bpf_pick_printk(...) \
+	___bpf_nth(_, ##__VA_ARGS__, __bpf_vprintk, __bpf_vprintk, __bpf_vprintk,	\
+		   __bpf_vprintk, __bpf_vprintk, __bpf_vprintk, __bpf_vprintk,		\
+		   __bpf_vprintk, __bpf_vprintk, __bpf_printk /*3*/, __bpf_printk /*2*/,\
+		   __bpf_printk /*1*/, __bpf_printk /*0*/)
+
+/* Helper macro to print out debug messages */
+#define bpf_printk(fmt, args...) ___bpf_pick_printk(args)(fmt, ##args)</code></pre>
+    <p>Both helpers write a line into the kernel's <em>global</em> ftrace buffer, the same one <code>trace_printk()</code>
+      uses. The helper documentation says it prints to <code>/sys/kernel/tracing/trace</code>, that "lines are discarded
+      while <code>/sys/kernel/tracing/trace</code> is open, use <code>/sys/kernel/tracing/trace_pipe</code> to avoid
+      this", and that the helper "is slow, and should only be used for debugging purposes". Only a small set of
+      conversion specifiers is accepted (<code>%d %i %u %x %ld %li %lu %lx %lld %lli %llu %llx %p %s</code>), with no
+      width or padding.</p>
+    <p>There are two equivalent ways to read it. <code>bpftool prog tracelog</code> (no arguments) "dumps the trace pipe
+      of the system". Its source (<code>src/tracelog.c</code>) looks for <code>/sys/kernel/tracing</code> first, then
+      <code>/sys/kernel/debug/tracing</code>, and mounts tracefs if neither is there (unless you pass
+      <code>-n</code>). So it is the same as <code>sudo cat /sys/kernel/tracing/trace_pipe</code>. Here it is on the
+      orb, with <code>bpftool prog run</code> (below) driving the program in another shell:</p>
+    <pre><code class="language-plaintext">$ sudo timeout 3 bpftool prog tracelog
+CPU:7 [LOST 15156 EVENTS]
+          &lt;idle&gt;-0       [007] d.h2.  3812.077713: bpf_trace_printk: kernel stack id = 15595
+          &lt;idle&gt;-0       [007] d.h2.  3812.077715: bpf_trace_printk: cl: no offsets, 0 not recognized as a go binary
+/* ... about 1,850 more lines from other programs ... */
+           &lt;...&gt;-133695  [003] ...11  7943.638736: bpf_trace_printk: xdp_hello: 64 bytes
+           &lt;...&gt;-133700  [004] ...11  7943.650722: bpf_trace_printk: xdp_hello: 64 bytes
+           &lt;...&gt;-133700  [004] ...11  7943.650752: bpf_trace_printk: xdp_hello: 64 bytes</code></pre>
+    <p>This output shows the three properties that make the trace pipe awkward on a shared machine:</p>
+    <ul>
+      <li><strong>It is global.</strong> The first lines come from a profiler some other user on the orb had loaded,
+        not from <code>xdp_hello</code>. Prefix your messages so you can <code>grep</code> for them.</li>
+      <li><strong>It is lossy.</strong> The ring buffer is per CPU and fixed in size, so old lines are overwritten
+        (<code>[LOST 15156 EVENTS]</code>). Out of 1,001 runs, 323 <code>xdp_hello</code> lines reached the reader.</li>
+      <li><strong>Reading consumes.</strong> <code>trace_pipe</code> is a consuming read: when two readers are open,
+        each line goes to only one of them. Reading <code>/sys/kernel/tracing/trace</code> instead gives a
+        non-consuming snapshot, but, per the helper documentation, new lines are discarded while that file is open.</li>
+    </ul>
+    <p>For anything beyond quick debugging, send data through a ring buffer or perf buffer map (<a
+      href="04-maps-helpers-kfuncs.html">04</a>), which is per-program and does not mix with other tools' output.</p>
+    <div class="callout key"><span class="label">Newer kernels: BPF streams</span>
+      <p>Linux 6.17 added per-program <em>standard streams</em>: a program writes with the
+        <code>bpf_stream_vprintk</code> kfunc (libbpf wraps it as <code>bpf_stream_printk()</code>), and the kernel
+        itself can write runtime errors to the program's stderr stream. Current bpftool reads a stream with
+        <code>bpftool prog tracelog { stdout | stderr } PROG</code>, plus <code>-w</code>/<code>--wait</code> to keep
+        following it, which the man page says needs Linux 7.4. Streams are per program, so they fix the "global" problem
+        above. <strong>Not run here:</strong> the orb's 6.1 kernel and bpftool 7.1 have neither.</p>
+    </div>
+
+    <h3>libbpf log levels and the verifier log</h3>
+    <p>libbpf reports through a print callback with three levels, <code>LIBBPF_WARN</code>, <code>LIBBPF_INFO</code>
+      and <code>LIBBPF_DEBUG</code>. A program can install its own with <code>libbpf_set_print()</code> (the
+      <code>bootstrap -v</code> flag does that). Without one, libbpf prints to stderr at <code>INFO</code> and above,
+      and the <code>libbpf.h</code> comment says "the verbosity of these messages can be controlled by setting the
+      environment variable <code>LIBBPF_LOG_LEVEL</code> to either warn, info, or debug". So
+      <code>LIBBPF_LOG_LEVEL=debug ./mytool</code> shows every step of open, relocation and load without a code change,
+      as long as the tool has not replaced the callback.</p>
+    <p>The verifier log is a separate stream: the kernel fills a buffer passed in <code>BPF_PROG_LOAD</code>. libbpf
+      loads without a log first and, on failure, retries with <code>log_level=1</code> and prints the log through the
+      callback. <code>bpf_object_open_opts.kernel_log_level</code> (or <code>bpf_program__set_log_level()</code>) asks
+      for the log even on success. bpftool's <code>-d</code>/<code>--debug</code> does both: it enables libbpf debug
+      output and sets <code>kernel_log_level = 1 + 2 + 4</code> (log, verbose, statistics) in <code>src/prog.c</code>.
+      Here is a real failure on the orb, for a program that reads <code>data[0]</code> without checking it against
+      <code>data_end</code>:</p>
+    <pre><code class="language-plaintext">$ sudo bpftool prog load bad.bpf.o /sys/fs/bpf/xdp_bad
+libbpf: prog 'xdp_bad': BPF program load failed: Permission denied
+libbpf: prog 'xdp_bad': -- BEGIN PROG LOAD LOG --
+0: R1=ctx(off=0,imm=0) R10=fp0
+; unsigned char *data = (void *)(long)ctx-&gt;data;
+0: (61) r1 = *(u32 *)(r1 +0)          ; R1_w=pkt(off=0,r=0,imm=0)
+; return data[0] == 0xff ? XDP_DROP : XDP_PASS;
+1: (71) r1 = *(u8 *)(r1 +0)
+invalid access to packet, off=0 size=1, R1(id=0,off=0,r=0)
+R1 offset is outside of the packet
+processed 2 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+-- END PROG LOAD LOG --
+libbpf: prog 'xdp_bad': failed to load: -13
+libbpf: failed to load object 'bad.bpf.o'
+Error: failed to load object file</code></pre>
+    <p>And the tail of <code>sudo bpftool -d prog load hello.bpf.o /sys/fs/bpf/xdp_hello2</code>, which loads
+      successfully but still prints libbpf's debug lines and the full verifier log:</p>
+    <pre><code class="language-plaintext">libbpf: sec '.relxdp': relo #0: insn #5 against '.rodata'
+libbpf: prog 'xdp_hello': found data map 0 (hello.rodata, sec 5, off 0) for insn 5
+libbpf: map 'hello.rodata': created successfully, fd=4
+libbpf: prog 'xdp_hello': -- BEGIN PROG LOAD LOG --
+/* ... */
+12: (2d) if r1 &gt; r6 goto pc+1         ; R1_w=14 R6_w=scalar(id=1,umin=14,umax=4294967295,var_off=(0x0; 0xffffffff))
+13: (b7) r0 = 2                       ; R0=2
+14: (95) exit
+from 12 to 14: safe
+verification time 194 usec
+stack depth 0
+processed 15 insns (limit 1000000) max_states_per_insn 0 total_states 1 peak_states 1 mark_read 1
+-- END PROG LOAD LOG --</code></pre>
+    <p>How to read these logs (register states, <code>processed N insns</code>, common errors) is the subject of <a
+      href="03-verifier.html#using-the-verifier-real-commands">chapter 03, "Using the verifier: real commands"</a>.</p>
+
+    <h3>What the kernel actually runs: dump xlated and jited</h3>
+    <p>The instructions in the <code>.bpf.o</code> are not what runs. The verifier rewrites context accesses, inlines
+      some helpers, patches map references and removes dead code. <code>bpftool prog dump xlated PROG</code> shows the
+      result, and the man page lists the options <code>file FILE</code>, <code>opcodes</code>, <code>linum</code> and
+      <code>visual</code> (a control-flow graph in DOT format). On the orb:</p>
+    <pre><code class="language-plaintext">$ sudo bpftool prog dump xlated pinned /sys/fs/bpf/xdp_hello
+int xdp_hello(struct xdp_md * ctx):
+; long len = ctx-&gt;data_end - ctx-&gt;data;
+   0: (79) r2 = *(u64 *)(r1 +0)
+; long len = ctx-&gt;data_end - ctx-&gt;data;
+   1: (79) r6 = *(u64 *)(r1 +8)
+; long len = ctx-&gt;data_end - ctx-&gt;data;
+   2: (1f) r6 -= r2
+   3: (67) r6 &lt;&lt;= 32
+   4: (77) r6 &gt;&gt;= 32
+; bpf_printk("xdp_hello: %ld bytes", len);
+   5: (18) r1 = map[id:1011][0]+0
+   7: (b7) r2 = 21
+   8: (bf) r3 = r6
+   9: (85) call bpf_trace_printk#-49440
+  10: (b7) r0 = 1
+  11: (b7) r1 = 14
+; return len &lt; 14 ? XDP_DROP : XDP_PASS;
+  12: (2d) if r1 &gt; r6 goto pc+1
+  13: (b7) r0 = 2
+  14: (95) exit</code></pre>
+    <p>Compare instructions 0–1 with the verifier log above. The program was compiled as 32-bit loads from
+      <code>struct xdp_md</code> (<code>(61) r2 = *(u32 *)(r1 +0)</code> and <code>+4</code>). After verification they
+      are 64-bit loads at offsets 0 and 8: the verifier rewrote them to read the kernel's real <code>struct
+      xdp_buff</code>, which <code>xdp_md</code> only stands for. Instruction 5 now names the <code>.rodata</code> map by
+      kernel id. Adding <code>linum</code> appends the source location to each line, for example
+      <code>[file:/tmp/ch06dbg/hello.bpf.c line_num:8 line_col:34]</code>; that comes from the BTF line info that
+      <code>-g</code> produced.</p>
+    <p><code>bpftool prog dump jited PROG</code> (options <code>file</code>, <code>opcodes</code>, <code>linum</code>)
+      disassembles the native code the JIT emitted. It needs a bpftool built with a disassembler, and a JIT. Neither was
+      available on the orb, so these are the two real failures:</p>
+    <pre><code class="language-plaintext">$ sudo bpftool prog dump jited pinned /sys/fs/bpf/xdp_hello                    # Debian bpftool 7.1
+Error: No libbfd support
+$ sudo ./bpftool prog dump jited pinned /sys/fs/bpf/xdp_hello                  # bpftool v7.5.0, "features: llvm, skeletons"
+no instructions returned</code></pre>
+    <p>On a JIT-enabled kernel the same command prints x86-64 (or arm64, …) assembly; the man page has an example.
+      <a href="02-ebpf-isa-and-vm.html">Chapter 02</a> covers what the JIT does.</p>
+
+    <h3>Running a program on demand: bpftool prog run and BPF_PROG_TEST_RUN</h3>
+    <p>Many program types can be executed without attaching them, using the <code>BPF_PROG_RUN</code> command. The kernel
+      documentation notes it "was previously named <code>BPF_PROG_TEST_RUN</code>, and both constants continue to be
+      defined in the UAPI header, aliased to the same value". You pass input data, an optional context and a repeat
+      count. The kernel runs the program on that input and returns its return value, the output data and the average
+      duration, without side effects: a packet the program drops is not really dropped. libbpf exposes it as
+      <code>bpf_prog_test_run_opts()</code>, cilium/ebpf as <code>Program.Run()</code> and <code>Program.Test()</code>,
+      and bpftool as <code>bpftool prog run PROG data_in FILE [data_out FILE [data_size_out L]] [ctx_in FILE [ctx_out FILE
+      [ctx_size_out M]]] [repeat N]</code>. The bpftool man page warns that "not all program types support test run" and
+      that bpftool does not check the type for you. The kernel page <a
+      href="https://docs.kernel.org/bpf/bpf_prog_run.html">"Running BPF programs from userspace"</a> lists the types that
+      do: socket filter, <code>sched_cls</code>/<code>sched_act</code> (tc), XDP, <code>sk_lookup</code>,
+      <code>cgroup_skb</code>, the LWT types, flow dissector, <code>struct_ops</code>, raw tracepoint,
+      <code>syscall</code>, tracing and netfilter. Kprobes and plain tracepoints are not on the list.</p>
+    <pre><code class="language-plaintext">$ head -c 64 /dev/zero &gt; pkt64
+$ sudo bpftool prog run pinned /sys/fs/bpf/xdp_hello data_in pkt64 repeat 1
+Return value: 2, duration: 36695ns
+$ sudo bpftool prog run pinned /sys/fs/bpf/xdp_hello data_in pkt64 data_out - repeat 1000
+0000000	0000 0000 0000 0000 0000 0000 0000 0000 | ........ ........
+0000010	0000 0000 0000 0000 0000 0000 0000 0000 | ........ ........
+0000020	0000 0000 0000 0000 0000 0000 0000 0000 | ........ ........
+0000030	0000 0000 0000 0000 0000 0000 0000 0000 | ........ ........
+Return value: 2, duration (average): 351ns
+$ head -c 8 /dev/zero &gt; pkt8
+$ sudo bpftool prog run pinned /sys/fs/bpf/xdp_hello data_in pkt8
+Error: failed to run program: Invalid argument</code></pre>
+    <p>Return value 2 is <code>XDP_PASS</code>. The first single run took 36.7 µs (cold caches, first
+      <code>bpf_printk</code>), the average over 1,000 runs 351 ns. The 8-byte input fails because the kernel's XDP test
+      runner rejects input shorter than an Ethernet header (<code>if (size &lt; ETH_HLEN) return -EINVAL;</code> in
+      <code>net/bpf/test_run.c</code>). So this program's <code>XDP_DROP</code> branch cannot be reached through
+      test runs at all, which is itself a useful thing to learn before production. Test runs are how BPF programs get
+      unit tests: the kernel's selftests use them heavily, and the library calls above let ordinary C or Go test code do
+      the same.</p>
+
+    <h3>Measuring cost: kernel.bpf_stats_enabled, run_time_ns and run_cnt</h3>
+    <p>Since Linux 5.1 the kernel can count, per program, how many times it ran and the total time spent. The kernel
+      documentation for <code>bpf_stats_enabled</code> says it is off by default because "enabling statistics causes a
+      slight reduction in performance on each program run". When it is on, <code>bpftool prog show</code> adds
+      <code>run_time_ns</code> and <code>run_cnt</code>:</p>
+    <pre><code class="language-plaintext">$ cat /proc/sys/kernel/bpf_stats_enabled
+0
+$ sudo sh -c 'echo 1 &gt; /proc/sys/kernel/bpf_stats_enabled'     # same as: sudo sysctl kernel.bpf_stats_enabled=1
+$ sudo bpftool prog run pinned /sys/fs/bpf/xdp_hello data_in pkt64 repeat 100000
+Return value: 2, duration (average): 295ns
+$ sudo bpftool prog show pinned /sys/fs/bpf/xdp_hello
+741: xdp  name xdp_hello  tag 15ce14bb99593c1d  gpl run_time_ns 26158571 run_cnt 100000
+	loaded_at 2026-11-06T01:45:52+0000  uid 0
+	xlated 120B  not jited  memlock 4096B  map_ids 1011
+	btf_id 970
+$ sudo bpftool prog show pinned /sys/fs/bpf/xdp_hello -j | jq '{run_time_ns,run_cnt,jited}'
+{
+  "run_time_ns": 26158571,
+  "run_cnt": 100000,
+  "jited": false
+}</code></pre>
+    <p>26,158,571 ns over 100,000 runs is about 262 ns per run, close to the 295 ns that the test runner reported (the
+      test runner's timer also covers its own loop). The earlier runs do not appear because the counters only advance
+      while the sysctl is on. Most of this time is the interpreter plus <code>bpf_printk</code>; remove the print and
+      enable the JIT and the number drops a lot (not measured here). Divide <code>run_time_ns</code> by
+      <code>run_cnt</code> for the average, and take two snapshots a few seconds apart to get a rate for an attached
+      program.</p>
+    <p>The sysctl is global, and the overhead applies to every program on the host while it is on, so turn it back off
+      (<code>echo 0</code>) when done. An alternative is the <code>BPF_ENABLE_STATS</code> command (Linux 5.8, libbpf
+      <code>bpf_enable_stats(BPF_STATS_RUN_TIME)</code>): it returns a file descriptor, and statistics (still global, for
+      all programs) stay enabled until that fd is closed, so a crashed tool cannot leave them on. Tetragon's documentation offers the same two choices: the sysctl, or
+      <code>tetra debug enable-stats</code>, which keeps statistics on only while the command runs; Tetragon then
+      exports the counters as per-program metrics. <a href="19-bpf-benchmark.html">Chapter 19</a> uses the same counters for
+      benchmarking.</p>
+
+    <h3>Hardware counters: bpftool prog profile</h3>
+    <p><code>bpftool prog profile PROG [duration DURATION] METRICs</code> reports hardware counters for one program. The
+      metrics in <code>src/prog.c</code> are <code>cycles</code>, <code>instructions</code>, <code>l1d_loads</code>,
+      <code>llc_misses</code>, <code>itlb_misses</code> and <code>dtlb_misses</code>. bpftool opens one perf event per
+      CPU per metric, then loads its own small BPF skeleton (<code>profiler.bpf.c</code>) that attaches
+      <code>fentry</code> and <code>fexit</code> programs to the target program and reads the counters before and after
+      each run. The man page example (not run here) looks like this:</p>
+    <pre><code class="language-plaintext"># bpftool prog profile id 337 duration 10 cycles instructions llc_misses
+
+         51397 run_cnt
+      40176203 cycles          # 781.68 cycles per run                (83.05%)
+      42518139 instructions    #   1.06 insns per cycle               (83.39%)
+           123 llc_misses      #   2.89 LLC misses per million insns  (83.15%)</code></pre>
+    <p>It has two requirements, and the orb met neither. The Debian bpftool was built without BPF skeleton support, and
+      fentry can only attach to JITed programs. Both real errors:</p>
+    <pre><code class="language-plaintext">$ sudo bpftool prog profile pinned /sys/fs/bpf/xdp_hello duration 3 cycles instructions     # bpftool 7.1
+Error: bpftool prog profile command is not supported. Please build bpftool with clang &gt;= 10.0.0
+$ sudo ./bpftool prog profile pinned /sys/fs/bpf/xdp_hello duration 3 cycles instructions   # bpftool 7.5
+libbpf: prog 'fentry_XXX': BPF program load failed: Invalid argument
+libbpf: prog 'fentry_XXX': -- BEGIN PROG LOAD LOG --
+Can attach to only JITed progs
+processed 0 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+-- END PROG LOAD LOG --
+libbpf: prog 'fentry_XXX': failed to load: -22
+libbpf: failed to load object 'profiler_bpf'
+libbpf: failed to load BPF skeleton 'profiler_bpf': -22
+Error: failed to load profile_obj</code></pre>
+    <p>The second error is a verifier message, so it is the kernel, not bpftool, saying no. On a normal distribution
+      kernel with the JIT on, the command works with a bpftool built from source. Hardware counters also need a PMU,
+      which many VMs do not expose.</p>
+
+    <h3>Comparing verifier cost: veristat</h3>
+    <p>Run time is one cost; verification is another. A change that doubles the number of instructions the verifier
+      processes can push a program over the 1-million-instruction limit on some kernel. <code>veristat</code> (in the
+      kernel's BPF selftests, mirrored at <a href="https://github.com/libbpf/veristat">libbpf/veristat</a>) loads every
+      program in an object and reports verdict, instructions processed and states, and can compare two builds. It was
+      not installed on the orb; <a href="03-verifier.html#using-the-verifier-real-commands">chapter 03</a> shows how to
+      use it.</p>
+
+    <h3>Quick checks with bpftrace</h3>
+    <p>When you only need to know whether an event happens, and how often, a bpftrace one-liner is faster than a
+      libbpf program. It also shows up in bpftool like any other loader, so the counters above apply to it. Real run on
+      the orb:</p>
+    <pre><code class="language-plaintext">$ sudo bpftrace -e 'tracepoint:sched:sched_process_exec { @execs[comm] = count(); } interval:s:3 { exit(); }'
+Attaching 2 probes...
+
+@execs[bpftool]: 1
+@execs[true]: 3
+@execs[sudo]: 3
+@execs[bash]: 4
+@execs[git]: 20
+/* ... other commands trimmed ... */
+
+$ sudo bpftool prog show          # in another shell while bpftrace was running (stats on)
+769: tracepoint  name sched_process_e  tag 6da3b410ac490c74  gpl run_time_ns 22182 run_cnt 7
+	loaded_at 2026-11-06T01:47:54+0000  uid 0
+	xlated 216B  not jited  memlock 4096B  map_ids 1026
+770: perf_event  name 3  tag 6f2dfdce5584cd93  gpl</code></pre>
+    <p>bpftrace also shows the limits of the kernel it runs on. On the orb,
+      <code>tracepoint:syscalls:sys_enter_openat</code> fails with <code>ERROR: tracepoint not found</code> (this kernel
+      has no syscall tracepoints), and <code>kprobe:do_sys_openat2</code> fails in bpftrace 0.17 because it tries to
+      create the probe through <code>/sys/kernel/debug/tracing/kprobe_events</code>, which is not available here.
+      The <code>sched:</code> tracepoints work. <a href="08-ecosystem.html#one-program-seven-frameworks">Chapter 08</a>
+      compares bpftrace with the other front-ends.</p>
+
+    <table>
+      <thead><tr><th>Question</th><th>Tool</th><th>Ran on the orb?</th></tr></thead>
+      <tbody>
+        <tr><td>What is my program printing?</td><td><code>bpftool prog tracelog</code> / <code>trace_pipe</code></td><td>yes</td></tr>
+        <tr><td>Why did it fail to load?</td><td><code>bpftool -d prog load</code>, <code>LIBBPF_LOG_LEVEL=debug</code></td><td>yes (bpftool -d)</td></tr>
+        <tr><td>What did the verifier turn it into?</td><td><code>bpftool prog dump xlated [linum|visual]</code></td><td>yes</td></tr>
+        <tr><td>What machine code runs?</td><td><code>bpftool prog dump jited</code></td><td>no (no JIT, no libbfd)</td></tr>
+        <tr><td>Does it return the right verdict for this input?</td><td><code>bpftool prog run</code> / <code>bpf_prog_test_run_opts()</code></td><td>yes</td></tr>
+        <tr><td>How often does it run, and how long?</td><td><code>kernel.bpf_stats_enabled</code> + <code>bpftool prog show</code></td><td>yes</td></tr>
+        <tr><td>Cycles, cache and TLB misses per run?</td><td><code>bpftool prog profile</code></td><td>no (needs JIT)</td></tr>
+        <tr><td>How hard is it to verify?</td><td><code>veristat</code> (<a href="03-verifier.html">03</a>)</td><td>no (not installed)</td></tr>
+        <tr><td>Does this event fire at all?</td><td>bpftrace one-liner</td><td>yes</td></tr>
+      </tbody>
+    </table>
+
     <h2>Benefits and limitations</h2>
     <div class="grid">
       <div class="card"><h4>Benefits</h4><p>One small binary per architecture, with no Clang, LLVM or kernel headers on the
@@ -1416,6 +1795,31 @@ bpf_link__destroy(link);      /* the pin keeps the attachment alive; rm the file
         <a href="https://github.com/torvalds/linux/commit/2f064a59a1">2f064a59a1 "sched: Change task_struct::state"</a>.</li>
       <li>Brendan Gregg, <a href="https://www.brendangregg.com/blog/2020-11-04/bpf-co-re-btf-libbpf.html">"BPF binaries:
         BTF, CO-RE, and the future of BPF perf tools"</a>, 4 Nov 2020.</li>
+      <li>bpftool man pages at commit <code>1f6bbb7</code>: <a
+        href="https://github.com/libbpf/bpftool/blob/main/docs/bpftool-prog.rst">bpftool-prog</a> (<code>tracelog</code>,
+        <code>run</code>, <code>profile</code>, <code>dump xlated</code>/<code>jited</code>, <code>-L</code>,
+        <code>-w</code>) and <a href="https://github.com/libbpf/bpftool/blob/main/docs/common_options.rst">common
+        options</a> (<code>-d</code>); sources <code>src/tracelog.c</code>, <code>src/prog.c</code>,
+        <code>src/skeleton/profiler.bpf.c</code>. Commands were run with the Debian <code>bpftool v7.1.0</code> and a
+        <code>bpftool v7.5.0</code> build on Linux 6.1.189.</li>
+      <li>libbpf <code>src/bpf_helper_defs.h</code> (<code>bpf_trace_printk</code> documentation),
+        <code>src/bpf_helpers.h</code> (<code>bpf_printk</code>), <code>src/libbpf.h</code> and
+        <code>src/libbpf.c</code> (<code>LIBBPF_LOG_LEVEL</code>, <code>kernel_log_level</code>), at the libbpf commit
+        above.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/bpf_prog_run.html">"Running BPF programs from
+        userspace"</a> (<code>BPF_PROG_RUN</code>), and <a
+        href="https://docs.kernel.org/admin-guide/sysctl/kernel.html#bpf-stats-enabled">"Documentation for
+        /proc/sys/kernel/: bpf_stats_enabled"</a>. Linux v6.1 <a
+        href="https://elixir.bootlin.com/linux/v6.1/source/net/bpf/test_run.c">net/bpf/test_run.c</a>
+        (<code>ETH_HLEN</code> check).</li>
+      <li>eBPF Docs, <a href="https://docs.ebpf.io/linux/syscall/BPF_ENABLE_STATS/">"Syscall command
+        BPF_ENABLE_STATS"</a> (v5.8) and <a href="https://docs.ebpf.io/linux/kfuncs/bpf_stream_vprintk_impl/">"KFunc
+        bpf_stream_vprintk_impl"</a> (v6.17). LWN, <a href="https://lwn.net/Articles/1032095/">"The rest of the 6.17
+        merge window"</a> (BPF standard output and error streams).</li>
+      <li>Tetragon documentation, <a href="https://tetragon.io/docs/troubleshooting/bpf-progs-stats/">"BPF programs
+        statistics"</a>.</li>
+      <li><a href="https://github.com/libbpf/veristat">libbpf/veristat</a>; <a
+        href="https://github.com/bpftrace/bpftrace">bpftrace</a> (v0.17.0 used on the orb).</li>
     </ol>
 
     <div class="chapter-nav">

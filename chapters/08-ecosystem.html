@@ -666,6 +666,152 @@ sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
     <h3>The kernel's own tooling: bpftool and selftests</h3>
     <p><a href="https://github.com/libbpf/bpftool">bpftool</a> lives in the kernel tree (<code>tools/bpf/bpftool</code>) and is mirrored on GitHub. It lists and dumps loaded programs and maps (<code>bpftool prog show</code>, <code>bpftool map dump</code>), generates <code>vmlinux.h</code> (<code>bpftool btf dump file /sys/kernel/btf/vmlinux format c</code>) and skeletons (<code>bpftool gen skeleton</code>), and probes kernel features. Chapter 06 used it throughout. The kernel's BPF selftests in <a href="https://github.com/torvalds/linux/tree/master/tools/testing/selftests/bpf"><code>tools/testing/selftests/bpf</code></a> are the most complete collection of eBPF examples anywhere. Almost every new feature lands with tests there (<code>test_progs</code>, the verifier tests in <code>progs/verifier_*.c</code>), and the <code>veristat</code> tool for comparing verifier statistics lives in the same directory. When documentation is missing, the selftests are the specification.</p>
 
+    <h3>eBPF in Kubernetes</h3>
+    <p>Most of the projects above run on Kubernetes, and they all solve the same three problems. The program must run on
+      <em>every node</em>, because each node has its own kernel. The loader needs <em>kernel privileges</em> inside a
+      container. And the kernel's view (PIDs, cgroup ids, network namespaces) has to be translated into Kubernetes
+      objects (pods, namespaces, labels).</p>
+    <p><strong>One agent per node: the DaemonSet.</strong> A DaemonSet runs one copy of a pod on each node that matches
+      its selector. The Cilium agent "runs on each node in the cluster" and "manages the eBPF programs which the Linux
+      kernel uses to control all network access in / out of those containers"; Tetragon, Falco and Inspektor Gadget
+      ship the same way. The pod usually uses the host network namespace (<code>hostNetwork: true</code> is the default
+      in the Tetragon chart), and sometimes the host PID namespace, so that its view of the node matches the kernel's.</p>
+    <p><strong>Privileges.</strong> Loading programs needs <code>CAP_BPF</code>, and tracing needs
+      <code>CAP_PERFMON</code>. Both exist since Linux 5.8, but older container runtimes cannot grant them, so charts
+      often fall back to <code>CAP_SYS_ADMIN</code>, which the kernel accepts in their place. The charts read for this
+      section show the range:</p>
+    <table>
+      <thead><tr><th>Project (source)</th><th>Privileged?</th><th>Capabilities added to the eBPF container</th></tr></thead>
+      <tbody>
+        <tr><td>Cilium agent (Helm <code>values.yaml</code>, main)</td><td>no (<code>privileged: false</code>, SELinux
+          type <code>spc_t</code>)</td><td><code>CHOWN</code>, <code>KILL</code>, <code>NET_ADMIN</code>,
+          <code>NET_RAW</code>, <code>IPC_LOCK</code>, <code>SYS_MODULE</code>, <code>SYS_ADMIN</code>,
+          <code>SYS_RESOURCE</code>, <code>DAC_OVERRIDE</code>, and more; <code>PERFMON</code> and <code>BPF</code> are
+          commented out with the note that they need kernel 5.8 and "cri-o &gt;= v1.22.0 or containerd &gt;=
+          v1.5.0"</td></tr>
+        <tr><td>Tetragon (Helm <code>values.yaml</code>, main)</td><td>no by default</td><td>drops <code>ALL</code>, adds
+          <code>SYS_ADMIN</code> ("Mount bpffs, tracefs and cgroup2, and load BPF programs. The kernel accepts it in
+          place of CAP_BPF and CAP_PERFMON."), <code>SYS_PTRACE</code>, <code>SYS_RESOURCE</code>,
+          <code>DAC_OVERRIDE</code>, <code>SYSLOG</code></td></tr>
+        <tr><td>Falco, modern eBPF driver (container docs)</td><td>"least privileged (recommended)" or fully
+          privileged</td><td>minimum <code>CAP_SYS_PTRACE</code>, <code>CAP_SYS_RESOURCE</code>, <code>CAP_BPF</code>,
+          <code>CAP_PERFMON</code>; the Docker example uses <code>CAP_SYS_ADMIN</code> instead because Docker did not
+          support the newer two</td></tr>
+        <tr><td>Inspektor Gadget (Helm chart, main)</td><td>no (only an optional GPU sidecar is)</td><td><code>SYS_ADMIN</code>, <code>SYSLOG</code>,
+          <code>SYS_PTRACE</code>, <code>SYS_RESOURCE</code>, <code>IPC_LOCK</code>, <code>NET_RAW</code>,
+          <code>NET_ADMIN</code>, <code>DAC_READ_SEARCH</code>, among others; <code>dropCapSysAdmin: true</code> swaps
+          <code>SYS_ADMIN</code> for <code>BPF</code> + <code>PERFMON</code> at the cost of fanotify-based container
+          detection</td></tr>
+      </tbody>
+    </table>
+    <p>Not running privileged is still very close to root on the node: <code>CAP_SYS_ADMIN</code> plus the ability to
+      load tracing programs lets a container read any kernel memory through BPF helpers. Treat these pods as part of the
+      node's trusted base. BPF tokens (Linux 6.9, <a href="03-verifier.html">chapter 03</a>) are the kernel's answer for
+      delegating a limited set of BPF commands into a user namespace; none of the charts read for this section
+      configures one.</p>
+    <p><strong>Host mounts.</strong> Three host paths matter.</p>
+    <ul>
+      <li><code>/sys/fs/bpf</code>, the BPF filesystem. Pinned maps and links (<a
+        href="06-btf-core-libbpf.html#bpf-links-and-pinning">chapter 06, "BPF links and pinning"</a>) must live on the
+        <em>host's</em> bpffs, not in the container's file system, so that they survive a restart of the agent pod.
+        This is why, per Cilium's upgrade guide, "networking connectivity, policy enforcement and load balancing will
+        remain functional in general" while the agent pod is replaced (L7 proxy connections are the stated exception).
+        Cilium's chart has <code>bpf.autoMount</code>
+        (default on, at <code>bpf.root: /sys/fs/bpf</code>); Tetragon mounts the host <code>/sys/fs/bpf</code> as
+        volume <code>bpf-maps</code>, with <code>Bidirectional</code> mount propagation when privileged and
+        <code>HostToContainer</code> otherwise (an init container then mounts bpffs on the host); Inspektor Gadget
+        mounts it too.</li>
+      <li><code>/sys/kernel/btf/vmlinux</code>, the kernel's BTF, for CO-RE (chapter 06). None of the four charts mounts
+        it as a separate volume: they rely on the container's own <code>/sys</code>, which shows the host's sysfs (not
+        verified here on a cluster). For kernels without BTF, Tetragon has a <code>btf</code> value that sets
+        <code>--btf</code> to an explicit BTF file, which is where BTFHub files fit.</li>
+      <li>The host's cgroup2 hierarchy and <code>/proc</code>, so the agent can attach cgroup programs and map events to
+        processes. Cilium mounts cgroup2 at <code>/run/cilium/cgroupv2</code>; Tetragon mounts host <code>/proc</code>;
+        Inspektor Gadget mounts <code>/sys/fs/cgroup</code>, <code>/sys/kernel/debug</code> and host
+        <code>/proc</code>.</li>
+    </ul>
+    <p><strong>From kernel ids to pods.</strong> A BPF program sees a PID, a mount namespace id or a cgroup id, never a
+      pod name. <code>bpf_get_current_cgroup_id()</code> returns the cgroup v2 id of the current task, which is the inode
+      number of its cgroup directory. On the orb:</p>
+    <pre><code class="language-plaintext">$ cat /proc/self/cgroup
+0::/amp.slice/amp-workload.slice/amp-run-136124-29633.scope
+$ stat -c 'inode %i' /sys/fs/cgroup/amp.slice/amp-workload.slice/amp-run-136124-29633.scope
+inode 106681
+$ sudo bpftrace -e 'BEGIN { printf("cgroup id from BPF: %llu\n", cgroup); exit(); }'
+Attaching 1 probe...
+cgroup id from BPF: 106681</code></pre>
+    <p>On a Kubernetes node the kubelet puts each pod and container into its own cgroup, so an agent can build the same
+      table: walk the cgroup tree (or ask the container runtime), record inode numbers, and join them with pod metadata
+      from the API server. Inspektor Gadget calls this <em>enrichment</em>: it "automatically uses kernel primitives
+      such as mount namespaces, pids or similar to infer which high-level concepts they relate to; Kubernetes pods,
+      container names, DNS names", and it works in the other direction too, turning a pod filter into an in-kernel
+      filter. Tetragon's policies target namespaces and pods in the same way.</p>
+    <p><strong>The projects, by role.</strong></p>
+    <ul>
+      <li><strong>Cilium as the CNI.</strong> The <code>cilium-cni</code> plugin "is invoked by Kubernetes when a pod
+        is scheduled or terminated on a node" and calls the local agent's API "to trigger the necessary datapath
+        configuration"; the agent attaches its tc/TCX and socket programs and updates its maps (see "Networking" above and <a href="07-networking-xdp-tc.html">07</a>). With
+        <code>kubeProxyReplacement</code> enabled, Cilium's eBPF datapath also takes over Service load balancing from
+        kube-proxy.</li>
+      <li><strong>Runtime security: Tetragon and Falco.</strong> Both run as DaemonSets and tag their events with pod
+        identity. Tetragon can enforce in the kernel; Falco detects in user space (see "Security" above).</li>
+      <li><strong>Inspektor Gadget</strong> (CNCF Sandbox since 7 March 2023). A <code>kubectl gadget</code> plugin plus
+        a DaemonSet: <code>kubectl gadget deploy</code> "will deploy the gadget DaemonSet along with its RBAC rules",
+        into namespace <code>gadget</code> by default. Its tools are <em>gadgets</em>: "an OCI image that includes one
+        or more eBPF programs, metadata YAML file and, optionally, WASM modules for post processing", run with, for
+        example, <code>kubectl gadget run trace_exec</code>.</li>
+      <li><strong>bpfman</strong> (<a href="https://bpfman.io/">bpfman.io</a>, formerly <code>bpfd</code>, CNCF Sandbox
+        since 19 June 2024). The projects above each embed their own loader. bpfman separates loading from the
+        application. Its documentation lists the components: <code>bpfman</code>, which loads, unloads and lists
+        programs; <code>bpfman-agent</code>, which "runs in a container in the bpfman daemonset and ensures that the
+        requested eBPF programs for a given node are in the desired state"; and <code>bpfman-operator</code>, which
+        manages the agent and the CRDs. You declare programs as custom resources whose bytecode comes from an OCI
+        image. Its XDP and TC programs share a hook through the libxdp multi-program dispatcher, and a CSI driver
+        (<code>csi.bpfman.io</code>) mounts specific pinned maps into an application pod, so that pod does not need a
+        host mount of <code>/sys/fs/bpf</code>. The documented example, unchanged:</li>
+    </ul>
+    <pre data-file="bpfman/examples/config/base/go-xdp-counter/bytecode.yaml"><code class="language-yaml">apiVersion: bpfman.io/v1alpha1
+kind: ClusterBpfApplication
+metadata:
+  labels:
+    app.kubernetes.io/name: xdpprogram
+  name: go-xdp-counter-example
+spec:
+  # Select all nodes
+  nodeSelector: {}
+  byteCode:
+    image:
+      url: quay.io/bpfman-bytecode/go-xdp-counter:latest
+  programs:
+    - name: xdp_stats
+      type: XDP
+      xdp:
+        links:
+          - interfaceSelector:
+              primaryNodeInterface: true
+            priority: 55</code></pre>
+    <p>After <code>kubectl apply</code>, each node's <code>bpfman-agent</code> loads <code>xdp_stats</code> on the
+      primary interface, records the result in a <code>ClusterBpfApplicationState</code> object, and the operator marks
+      the <code>ClusterBpfApplication</code> as <code>Success</code> once every selected node reports in. The user-space
+      half is an ordinary DaemonSet that reads <code>xdp_stats_map</code> through the CSI volume; in the example's
+      <code>deployment.yaml</code> its container runs as user 65534 with <code>capabilities: drop: [ALL]</code>. This
+      split also means the bytecode and the user-space image have separate versions, which bpfman's documentation
+      lists as a goal ("fine-grained separate versioning control for userspace and kernelspace programs").</p>
+    <p>Packaging eBPF as OCI artifacts is not unique to bpfman and Inspektor Gadget. The eunomia-bpf side of this
+      curriculum does it too: ecli pushes and pulls compiled programs to and from OCI registries (<a
+      href="10-eunomia-bpf-ecc-ecli.html#ecli-running-from-a-file-a-url-or-a-registry">chapter 10, "ecli: running from
+      a file, a URL or a registry"</a>), and wasm-bpf packages a whole eBPF tool as a small Wasm OCI image that a
+      Wasm-capable container runtime could schedule instead of a privileged DaemonSet (<a
+      href="12-wasm-bpf.html#packaging-and-deployment-oci-wasmedge-and-kubernetes">chapter 12, "Packaging and
+      deployment: OCI, WasmEdge and Kubernetes"</a>). Chapter 12 points out that the node runtime still needs eBPF
+      privileges; Wasm moves the privilege boundary, it does not remove it.</p>
+    <div class="callout warn"><span class="label">Not verified on a cluster</span>
+      <p>The capability lists, mounts and bpfman flow above come from the projects' current Helm charts and documentation
+        (see references). No Kubernetes cluster was available on the orb, so none of these deployments were run for
+        this chapter. Only the cgroup-id example was run. Chart defaults change between releases; check the chart
+        version you install.</p>
+    </div>
+
     <h2>eBPF beyond the Linux kernel</h2>
     <p>eBPF is a bytecode with a formal ISA specification (<a href="https://www.rfc-editor.org/rfc/rfc9669.html">RFC 9669</a>; see <a href="02-ebpf-isa-and-vm.html">02</a>), so nothing ties it to Linux. Three groups of projects use that.</p>
 
@@ -837,6 +983,7 @@ sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
       <li>Falco — <a href="https://github.com/falcosecurity/falco">falcosecurity/falco</a>, <a href="https://github.com/falcosecurity/libs">falcosecurity/libs</a>; CNCF, <a href="https://www.cncf.io/announcements/2024/02/29/cloud-native-computing-foundation-announces-falco-graduation">Falco graduation announcement</a> (2024).</li>
       <li>Tracee — <a href="https://github.com/aquasecurity/tracee">aquasecurity/tracee</a>. Pixie — <a href="https://github.com/pixie-io/pixie">pixie-io/pixie</a>. Parca Agent — <a href="https://github.com/parca-dev/parca-agent">parca-dev/parca-agent</a>. Katran — <a href="https://github.com/facebookincubator/katran">facebookincubator/katran</a>.</li>
       <li>bpftool — <a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a>; BPF selftests — <a href="https://github.com/torvalds/linux/tree/master/tools/testing/selftests/bpf">tools/testing/selftests/bpf</a>; kernel docs — <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>.</li>
+      <li>eBPF in Kubernetes (read 2026-11-06). Cilium — <a href="https://docs.cilium.io/en/stable/overview/component-overview/">Component Overview</a>; Helm <a href="https://github.com/cilium/cilium/blob/00354062bc/install/kubernetes/cilium/values.yaml">install/kubernetes/cilium/values.yaml</a> (commit 00354062bc: <code>securityContext.capabilities</code>, <code>bpf.autoMount</code>, <code>bpf.root</code>, <code>cgroup.hostRoot</code>); <a href="https://docs.cilium.io/en/stable/operations/upgrade/">Upgrade Guide</a> ("Upgrade Impact"). Tetragon — Helm chart <a href="https://github.com/cilium/tetragon/tree/e4ea242078/install/kubernetes/tetragon">install/kubernetes/tetragon</a> (commit e4ea242078: <code>values.yaml</code>, <code>templates/daemonset.yaml</code>, <code>templates/_container_tetragon.tpl</code>). Falco — <a href="https://falco.org/docs/setup/container/">"Deploy as a container"</a> (least-privileged capabilities). Inspektor Gadget — <a href="https://inspektor-gadget.io/docs/latest/">documentation</a> (gadgets, enrichment), <a href="https://inspektor-gadget.io/docs/latest/reference/install-kubernetes">"Installing on Kubernetes"</a>, Helm chart <a href="https://github.com/inspektor-gadget/inspektor-gadget/tree/447ef9f641/charts/gadget">charts/gadget</a> (commit 447ef9f641); CNCF, <a href="https://www.cncf.io/projects/inspektor-gadget/">project page</a> (Sandbox, 7 Mar 2023). bpfman — <a href="https://bpfman.io/main/">bpfman.io</a> ("What is bpfman?"), <a href="https://bpfman.io/main/getting-started/example-bpf-k8s/">"Deploying Example eBPF Programs On Kubernetes"</a>, <a href="https://github.com/bpfman/bpfman/tree/38a68b5f9f/examples/config/base/go-xdp-counter">examples/config/base/go-xdp-counter</a> (commit 38a68b5f9f: <code>bytecode.yaml</code>, <code>deployment.yaml</code>); CNCF, <a href="https://www.cncf.io/projects/bpfman/">project page</a> (Sandbox, 19 Jun 2024).</li>
       <li>eBPF for Windows — <a href="https://github.com/microsoft/ebpf-for-windows">microsoft/ebpf-for-windows</a> (README: architectural overview).</li>
       <li>E. Gershuni, N. Amit, A. Gurfinkel, N. Narodytska, J. A. Navas, N. Rinetzky, L. Ryzhyk, M. Sagiv. <em>Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions</em>. PLDI 2019. <a href="https://doi.org/10.1145/3314221.3314590">doi:10.1145/3314221.3314590</a>; code: <a href="https://github.com/vbpf/prevail">vbpf/prevail</a>.</li>
       <li>uBPF — <a href="https://github.com/iovisor/ubpf">iovisor/ubpf</a>; rbpf — <a href="https://github.com/qmonnet/rbpf">qmonnet/rbpf</a>.</li>

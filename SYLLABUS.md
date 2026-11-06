@@ -67,30 +67,30 @@ Status key:
 
 | # | File | Title | Repos | Status |
 |---|------|-------|-------|--------|
-| 23 | `23-agentsight.html` | AgentSight: system-level observability for AI agents | agentsight, agentsight-website | drafting |
+| 23 | `23-agentsight.html` | AgentSight: system-level observability for AI agents | agentsight, agentsight-website | reviewed [part8] |
 | 24 | `24-actplane.html` | ActPlane: information-flow enforcement for AI agents | ActPlane | reviewed (part5) |
-| 25 | `25-agentcgroup.html` | AgentCgroup: understanding and controlling the OS resources of AI agents | agentcgroup | validating |
-| 26 | `26-reward-guard-and-safe-change.html` | RewardGuard and safe change after external operations | reward-guard, agent-check-restore-safety | validating |
-| 27 | `27-actime-and-akeep.html` | Actime and Akeep: one runtime for agent policy, observability and backup | actime, akeep, backup-client-sdk, agentqos | validating |
+| 25 | `25-agentcgroup.html` | AgentCgroup: understanding and controlling the OS resources of AI agents | agentcgroup | reviewed [part6] |
+| 26 | `26-reward-guard-and-safe-change.html` | RewardGuard and safe change after external operations | reward-guard, agent-check-restore-safety | reviewed [part6] |
+| 27 | `27-actime-and-akeep.html` | Actime and Akeep: one runtime for agent policy, observability and backup | actime, akeep, backup-client-sdk, agentqos | reviewed [part6] |
 
 ## Part VII · Kernel extension research
 
 | # | File | Title | Repos | Status |
 |---|------|-------|-------|--------|
-| 28 | `28-namei-ext.html` | namei_ext: programmable VFS name resolution | namei_ext | validating |
-| 29 | `29-qwen3-ebpf.html` | qwen3-ebpf: a language model forward pass inside eBPF | qwen3-ebpf | validating |
-| 30 | `30-llm-kernel-tooling.html` | LLM agents for the kernel: schedcp, MCPtrace, GPTtrace | schedcp, MCPtrace, GPTtrace, GPTtrace-web (less active, but the org's LLM-for-kernel line) | validating |
+| 28 | `28-namei-ext.html` | namei_ext: programmable VFS name resolution | namei_ext | reviewed [part6] |
+| 29 | `29-qwen3-ebpf.html` | qwen3-ebpf: a language model forward pass inside eBPF | qwen3-ebpf | reviewed [part7] |
+| 30 | `30-llm-kernel-tooling.html` | LLM agents for the kernel: schedcp, MCPtrace, GPTtrace | schedcp, MCPtrace, GPTtrace, GPTtrace-web (less active, but the org's LLM-for-kernel line) | reviewed [part7] |
 
 ## Appendix
 
 | # | File | Title | Repos | Status |
 |---|------|-------|-------|--------|
-| 31 | `31-org-meta.html` | The org behind the code: eunomia.dev, agent skills and research notes | eunomia.dev, agent-skills, research-skills, megakernel-profiling-feasibility, .github, basic-cuda-tutorial, cupti-tutorial, nvbit-tutorial; map of every active repo | validating |
-| 32 | `32-glossary-and-reading-list.html` | Glossary and reading list | Glossary, paper reading list, learning path | drafting |
+| 31 | `31-org-meta.html` | The org behind the code: eunomia.dev, agent skills and research notes | eunomia.dev, agent-skills, research-skills, megakernel-profiling-feasibility, .github, basic-cuda-tutorial, cupti-tutorial, nvbit-tutorial; map of every active repo | reviewed [part7] |
+| 32 | `32-glossary-and-reading-list.html` | Glossary and reading list | Glossary, paper reading list, learning path | reviewed [part8] |
 
 ## Known gaps
 
-`reviews/syllabus-audit.md` lists what to add. In short: signed BPF programs (6.18) are missing; BPF
-tokens, BPF in Kubernetes, and debugging/measurement tooling (`bpftool prog tracelog`,
-`kernel.bpf_stats_enabled`, `bpftool prog profile`) are only touched in passing; BPF exceptions are
-not covered.
+The gaps found by `reviews/syllabus-audit.md` were filled afterwards: BPF tokens, signed BPF programs and
+eBPF as an attack surface (chapter 03), BPF exceptions (chapter 04), debugging and measuring eBPF programs
+(chapter 06), and eBPF in Kubernetes (chapter 08). The orb used to write this has no BPF JIT, no GPU and no
+Kubernetes cluster, so JIT output, GPU runs and cluster deployments are quoted from sources and labelled so.

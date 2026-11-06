@@ -7,7 +7,7 @@
 <!-- Metadata read by tools/build_index.py -->
 <meta name="chapter-number" content="32">
 <meta name="chapter-part" content="Appendix">
-<meta name="chapter-summary" content="A searchable glossary of 148 terms linked to the chapters that explain them, every research paper the curriculum cites grouped by theme, and three suggested routes through the 32 chapters.">
+<meta name="chapter-summary" content="A searchable glossary of 152 terms linked to the chapters that explain them, every research paper the curriculum cites grouped by theme, and three suggested routes through the 32 chapters.">
 <meta name="chapter-repo" content="https://github.com/eunomia-bpf">
 <link rel="stylesheet" href="../assets/style.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
@@ -47,10 +47,10 @@
     <div class="callout key"><span class="label">Key idea</span><p>The curriculum makes one argument across seven parts. eBPF is a <em>verified</em> extension mechanism: the verifier (<a href="03-verifier.html">03</a>) is what makes it safe to load other people's code into a privileged context. The eunomia-bpf projects then carry the same idea to new places: user-space processes (<a href="14-bpftime-architecture.html">14</a>), GPU drivers and kernels (<a href="20-gpu-ext.html">20</a>), collective-communication libraries (<a href="21-nccl-ebpf.html">21</a>), path lookup (<a href="28-namei-ext.html">28</a>) and the operating-system boundary of AI agents (<a href="24-actplane.html">24</a>). Many glossary terms are either a piece of the verifier's safety argument or a new hook where that argument is reused.</p></div>
 
     <h2>Glossary</h2>
-    <p>The 148 terms are in alphabetical order. Type in the box to filter them: the filter matches the term, its definition and a few synonyms, so <code>loop</code> finds <code>bpf_loop</code>, <code>may_goto</code> and open-coded iterators, and <code>gpu</code> finds everything from CUPTI to UVM. Every term has an anchor, so another page can link to it as <code>32-glossary-and-reading-list.html#g-</code><em>slug</em> (for example <a href="#g-tnum-tristate-number"><code>#g-tnum-tristate-number</code></a>).</p>
+    <p>The 152 terms are in alphabetical order. Type in the box to filter them: the filter matches the term, its definition and a few synonyms, so <code>loop</code> finds <code>bpf_loop</code>, <code>may_goto</code> and open-coded iterators, and <code>gpu</code> finds everything from CUPTI to UVM. Every term has an anchor, so another page can link to it as <code>32-glossary-and-reading-list.html#g-</code><em>slug</em> (for example <a href="#g-tnum-tristate-number"><code>#g-tnum-tristate-number</code></a>).</p>
     <div class="gloss-tools">
       <input id="gloss-filter" type="search" placeholder="Filter terms, e.g. verifier, ring, gpu, agent" aria-label="Filter glossary terms" autocomplete="off">
-      <span class="count" id="gloss-count" aria-live="polite">148 terms</span>
+      <span class="count" id="gloss-count" aria-live="polite">152 terms</span>
     </div>
     <dl class="gloss" id="gloss">
       <div class="gloss-entry" id="g-512-byte-stack" data-k="512-byte stack stack frame r10">
@@ -79,7 +79,7 @@
       </div>
       <div class="gloss-entry" id="g-agentsight" data-k="agentsight agent observability tls">
         <dt>AgentSight</dt>
-        <dd>Observability for AI agents that watches two boundaries: the plaintext of the agent's TLS traffic with the LLM (captured with uprobes) and its kernel-visible actions (processes, file opens). The two streams are correlated afterwards. <span class="gloss-see">See <a href="23-agentsight.html">23 · AgentSight: system-level observability for AI agents</a>.</span></dd>
+        <dd>Observability for AI agents that watches two boundaries: the plaintext of the agent's TLS traffic with the LLM (captured with uprobes) and its kernel-visible actions (processes, file opens). The two streams are correlated afterwards. <span class="gloss-see">See <a href="23-agentsight.html#boundary-tracing-the-design-in-one-picture">23 · Boundary tracing: the design in one picture</a>; <a href="23-agentsight.html#correlating-intent-with-actions">23 · Correlating intent with actions</a>.</span></dd>
       </div>
       <div class="gloss-entry" id="g-agent-skill" data-k="agent skill skill.md agents procedures">
         <dt>Agent skill</dt>
@@ -125,6 +125,10 @@
         <dt>bpffs</dt>
         <dd>The BPF pseudo-filesystem, usually mounted at <code>/sys/fs/bpf</code>. Pinning a map, program or link there keeps it alive after the loading process exits. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#pinning-maps-in-bpffs">04 · Pinning maps in bpffs</a>; <a href="06-btf-core-libbpf.html#bpf-links-and-pinning">06 · BPF links and pinning</a>.</span></dd>
       </div>
+      <div class="gloss-entry" id="g-bpf-iterator" data-k="bpf iterator bpf_iter iter/task seq_file pull">
+        <dt>BPF iterator</dt>
+        <dd>A tracing program (<code>SEC("iter/task")</code> and similar, Linux 5.8) that the kernel calls once per object of a collection, such as each task, open file, TCP socket or map element, writing output through a <code>seq_file</code>. It runs only when user space <code>read()</code>s the iterator's file descriptor or a file pinned in bpffs, so it pulls state instead of reacting to events. Not the same as an open-coded iterator. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#iterators-pulling-kernel-state">05 · Iterators: pulling kernel state</a>.</span></dd>
+      </div>
       <div class="gloss-entry" id="g-bpfix" data-k="bpfix verifier errors diagnostic llm">
         <dt>bpfix</dt>
         <dd>A Rust command-line tool that reads a verifier log, finds where the proof the failing instruction needed was established and then lost, and prints a compiler-style diagnostic. The repository also contains a study of 235 real rejections and an LLM repair benchmark. <span class="gloss-see">See <a href="17-bpfix.html#what-bpfix-is-and-what-it-is-not">17 · What bpfix is, and what it is not</a>; <a href="17-bpfix.html#how-bpfix-works">17 · How bpfix works</a>.</span></dd>
@@ -149,6 +153,10 @@
         <dt>bpf() system call</dt>
         <dd>The single system call through which user space creates maps, loads programs and attaches them. A command argument such as <code>BPF_PROG_LOAD</code>, <code>BPF_MAP_CREATE</code> or <code>BPF_LINK_CREATE</code> selects the operation. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#underneath-the-bpf-syscall">06 · Underneath: the bpf() syscall</a>.</span></dd>
       </div>
+      <div class="gloss-entry" id="g-bpf-throw-bpf-exceptions" data-k="bpf_throw (bpf exceptions) exception assert __exception_cb unwind kfunc">
+        <dt>bpf_throw (BPF exceptions)</dt>
+        <dd>A kfunc (Linux 6.7) that ends the program at once: the kernel unwinds every active BPF stack frame and returns to the program's caller. The <code>u64</code> cookie becomes the return value, or the argument of an exception callback declared with <code>__exception_cb()</code>. The verifier rejects a throw while the program holds resources such as locks or references. It is meant for assertions about conditions the verifier cannot see. <span class="gloss-see">See <a href="04-maps-helpers-kfuncs.html#bpf-exceptions-bpf-throw-and-bpf-assert">04 · BPF exceptions: bpf_throw and bpf_assert</a>; <a href="https://lwn.net/Articles/938435/">LWN, "Exceptions in BPF"</a>; <a href="https://docs.ebpf.io/linux/kfuncs/bpf_throw/">docs.ebpf.io, bpf_throw</a>.</span></dd>
+      </div>
       <div class="gloss-entry" id="g-bpftime" data-k="bpftime userspace ebpf runtime osdi 25">
         <dt>bpftime</dt>
         <dd>eunomia-bpf's userspace eBPF runtime. It intercepts the loader's <code>bpf()</code> calls, keeps maps in shared memory, and runs uprobe and syscall programs inside the target process through binary rewriting. It is described in an OSDI '25 paper. <span class="gloss-see">See <a href="14-bpftime-architecture.html#what-bpftime-is">14 · What bpftime is</a>; <a href="15-bpftime-in-practice.html">15 · bpftime in practice</a>.</span></dd>
@@ -159,7 +167,7 @@
       </div>
       <div class="gloss-entry" id="g-bpf-token" data-k="bpf token delegation container unprivileged bpffs">
         <dt>BPF token</dt>
-        <dd>An object created from a specially mounted bpffs instance through which an administrator delegates a chosen subset of BPF permissions to a less privileged process, such as one inside a container. <span class="gloss-see">See <a href="03-verifier.html#privileged-and-unprivileged-loading">03 · Privileged and unprivileged loading</a>.</span></dd>
+        <dd>An object (Linux 6.9) created from a specially mounted bpffs instance through which an administrator delegates a chosen subset of BPF permissions to a less privileged process, such as one inside a container. The bpffs mount options <code>delegate_cmds</code>, <code>delegate_maps</code>, <code>delegate_progs</code> and <code>delegate_attachs</code> say what is delegated. <span class="gloss-see">See <a href="03-verifier.html#bpf-tokens-linux-6-9">03 · BPF tokens (Linux 6.9)</a>; <a href="03-verifier.html#privileged-and-unprivileged-loading">03 · Privileged and unprivileged loading</a>.</span></dd>
       </div>
       <div class="gloss-entry" id="g-bpftool" data-k="bpftool inspection prog show gen skeleton">
         <dt>bpftool</dt>
@@ -283,7 +291,7 @@
       </div>
       <div class="gloss-entry" id="g-fmod-ret" data-k="fmod_ret modify return error injection">
         <dt>fmod_ret</dt>
-        <dd>A trampoline program type that runs before a function and can make it return a chosen value without running its body. It is allowed only on functions marked for error injection. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#fentry-fexit-fmod-ret-the-bpf-trampoline">05 · fentry, fexit, fmod_ret: the BPF trampoline</a>.</span></dd>
+        <dd>A trampoline program type that runs before a function; a non-zero return makes the function return that value without running its body. It is allowed only on <code>security_*</code> functions and functions marked for error injection. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#fentry-fexit-fmod-ret-the-bpf-trampoline">05 · fentry, fexit, fmod_ret: the BPF trampoline</a>.</span></dd>
       </div>
       <div class="gloss-entry" id="g-gpttrace" data-k="gpttrace openai function calling bpftrace">
         <dt>GPTtrace</dt>
@@ -437,6 +445,10 @@
         <dt>perf_event program</dt>
         <dd>A program attached to a perf event, such as a CPU clock, that runs on every sample. It is the basis of eBPF CPU profilers such as xpu-perf's. <span class="gloss-see">See <a href="05-program-types-and-hooks.html#perf-event-sampling">05 · perf_event: sampling</a>; <a href="22-xpu-perf.html#code-walkthrough-1-cpu-sampling-with-perf-event-ebpf">22 · Code walkthrough 1: CPU sampling with perf_event eBPF</a>.</span></dd>
       </div>
+      <div class="gloss-entry" id="g-pinning" data-k="pinning pin bpf_obj_pin bpf_obj_get bpffs persist libbpf_pin_by_name">
+        <dt>Pinning</dt>
+        <dd>Giving a BPF program, map or link a file name in bpffs with the <code>BPF_OBJ_PIN</code> command. The file holds a reference, so the object outlives the process that created it. Another process opens it with <code>BPF_OBJ_GET</code>, and removing the file drops the reference. In libbpf, <code>bpf_link__pin()</code>, <code>bpf_map__pin()</code> or a map declared with <code>LIBBPF_PIN_BY_NAME</code>. <span class="gloss-see">See <a href="06-btf-core-libbpf.html#bpf-links-and-pinning">06 · BPF links and pinning</a>; <a href="04-maps-helpers-kfuncs.html#pinning-maps-in-bpffs">04 · Pinning maps in bpffs</a>.</span></dd>
+      </div>
       <div class="gloss-entry" id="g-policy-domain" data-k="policy domain actplane sub-agent monotonic tightening">
         <dt>Policy domain</dt>
         <dd>In ActPlane, the policy boundary for one process tree. A child domain can add rules and narrow its scope, but never remove what it inherits (monotonic tightening). <span class="gloss-see">See <a href="24-actplane.html#policy-domains">24 · Policy domains</a>.</span></dd>
@@ -516,6 +528,10 @@
       <div class="gloss-entry" id="g-seccomp-bpf" data-k="seccomp-bpf system call filter">
         <dt>seccomp-bpf</dt>
         <dd>System-call filtering with classic BPF programs that inspect the syscall number and arguments (Linux 3.5). It is still cBPF, not eBPF. <span class="gloss-see">See <a href="01-what-is-bpf.html#seccomp-bpf-linux-3-5-bpf-beyond-networking">01 · seccomp-bpf (Linux 3.5): BPF beyond networking</a>; <a href="05-program-types-and-hooks.html#what-about-seccomp">05 · What about seccomp?</a>.</span></dd>
+      </div>
+      <div class="gloss-entry" id="g-signed-bpf-program" data-k="signed bpf program signing signature keyring_id loader exclusive map bpftool sign">
+        <dt>Signed BPF program</dt>
+        <dd>Program signing, merged in Linux 6.18. <code>BPF_PROG_LOAD</code> gains <code>signature</code>, <code>signature_size</code> and <code>keyring_id</code> fields, and the kernel checks the signature against a keyring before the <code>security_bpf_prog</code> LSM hook runs. What is signed is a light-skeleton loader program that embeds the SHA-256 of its metadata map. That map is frozen and <em>exclusive</em> (usable only by a program with a given hash), so the trusted loader can check everything it loads. bpftool can sign programs. Policies that make use of signatures were still being written at merge time. <span class="gloss-see">See <a href="03-verifier.html#signed-bpf-programs-linux-6-18">03 · Signed BPF programs (Linux 6.18)</a>; <a href="https://lwn.net/Articles/1038961/">LWN, "Signed BPF programs" (patch set v5)</a>; <a href="https://lwn.net/Articles/1040203/">LWN, "6.18 merge window, part 1"</a>.</span></dd>
       </div>
       <div class="gloss-entry" id="g-skeleton" data-k="skeleton bpftool gen skeleton .skel.h">
         <dt>Skeleton</dt>
@@ -649,7 +665,7 @@
     <p id="gloss-empty" hidden>No term matches. Try a shorter word.</p>
 
     <h2>Paper reading list</h2>
-    <p>These are the 97 distinct papers cited in the reference lists of chapters 01–31, deduplicated across chapters. Each entry gives the venue and year as the citing chapter states them. The <em>Cited in</em> column links to every chapter that cites the paper, and that chapter explains why it matters. Preprints are marked, and so are the few drafts and reports that have not been peer reviewed, so you can weigh them accordingly. RFC 9669 is a standard rather than a paper, but it is the primary source for the ISA, so it is included and marked.</p>
+    <p>These are the 101 distinct papers cited in the reference lists of chapters 01–31, deduplicated across chapters. Each entry gives the venue and year as the citing chapter states them. The <em>Cited in</em> column links to every chapter that cites the paper, and that chapter explains why it matters. Preprints are marked, and so are the few drafts and reports that have not been peer reviewed, so you can weigh them accordingly. RFC 9669 is a standard rather than a paper, but it is the primary source for the ISA, so it is included and marked.</p>
     <figure>
       <svg viewBox="0 0 820 336" role="img" aria-label="Number of cited papers per theme">
         <text x="300" y="37" text-anchor="end" font-size="13" fill="var(--fg)">BPF origins and the ISA</text><rect x="312" y="23" width="48" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="368" y="38" font-size="13" fill="var(--muted)">2</text>
@@ -658,11 +674,11 @@
         <text x="300" y="139" text-anchor="end" font-size="13" fill="var(--fg)">Networking</text><rect x="312" y="125" width="72" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="392" y="140" font-size="13" fill="var(--muted)">3</text>
         <text x="300" y="173" text-anchor="end" font-size="13" fill="var(--fg)">Userspace runtimes, isolation and Wasm</text><rect x="312" y="159" width="217" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="537" y="174" font-size="13" fill="var(--muted)">9</text>
         <text x="300" y="207" text-anchor="end" font-size="13" fill="var(--fg)">GPUs, collectives and accelerator profiling</text><rect x="312" y="193" width="314" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="634" y="208" font-size="13" fill="var(--muted)">13</text>
-        <text x="300" y="241" text-anchor="end" font-size="13" fill="var(--fg)">AI agents</text><rect x="312" y="227" width="387" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="707" y="242" font-size="13" fill="var(--muted)">16</text>
+        <text x="300" y="241" text-anchor="end" font-size="13" fill="var(--fg)">AI agents</text><rect x="312" y="227" width="484" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="804" y="242" font-size="13" fill="var(--muted)">20</text>
         <text x="300" y="275" text-anchor="end" font-size="13" fill="var(--fg)">LLMs and ML in or for the kernel</text><rect x="312" y="261" width="290" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="610" y="276" font-size="13" fill="var(--muted)">12</text>
         <text x="300" y="309" text-anchor="end" font-size="13" fill="var(--fg)">Adjacent systems: IFC, filesystems, memory, profiling</text><rect x="312" y="295" width="460" height="20" rx="4" fill="var(--accent2)" opacity="0.85"/><text x="780" y="310" font-size="13" fill="var(--muted)">19</text>
       </svg>
-      <figcaption>Figure 32.1 — Cited papers per theme. The adjacent-systems group is the largest because the agent and filesystem chapters build on older OS research (information-flow control, FUSE). The agent group is mostly 2025–2026 preprints.</figcaption>
+      <figcaption>Figure 32.1 — Cited papers per theme. The agent group is the largest and mostly 2024–2026 preprints. The adjacent-systems group comes next because the agent and filesystem chapters build on older OS research (information-flow control, FUSE).</figcaption>
     </figure>
     <div class="callout tip"><span class="label">Where to start reading</span><p>If you read only five papers: McCanne and Jacobson's BSD Packet Filter (1993) for the original design; the XDP paper (CoNEXT 2018) for eBPF in the data path; PREVAIL (PLDI 2019) for what a principled verifier looks like; Agni (CAV 2023) for how the kernel's own range analysis was checked; and the bpftime paper (OSDI '25) for how the org carries the model into user space.</p></div>
     <h3>BPF origins and the ISA</h3>
@@ -758,9 +774,13 @@
         <tr><td><a href="https://arxiv.org/abs/1908.04734">Reward Tampering Problems and Solutions in Reinforcement Learning: A Causal Influence Diagram Perspective</a></td><td>T. Everitt, M. Hutter, R. Kumar, V. Krakovna</td><td>arXiv:1908.04734</td><td>2019</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
         <tr><td><a href="https://arxiv.org/abs/2209.13085">Defining and Characterizing Reward Hacking</a></td><td>J. Skalse, N. H. R. Howe, D. Krasheninnikov, D. Krueger</td><td>NeurIPS</td><td>2022</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
         <tr><td><a href="https://doi.org/10.1145/3605764.3623985">Not What You&#x27;ve Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection</a></td><td>K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, M. Fritz</td><td>ACM AISec</td><td>2023</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2411.05285">AgentOps: Enabling Observability of LLM Agents</a> <small>(preprint)</small></td><td>L. Dong et al.</td><td>arXiv:2411.05285</td><td>2024</td><td><a href="23-agentsight.html" title="AgentSight: system-level observability for AI agents">23</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2407.20859">Breaking Agents: Compromising Autonomous LLM Agents Through Malfunction Amplification</a> <small>(preprint)</small></td><td>B. Zhang et al.</td><td>arXiv:2407.20859</td><td>2024</td><td><a href="23-agentsight.html" title="AgentSight: system-level observability for AI agents">23</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2403.02691">InjecAgent: Benchmarking Indirect Prompt Injections in Tool-Integrated Large Language Model Agents</a></td><td>Q. Zhan et al.</td><td>Findings of ACL</td><td>2024</td><td><a href="23-agentsight.html" title="AgentSight: system-level observability for AI agents">23</a></td></tr>
         <tr><td><a href="https://arxiv.org/abs/2310.06770">SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</a></td><td>C. E. Jimenez et al.</td><td>ICLR</td><td>2024</td><td><a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a></td></tr>
         <tr><td><a href="https://arxiv.org/abs/2406.10162">Sycophancy to Subterfuge: Investigating Reward-Tampering in Large Language Models</a> <small>(year from the arXiv number)</small></td><td>C. Denison, M. MacDiarmid, F. Barez, D. Duvenaud, S. Kravec, S. Marks, N. Schiefer, R. Soklaski, A. Tamkin, J. Kaplan, B. Shlegeris, S. R. Bowman, E. Perez, E. Hubinger</td><td>arXiv:2406.10162</td><td>2024</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
-        <tr><td><a href="https://doi.org/10.1145/3766882.3767169">AgentSight: System-Level Observability for AI Agents Using eBPF</a> <small>(also arXiv:2508.02736; chapter 23 describes it in prose)</small></td><td>Y. Zheng, Y. Hu, T. Yu, A. Quinn</td><td>PACMI &#x27;25 (workshop, with SOSP &#x27;25)</td><td>2025</td><td><a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a>, <a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a>, <a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a>, <a href="27-actime-and-akeep.html" title="Actime and Akeep: one runtime for agent policy, observability and backup">27</a></td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2411.03455">Watson: A Cognitive Observability Framework for the Reasoning of LLM-Powered Agents</a> <small>(preprint)</small></td><td>B. Rombaut et al.</td><td>arXiv:2411.03455</td><td>2024</td><td><a href="23-agentsight.html" title="AgentSight: system-level observability for AI agents">23</a></td></tr>
+        <tr><td><a href="https://doi.org/10.1145/3766882.3767169">AgentSight: System-Level Observability for AI Agents Using eBPF</a> <small>(also arXiv:2508.02736)</small></td><td>Y. Zheng, Y. Hu, T. Yu, A. Quinn</td><td>PACMI &#x27;25 (workshop, with SOSP &#x27;25)</td><td>2025</td><td><a href="08-ecosystem.html" title="The eBPF ecosystem map">08</a>, <a href="23-agentsight.html" title="AgentSight: system-level observability for AI agents">23</a>, <a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a>, <a href="25-agentcgroup.html" title="AgentCgroup: OS resources of AI agents">25</a>, <a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a>, <a href="27-actime-and-akeep.html" title="Actime and Akeep: one runtime for agent policy, observability and backup">27</a></td></tr>
         <tr><td><a href="https://arxiv.org/abs/2503.18813">Defeating Prompt Injections by Design (CaMeL)</a> <small>(preprint)</small></td><td>E. Debenedetti et al.</td><td>arXiv:2503.18813</td><td>2025</td><td><a href="24-actplane.html" title="ActPlane: information-flow enforcement for AI agents">24</a></td></tr>
         <tr><td><a href="https://arxiv.org/abs/2511.21654">EvilGenie: A Reward Hacking Benchmark</a> <small>(preprint)</small></td><td>J. Gabor, J. Lynch, J. Rosenfeld</td><td>arXiv:2511.21654</td><td>2025</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
         <tr><td><a href="https://arxiv.org/abs/2510.20270">ImpossibleBench: Measuring LLMs&#x27; Propensity of Exploiting Test Cases</a> <small>(preprint)</small></td><td>Z. Zhong, A. Raghunathan, N. Carlini</td><td>arXiv:2510.20270</td><td>2025</td><td><a href="26-reward-guard-and-safe-change.html" title="RewardGuard and safe change after external operations">26</a></td></tr>
@@ -971,7 +991,7 @@ heads.forEach((h, i) =&gt; {
   if (!h.id) h.id = h.textContent.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "s" + i;
   /* ... */
 });</code></pre>
-    <p>The glossary links in this chapter were computed with the same rule from each chapter's actual headings, and every target was checked to exist. If you rename a heading in another chapter, rerun that check. Chapter 23 was being written while this appendix was assembled, so its terms link to the chapter as a whole, not to a section.</p>
+    <p>The glossary links in this chapter were computed with the same rule from each chapter's actual headings, and every target was checked to exist. If you rename a heading in another chapter, rerun that check.</p>
 
     <h2>Check your understanding</h2>
     <p>These questions each draw on two or more parts of the curriculum.</p>
