@@ -1,0 +1,1681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>27 · Actime and Akeep: one runtime for agent policy, observability and backup · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="27">
+<meta name="chapter-part" content="Part VI · eBPF for AI agents">
+<meta name="chapter-summary" content="How Actime composes the eBPF engines ActPlane and AgentSight with the Akeep session-history backup into one command and one run record, how Akeep stores agent transcripts in a content-addressed, optionally age-encrypted archive, and which of these parts actually use eBPF.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/actime">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VI · eBPF for AI agents › 27 · Actime and Akeep</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 27</div>
+      <h1>Actime and Akeep: one runtime for agent policy, observability and backup</h1>
+      <p class="lede">Chapters 23 and 24 built two eBPF engines for AI agents: AgentSight
+      watches what an agent does, and ActPlane decides what it may do. A team that wants both
+      still has to install them, start them in the right order, give them privileges, collect
+      their output, and keep the agent's own transcript somewhere safe. This chapter studies
+      the two projects that do that work. <strong>Actime</strong> is a Rust orchestrator that
+      runs an agent under ActPlane and AgentSight and writes one run record.
+      <strong>Akeep</strong> is a Git-like, content-addressed backup tool for agent session
+      history. Neither one contains an eBPF program. The chapter is about what it takes to turn
+      kernel mechanisms into something a team can run every day.</p>
+      <div class="meta"><span>Prerequisites: <a href="23-agentsight.html">23</a>, <a href="24-actplane.html">24</a></span><span>Repos: eunomia-bpf/actime @ <code>9c035981</code>, eunomia-bpf/akeep @ <code>7d690362</code>, eunomia-bpf/backup-client-sdk @ <code>2774aa0b</code></span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Coding agents such as Claude Code, Codex, Gemini CLI and OpenCode run on laptops, CI
+    runners and cloud sandboxes. Each one can start shells, rewrite files, open network
+    connections and use a lot of CPU. When something goes wrong, the usual record of what
+    happened is the agent's own transcript. Actime's README puts the problem this way: the
+    transcript is "written by the thing you are trying to audit."</p>
+
+    <p>The earlier chapters in this part give three answers to three questions:</p>
+    <ul>
+      <li><em>What did the agent actually do?</em> <a href="23-agentsight.html">AgentSight</a>
+      uses eBPF to record process, file, network and decrypted TLS activity from outside the
+      agent.</li>
+      <li><em>What is the agent allowed to do?</em> <a href="24-actplane.html">ActPlane</a>
+      compiles a small policy language into an eBPF/BPF-LSM engine that kills, blocks or
+      reports effects at the syscall boundary.</li>
+      <li><em>What did the agent decide, and can I get it back?</em> The transcript lives in
+      files such as <code>~/.claude/projects/…/*.jsonl</code> and
+      <code>~/.codex/sessions</code>. These formats are undocumented and change between
+      versions, and Claude Code's documentation describes a
+      <a href="https://code.claude.com/docs/en/sessions">default 30-day cleanup</a> of local
+      transcripts. Akeep is the eunomia-bpf answer to this question.</li>
+    </ul>
+
+    <p>Each tool is useful alone. Together they are harder to use. ActPlane has to start
+    before the agent so the policy covers the whole process tree. AgentSight has to attach to
+    the right pid. Both need root or <code>CAP_BPF</code>. Both write output in their own
+    formats. The transcript backup has to run after the agent exits. If any engine is missing
+    or lacks privileges, someone has to decide whether the run should continue. Actime is the
+    code that makes these decisions once, the same way every time, and writes the outcome
+    down.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Actime composes; it does
+    not reimplement. Its design document lists as a non-goal: "Actime does not build its own
+    eBPF programs. It orchestrates ActPlane and AgentSight, which own their kernel code." The
+    interesting engineering is in the contract around the engines: when a plane counts as
+    active, what happens when one is missing, and why a policy in <code>enforce</code> mode
+    refuses to run rather than enforce a subset of its rules.</p></div>
+
+    <h2>Which parts use eBPF, and which do not</h2>
+    <p>This chapter sits in an eBPF curriculum, but most of the code it covers is ordinary
+    userspace Rust. Here is where the eBPF code is:</p>
+    <table>
+      <tr><th>Component</th><th>Uses eBPF?</th><th>What it does</th></tr>
+      <tr><td><strong>Actime</strong> (<code>actime</code> binary)</td><td>No, not directly. It starts eBPF engines as subprocesses.</td><td>Resolves config, composes policy text, launches <code>actplane</code> and <code>agentsight</code> with <code>sudo</code> when needed, runs <code>akeep commit</code>, writes the run directory and report.</td></tr>
+      <tr><td>ActPlane (policy plane)</td><td><strong>Yes</strong>: BPF LSM and tracepoint programs</td><td>Kernel enforcement of exec / file / connect rules. See <a href="24-actplane.html">chapter 24</a>.</td></tr>
+      <tr><td>AgentSight (observability plane)</td><td><strong>Yes</strong>: uprobes on TLS libraries and process/file/network tracing</td><td>Writes the observation SQLite database Actime reads. See <a href="23-agentsight.html">chapter 23</a>.</td></tr>
+      <tr><td><strong>Akeep</strong> (backup plane)</td><td>No</td><td>Userspace file discovery, BLAKE3 hashing, zstd, optional age encryption, filesystem / S3 / Git storage. Its only link to eBPF is that one of its "providers" is AgentSight's monitor database.</td></tr>
+      <tr><td><strong>backup-client-sdk</strong></td><td>No</td><td>An HTTP client for a hosted Akeep control plane: device pairing, quotas, uploads of already-encrypted files to Cloudflare R2.</td></tr>
+      <tr><td>agentqos</td><td>No</td><td>A small CLI that turns latency, error-rate and token budgets into a pass/fail QoS score.</td></tr>
+    </table>
+
+    <div class="callout warn"><span class="label">Correction to the repository description</span>
+    <p>At the time of writing, the GitHub description of <code>eunomia-bpf/actime</code> still
+    reads "Unified runtime for AI coding agents: sandbox isolation, kernel-enforced policy,
+    system evidence, and session history in one command". The code no longer does sandbox
+    isolation. Commit <code>3f29370</code> ("Remove sandbox management; attach to user process
+    trees", 2026-08-05) deleted the <code>actime-sandbox</code> crate, including a bubblewrap
+    backend (<code>bwrap.rs</code>), a Docker backend and a sandbox image. Current Actime uses
+    no namespaces, no Landlock and no seccomp of its own. Its design document says "Exactly three
+    planes. There is no isolation plane." Isolation is left to whatever sandbox you already
+    run.</p></div>
+
+    <h2>Actime in one paragraph</h2>
+    <p>The README describes Actime as "the effect plane for AI coding agents: kernel-enforced
+    policy, system observability, and session backup, attached to the agent you already run,
+    wherever it already runs." You type <code>actime run -- claude</code>. Actime launches
+    Claude Code under <code>actplane run</code> so the policy covers every process the agent
+    starts. It attaches <code>agentsight record</code> to that process tree. When the agent
+    exits, it runs <code>akeep commit</code> on the session files. It then reads back what
+    the engines wrote and prints a report. That report is not built from what the agent says it
+    did. It is built from what the kernel saw. The project sums up its role relative to a
+    sandbox in one line:</p>
+    <blockquote><p><strong>The sandbox contains. Actime accounts.</strong></p></blockquote>
+    <p>The README states the one invariant: "Actime observes and enforces <strong>below the
+    tool layer</strong>, at the syscall/effect boundary." A tool-layer guardrail can block a
+    tool call, but it misses <code>bash -c</code>, a Python <code>subprocess</code>, or a
+    subagent doing the same thing. An exec-level rule enforced in the kernel catches all of
+    them, because each one eventually calls <code>execve</code>. <a href="24-actplane.html">Chapter
+    24</a> explains how.</p>
+
+    <h3>The three planes</h3>
+    <div class="grid">
+      <div class="card"><h4>Policy · ActPlane (eBPF)</h4><p>"What is the agent allowed to
+      do?" Rules such as <code>kill exec "git" "--force" if AGENT</code>. Modes
+      <code>off</code>, <code>observe</code>, <code>enforce</code>.</p></div>
+      <div class="card"><h4>Observability · AgentSight (eBPF)</h4><p>"What did the agent
+      actually do?" Processes, files written, endpoints, LLM calls and tokens, peak RSS and
+      CPU, all read from AgentSight's SQLite store.</p></div>
+      <div class="card"><h4>Backup · Akeep (userspace)</h4><p>"What did the agent decide, and
+      can we replay it?" A versioned commit of the provider-native session files at run
+      exit.</p></div>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 900 430" role="img" aria-label="Actime architecture: the actime process launches the agent under actplane run, attaches agentsight record to the agent's pid, and on exit runs akeep commit; ActPlane and AgentSight load eBPF programs into the kernel; all outputs land in a run directory">
+        <style>
+          .b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .k{fill:none;stroke:var(--accent);stroke-width:2}
+          .u{fill:none;stroke:var(--accent2);stroke-width:2}
+          .tx{fill:var(--fg);font:13px sans-serif}
+          .mo{fill:var(--fg);font:12px monospace}
+          .mu{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah27a)}
+          .da{stroke:var(--muted);stroke-width:1.5;fill:none;stroke-dasharray:5 4;marker-end:url(#ah27a)}
+          .ln{stroke:var(--border);stroke-width:1;stroke-dasharray:5 4}
+        </style>
+        <defs><marker id="ah27a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="mu" x="10" y="18">user space</text>
+        <text class="mu" x="830" y="352">kernel</text>
+        <line class="ln" x1="0" y1="330" x2="900" y2="330"/>
+        <!-- actime -->
+        <rect class="u" x="320" y="28" width="260" height="62" rx="6"/>
+        <text class="tx" x="334" y="50" style="font-weight:600">actime run -- claude</text>
+        <text class="mu" x="334" y="70">config · compose policy · orchestrate</text>
+        <!-- actplane wrap -->
+        <rect class="b" x="40" y="130" width="250" height="62" rx="6"/>
+        <text class="mo" x="52" y="152">[sudo] actplane --policy</text>
+        <text class="mo" x="52" y="170">  policy.yaml run -- claude</text>
+        <!-- agent -->
+        <rect class="b" x="40" y="225" width="250" height="80" rx="6"/>
+        <text class="tx" x="52" y="247">agent process tree (unmodified)</text>
+        <text class="mo" x="52" y="267">claude → bash → git, rm,</text>
+        <text class="mo" x="52" y="285">python, curl, subagents …</text>
+        <!-- agentsight -->
+        <rect class="b" x="325" y="130" width="250" height="62" rx="6"/>
+        <text class="mo" x="337" y="152">[sudo] agentsight record</text>
+        <text class="mo" x="337" y="170">  --no-server --db … --pid N</text>
+        <!-- akeep -->
+        <rect class="b" x="610" y="130" width="250" height="62" rx="6"/>
+        <text class="mo" x="622" y="152">akeep init; akeep commit -m</text>
+        <text class="mu" x="622" y="172">after the agent exits (no eBPF)</text>
+        <!-- run dir -->
+        <rect class="u" x="670" y="225" width="210" height="80" rx="6"/>
+        <text class="tx" x="682" y="245">run directory</text>
+        <text class="mo" x="682" y="263">manifest.json report.md</text>
+        <text class="mo" x="682" y="279">violations.jsonl</text>
+        <text class="mo" x="682" y="295">observability.db</text>
+        <!-- session files -->
+        <rect class="b" x="460" y="235" width="170" height="60" rx="6"/>
+        <text class="tx" x="472" y="257">session files</text>
+        <text class="mo" x="472" y="277">~/.claude ~/.codex</text>
+        <!-- kernel -->
+        <rect class="k" x="40" y="362" width="320" height="56" rx="8"/>
+        <text class="tx" x="52" y="384">ActPlane: BPF-LSM + tracepoints</text>
+        <text class="mu" x="52" y="404">kill / block / notify on exec, connect …</text>
+        <rect class="k" x="380" y="362" width="300" height="56" rx="8"/>
+        <text class="tx" x="392" y="384">AgentSight probes</text>
+        <text class="mu" x="392" y="404">process, file, network, TLS uprobes</text>
+        <!-- arrows -->
+        <path class="ar" d="M380,90 L190,128"/>
+        <path class="ar" d="M450,90 V128"/>
+        <path class="ar" d="M520,90 L730,128"/>
+        <path class="ar" d="M165,192 V223"/>
+        <path class="da" d="M370,192 L270,223"/>
+        <path class="da" d="M200,360 V307"/>
+        <path class="ar" d="M40,161 H22 V390 H38"/>
+        <path class="ar" d="M400,192 V360"/>
+        <path class="da" d="M650,192 L590,233"/>
+        <path class="ar" d="M800,192 V223"/>
+        <path class="ar" d="M560,192 L690,223"/>
+        <text class="mu" x="60" y="122">1. wrap launch</text>
+        <text class="mu" x="460" y="120">2. attach to pid</text>
+        <text class="mu" x="670" y="120">3. commit on exit</text>
+        <text class="mu" x="26" y="350">load</text>
+        <text class="mu" x="408" y="345">load</text>
+        <text class="mu" x="208" y="340">enforce</text>
+        <text class="mu" x="575" y="224">harvest</text>
+      </svg>
+      <figcaption>Figure 27.1 — Actime itself loads nothing into the kernel. It starts two eBPF
+      engines and one backup tool as child processes, then collects what they wrote into one
+      run directory. Solid arrows show process launches and data flow; dashed arrows show
+      attach and read relationships.</figcaption>
+    </figure>
+
+    <h2>How a run works</h2>
+    <p>The design document (<code>docs/DESIGN.md</code> §7) calls itself "the implementation
+    contract" and lists the steps of <code>actime run</code>. The stepper below follows those
+    steps, with the code that does each one in <code>crates/actime-cli/src/planes.rs</code>
+    and <code>run.rs</code>.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Resolve configuration</h4><p>The first match wins:
+      <code>--config FILE</code>, then <code>./actime.yaml</code> searched upward to the git
+      root, then <code>~/.config/actime/actime.yaml</code>, then the built-in
+      <code>balanced</code> profile. Every field is optional. "<code>actime run -- claude</code>
+      with no config file at all must work." CLI flags such as <code>--policy observe</code>
+      are applied last. Actime then looks for the three engine binaries on <code>PATH</code>,
+      in <code>~/.local/share/actime/bin</code> and in <code>~/.cargo/bin</code>, and records
+      their versions.</p></div>
+      <div class="step"><h4>2. Create the run directory</h4><p><code>RunStore::create</code>
+      makes <code>~/.local/share/actime/runs/&lt;run-id&gt;/</code> (override the root with
+      <code>ACTIME_HOME</code>). It writes the effective <code>actime.yaml</code> there, so the
+      record shows the exact configuration that was in force. A run id looks like
+      <code>20261106-010537-c2d2</code>.</p></div>
+      <div class="step"><h4>3. Compose the policy</h4><p>The selected packs (built into the binary
+      with <code>include_str!</code>) and any extra policy files are joined into one text.
+      <code>${WORKSPACE}</code> is replaced with the real working directory. The result is
+      saved as <code>policy.dsl</code> (human-readable) and wrapped in
+      <code>policy.yaml</code>, the project file that ActPlane's <code>--policy</code> flag
+      accepts.</p></div>
+      <div class="step"><h4>4. Decide which rules can be enforced</h4><p>Before starting
+      anything, Actime runs <code>actplane --rule &lt;dsl&gt; compile --json</code> and checks
+      each rule against the feature budget of the installed ActPlane version. In
+      <code>enforce</code> mode, if any rule cannot be enforced, the run stops here: the agent
+      is never started, and the run directory is finalized as a refusal. In
+      <code>observe</code> mode the run continues, and the unenforceable rules are recorded in
+      the manifest.</p></div>
+      <div class="step"><h4>5. Launch the agent under the policy</h4><p>With policy on, the
+      agent's argv becomes <code>[sudo -n -E] actplane --policy &lt;run&gt;/policy.yaml run --
+      claude …</code>. Starting the agent this way means every descendant inherits the policy
+      scope from its first instruction. Actime then reads the engine log. If the log shows an
+      install failure, the policy plane is changed from <em>Active</em> to <em>Disabled</em>,
+      and in <code>enforce</code> mode the run aborts.</p></div>
+      <div class="step"><h4>6. Attach observability</h4><p>Once the child pid exists, Actime
+      starts <code>agentsight record --no-server --db &lt;run&gt;/observability.db --pid
+      N</code>. For a container target it passes <code>--binary-path docker://…</code> or
+      <code>k8s://…</code> instead. This plane is always fail-soft: if it cannot start, the run
+      continues.</p></div>
+      <div class="step"><h4>7. Wait, then stop the engines in order</h4><p>Actime waits for the
+      agent and applies <code>limits.wall_clock</code> or <code>--timeout</code>. It lets the
+      engines exit on their own first so their events reach disk. If they do not, it sends
+      SIGTERM, waits a few seconds, then sends SIGKILL. "Nothing may hang a run
+      forever."</p></div>
+      <div class="step"><h4>8. Harvest, back up, report</h4><p>Only after ActPlane has exited
+      does Actime copy its scoped <code>actplane/runs/run-&lt;pid&gt;-&lt;ts&gt;/events.jsonl</code>
+      into <code>violations.jsonl</code>. It reads AgentSight's SQLite database defensively,
+      runs <code>akeep init</code> and <code>akeep commit -m "actime run &lt;id&gt;"</code>,
+      updates <code>manifest.json</code>, renders <code>report.md</code> and prints the
+      summary. The exit code is the agent's own, or 3 with <code>--fail-on-violation</code>
+      when a rule blocked or killed something.</p></div>
+    </div>
+
+    <h3>Starting engines with privileges</h3>
+    <p>Both eBPF engines need root or <code>CAP_BPF</code> (usually with
+    <code>CAP_PERFMON</code> as well; see LWN's
+    <a href="https://lwn.net/Articles/822362/">"A crop of new capabilities"</a> for how these
+    were split out of <code>CAP_SYS_ADMIN</code>). Actime itself runs unprivileged and adds
+    <code>sudo</code> only to the engine commands. The helper is short, and the
+    non-interactive case is what makes it safe to use in CI:</p>
+    <pre data-file="crates/actime-cli/src/planes.rs"><code class="language-rust">/// Build a command, prefixing `sudo` when the eBPF planes need privileges we
+/// do not have.
+///
+/// Interactive password prompts are allowed only when [`may_prompt_sudo`] is
+/// true. Otherwise `sudo -n` is used so a non-interactive run fails fast
+/// instead of hanging forever on a prompt nobody will answer.
+pub fn privileged(program: &amp;Path, args: &amp;[String]) -&gt; Command {
+    if is_root() {
+        let mut c = Command::new(program);
+        c.args(args);
+        return c;
+    }
+    let mut c = Command::new("sudo");
+    if !may_prompt_sudo() {
+        // Non-interactive: never block on a password prompt.
+        c.arg("-n");
+    }
+    c.arg("-E").arg(program).args(args);
+    c
+}</code></pre>
+
+    <p>The policy plane does not attach after the fact. It wraps the agent. This is the argv
+    Actime builds:</p>
+    <pre data-file="crates/actime-cli/src/planes.rs"><code class="language-rust">    /// Build argv that launches `agent` under `actplane run` (host wrap path).
+    ///
+    /// Prefixes `sudo -n -E` when not root and a password prompt is not safe.
+    /// Invokes `actplane --policy &lt;file&gt; run -- &lt;cmd&gt;` so the engine installs
+    /// the composed policy for that run (not a post-hoc attach delta alone).
+    pub fn wrap_argv(actplane: &amp;Path, policy_yaml: &amp;Path, agent: &amp;[String]) -&gt; Vec&lt;String&gt; {
+        let mut v = Vec::new();
+        if !is_root() {
+            v.push("sudo".into());
+            if !may_prompt_sudo() {
+                v.push("-n".into());
+            }
+            v.push("-E".into());
+        }
+        v.push(actplane.display().to_string());
+        v.push("--policy".into());
+        v.push(policy_yaml.display().to_string());
+        v.push("run".into());
+        v.push("--".into());
+        v.extend(agent.iter().cloned());
+        v
+    }</code></pre>
+    <p>The comment matters. In <a href="24-actplane.html">chapter 24</a>, <code>actplane
+    run</code> seeds the agent's pid before <code>exec</code>. Every child then inherits the
+    "agent" label, and the <code>AGENT</code> source in the policy matches the whole tree. An
+    attach to a running process sees only future events and only processes that are tracked
+    from then on.</p>
+
+    <p>The observability plane is attached once a pid exists. Here is how its argv is built:</p>
+    <pre data-file="crates/actime-cli/src/planes.rs"><code class="language-rust">        let mut args = vec![
+            "record".to_string(),
+            "--no-server".to_string(),
+            "--db".to_string(),
+            spec.db.display().to_string(),
+        ];
+        match (&amp;spec.target, spec.host_pid) {
+            (Some(target), _) =&gt; {
+                args.push("--binary-path".to_string());
+                args.push(target.clone());
+            }
+            (None, Some(pid)) =&gt; {
+                args.push("--pid".to_string());
+                args.push(pid.to_string());
+            }
+            (None, None) =&gt; {
+                plane.outcome = Outcome::Disabled(
+                    "no host pid or container target to attach observability to".into(),
+                );
+                return plane;
+            }
+        }
+        /* ... open the engine log ... */
+        let mut cmd = privileged(binary, &amp;args);</code></pre>
+
+    <p>The backup plane is plain process execution with a timeout. It does not use
+    <code>sudo</code>, because Akeep only reads the user's own home directory:</p>
+    <pre data-file="crates/actime-cli/src/planes.rs"><code class="language-rust">        // Akeep needs an initialized repository. `init` on an existing vault is
+        // a no-op; bound it so a stuck vault cannot hang the run either.
+        match run_with_timeout(
+            Command::new(binary)
+                .arg("init")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            AKEEP_TIMEOUT,
+        ) {
+            /* ... timeout =&gt; Degraded, error =&gt; Disabled ... */
+            Timed::Finished(_) =&gt; {}
+        }
+
+        let mut commit_cmd = Command::new(binary);
+        commit_cmd
+            .args(["commit", "-m", message])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());</code></pre>
+    <p>The commit id is parsed from Akeep's output and stored in the manifest as
+    <code>akeep_commit</code>. Later, <code>actime keep restore &lt;run&gt;</code> looks up
+    that id and runs <code>akeep checkout &lt;commit&gt; --to &lt;dir&gt;</code>. The run
+    record and the session backup stay linked even though they live in different stores.</p>
+
+    <h2>Policy packs and "enforceable on this host"</h2>
+    <p>Actime ships three ActPlane policy packs in <code>policies/</code>. They use the
+    language from <a href="24-actplane.html">chapter 24</a>: <code>source</code> lines attach
+    labels, and <code>rule</code> blocks combine an effect (<code>kill</code>,
+    <code>block</code>, <code>notify</code>), an operation and a target with a label
+    condition and a <code>because</code> message that is shown to the agent.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="coding-agent-baseline"><pre data-file="policies/coding-agent-baseline.dsl"><code class="language-plaintext">source AGENT = exec "**/claude"
+source AGENT = exec "**/codex"
+source AGENT = exec "**/gemini"
+source AGENT = exec "**/opencode"
+source AGENT = exec "**/openclaw"
+source AGENT = exec "**/aider"
+source AGENT = exec "**/cursor-agent"
+source AGENT = exec "**/actime-demo-agent"
+
+# 1. History rewriting and forced pushes destroy work that is not the agent's.
+rule destructive-vcs:
+  kill exec "git" "--force" if AGENT
+  kill exec "git" "--hard" if AGENT
+  kill exec "git" "clean" if AGENT
+  because "Force-pushing, hard-resetting, and cleaning discard work that cannot be recovered from the agent's own history. Use a non-destructive git command, or ask the user to run this."
+
+# 2. Whole-tree deletion is never a step in a coding task.
+#    Path-scoped `unless target` matches the exec object (the rm binary), not
+#    argv paths, so the unrestricted form is the enforceable shape today.
+rule mass-deletion:
+  kill exec "rm" "-rf" if AGENT
+  because "Recursive deletion is not a step in a coding task. Delete specific paths under ${WORKSPACE}, or ask the user."</code></pre></div>
+      <div class="tab-panel" data-label="no-vcs-write"><pre data-file="policies/no-vcs-write.dsl"><code class="language-plaintext">rule no-publish:
+  kill exec "git" "push" if AGENT
+  kill exec "git" "tag" if AGENT
+  because "This run may change the working tree but may not publish. Leave the changes staged and report what you did; the user pushes."
+
+rule no-branch-churn:
+  kill exec "git" "branch" if AGENT
+  kill exec "git" "worktree" if AGENT
+  because "This run does not create branches or worktrees. Work on the current checkout, or ask the user to prepare the branch."
+
+# Commits are gated, not forbidden: the user writes the approval file when they
+# have reviewed the diff, and the gate goes stale again after each commit.
+rule gated-commit:
+  kill exec "git" "commit"
+    if AGENT unless after write "${WORKSPACE}/.actime/commit-approved"
+      since exec "git" "commit"
+  because "Commits need explicit approval. Show the user the diff; once they approve, they (or you, on their instruction) write ${WORKSPACE}/.actime/commit-approved, and the next commit is allowed."</code></pre></div>
+      <div class="tab-panel" data-label="information-flow"><pre data-file="policies/information-flow.dsl"><code class="language-plaintext">source SECRET = file "**/.env"
+source SECRET = file "**/.env.*"
+source SECRET = file "**/.ssh/id_*"
+source SECRET = file "**/.aws/credentials"
+/* ... more secret-shaped paths ... */
+source SECRET = file "**/*.key"
+
+# A redaction step clears the label, so a deliberate, reviewed release path
+# stays possible: run the data through your scrubber and the flow is allowed.
+declassify SECRET by exec "**/actime-redact"
+
+/* ... rules system-fence, run-record-integrity, credential-access ... */
+
+# 4. Data labeled from a secret file may not reach the network.
+rule no-secret-egress:
+  kill connect endpoint "*" if AGENT and SECRET
+  because "This process holds data derived from a secret file and tried to open a network connection. ..."</code></pre></div>
+    </div>
+
+    <p>Two details are worth noticing. First, every argv-matching rule uses
+    <code>kill</code>, not <code>block</code>. Actime's <code>CLAUDE.md</code> explains why:
+    "<code>block exec</code> with an argv token cannot deny before the fact — argv is only
+    available after exec — so argv-sensitive rules use <code>kill</code>." ActPlane reads
+    argv at the exec tracepoint, after the new image is loaded, and a tracepoint can kill but
+    cannot fail the syscall (<a href="24-actplane.html">chapter 24</a> covers the hook
+    placement). The new program may start, but it is killed before it gets far. Second, <code>gated-commit</code> uses the temporal operators <code>after</code> and
+    <code>since</code>. An approval file permits one commit, and the permission expires when
+    that commit happens. A per-call permission prompt cannot express this.</p>
+
+    <h3>Rules are a host property</h3>
+    <p>A policy that compiles is not always a policy the kernel will install. Released ActPlane
+    0.1.8, on the path Actime uses, loads a host-wide eBPF engine with a fixed feature budget.
+    Actime copies the feature bits from ActPlane's source and hard-codes the budget it expects:</p>
+    <pre data-file="crates/actime-core/src/enforceability.rs"><code class="language-rust">// Feature bits mirror ActPlane `bpf/src/lib.rs` (released 0.1.8).
+const FEAT_PATH_CONTAINS: u32 = 1 &lt;&lt; 0;
+const FEAT_PATH_SUFFIX: u32 = 1 &lt;&lt; 1;
+const FEAT_OPEN_RULES: u32 = 1 &lt;&lt; 2;
+const FEAT_WRITE_RULES: u32 = 1 &lt;&lt; 3;
+const FEAT_CONNECT: u32 = 1 &lt;&lt; 4;
+const FEAT_RECV: u32 = 1 &lt;&lt; 5;
+const FEAT_FILE_FLOW: u32 = 1 &lt;&lt; 6;
+const FEAT_BLOCK_EXEC: u32 = 1 &lt;&lt; 7;
+const FEAT_BLOCK_FILE: u32 = 1 &lt;&lt; 8;
+const FEAT_BLOCK_CONNECT: u32 = 1 &lt;&lt; 9;
+
+/// Feature budget of the ActPlane 0.1.8 pinned singleton (`supported=0x3f0`).
+///
+/// Path contains/suffix matchers and open/write sink rule classes are omitted.
+pub const ENGINE_SUPPORTED_0_1_8: u32 = FEAT_CONNECT
+    | FEAT_RECV
+    | FEAT_FILE_FLOW
+    | FEAT_BLOCK_EXEC
+    | FEAT_BLOCK_FILE
+    | FEAT_BLOCK_CONNECT;</code></pre>
+    <p>For each clause reported by <code>actplane compile --json</code>, Actime computes the
+    feature bits the clause needs and compares them with this mask:</p>
+    <pre data-file="crates/actime-core/src/enforceability.rs"><code class="language-rust">fn features_for_clause(op: &amp;str, target_kind: &amp;str, pattern: &amp;str) -&gt; u32 {
+    let mut f = 0u32;
+    let op = op.to_ascii_lowercase();
+    let kind = target_kind.to_ascii_lowercase();
+    match (op.as_str(), kind.as_str()) {
+        ("open", "file") =&gt; {
+            f |= FEAT_OPEN_RULES;
+            f |= path_match_features(pattern);
+        }
+        ("write" | "unlink", "file") =&gt; {
+            f |= FEAT_WRITE_RULES | FEAT_FILE_FLOW;
+            f |= path_match_features(pattern);
+        }
+        ("connect", _) =&gt; {
+            f |= FEAT_CONNECT;
+        }
+        ("recv", _) =&gt; {
+            f |= FEAT_RECV;
+        }
+        ("exec", _) =&gt; {
+            // Exec sinks load under the pinned hook budget.
+        }
+        /* ... */
+    }
+    f
+}</code></pre>
+    <p>The result is the table that <code>actime policy check</code> prints. The README shows
+    it for the <code>information-flow</code> pack (output quoted from the README; I did not
+    have ActPlane installed to reproduce it):</p>
+    <pre><code class="language-plaintext">$ actime policy check        # packs: [information-flow]
+ok policy compiled from information-flow · 0/4 rules enforceable on this host
+
+RULE                     EFFECT   ENFORCEABLE  REASON
+credential-access        notify   no           engine missing features required on attach/delta path: path contains matches, path suffix matches
+run-record-integrity       block    no           engine missing features required on attach/delta path: path contains matches, write sink rules
+no-secret-egress         kill     no           engine missing features required on attach/delta path: path contains matches, path suffix matches
+system-fence             block    no           engine missing features required on attach/delta path: write sink rules</code></pre>
+    <p>The repository says this plainly. The secret-egress rule, the idea that makes ActPlane
+    interesting, is "expressible … <strong>not enforceable with released ActPlane
+    0.1.8</strong>." The two exec-only packs install and fire. No default profile includes the
+    <code>information-flow</code> pack.</p>
+
+    <div class="callout danger"><span class="label">Fail closed, but only in enforce</span>
+    <p>The design document names the worst outcome: "Silent partial enforcement is the worst
+    outcome." In <code>enforce</code> mode, Actime aborts before the agent starts if any
+    requested rule cannot be enforced, or if the policy plane cannot start at all. In every
+    other case it fails soft: a missing engine, missing root or an old kernel disables a plane
+    and records the reason, and the run continues. The asymmetry is on purpose. A user who
+    asked for enforcement must not get an unprotected run that looks protected. A user who
+    asked for observation should still get a record.</p></div>
+
+    <h2>Degradation: what happens when something is missing</h2>
+    <p>Actime is designed to be useful on a laptop with no root and no container runtime, and
+    stricter when the environment allows it. Here is the degradation matrix from
+    <code>DESIGN.md</code> §8:</p>
+    <table>
+      <tr><th>Missing</th><th>Effect</th></tr>
+      <tr><td>root / <code>CAP_BPF</code></td><td>policy and observability disabled; backup still runs; <code>doctor</code> explains</td></tr>
+      <tr><td>running inside a container without <code>CAP_BPF</code></td><td>same; doctor warns that this is deployment B without host-side tamper resistance</td></tr>
+      <tr><td><code>actplane</code> binary</td><td>policy plane disabled in <code>observe</code>; hard error in <code>enforce</code></td></tr>
+      <tr><td><code>agentsight</code> binary</td><td>observability disabled; process-level fallback still records argv, exit code and duration</td></tr>
+      <tr><td><code>akeep</code> binary</td><td>backup plane disabled</td></tr>
+      <tr><td>kernel &lt; 5.10</td><td>policy plane disabled, with the kernel version in the reason</td></tr>
+    </table>
+    <p>Each plane ends a run in one of three states, defined in <code>actime-core</code>:
+    <code>Active</code>, <code>Degraded(reason)</code> or <code>Disabled(reason)</code>. Try the
+    combinations below. The widget encodes only the rules in the matrix above and in
+    <code>DESIGN.md</code> §7; it is a teaching aid, not Actime code.</p>
+
+    <div id="plane-sim" class="card" style="padding:1rem">
+      <p style="margin-top:0"><strong>Plane outcome explorer</strong> (illustrative)</p>
+      <p>
+        <label>policy mode
+          <select id="ps-mode"><option>enforce</option><option>observe</option><option>off</option></select>
+        </label>
+        &nbsp;<label><input type="checkbox" id="ps-priv" checked> root or CAP_BPF</label>
+        &nbsp;<label><input type="checkbox" id="ps-ap" checked> actplane installed</label>
+        &nbsp;<label><input type="checkbox" id="ps-as" checked> agentsight installed</label>
+        &nbsp;<label><input type="checkbox" id="ps-ak" checked> akeep installed</label>
+        &nbsp;<label><input type="checkbox" id="ps-k510" checked> kernel ≥ 5.10</label>
+        &nbsp;<label><input type="checkbox" id="ps-ifc"> include information-flow pack</label>
+      </p>
+      <pre id="ps-out" style="margin-bottom:0"><code class="language-plaintext"></code></pre>
+    </div>
+
+    <h2>Where Actime sits relative to a sandbox</h2>
+    <p>Because Actime no longer creates sandboxes, it has to work with whatever sandbox already
+    exists. <code>docs/deployment.md</code> describes three positions and is open about how
+    their guarantees differ:</p>
+
+    <figure>
+      <svg viewBox="0 0 900 300" role="img" aria-label="Three deployment positions: A, Actime on the host attached to a container from outside; B, Actime inside the container next to the agent; C, no sandbox, Actime and agent on a plain host">
+        <style>
+          .b2{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .c2{fill:none;stroke:var(--accent2);stroke-width:2;stroke-dasharray:6 4}
+          .a2{fill:none;stroke:var(--accent);stroke-width:2}
+          .t2{fill:var(--fg);font:13px sans-serif}
+          .m2{fill:var(--muted);font:12px sans-serif}
+          .h2{fill:var(--fg);font:bold 14px sans-serif}
+        </style>
+        <text class="h2" x="20" y="24">A · outside the sandbox</text>
+        <rect class="b2" x="20" y="36" width="270" height="200" rx="8"/>
+        <text class="m2" x="32" y="56">host (you own it)</text>
+        <rect class="a2" x="32" y="66" width="246" height="40" rx="6"/>
+        <text class="t2" x="44" y="91">sudo actime attach --container</text>
+        <rect class="c2" x="32" y="120" width="246" height="80" rx="6"/>
+        <text class="m2" x="44" y="140">container (existing)</text>
+        <text class="t2" x="44" y="168">agent</text>
+        <text class="m2" x="32" y="222">kernel: eBPF engines</text>
+        <text class="t2" x="20" y="262">strongest tamper story:</text>
+        <text class="m2" x="20" y="280">root in the container cannot reach the recorder</text>
+
+        <text class="h2" x="315" y="24">B · inside the sandbox</text>
+        <rect class="b2" x="315" y="36" width="270" height="200" rx="8"/>
+        <text class="m2" x="327" y="56">host (someone else's)</text>
+        <rect class="c2" x="327" y="66" width="246" height="134" rx="6"/>
+        <text class="m2" x="339" y="86">container + CAP_BPF, CAP_PERFMON</text>
+        <rect class="a2" x="339" y="96" width="222" height="40" rx="6"/>
+        <text class="t2" x="351" y="121">actime run -- claude</text>
+        <text class="t2" x="351" y="170">agent</text>
+        <text class="m2" x="327" y="222">kernel: eBPF engines</text>
+        <text class="t2" x="315" y="262">weaker: root inside can</text>
+        <text class="m2" x="315" y="280">kill actime, delete records, detach probes</text>
+
+        <text class="h2" x="610" y="24">C · no sandbox</text>
+        <rect class="b2" x="610" y="36" width="270" height="200" rx="8"/>
+        <text class="m2" x="622" y="56">workstation</text>
+        <rect class="a2" x="622" y="66" width="246" height="40" rx="6"/>
+        <text class="t2" x="634" y="91">actime run -- claude</text>
+        <text class="t2" x="634" y="150">agent (plain child process)</text>
+        <text class="m2" x="622" y="222">kernel: eBPF engines</text>
+        <text class="t2" x="610" y="262">same as host-side attach</text>
+        <text class="m2" x="610" y="280">to a plain process tree</text>
+      </svg>
+      <figcaption>Figure 27.2 — The three deployment positions in
+      <code>docs/deployment.md</code>. Solid boxes are where Actime runs; dashed boxes are the
+      sandbox someone else created. Actime never creates, starts, stops or removes a container
+      or pod.</figcaption>
+    </figure>
+
+    <p>Position B is the only option on managed sandbox platforms (the docs name E2B, Daytona,
+    AWS AgentCore and managed Kubernetes), because you cannot attach from a host you cannot
+    log into. The setup grants the eBPF capabilities to the container:</p>
+    <pre data-file="docs/deployment.md"><code class="language-bash">docker run --rm -it \
+  --cap-add BPF --cap-add PERFMON \
+  -v "$PWD":/workspace -w /workspace \
+  your-agent-image \
+  actime run -- claude</code></pre>
+    <p>The tamper story for B is honest: "An agent that gets root inside the sandbox
+    <em>can</em> interfere: it can kill the Actime process, delete the run directory, or (with
+    the same capabilities you granted for eBPF) detach the probes." The last point is the eBPF
+    detail to remember. <code>CAP_BPF</code> is not scoped to a container. Granting it so a
+    recorder can load programs also lets anything else with that capability in the same
+    container load or detach programs. <code>actime doctor</code> detects the in-container case
+    from <code>/.dockerenv</code>, <code>/run/.containerenv</code> and markers in
+    <code>/proc/1/cgroup</code>, and reads <code>CapEff</code> from
+    <code>/proc/self/status</code>.</p>
+
+    <p>In position A, <code>actime attach --container REF</code> resolves the container's host
+    pid through <code>docker inspect</code> or <code>podman inspect</code>, and <code>--pod
+    NS/POD</code> resolves it through <code>kubectl</code> and then the container runtime. Attach
+    binds the planes only to future events, and it does not commit a backup. The report shows
+    the backup plane as <code>Disabled</code> with "attach does not commit a backup".</p>
+
+    <h2>Actime directory map</h2>
+    <pre><code class="language-plaintext">actime/                         (@ 9c035981, workspace version 0.1.0, MSRV 1.85)
+├── Cargo.toml                  workspace: actime-core + actime-cli
+├── CLAUDE.md, AGENTS.md        agent instructions (AGENTS.md is a symlink)
+├── crates/
+│   ├── actime-core/src/        library, ~4.4k lines
+│   │   ├── config.rs           actime.yaml, profiles, CLI overrides, resolution order
+│   │   ├── components.rs       find actplane/agentsight/akeep, versions, install hints
+│   │   ├── run.rs              RunId, Run, Manifest, TargetReport, PlaneStatus, RunStore
+│   │   ├── enforceability.rs   engine feature budget, per-rule verdicts
+│   │   ├── observations.rs     read violations.jsonl + AgentSight SQLite defensively
+│   │   ├── report.rs           text / Markdown / JSON report rendering
+│   │   └── doctor.rs           deployment position, kernel, BTF, CapEff, engines
+│   └── actime-cli/src/         the `actime` binary, ~4.4k lines
+│       ├── main.rs             clap surface (init/run/attach/status/runs/report/policy/keep/doctor)
+│       ├── run.rs              run and attach orchestration, container/pod resolution
+│       ├── planes.rs           sudo wrapping, actplane wrap, agentsight record, akeep commit
+│       ├── commands.rs         policy check/explain, keep log/restore, doctor
+│       ├── embedded.rs         include_str! of packs and profiles, compose_policy()
+│       └── ui.rs               terminal styling
+├── crates/actime-cli/tests/    cli.rs (drives the real binary), policy_packs.rs
+├── policies/                   coding-agent-baseline.dsl, no-vcs-write.dsl, information-flow.dsl
+├── profiles/                   observe.yaml, balanced.yaml (default), strict.yaml
+├── docs/                       DESIGN.md (the contract), deployment.md, policies.md,
+│                               configuration.md, observability.md, quickstart.md, faq.md
+└── scripts/install.sh          Linux x86_64/aarch64 installer with SHA-256 check</code></pre>
+    <p>The split follows one rule from <code>CLAUDE.md</code>: "<code>actime-core</code> must
+    not depend on process-spawning code beyond what doctor and the report layer need. The CLI
+    owns <code>run</code> / <code>attach</code> orchestration." The core types, such as the
+    manifest, are fixed by <code>DESIGN.md</code> §5:</p>
+    <pre data-file="docs/DESIGN.md"><code class="language-rust">/// Exactly three planes. There is no isolation plane.
+pub struct PlaneStatus {
+    pub policy: PlaneState,
+    pub observability: PlaneState,
+    pub backup: PlaneState,
+}
+pub enum PlaneState { Active, Degraded(String), Disabled(String) }</code></pre>
+
+    <h2>Building and using Actime</h2>
+    <p>Actime is a small Rust workspace with no eBPF build step: it needs no clang and no
+    libbpf. The largest C component it compiles is SQLite, bundled by <code>rusqlite</code>. On this
+    orb (8 CPUs, rustc 1.99.1) a clean release build with two jobs took 1 minute 12 seconds:</p>
+    <pre><code class="language-bash">git clone --depth 1 https://github.com/eunomia-bpf/actime
+cd actime
+cargo build --release -j2 --locked
+./target/release/actime --help</code></pre>
+    <p>The README also gives a one-line installer
+    (<code>curl -fsSL …/scripts/install.sh | sh</code>) and says the engines are installed
+    with <code>cargo install actplane agentsight akeep</code>. Actime requires
+    <code>actplane</code> ≥ 0.1.8, <code>agentsight</code> ≥ 0.2.60 and <code>akeep</code> ≥
+    0.2.0. Linux only; the eBPF planes need kernel 5.10+ with BTF, and 6.1+ is
+    recommended.</p>
+
+    <h3>Real output from this orb</h3>
+    <p>I ran the freshly built binary without root and without any of the three engines
+    installed. That is the "laptop with nothing" case the degradation matrix is designed for.
+    First, <code>actime doctor</code>:</p>
+    <pre><code class="language-plaintext">ok    deployment                   running on a host (deployment A/C). Host-side attach is available and is the stronger tamper-resistance position: ...
+ok    os                           Linux
+ok    kernel                       kernel 6.1.189+ (≥ 6.1)
+ok    btf                          /sys/kernel/btf/vmlinux present
+warn  cap_bpf                      neither root nor CAP_BPF; policy and observability planes will disable
+      → Run as root, or grant CAP_BPF (e.g. `sudo setcap cap_bpf,cap_perfmon+ep $(which actplane)`), or use `actime run` knowing those planes will degrade (see DESIGN.md §8)
+warn  actplane                     actplane not found on PATH, ~/.local/share/actime/bin, or ~/.cargo/bin
+      → cargo install actplane
+warn  agentsight                   agentsight not found on PATH, ~/.local/share/actime/bin, or ~/.cargo/bin
+      → cargo install agentsight
+warn  akeep                        akeep not found on PATH, ~/.local/share/actime/bin, or ~/.cargo/bin
+      → cargo install akeep
+ok    run_store                    writable at /tmp/ch27/actime-home
+ok    config                       profile=balanced policy=enforce observability=on backup=on
+
+0 check(s) failed, 4 warning(s). Actime still runs: unavailable planes degrade rather than stopping a run.</code></pre>
+
+    <p>Next, the README's first run, with policy and backup turned off explicitly. The agent is
+    <code>/bin/echo</code>:</p>
+    <pre><code class="language-plaintext">$ actime run --policy off --no-backup -- /bin/echo hi
+actime  run 20261106-010537-c2d2   target: command   policy: off   observability: on
+warning: policy plane disabled: policy.mode is off
+
+hi
+
+Actime run report
+------------------------------------------------------------------------
+  Run id:     20261106-010537-c2d2
+  Agent:      command
+  Argv:       /bin/echo hi
+  Duration:   0.1s
+  Exit code:  0
+  Profile:    balanced
+/* ... Target section ... */
+Planes
+------------------------------------------------------------------------
+  policy         Disabled   policy.mode is off
+  observability  Disabled   agentsight is not installed; run `cargo install ag…
+  backup         Disabled   backup.enabled is false
+/* ... Summary: all counters 0 ... */</code></pre>
+
+    <p>Then the same command with the default <code>balanced</code> profile, whose policy mode
+    is <code>enforce</code>. ActPlane is not installed, so Actime fails closed (exit code 1) and
+    never starts <code>echo</code>:</p>
+    <pre><code class="language-plaintext">$ actime run -- /bin/echo hi
+error: policy.mode is `enforce` but the policy plane could not start: actplane is not installed; run `cargo install actplane`
+
+Actime fails closed rather than running an agent unprotected.
+Fix one of:
+• re-run with privileges:  sudo actime run --policy enforce -- &lt;agent&gt;
+• learn first without blocking:  actime run --policy observe -- &lt;agent&gt;
+• diagnose this machine:  actime doctor</code></pre>
+    <p>The refusal is still a finished, auditable run. This is part of the
+    <code>manifest.json</code> it wrote:</p>
+    <pre><code class="language-json">{
+  "id": "20261106-010541-5fe5",
+  "schema": 1,
+  "argv": ["/bin/echo", "hi"],
+  "agent": "command",
+  "profile": "balanced",
+  "target": {
+    "kind": "command",
+    "host_pid": null,
+    "note": "launched as a host child process; refused before agent launch — policy.mode is `enforce` but the policy plane could not start: actplane is not installed; run `cargo install actplane`"
+  },
+  "planes": {
+    "policy":        { "disabled": "actplane is not installed; run `cargo install actplane`" },
+    "observability": { "disabled": "not started: run refused before agent launch" },
+    "backup":        { "disabled": "not started: run refused before agent launch" }
+  },
+  "exit_code": 1,
+  "akeep_commit": null
+}</code></pre>
+    <p><code>actime runs</code> lists both runs, and <code>actime policy list</code> shows the
+    three packs ("2 rules", "3 rules", "4 rules"). Without ActPlane, <code>actime policy
+    check</code> can only compose the text: "warning: actplane is not installed, so the policy
+    could only be composed, not compiled … Composed 44 lines of policy from:
+    coding-agent-baseline". On this orb the run directories contained
+    <code>actime.yaml</code>, <code>actplane/</code>, <code>manifest.json</code> and
+    <code>report.md</code>. The other files in the design's run-directory layout
+    (<code>violations.jsonl</code>, <code>observability.db</code>, <code>stdout.log</code> and so
+    on) appear only when the corresponding planes run.</p>
+
+    <div class="callout tip"><span class="label">Not tried here</span><p>I did not run Actime
+    with root and the engines installed, so this chapter does not show a real
+    <code>Active</code> report. The README's three-plane example (214 processes, 37 LLM calls,
+    two killed violations) is labeled "illustrative" by the project itself. Do not read it as a
+    measurement.</p></div>
+
+    <h3>Everyday commands</h3>
+    <pre data-file="docs/DESIGN.md"><code class="language-plaintext">actime init [--force] [--print]
+actime run [--policy MODE] [--no-observability] [--no-backup]
+           [--fail-on-violation] [--timeout D] -- &lt;cmd&gt;...
+actime attach (--pid N | --comm NAME | --container REF | --pod NS/POD)
+              [--policy MODE]
+actime status
+actime runs [--json] [--limit N]
+actime report [RUN|latest] [--json|--markdown]
+actime policy (list | show PACK | check | explain)
+actime keep (commit [-m MSG] | log | restore RUN [--to DIR])
+actime doctor [--json]</code></pre>
+    <p>The design document adds: "There is no <code>sandbox</code> subcommand, no
+    <code>--sandbox</code> flag, no <code>demo</code> command, and no <code>shell</code>
+    command." The recommended rollout is to start with <code>--policy observe</code> for a
+    week, read the reports, and move rules to <code>enforce</code> one at a time.</p>
+
+    <h2>Akeep: version control for agent history</h2>
+    <p>Akeep's README opens with "Your agent history is not a cache." A long Claude Code or
+    Codex session holds hours of decisions, commands, diffs and plans. The agent stores them in
+    provider-local files that are "undocumented, mutable, and not a backup". Akeep finds those
+    files, saves them as compressed, deduplicated commits, and gives them back byte for byte. It
+    makes five promises: <em>versioned</em> (commits with messages and parents,
+    <code>HEAD~N</code>, <code>log</code>, <code>diff</code>), <em>cloud backup</em> (S3, R2, a
+    Git remote or local disk), <em>exact</em> (raw provider files stay the source of truth),
+    <em>private</em> (no upload or telemetry by default, optional client-side encryption) and
+    <em>non-destructive</em> (commits never edit provider state, and checkout goes to a
+    separate directory).</p>
+    <p>Akeep uses no eBPF at all. It is a single Rust binary (v0.2.0, about 8.8k lines in
+    <code>src/</code>) built on <code>blake3</code>, <code>zstd</code>, <code>age</code>,
+    <code>rusqlite</code> (with its <code>backup</code> feature) and <code>rayon</code>. It
+    shells out to the AWS CLI and the Git CLI for remote storage.</p>
+
+    <h3>Providers: whose sessions it reads</h3>
+    <p>A provider adapter is an allowlist of durable paths in one agent's home directory.
+    Akeep does not convert the formats; it copies the native files. From
+    <code>src/providers.rs</code>:</p>
+    <pre data-file="src/providers.rs"><code class="language-rust">pub enum Provider {
+    AgentSight,
+    ClaudeCode,
+    Codex,
+    Grok,
+    KimiCode,
+    OpenCode,
+}
+
+impl Provider {
+    pub const ADAPTER_VERSION: u32 = 1;
+    /* ... */
+}
+/* ... */
+fn claude_spec(root: PathBuf) -&gt; ProviderSpec {
+    let provider = Provider::ClaudeCode;
+    let mut items = Vec::new();
+    for relative in ["projects", "sessions", "file-history", "plans", "commands"] {
+        items.push(item(provider, &amp;root, relative, SourceKind::Directory));
+    }
+    for relative in [
+        "tasks",
+        "todos",
+        "shell-snapshots",
+        "session-env",
+        "backups",
+    ] {
+        items.push(item(
+            provider,
+            &amp;root,
+            relative,
+            SourceKind::SnapshotDirectory,
+        ));
+    }
+    items.push(item(provider, &amp;root, "history.jsonl", SourceKind::File));
+    /* ... exclusions ... */</code></pre>
+    <p><code>SnapshotDirectory</code> marks rotating state that is staged into a private
+    copy early in the commit ("Rotating shell/task state is staged early", per
+    <code>docs/providers.md</code>).</p>
+    <table>
+      <tr><th>Provider</th><th>Default home (override)</th><th>What is kept (docs/providers.md)</th></tr>
+      <tr><td>Claude Code</td><td><code>~/.claude</code> (<code>CLAUDE_CONFIG_DIR</code>)</td><td><code>projects</code>, <code>sessions</code>, <code>file-history</code>, <code>plans</code>, <code>commands</code>, <code>tasks</code>, <code>todos</code>, <code>shell-snapshots</code>, <code>session-env</code>, <code>backups</code>, <code>history.jsonl</code></td></tr>
+      <tr><td>Codex CLI</td><td><code>~/.codex</code> (<code>CODEX_HOME</code>)</td><td><code>sessions</code>, <code>attachments</code>, <code>memories</code>, <code>shell_snapshots</code>, <code>automations</code>, <code>history.jsonl</code>, <code>session_index.jsonl</code>, state/log/goals/memories databases</td></tr>
+      <tr><td>Grok CLI</td><td><code>~/.grok</code> (<code>GROK_HOME</code>)</td><td><code>sessions</code>, <code>active_sessions.json</code>, <code>worktrees.db</code></td></tr>
+      <tr><td>Kimi Code</td><td><code>~/.kimi-code</code> (<code>KIMI_CODE_HOME</code>)</td><td><code>sessions</code>, <code>user-history</code>, <code>session_index.jsonl</code>, <code>workspaces.json</code></td></tr>
+      <tr><td>OpenCode</td><td>XDG data/state dirs (<code>OPENCODE_SHARE_DIR</code>, <code>OPENCODE_STATE_DIR</code>)</td><td><code>opencode.db</code>, <code>storage</code>, <code>prompt-history.jsonl</code></td></tr>
+      <tr><td>AgentSight</td><td><code>~/.agentsight</code> (<code>AGENTSIGHT_HOME</code>)</td><td>weekly <code>monitor/monitor-YYYY-Www.db</code> SQLite files, plus a generated <code>activity-summary.json</code></td></tr>
+    </table>
+    <p>The exclusion policy is just as important. Auth and OAuth files, caches, telemetry,
+    logs, installed plugins, worktrees, sockets and locks are never copied, and symlinks are
+    never followed. The docs add a warning that no allowlist can fix: "Agent transcripts can
+    themselves contain secrets printed during a session; exclusion rules cannot redact source
+    content." That is the reason encryption exists.</p>
+    <p>The AgentSight provider connects Akeep to the rest of this part. AgentSight's long-running
+    <code>monitor</code> service records eBPF observations into weekly SQLite databases, and
+    Akeep archives them. It also writes a privacy-reduced <code>activity-summary.json</code>
+    (schema version 2) for dashboards: counts, a downsampled activity series, capped per-session
+    CPU shapes, and a histogram of program basenames. It never includes "file paths, command
+    lines, network hostnames/addresses, prompt/completion text, environment variables".</p>
+
+    <h3>The archive: content-addressed chunks</h3>
+    <p>The archive format (<code>docs/archive-format.md</code>) is "an application-level
+    content-addressed store". Filesystem, S3 and Git targets all use the same four kinds of
+    logical keys:</p>
+    <pre data-file="docs/archive-format.md"><code class="language-plaintext">vault.json
+objects/&lt;first two BLAKE3 hex characters&gt;/&lt;remaining hex&gt;.zst[.age]
+manifests/&lt;snapshot-id&gt;.json[.age]
+refs/latest</code></pre>
+
+    <figure>
+      <svg viewBox="0 0 900 360" role="img" aria-label="Akeep data model: provider files are split into fixed 4 MiB chunks, each chunk hashed with BLAKE3, compressed with zstd, optionally age-encrypted and stored under objects; a manifest lists files and chunk ids and points to its parent; refs/latest names the newest manifest">
+        <style>
+          .b3{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .o3{fill:none;stroke:var(--accent);stroke-width:2}
+          .m3{fill:none;stroke:var(--accent2);stroke-width:2}
+          .t3{fill:var(--fg);font:13px sans-serif}
+          .c3{fill:var(--fg);font:12px monospace}
+          .u3{fill:var(--muted);font:12px sans-serif}
+          .ar3{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah27c)}
+        </style>
+        <defs><marker id="ah27c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="u3" x="20" y="22">provider file</text>
+        <rect class="b3" x="20" y="32" width="260" height="34" rx="4"/>
+        <text class="c3" x="30" y="54">claude-code/projects/x/s.jsonl</text>
+        <rect class="b3" x="20" y="80" width="80" height="30"/><text class="c3" x="30" y="100">4 MiB</text>
+        <rect class="b3" x="100" y="80" width="80" height="30"/><text class="c3" x="110" y="100">4 MiB</text>
+        <rect class="b3" x="180" y="80" width="50" height="30"/><text class="c3" x="186" y="100">tail</text>
+        <text class="u3" x="20" y="132">fixed-size chunks</text>
+        <rect class="b3" x="20" y="150" width="260" height="90" rx="6"/>
+        <text class="t3" x="32" y="172">per chunk</text>
+        <text class="c3" x="32" y="192">id  = BLAKE3(raw)</text>
+        <text class="c3" x="32" y="210">obj = age(zstd(raw))?</text>
+        <text class="c3" x="32" y="228">put if absent, never overwrite</text>
+        <path class="ar3" d="M150,112 V148"/>
+        <!-- objects -->
+        <rect class="o3" x="340" y="32" width="250" height="208" rx="6"/>
+        <text class="t3" x="352" y="54" style="font-weight:600">objects/</text>
+        <text class="c3" x="352" y="80">e4/db3e17….zst.age</text>
+        <text class="c3" x="352" y="102">7a/91c0d2….zst.age</text>
+        <text class="c3" x="352" y="124">0f/55ab3e….zst.age</text>
+        <text class="u3" x="352" y="150">same bytes → same key, across</text>
+        <text class="u3" x="352" y="168">files, providers and commits</text>
+        <text class="u3" x="352" y="196">immutable; fsck re-hashes</text>
+        <text class="u3" x="352" y="214">after decoding</text>
+        <path class="ar3" d="M280,195 H338"/>
+        <!-- manifests -->
+        <rect class="m3" x="640" y="32" width="240" height="120" rx="6"/>
+        <text class="t3" x="652" y="54" style="font-weight:600">manifests/&lt;id&gt;.json.age</text>
+        <text class="c3" x="652" y="76">parent: &lt;older id&gt;</text>
+        <text class="c3" x="652" y="94">files[]: path, blake3,</text>
+        <text class="c3" x="652" y="112">  chunks[]: id, sizes</text>
+        <text class="c3" x="652" y="130">stats, hostname, message</text>
+        <path class="ar3" d="M640,100 L592,120"/>
+        <rect class="m3" x="640" y="190" width="240" height="50" rx="6"/>
+        <text class="t3" x="652" y="212" style="font-weight:600">refs/latest  (= HEAD)</text>
+        <text class="c3" x="652" y="230">20261106T010751.832Z-e994ac86</text>
+        <path class="ar3" d="M760,190 V154"/>
+        <!-- commit order -->
+        <rect class="b3" x="20" y="270" width="860" height="72" rx="6"/>
+        <text class="t3" x="32" y="292" style="font-weight:600">commit order</text>
+        <text class="u3" x="32" y="314">1. lock vault  2. stage + snapshot SQLite  3. store all chunks  4. re-check every object exists</text>
+        <text class="u3" x="32" y="332">5. publish manifest  6. update refs/latest.  A crash before 5 leaves only unreferenced objects, never a half commit.</text>
+      </svg>
+      <figcaption>Figure 27.3 — Akeep's archive is a small content-addressed store in the style
+      of Git: chunk objects named by their BLAKE3 hash, manifests that list files and point to a
+      parent, and a mutable <code>refs/latest</code>. Unlike Git, Akeep does not keep a snapshot
+      of the whole tree. A manifest lists only the provider files.</figcaption>
+    </figure>
+
+    <p>The format makes four choices:</p>
+    <ul>
+      <li><strong>Fixed-size 4 MiB chunks</strong>, not content-defined chunking. The docs
+      explain: "coding-agent state is dominated by append-only JSONL and SQLite snapshots, it
+      supports bounded memory, and it keeps the recovery implementation small enough to audit."
+      An append-only JSONL file keeps the same leading chunks, so only its last chunk changes.
+      Inserting bytes in the middle of a file would shift every following chunk. Tools such as
+      restic use content-defined chunking to avoid that, and Akeep reserves "a future format"
+      for it.</li>
+      <li><strong>Object id = BLAKE3 of the uncompressed chunk.</strong> Identical chunks
+      deduplicate across files, providers and commits. BLAKE3 is fast and produces a 256-bit
+      digest (64 hex characters).</li>
+      <li><strong>Compress, then optionally encrypt, each chunk on its own</strong>: zstd
+      (level 3 by default) and then age to the vault's X25519 recipient.</li>
+      <li><strong>Publish the manifest last.</strong> A commit becomes visible only when its
+      manifest exists, and that happens only after every referenced object has been checked.
+      "An interrupted commit can leave unreferenced immutable objects but cannot create a
+      false-complete version."</li>
+    </ul>
+
+    <p>Here is the chunk store. It is the content-addressing step in one function:</p>
+    <pre data-file="src/vault.rs"><code class="language-rust">    pub fn store_chunk(&amp;self, raw: &amp;[u8], compression_level: i32) -&gt; Result&lt;StoredChunk&gt; {
+        let id = blake3::hash(raw).to_hex().to_string();
+        let key = self.object_key(&amp;id)?;
+        let compressed = zstd::stream::encode_all(Cursor::new(raw), compression_level)
+            .context("failed to compress archive chunk")?;
+        let encoded = self.codec.encrypt(&amp;compressed)?;
+        let stored_size = encoded.len() as u64;
+        let shard = usize::from(u8::from_str_radix(&amp;id[..2], 16).context("invalid chunk id")?)
+            % self.chunk_locks.len();
+        let _chunk_lock = self.chunk_locks[shard]
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chunk coordination lock is poisoned"))?;
+
+        if let Some(metadata) = self.storage.metadata(&amp;key)? {
+            if metadata.size != stored_size {
+                bail!(
+                    "existing object {id} has size {}, expected {stored_size}",
+                    metadata.size
+                );
+            }
+            return Ok(StoredChunk {
+                id,
+                stored_size: metadata.size,
+                is_new: false,
+            });
+        }
+
+        self.storage.put(&amp;key, &amp;encoded, false)?;
+
+        Ok(StoredChunk {
+            id,
+            stored_size,
+            is_new: true,
+        })
+    }</code></pre>
+    <p>Three details stand out. The lock is sharded by the first byte of the hash, so parallel
+    rayon workers storing the same chunk do not race. An existing object is never rewritten
+    (<code>put(..., false)</code>). Its stored size is compared as a cheap consistency check.
+    That comparison works even in age mode, where encrypting the same plaintext twice gives
+    different ciphertext of the same length. The full check, which decodes and re-hashes each
+    chunk, is <code>akeep fsck</code>.</p>
+
+    <p>The manifest is a strict serde struct (<code>deny_unknown_fields</code>). A reader
+    refuses a manifest with fields it does not know instead of silently ignoring them:</p>
+    <pre data-file="src/manifest.rs"><code class="language-rust">pub struct Manifest {
+    pub format_version: u32,
+    pub vault_id: Uuid,
+    pub snapshot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option&lt;String&gt;,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option&lt;String&gt;,
+    pub created_at: DateTime&lt;Utc&gt;,
+    pub hostname: String,
+    pub archive: ArchiveDescriptor,
+    pub providers: Vec&lt;ProviderSummary&gt;,
+    pub files: Vec&lt;FileRecord&gt;,
+    pub stats: SnapshotStats,
+}
+/* ... */
+pub struct FileRecord {
+    pub provider: Provider,
+    pub logical_path: String,
+    pub kind: ArchivedFileKind,       // Regular | SqliteSnapshot
+    pub size: u64,
+    pub blake3: String,
+    pub modified_unix_seconds: Option&lt;i64&gt;,
+    pub modified_subsec_nanos: Option&lt;u32&gt;,
+    pub unix_mode: Option&lt;u32&gt;,
+    pub chunks: Vec&lt;ChunkRecord&gt;,
+}</code></pre>
+    <p>(The comment on <code>kind</code> is mine; the enum has exactly those two variants.) In
+    age mode the whole manifest is encrypted. Someone with read access to the bucket sees object
+    hashes and snapshot ids in key names, but not provider paths, hostnames or file metadata.</p>
+
+    <h3>Live SQLite databases</h3>
+    <p>Codex, Grok, OpenCode and AgentSight keep state in SQLite databases that may be open
+    while a backup runs. Copying such a file byte for byte, especially in WAL mode, can produce
+    a torn database. Akeep uses SQLite's
+    <a href="https://www.sqlite.org/backup.html">online backup API</a> inside a read
+    transaction, then runs <code>PRAGMA integrity_check</code> on the copy:</p>
+    <pre data-file="src/source.rs"><code class="language-rust">fn snapshot_sqlite(source: &amp;Path, destination: &amp;Path, busy_budget: Duration) -&gt; Result&lt;()&gt; {
+    let source_connection =
+        Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open SQLite source {}", source.display()))?;
+    source_connection
+        .execute_batch("BEGIN DEFERRED")
+        /* ... */;
+    let _: i64 = source_connection
+        .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+        /* ... pins the read snapshot ... */;
+    /* ... open destination with journal_mode=OFF, synchronous=OFF ... */
+    {
+        let backup = Backup::new(&amp;source_connection, &amp;mut destination_connection)
+            .with_context(|| format!("failed to start SQLite backup for {}", source.display()))?;
+        let deadline = std::time::Instant::now() + busy_budget;
+        loop {
+            match backup.step(-1) /* ... */ {
+                StepResult::Done =&gt; break,
+                StepResult::More =&gt; continue,
+                StepResult::Busy | StepResult::Locked =&gt; {
+                    if std::time::Instant::now() &gt;= deadline {
+                        bail!(/* "SQLite backup remained busy ..." */);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ =&gt; bail!("SQLite backup returned an unsupported step state"),
+            }
+        }
+    }
+    /* ... ROLLBACK, then PRAGMA integrity_check must return exactly ["ok"] ... */</code></pre>
+    <p>The archived snapshot is a separate file kind (<code>sqlite-snapshot</code>). WAL, SHM
+    and journal sidecars are never archived. For AgentSight, an invalid or busy database is
+    skipped with a warning instead of failing the commit.</p>
+
+    <h3>Bounded memory</h3>
+    <p><code>archive_file</code> reads each file in chunk-size pieces and hashes a small batch
+    in parallel. It never holds a whole file in memory. Files are grouped into batches whose
+    total size is capped (<code>S3_UPLOAD_BATCH_BYTES</code>), and each batch's objects are
+    flushed before the next batch starts. The README says this change took the project's own
+    installation, "more than 50 GB across agent providers", from an observed peak of 23.6 GiB
+    down to about 243 MiB. That is the project's claim; I did not reproduce it. On this orb,
+    <code>akeep status</code> estimated "peak memory 256.0 MiB" for 4 workers.</p>
+
+    <h3>Storage backends and encryption</h3>
+    <div class="grid">
+      <div class="card"><h4>Filesystem</h4><p><code>akeep init [--target DIR]</code>. The
+      default is <code>~/.local/share/akeep/vaults/default</code>. Writes go to a temporary
+      file, are synced, then atomically renamed.</p></div>
+      <div class="card"><h4>S3 / R2</h4><p><code>--s3-bucket --s3-prefix --aws-profile
+      [--s3-endpoint-url]</code>. Akeep runs AWS CLI v2 without a shell, checks bucket
+      versioning, re-reads uploaded sizes before publishing, and "never issues a remote
+      delete".</p></div>
+      <div class="card"><h4>Git remote</h4><p><code>--git-repository URL --git-branch
+      akeep</code>. One Git commit per snapshot. A non-fast-forward push is refused, so a stale
+      writer cannot publish. Your SSH agent or credential helper does the authentication.</p></div>
+      <div class="card"><h4>age encryption</h4><p><code>--encryption age</code> generates a
+      mode-0600 X25519 identity next to the config. Encryption is optional and is checked with a
+      self-test on every open. "If every copy is lost, nobody can decrypt the
+      repository."</p></div>
+    </div>
+    <p>The encryption layer is thin. It wraps the <code>age</code> crate, and on open it checks
+    that the identity matches the recipient and that a round trip works:</p>
+    <pre data-file="src/crypto.rs"><code class="language-rust">const SELF_TEST_PLAINTEXT: &amp;[u8] = b"akeep age self-test v1";
+/* ... */
+            EncryptionMode::Age =&gt; {
+                /* ... parse recipient, load identity file ... */
+                if identity.to_public().to_string() != recipient.to_string() {
+                    bail!(
+                        "age identity {} does not match configured recipient",
+                        identity_path.display()
+                    );
+                }
+                /* ... */
+                let encrypted = context.encrypt(SELF_TEST_PLAINTEXT)?;
+                let decrypted = context.decrypt(&amp;encrypted)?;
+                if decrypted != SELF_TEST_PLAINTEXT {
+                    bail!("age encryption self-test failed");
+                }
+                Ok(context)
+            }</code></pre>
+
+    <h2>Building and using Akeep</h2>
+    <p>A release build took 1 minute 59 seconds with <code>-j2</code> on this orb. The CLI:</p>
+    <pre><code class="language-plaintext">$ akeep --help
+Privacy-first, Git-like backup, recovery, migration, and sharing for AI agent session history
+
+Usage: akeep [OPTIONS] &lt;COMMAND&gt;
+
+Commands:
+  init      Initialize a new Akeep repository
+  config    Inspect the active configuration
+  status    Show provider coverage and repository readiness
+  commit    Save a new version of discovered agent history
+  log       List committed versions
+  fsck      Check repository structure and archived content
+  checkout  Restore a version into an empty directory
+  diff      Compare two committed versions
+  clone     Copy the active repository into a self-contained local bundle
+  schedule  Manage an optional automatic commit schedule
+  handoff   Create a reviewed Claude Code ↔ Codex handoff bundle
+  help      Print this message or the help of the given subcommand(s)</code></pre>
+    <p>There is no <code>add</code>: "provider adapters discover the supported durable files
+    automatically." The repository ships <code>scripts/demo.sh</code>, which builds synthetic
+    fixtures for all six providers in a temporary directory, points the provider environment
+    variables at them, and exercises the whole loop. Running it with the binary I built
+    (<code>AKEEP_BIN=…/akeep ./scripts/demo.sh</code>) printed, among other lines:</p>
+    <pre><code class="language-plaintext">==&gt; Discover six providers
+Resources: 4 worker(s) / 8 CPU threads, estimated peak memory 256.0 MiB
+Providers:
+  agentsight present          1 files    20.0 KiB
+  claude-code present          1 files        51 B
+  codex present          1 files        58 B
+  grok present          1 files        27 B
+  kimi-code present          1 files        27 B
+  opencode present          1 files        31 B
+Result: ready
+==&gt; Commit two versions, diff, check, and restore
+Committed agent history 20261106T010743.548Z-52fc40ee
+Files: 7
+Logical bytes: 23276
+Unique objects: 7
+New objects: 7 (1688 stored bytes)
+Committed agent history 20261106T010743.564Z-b696aae4
+Files: 7
+Logical bytes: 23339
+Unique objects: 7
+New objects: 2 (848 stored bytes)
+M  agentsight/activity-summary.json
+M  claude-code/projects/demo/session.jsonl
+Checked commit 20261106T010743.564Z-b696aae4 (full, 7 files, 23339 bytes)
+PASS: recovered AgentSight monitor snapshot is a valid SQLite database
+PASS: recovered provider-native files match every source byte
+==&gt; Clone the repository and check the independent bundle
+PASS: cloned repository has a readable, complete HEAD
+PASS: full fsck rejected a deliberately corrupted object</code></pre>
+    <p>Look at the second commit. The demo appends one line to the Claude session, so two
+    files changed: that session and the regenerated AgentSight summary. Seven files are
+    referenced, but only two new objects are stored. The other five chunks already exist under
+    the same BLAKE3 keys. That is deduplication at work.</p>
+    <p>I also created a small encrypted vault by hand (synthetic Claude Code directory, other
+    providers pointed at empty paths):</p>
+    <pre><code class="language-bash">akeep --config $D/config.toml init --target $D/vault --encryption age
+akeep --config $D/config.toml commit -m first
+find $D/vault -type f</code></pre>
+    <pre><code class="language-plaintext">Initialized Akeep repository 6cfda586-17b1-4885-a8a7-28f9dc01cd4f
+Encryption: age
+Recovery identity: /tmp/ch27/enc/age-identity-a659b4aa.txt
+Back up this identity separately; losing it makes recovery impossible.
+Committed agent history 20261106T010751.832Z-e994ac86
+Files: 1
+Logical bytes: 34
+Unique objects: 1
+New objects: 1 (390 stored bytes)
+
+./manifests/20261106T010751.832Z-e994ac86.json.age
+./objects/e4/db3e178385e6ae59c16481f9240732c111c0309c9a2520aaf154107732d1d6.zst.age
+./refs/latest
+./vault.json</code></pre>
+    <p>The layout matches the format document exactly. A 34-byte transcript became a
+    390-byte object: age adds a fixed header, so tiny files grow, and the overhead matters only
+    for very small files. <code>vault.json</code> holds the format version, vault UUID,
+    encryption mode and the public age recipient, and nothing about providers.
+    <code>akeep checkout HEAD --provider claude-code --to DIR</code> restored
+    <code>DIR/claude-code/projects/demo/s.jsonl</code>.</p>
+
+    <div class="callout warn"><span class="label">Small inconsistency observed</span><p>The
+    README writes provider ids as <code>agentsight</code> and <code>opencode</code>, and those
+    are the archive path prefixes. The <code>--provider</code> flag, however, is a clap
+    <code>ValueEnum</code> with kebab-case renaming, so it accepts <code>agent-sight</code> and
+    <code>open-code</code>. <code>--provider agentsight</code> is rejected with "invalid value",
+    and <code>status --json</code> reports <code>"provider": "agent-sight"</code>.
+    <code>claude-code</code>, <code>codex</code> and <code>grok</code> are the same in both
+    spellings.</p></div>
+
+    <h3>Recovery drills and handoff</h3>
+    <p>Recovery goes to an empty scratch directory, never into the live home. Akeep refuses a
+    symlink target, a non-empty directory, or any target that overlaps the vault. To check that
+    a recovered session is usable, the docs suggest pointing <code>CLAUDE_CONFIG_DIR</code> at
+    <code>claude-code/</code> and opening the native resume picker, or pointing
+    <code>CODEX_HOME</code> at <code>codex/</code> and running <code>codex resume --all</code>,
+    and then exiting without starting a turn.</p>
+    <p><code>akeep handoff</code> is the one command that goes beyond backup. It builds a
+    Markdown bundle for moving work between Claude Code and Codex, in either direction:</p>
+    <pre data-file="docs/portable-history.md"><code class="language-bash">akeep handoff HEAD \
+  --from claude-code \
+  --for codex \
+  --goal "Finish the restore drill and fix any mismatch" \
+  --decision "Keep remote encryption optional" \
+  --open-task "Run the provider fixture smoke test" \
+  --test-status "cargo test passes" \
+  --repo . \
+  --artifact target/recovery-report.json \
+  --to handoff.md</code></pre>
+    <p>The bundle keeps what the user supplied (goal, decisions, tasks) separate from what was
+    captured (Git state, artifact hashes, bounded tails of up to three recent transcript files).
+    The captured parts are labeled "as evidence rather than presented as an AI-generated
+    interpretation." It does not write the target agent's internal files and does not claim
+    "lossless native import".</p>
+    <p><code>akeep schedule install --weekly</code> installs one systemd user service and
+    timer per vault. The timer runs at low CPU and I/O priority with a randomized six-hour
+    delay, and uses the same per-vault lock as a manual commit.</p>
+
+    <h2>Akeep directory map</h2>
+    <pre><code class="language-plaintext">akeep/                      (@ 7d690362, crate version 0.2.0, edition 2024)
+├── src/
+│   ├── main.rs, lib.rs     entry point
+│   ├── cli.rs              clap surface: init config status commit log fsck checkout
+│   │                       diff clone schedule handoff
+│   ├── config.rs           config.toml, TargetConfig (filesystem | s3 | git), private dirs
+│   ├── providers.rs        six provider adapters: allowlists, env overrides, exclusions
+│   ├── source.rs           discovery, staging, SQLite online backup + integrity_check
+│   ├── archive.rs          commit (backup), log, fsck (verify), checkout (recover), diff, clone
+│   ├── vault.rs            store_chunk / read_chunk, object keys, write lock, publish
+│   ├── manifest.rs         Manifest, FileRecord, ChunkRecord, path and id validation
+│   ├── storage.rs          FilesystemStorage, S3Storage (AWS CLI), GitStorage (git CLI)
+│   ├── crypto.rs           optional age X25519 encryption + self-test
+│   ├── resources.rs        worker pool and batch sizing for bounded memory
+│   ├── scheduler.rs        systemd user timer install/status/uninstall
+│   ├── handoff.rs          Claude Code ↔ Codex Markdown bundle
+│   └── doctor.rs           status/preflight: RAM, staging space, provider coverage
+├── tests/                  cli_archive, cli_doctor, cli_git, cli_init, cli_portable,
+│                           cli_s3, cli_scale (synthetic fixtures only)
+├── docs/                   archive-format.md, providers.md, configuration.md,
+│                           recovery-runbook.md, reliability.md, testing.md,
+│                           portable-history.md, product.zh-CN.md
+└── scripts/                demo.sh (self-contained trust demo), install.sh</code></pre>
+
+    <h2>backup-client-sdk: the hosted control-plane boundary</h2>
+    <p>Akeep's own backends are things you run yourself: a disk, a bucket, a Git remote.
+    <code>eunomia-bpf/backup-client-sdk</code> (crate <code>akeep-backup-client-sdk</code>,
+    v0.1.0) is the client side of a hosted service. Its README calls it "the public Rust
+    boundary between a Backup Client and the Akeep Control Plane." It "is pre-release and has
+    not been published to crates.io." Its <code>Cargo.toml</code> lists
+    <code>github.com/agent-sight/backup-client-sdk</code> as the repository. The Control Plane
+    itself is private, and Akeep 0.2.0 does not depend on this SDK: nothing in Akeep's
+    <code>src/</code> or <code>docs/</code> refers to it. Treat the SDK as the start of a
+    managed-storage option, not as a feature of the current Akeep CLI.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 270" role="img" aria-label="backup-client-sdk boundary: the backup client creates and encrypts an archive, the SDK pairs the device and asks the control plane for upload authorizations, then PUTs the opaque bytes straight to private Cloudflare R2 using a signed URL; the control plane never sees object bodies">
+        <style>
+          .b4{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .s4{fill:none;stroke:var(--accent);stroke-width:2}
+          .t4{fill:var(--fg);font:13px sans-serif}
+          .c4{fill:var(--fg);font:12px monospace}
+          .u4{fill:var(--muted);font:12px sans-serif}
+          .ar4{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah27d)}
+          .bo4{stroke:var(--accent2);stroke-width:2.5;fill:none;marker-end:url(#ah27d)}
+        </style>
+        <defs><marker id="ah27d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <rect class="b4" x="20" y="30" width="270" height="210" rx="8"/>
+        <text class="t4" x="34" y="52" style="font-weight:600">Backup Client (your code)</text>
+        <text class="u4" x="34" y="76">owns: archive, keys, encrypt,</text>
+        <text class="u4" x="34" y="94">decrypt, restore, keychain</text>
+        <rect class="s4" x="34" y="110" width="242" height="116" rx="6"/>
+        <text class="t4" x="46" y="132">akeep-backup-client-sdk</text>
+        <text class="c4" x="46" y="154">.auth()    pairing</text>
+        <text class="c4" x="46" y="174">.account() identity, usage</text>
+        <text class="c4" x="46" y="194">.objects() upload, list,</text>
+        <text class="c4" x="46" y="212">           download, delete</text>
+        <rect class="b4" x="380" y="30" width="230" height="110" rx="8"/>
+        <text class="t4" x="394" y="52" style="font-weight:600">Akeep Control Plane</text>
+        <text class="u4" x="394" y="74">(private; OpenAPI contract</text>
+        <text class="u4" x="394" y="92">checked in as akeep-api-v1.json)</text>
+        <text class="c4" x="394" y="116">/api/v1/uploads …</text>
+        <rect class="b4" x="680" y="150" width="200" height="90" rx="8"/>
+        <text class="t4" x="694" y="174" style="font-weight:600">private Cloudflare R2</text>
+        <text class="u4" x="694" y="196">opaque encrypted bytes</text>
+        <text class="u4" x="694" y="214">via short-lived signed URL</text>
+        <path class="ar4" d="M276,130 L378,90"/>
+        <path class="ar4" d="M378,110 L278,150"/>
+        <text class="u4" x="290" y="92">JSON: pair,</text>
+        <text class="u4" x="290" y="106">authorize</text>
+        <text class="u4" x="300" y="160">signed URL</text>
+        <path class="bo4" d="M276,200 H678"/>
+        <text class="u4" x="420" y="192">PUT body (Content-MD5, If-None-Match: *)</text>
+        <path class="ar4" d="M680,165 L612,125"/>
+        <text class="u4" x="618" y="150">complete</text>
+      </svg>
+      <figcaption>Figure 27.4 — The SDK's security boundary. Control requests go to the Control
+      Plane; object bodies go directly to R2 and "the Worker never proxies object bodies." The
+      SDK never holds the encryption key.</figcaption>
+    </figure>
+
+    <p>The boundary is drawn carefully. "The SDK does not create archives, hold backup
+    encryption keys, encrypt, decrypt, or restore files." It also does not read credentials
+    from disk or the environment. The caller must supply a <code>CredentialStore</code>,
+    normally backed by the OS keychain:</p>
+    <pre data-file="src/credential_store.rs"><code class="language-rust">#[async_trait]
+pub trait CredentialStore: Send + Sync {
+    async fn load_device_credential(
+        &amp;self,
+    ) -&gt; Result&lt;Option&lt;StoredDeviceCredential&gt;, CredentialStoreError&gt;;
+    async fn save_device_credential(
+        &amp;self,
+        credential: &amp;StoredDeviceCredential,
+    ) -&gt; Result&lt;(), CredentialStoreError&gt;;
+    async fn delete_device_credential(&amp;self) -&gt; Result&lt;(), CredentialStoreError&gt;;
+}</code></pre>
+    <p>The public surface is a builder and three sub-APIs, as shown in the README:</p>
+    <pre data-file="README.md"><code class="language-rust">use std::sync::Arc;
+use akeep_backup_client_sdk::{AkeepClient, MemoryCredentialStore};
+
+let client = AkeepClient::builder()
+    .base_url("https://control-plane.example/")
+    .credential_store(Arc::new(MemoryCredentialStore::default()))
+    .build()?;
+
+let _auth = client.auth();
+let _account = client.account();
+let _objects = client.objects();</code></pre>
+    <p>From <code>src/client.rs</code>: <code>auth()</code> has
+    <code>start_device_pairing</code>, <code>wait_for_approval</code>,
+    <code>credential_status</code> and <code>sign_out</code>. Pairing works like a device-code
+    flow: the user approves a short code at a verification URI, and the client polls with a
+    secret header <code>x-akeep-poll-secret</code>. <code>account()</code> has
+    <code>identity</code> and <code>usage</code>. <code>objects()</code> has
+    <code>upload_encrypted_file</code>, <code>list</code>, <code>get</code>,
+    <code>download_encrypted_file</code> and <code>delete</code>. Uploads hash the file first
+    and ask <code>POST /api/v1/uploads</code> for an authorization. The server answers with
+    either a single signed PUT (which must carry the exact <code>Content-Length</code>,
+    <code>Content-MD5</code> and <code>If-None-Match: *</code>) or a multipart plan with fixed
+    64 MiB parts, "and retains at most one part body in memory." The OpenAPI contract lists
+    these paths: <code>/api/v1/device-authorizations[/{code}[/exchange]]</code>,
+    <code>/me</code>, <code>/usage</code>, <code>/objects[/{id}[/download-url]]</code> and
+    <code>/uploads[/{id}[/abort | /complete | /parts/{n}/url]]</code>.</p>
+    <p>The example <code>examples/backup_client_e2e.rs</code> shows who owns what. The example,
+    not the SDK, builds a tar file, encrypts it with ChaCha20-Poly1305, uploads it, downloads
+    it, decrypts it, unpacks it, checks the content and deletes the object:</p>
+    <pre data-file="examples/backup_client_e2e.rs"><code class="language-rust">    let client_upload_id = format!("backup-client-e2e-{}", Uuid::new_v4());
+    let mut upload = UploadEncryptedFileInput::encrypted_archive(
+        &amp;encrypted_path,
+        client_upload_id.clone(),
+        format!("{client_upload_id}.akp"),
+    );
+    upload.source = "backup-client-e2e".to_owned();
+    upload.external_ref = Some(client_upload_id);
+    upload.integrity = Some(Integrity {
+        algorithm: "chacha20poly1305".to_owned(),
+        value: None,
+    });
+
+    let object = client.objects().upload_encrypted_file(upload).await?;</code></pre>
+    <p>I did not build or run the SDK. It needs a Control Plane URL and a device token
+    (<code>AKEEP_E2E_BASE_URL</code>, <code>AKEEP_E2E_DEVICE_TOKEN</code>), and the
+    service is not public.</p>
+
+    <h2>agentqos, briefly</h2>
+    <p><code>eunomia-bpf/agentqos</code> ("AgentQoS CLI for AI-agent QoS checks", Rust, last
+    pushed 2026-06-15) is a very small tool. Its README says it "turns latency, error-rate,
+    token, and tool-call failure budgets into a pass/fail result and a 0-100 QoS score" for
+    local runs and CI:</p>
+    <pre data-file="README.md"><code class="language-bash">agentqos check \
+  --latency-ms 840 \
+  --latency-budget-ms 1000 \
+  --error-rate 0.01 \
+  --max-error-rate 0.05 \
+  --input-tokens 1200 \
+  --output-tokens 600 \
+  --token-budget 4096 \
+  --strict</code></pre>
+    <p>It uses no eBPF and is not wired into Actime. The README describes the name as "a
+    release-surface and supply-chain name for Eunomia's agent runtime QoS, profiling, and
+    enforcement work". Read it as a name kept for future work, not as a part of the stack
+    described above. I only read its README.</p>
+
+    <h2>Benefits and limitations</h2>
+    <h3>What the design gets right</h3>
+    <ul>
+      <li><strong>Honest state.</strong> Every plane ends <code>Active</code>,
+      <code>Degraded</code> or <code>Disabled</code> with a reason. A plane is reported as
+      <code>Active</code> only after the engine log confirms the policy installed. A refusal is
+      a complete record, not a crash. This is the kind of detail that decides whether a
+      security tool can be trusted in an audit.</li>
+      <li><strong>Enforcement below the tool layer.</strong> The exec rules hold no matter how
+      the agent reached <code>execve</code>: a tool call, <code>bash -c</code>, a Python
+      subprocess or a subagent. That holds in every deployment position.</li>
+      <li><strong>Small, auditable backup.</strong> Akeep's format fits in one page:
+      fixed chunks, BLAKE3 ids, manifest published last, never overwrite, never delete
+      remotely. Raw provider bytes are the source of truth, so a provider format change cannot
+      corrupt the backup. At worst it makes a restored session unreadable by a newer
+      agent.</li>
+      <li><strong>Privacy by default.</strong> Akeep uploads nothing unless you configure a
+      remote, can encrypt both manifests and objects, and keeps the AgentSight summary free of
+      paths and command lines.</li>
+    </ul>
+    <h3>What to keep in mind</h3>
+    <ul>
+      <li><strong>The flagship policy is not enforceable yet.</strong> With released ActPlane
+      0.1.8, only exec rules install on Actime's path. File fences, credential-read reporting
+      and secret-egress labels compile but are reported as not enforceable. The feature budget
+      is hard-coded in <code>enforceability.rs</code>
+      (<code>engine_supported_features</code> ignores its version argument), so Actime has to
+      be updated when ActPlane changes.</li>
+      <li><strong>Coarse rules.</strong> <code>mass-deletion</code> kills every <code>rm
+      -rf</code> by an agent, including one inside the workspace, because path-scoped matching
+      on argv is not available. The pack comments say this outright.</li>
+      <li><strong>Agent identification by executable path.</strong> <code>AGENT</code> is
+      <code>exec "**/claude"</code> and similar. An agent started under a different binary name
+      is not labeled unless you add a source line. (<code>actime run</code> wraps the command
+      under <code>actplane run</code>; whether ActPlane then seeds the wrapped pid regardless of
+      name is an ActPlane detail I did not verify.)</li>
+      <li><strong>Position B is weaker.</strong> Inside a container, root can interfere with
+      the recorder. <code>CAP_BPF</code> granted for the recorder is also available to anything
+      else in that container with the capability.</li>
+      <li><strong>Privileges.</strong> The eBPF planes need <code>sudo</code> or capabilities.
+      Without them, the planes degrade; in <code>enforce</code> mode the run refuses to
+      start.</li>
+      <li><strong>Akeep limits.</strong> Single-writer per vault ("operators must not schedule
+      the same S3 vault from multiple machines concurrently"). Fixed chunking deduplicates
+      append-only files well but not files edited in the middle. Provider formats are not
+      stable, so each adapter version needs new fixtures and a new recovery test. Losing the
+      age identity means losing the data.</li>
+      <li><strong>Young code.</strong> Actime 0.1.0 and Akeep 0.2.0 are a few months old. The
+      SDK is unpublished and its server side is private.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>Sandboxes.</strong> <a href="https://github.com/containers/bubblewrap">bubblewrap</a>
+      (namespaces), <a href="https://docs.kernel.org/userspace-api/landlock.html">Landlock</a>
+      (unprivileged filesystem and network access control) and
+      <a href="https://docs.kernel.org/userspace-api/seccomp_filter.html">seccomp</a> (syscall
+      filtering with classic BPF) contain a process. Actime's early design had a bubblewrap
+      backend and dropped it. The project chose to account for whatever sandbox is in use
+      instead of being one.</li>
+      <li><strong>BPF LSM.</strong> ActPlane's enforcement rests on
+      <a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF programs</a>; see
+      <a href="24-actplane.html">chapter 24</a> and <a href="05-program-types-and-hooks.html">chapter 05</a>.</li>
+      <li><strong>Agent observability.</strong> AgentSight
+      (<a href="23-agentsight.html">chapter 23</a>) is the engine behind Actime's report. For
+      resource control of the same agent process trees, see
+      <a href="25-agentcgroup.html">chapter 25</a>. For checkpoint and rollback safety of agent
+      changes, see <a href="26-reward-guard-and-safe-change.html">chapter 26</a>.</li>
+      <li><strong>Content-addressed backup.</strong> Akeep's layout follows
+      <a href="https://git-scm.com/book/en/v2/Git-Internals-Git-Objects">Git's object model</a>
+      (hash-named immutable objects, a mutable ref) and the deduplicating backup tradition of
+      <a href="https://restic.readthedocs.io/en/stable/100_references.html">restic</a>, which
+      uses content-defined chunking and encrypts all repository data. Akeep is narrower: it
+      backs up a handful of known agent directories, so it can treat SQLite specially and offer
+      provider-aware restore drills.</li>
+      <li><strong>Building blocks.</strong> <a href="https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf">BLAKE3</a>
+      for hashing, <a href="https://www.rfc-editor.org/rfc/rfc8878">Zstandard (RFC 8878)</a>
+      for compression, <a href="https://age-encryption.org/v1">age v1</a> for encryption, and
+      the <a href="https://www.sqlite.org/backup.html">SQLite online backup API</a>. The SDK's
+      pairing resembles the
+      <a href="https://www.rfc-editor.org/rfc/rfc8628">OAuth 2.0 Device Authorization Grant (RFC
+      8628)</a> in shape. The SDK does not claim to implement that RFC. Its uploads use
+      <a href="https://developers.cloudflare.com/r2/api/s3/presigned-urls/">R2 presigned URLs</a>.</li>
+    </ul>
+
+    <h2>Recent development</h2>
+    <p>All three repositories are young. Here is the commit history from the GitHub API:</p>
+    <ul>
+      <li><strong>actime</strong>: created 2026-08-05 with an initial commit (<code>af77a87</code>)
+      that included a sandbox crate. The same day it went through a rapid redesign:
+      <code>3f29370</code> removed sandbox management ("attach to user process trees"),
+      <code>2224eca</code> resolved per-rule enforceability before runs, <code>3145726</code>
+      "state[d] plainly what the policy layer enforces today", <code>a8b984a</code> added an
+      integration suite that drives the real binary, <code>990d76c</code> raised the MSRV to
+      1.85, <code>206b6cb</code> made fail-closed enforce an "auditable refusal record", and
+      <code>268ffa5</code> renamed the planes evidence→observability and history→backup ("Evidence"
+      overclaimed forensic admissibility, says the changelog). From 2026-08-09 to the newest
+      commit, <code>9c03598</code> on 2026-10-13, the history is Dependabot updates only
+      (libc, thiserror, clap, rusqlite 0.40, GitHub Actions).</li>
+      <li><strong>akeep</strong>: a burst on 2026-08-01 (simplified install, removed
+      "non-core search and export commands", automatic release of 0.1.0, <code>37be499</code>
+      Git repository backend), then <code>843754f</code> on 2026-08-06 added backup of
+      AgentSight monitor databases with the displayable activity summary. Since then: dependency
+      updates (zstd 0.14, toml 1.1.x, blake3, uuid, clap, rusqlite 0.40) and a CI fix
+      (<code>e7c5d59</code>). Newest commit <code>7d69036</code>, 2026-10-13.</li>
+      <li><strong>backup-client-sdk</strong>: two commits, <code>e940ad9</code> "Initialize public
+      Backup Client SDK" and <code>2774aa0</code> "Update GitHub Actions runtimes", both on
+      2026-08-02.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Which of these components loads eBPF programs into the kernel?</p>
+        <button class="opt">Actime, through its own BPF objects in <code>actime-core</code></button>
+        <button class="opt">Akeep, to watch session files change</button>
+        <button class="opt" data-right>ActPlane and AgentSight, which Actime starts as subprocesses</button>
+        <button class="opt">backup-client-sdk, to measure upload bandwidth</button>
+        <div class="why">Actime's design lists "does not build its own eBPF programs" as a
+        non-goal. It runs <code>actplane run</code> and <code>agentsight record</code>. Akeep and
+        the SDK are ordinary userspace code.</div></div>
+
+      <div class="q"><p><strong>Q2.</strong> With the default <code>balanced</code> profile
+      (policy mode <code>enforce</code>), <code>actplane</code> is not installed. What does
+      <code>actime run -- claude</code> do?</p>
+        <button class="opt">Runs Claude with the policy plane Disabled and prints a warning</button>
+        <button class="opt" data-right>Refuses to start Claude, exits 1, and still writes a finished manifest and report</button>
+        <button class="opt">Falls back to a seccomp filter</button>
+        <button class="opt">Installs ActPlane automatically</button>
+        <div class="why"><code>enforce</code> fails closed. The run is finalized as a refusal:
+        <code>ended_at</code> set, <code>exit_code</code> 1, and the note "refused before agent
+        launch". This chapter reproduced exactly that output on the orb. In
+        <code>observe</code> mode the same situation only disables the plane.</div></div>
+
+      <div class="q"><p><strong>Q3.</strong> Why does <code>actime policy check</code> report
+      <code>no-secret-egress</code> as not enforceable even though it compiles?</p>
+        <button class="opt">The rule has a syntax error</button>
+        <button class="opt">Network rules need a sandbox</button>
+        <button class="opt" data-right>The rule needs engine features (path contains/suffix matchers, file-source labels) that released ActPlane 0.1.8 does not enable on Actime's path</button>
+        <button class="opt">Secret files are excluded by Akeep</button>
+        <div class="why"><code>enforceability.rs</code> compares each clause's required feature
+        bits with <code>ENGINE_SUPPORTED_0_1_8 = 0x3f0</code>, which omits the path-matcher and
+        open/write sink classes. Enforceability is a property of the host and engine, not of
+        the pack.</div></div>
+
+      <div class="q"><p><strong>Q4.</strong> An agent appends one line to a 9 MiB session
+      JSONL file, and you commit again. Roughly what new data does Akeep store for that
+      file?</p>
+        <button class="opt">A full new 9 MiB copy</button>
+        <button class="opt" data-right>One new object for the last (changed) chunk; the first two 4 MiB chunks already exist under the same BLAKE3 keys</button>
+        <button class="opt">Only a binary diff against the previous manifest</button>
+        <button class="opt">Nothing until <code>akeep add</code> is run</button>
+        <div class="why">Chunks are fixed 4 MiB pieces named by the BLAKE3 hash of their
+        uncompressed bytes. An append changes only the tail chunk, so earlier chunks
+        deduplicate. The new manifest still lists all three chunk ids. There is no
+        <code>add</code> command.</div></div>
+
+      <div class="q"><p><strong>Q5.</strong> In an age-encrypted Akeep vault, what can someone
+      with read access to the bucket learn?</p>
+        <button class="opt">Provider paths and hostnames, because manifests are plaintext</button>
+        <button class="opt" data-right>Object hashes and snapshot ids (from key names) and object sizes, but not paths, hostnames or file metadata</button>
+        <button class="opt">Nothing at all, not even the number of objects</button>
+        <button class="opt">The age private key, stored in <code>vault.json</code></button>
+        <div class="why">In age mode the whole manifest is encrypted. Object and snapshot ids
+        stay visible in key names. <code>vault.json</code> holds only the public recipient. The
+        identity file stays local, and <code>akeep clone</code> does not copy it.</div></div>
+
+      <div class="q"><p><strong>Q6.</strong> Why is deployment position B (Actime inside the
+      agent's container) described as having a weaker tamper story?</p>
+        <button class="opt">eBPF programs cannot run inside containers</button>
+        <button class="opt">AgentSight cannot see TLS inside containers</button>
+        <button class="opt" data-right>Root in the same container can kill Actime, delete the run directory, or use the granted CAP_BPF to detach probes</button>
+        <button class="opt">Akeep refuses to run in containers</button>
+        <div class="why">The recorder and the agent share a container boundary. In position A
+        the recorder, the eBPF programs and the record are on the host, outside the
+        container's view.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li id="ref-actime"><a href="https://github.com/eunomia-bpf/actime">eunomia-bpf/actime</a>, studied at commit <a href="https://github.com/eunomia-bpf/actime/tree/9c03598117af522c70e33695ca83dd4b38c12ff8"><code>9c035981</code></a> (2026-10-13): <code>README.md</code>, <code>CLAUDE.md</code>, <code>CHANGELOG.md</code>, <code>docs/DESIGN.md</code>, <code>docs/deployment.md</code>, <code>docs/policies.md</code>, <code>policies/*.dsl</code>, <code>crates/</code>. Sandbox removal: commit <a href="https://github.com/eunomia-bpf/actime/commit/3f29370">3f29370</a>.</li>
+      <li id="ref-akeep"><a href="https://github.com/eunomia-bpf/akeep">eunomia-bpf/akeep</a>, studied at commit <a href="https://github.com/eunomia-bpf/akeep/tree/7d690362f19d9341b78f99d610a09488c2d020c1"><code>7d690362</code></a> (2026-10-13): <code>README.md</code>, <code>docs/archive-format.md</code>, <code>docs/providers.md</code>, <code>docs/portable-history.md</code>, <code>docs/configuration.md</code>, <code>src/</code>, <code>scripts/demo.sh</code>.</li>
+      <li id="ref-sdk"><a href="https://github.com/eunomia-bpf/backup-client-sdk">eunomia-bpf/backup-client-sdk</a>, studied at commit <a href="https://github.com/eunomia-bpf/backup-client-sdk/tree/2774aa0b3e9d840fe9e6532089f95297cb48fcea"><code>2774aa0b</code></a> (2026-08-02): <code>README.md</code>, <code>AGENTS.md</code>, <code>src/client.rs</code>, <code>src/credential_store.rs</code>, <code>src/types.rs</code>, <code>contract/akeep-api-v1.json</code>, <code>examples/backup_client_e2e.rs</code>.</li>
+      <li id="ref-agentqos"><a href="https://github.com/eunomia-bpf/agentqos">eunomia-bpf/agentqos</a>, README only.</li>
+      <li id="ref-actplane"><a href="https://github.com/eunomia-bpf/ActPlane">eunomia-bpf/ActPlane</a> and Y. Zheng et al., <a href="https://arxiv.org/abs/2606.25189">"ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses"</a>, arXiv:2606.25189 [cs.OS], 2026. See <a href="24-actplane.html">chapter 24</a>.</li>
+      <li id="ref-agentsight">Y. Zheng, Y. Hu, T. Yu, A. Quinn, <a href="https://doi.org/10.1145/3766882.3767169">"AgentSight: System-Level Observability for AI Agents Using eBPF"</a>, Proceedings of the 4th Workshop on Practical Adoption Challenges of ML for Systems, ACM, 2025; repo <a href="https://github.com/eunomia-bpf/agentsight">eunomia-bpf/agentsight</a>. See <a href="23-agentsight.html">chapter 23</a>.</li>
+      <li><a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>, Linux kernel documentation.</li>
+      <li>J. Corbet, <a href="https://lwn.net/Articles/822362/">"A crop of new capabilities"</a> (CAP_BPF and CAP_PERFMON), LWN.net, June 8, 2020.</li>
+      <li><a href="https://docs.kernel.org/userspace-api/landlock.html">Landlock: unprivileged access control</a>, Linux kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/userspace-api/seccomp_filter.html">Seccomp BPF (SECure COMPuting with filters)</a>, Linux kernel documentation.</li>
+      <li><a href="https://github.com/containers/bubblewrap">containers/bubblewrap</a>, unprivileged sandboxing tool.</li>
+      <li>J. O'Connor, J.-P. Aumasson, S. Neves, Z. Wilcox-O'Hearn, <a href="https://github.com/BLAKE3-team/BLAKE3-specs/blob/master/blake3.pdf">"BLAKE3: one function, fast everywhere"</a>, specification, 2020.</li>
+      <li>Y. Collet, M. Kucherawy, <a href="https://www.rfc-editor.org/rfc/rfc8878">"Zstandard Compression and the 'application/zstd' Media Type"</a>, RFC 8878, 2021.</li>
+      <li><a href="https://age-encryption.org/v1">The age file encryption format, v1</a> (C2SP specification).</li>
+      <li><a href="https://www.sqlite.org/backup.html">SQLite Online Backup API</a>, sqlite.org.</li>
+      <li>W. Denniss, J. Bradley, M. Jones, H. Tschofenig, <a href="https://www.rfc-editor.org/rfc/rfc8628">"OAuth 2.0 Device Authorization Grant"</a>, RFC 8628, 2019.</li>
+      <li><a href="https://developers.cloudflare.com/r2/api/s3/presigned-urls/">Cloudflare R2 presigned URLs</a>, Cloudflare documentation.</li>
+      <li><a href="https://git-scm.com/book/en/v2/Git-Internals-Git-Objects">Git Internals — Git Objects</a>, Pro Git, 2nd ed.</li>
+      <li><a href="https://restic.readthedocs.io/en/stable/100_references.html">restic references: design and repository format</a>, restic documentation.</li>
+      <li><a href="https://code.claude.com/docs/en/sessions">Claude Code documentation: sessions</a> (local transcript retention, cited by Akeep's README).</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="26-reward-guard-and-safe-change.html"><small>Previous</small>26 · RewardGuard and safe change</a>
+      <a class="next" href="28-namei-ext.html"><small>Next</small>28 · namei_ext</a>
+    </div>
+  </main>
+</div>
+<script>
+(function () {
+  var ids = ['ps-mode', 'ps-priv', 'ps-ap', 'ps-as', 'ps-ak', 'ps-k510', 'ps-ifc'];
+  function el(id) { return document.getElementById(id); }
+  function pad(s, n) { while (s.length < n) s += ' '; return s; }
+  function render() {
+    var mode = el('ps-mode').value, priv = el('ps-priv').checked, ap = el('ps-ap').checked,
+        as = el('ps-as').checked, ak = el('ps-ak').checked, k = el('ps-k510').checked,
+        ifc = el('ps-ifc').checked;
+    var policy, obs, backup, refused = null;
+    if (mode === 'off') policy = 'Disabled   policy.mode is off';
+    else if (!ap) policy = 'Disabled   actplane is not installed';
+    else if (!k) policy = 'Disabled   kernel older than 5.10';
+    else if (!priv) policy = 'Disabled   needs root or CAP_BPF';
+    else if (ifc) policy = 'Disabled   information-flow rules not enforceable on this host';
+    else policy = 'Active';
+    if (mode === 'enforce' && policy !== 'Active') {
+      refused = 'run refused before agent launch (enforce fails closed), exit code 1';
+    }
+    if (refused) {
+      obs = 'Disabled   not started: run refused before agent launch';
+      backup = 'Disabled   not started: run refused before agent launch';
+    } else {
+      obs = !as ? 'Disabled   agentsight is not installed'
+          : !priv ? 'Disabled   needs root or CAP_BPF' : 'Active';
+      backup = ak ? 'Active' : 'Disabled   akeep is not installed';
+    }
+    var lines = [];
+    lines.push(refused ? 'agent: NOT started — ' + refused : 'agent: started');
+    if (!refused && mode === 'observe' && ifc && ap && priv && k) {
+      lines.push('note:  unenforceable rules recorded in manifest (observe proceeds)');
+    }
+    lines.push('');
+    lines.push(pad('policy', 15) + policy);
+    lines.push(pad('observability', 15) + obs);
+    lines.push(pad('backup', 15) + backup);
+    el('ps-out').firstChild.textContent = lines.join('\n');
+  }
+  ids.forEach(function (id) { el(id).addEventListener('change', render); });
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>25 · AgentCgroup: OS resources of AI agents · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="25">
+<meta name="chapter-part" content="Part VI · eBPF for AI agents">
+<meta name="chapter-summary" content="What a measurement study of 144 SWE-rebench tasks says about the CPU and memory behaviour of AI coding agents, and how AgentCgroup puts each tool call in its own cgroup and enforces priority with sched_ext and the proposed memcg_bpf_ops struct_ops.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/agentcgroup">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VI · eBPF for AI agents › 25 · AgentCgroup</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 25</div>
+      <h1>AgentCgroup: understanding and controlling the OS resources of AI agents</h1>
+      <p class="lede">A coding agent spends most of a task idling at about 185 MB while the
+      model thinks. Then it runs <code>pytest</code>, and for one or two seconds the container
+      needs gigabytes. If the container limit is set to the peak, most of that memory sits
+      unused. If it is set lower, the OOM killer can wipe out ten minutes of LLM context. This
+      chapter covers what the AgentCgroup study measured about such workloads, and how its
+      prototype gives every tool call its own cgroup and pushes the priority decisions into
+      the kernel with eBPF.</p>
+      <div class="meta"><span>Prerequisites: <a href="05-program-types-and-hooks.html">05</a> (cgroup programs, struct_ops, sched_ext), <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: eunomia-bpf/agentcgroup @ <code>551ca168</code></span><span>~60 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>AI coding agents such as Claude Code, OpenHands and SWE-agent run a loop. The model
+    reasons, emits a tool call, the framework runs it (often as <code>bash -c "…"</code>
+    inside a sandbox container), and the output goes back to the model. Providers now run many
+    such sandboxes side by side on shared machines. Each one is a Linux container, and Linux
+    containers are governed by <strong>cgroups</strong>: the kernel mechanism that accounts
+    for and limits the CPU, memory, I/O and process count of a group of tasks.</p>
+
+    <p>Cgroup limits were designed for workloads whose demand is roughly known: a web service
+    with a steady footprint, a batch job that grows with its input, a serverless function that
+    lives for a second. The AgentCgroup paper (<a href="#ref-paper">Zheng et al.,
+    arXiv:2602.09345</a>) asks whether agent sandboxes look like any of these. Its answer is
+    no. Agent memory has a flat baseline with short, tall spikes caused by tool calls, and the
+    size and timing of those spikes change from task to task and from run to run. Killing an
+    agent is also unusually expensive: the in-process conversation state cannot be
+    checkpointed, and a rerun takes a different path.</p>
+
+    <p>The repository (<a href="#ref-repo">eunomia-bpf/agentcgroup</a>) contains both halves of
+    the paper: the raw traces and analysis scripts behind the characterization, and
+    <code>agentcg/</code>, a proof-of-concept controller built from a bash wrapper, a Python
+    daemon and three eBPF components.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Make the cgroup tree follow
+    the agent's structure. Each agent session is a cgroup, and each tool call becomes a
+    short-lived child cgroup created by a wrapper that replaces <code>/usr/bin/bash</code>.
+    Priority between sessions is enforced inside the kernel: a <strong>sched_ext</strong>
+    scheduler (<code>scx_flatcg</code>) shares CPU by cgroup weight, and a
+    <strong><code>memcg_bpf_ops</code></strong> struct_ops program (from an RFC kernel patch
+    series) shields the high-priority session from reclaim and adds a throttle delay to
+    low-priority sessions. The agent can also hint at what a command will need
+    (<code>AGENT_RESOURCE_HINT</code>), and after an OOM kill it gets a plain-English
+    explanation on stderr.</p></div>
+
+    <p>This chapter is about resources. Observing agents is the topic of
+    <a href="23-agentsight.html">chapter 23 (AgentSight)</a>, and AgentCgroup's process monitor
+    comes from that code base. Enforcing information-flow policies is the topic of
+    <a href="24-actplane.html">chapter 24 (ActPlane)</a>.</p>
+
+    <h2>cgroup v2 for programmers</h2>
+    <p>You only need a small part of cgroup v2 to follow this chapter. All of it is in the
+    kernel's <a href="#ref-cgv2">Control Group v2</a> document.</p>
+
+    <h3>A tree of directories</h3>
+    <p>cgroup v2 is a single hierarchy mounted at <code>/sys/fs/cgroup</code>. A cgroup is a
+    directory. You create one with <code>mkdir</code> and remove an empty one with
+    <code>rmdir</code>. You move a process into a cgroup by writing its PID to that cgroup's
+    <code>cgroup.procs</code> file. Children forked afterwards start in the same cgroup.
+    Everything else is a control file in the directory.</p>
+
+    <p>Controllers (cpu, memory, io, pids, …) are switched on per subtree. The kernel
+    documentation says "No controller is enabled by default". A parent turns them on for its
+    children by writing to <code>cgroup.subtree_control</code>:</p>
+    <pre><code class="language-bash"># echo "+cpu +memory -io" &gt; cgroup.subtree_control</code></pre>
+    <p>One rule surprises most people. The <em>no internal process</em> constraint says a
+    non-root cgroup can hand domain resources (such as memory) to its children only when it
+    has no processes of its own. Processes live in the leaves, and the inner nodes only
+    distribute. Keep that in mind when we read the wrapper's clean-up code later.</p>
+
+    <h3>The four controllers that matter here</h3>
+    <div class="grid">
+      <div class="card"><h4>cpu</h4><p><code>cpu.weight</code>: proportional share among
+      active siblings, range [1, 10000], default 100. <code>cpu.max</code>: a bandwidth cap,
+      written as <code>"$MAX $PERIOD"</code>, default <code>"max 100000"</code>. The docs note
+      that these files affect the fair class and "a BPF scheduler with the
+      <code>cgroup_set_weight</code> callback".</p></div>
+      <div class="card"><h4>memory</h4><p>Two protections (<code>memory.min</code> hard,
+      <code>memory.low</code> best effort) and two limits (<code>memory.high</code> throttle,
+      <code>memory.max</code> hard). Observability: <code>memory.current</code>,
+      <code>memory.peak</code>, <code>memory.events</code>,
+      <code>memory.pressure</code>.</p></div>
+      <div class="card"><h4>io</h4><p><code>io.weight</code> (default
+      <code>"default 100"</code>, per-device overrides keyed by <code>MAJ:MIN</code>) and
+      <code>io.max</code> (BPS/IOPS caps). AgentCgroup does not use io.</p></div>
+      <div class="card"><h4>pids</h4><p><code>pids.max</code> is a hard cap on the number of
+      processes in the subtree. <code>pids.current</code> and <code>pids.peak</code> report
+      usage. AgentCgroup does not use pids either. Its prototype manages CPU and
+      memory.</p></div>
+    </div>
+
+    <h3>memory.min, low, high, max</h3>
+    <p>These four boundaries are the core of the memory story, so here they are in the kernel
+    doc's own terms:</p>
+    <ul>
+      <li><code>memory.min</code>: "Hard memory protection". Memory within the effective min
+      boundary "won't be reclaimed under any conditions".</li>
+      <li><code>memory.low</code>: "Best-effort memory protection". Below it, the cgroup's
+      memory is reclaimed only when no unprotected memory is left.</li>
+      <li><code>memory.high</code>: "Memory usage throttle limit". Above it, "the processes of
+      the cgroup are throttled and put under heavy reclaim pressure". Going over it "never
+      invokes the OOM killer". The kernel adds a sleep (a <em>penalty delay</em>) on the way
+      back to user space for tasks that allocate past it.</li>
+      <li><code>memory.max</code>: "Memory usage hard limit". If usage reaches it and reclaim
+      cannot help, "the OOM killer is invoked in the cgroup".</li>
+    </ul>
+    <p><code>memory.peak</code> is the high-water mark for the cgroup and its descendants
+    since it was created, which is exactly what you want for a cgroup that lives as long as
+    one command. <code>memory.events</code> counts how often each boundary was hit (for
+    example <code>high</code>, <code>max</code>, <code>oom_kill</code>).
+    <code>memory.oom.group</code> makes the OOM killer treat the cgroup as one unit.
+    <code>cgroup.freeze</code> stops every process in a subtree, and <code>cgroup.kill</code>
+    SIGKILLs every process in it.</p>
+
+    <h3>PSI: measuring the pain</h3>
+    <p>Pressure Stall Information (<a href="#ref-psi">kernel doc</a>) reports how much time
+    tasks spent waiting for a resource. Each cgroup has <code>cpu.pressure</code>,
+    <code>memory.pressure</code> and <code>io.pressure</code> with lines like</p>
+    <pre><code class="language-plaintext">some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0</code></pre>
+    <p><code>some</code> is the share of time at least one task was stalled. <code>full</code>
+    is the share of time all non-idle tasks were stalled at once. <code>total</code> is the
+    cumulative stall in microseconds. User-space OOM daemons such as
+    <a href="#ref-oomd">oomd</a> and <a href="#ref-systemd-oomd">systemd-oomd</a> watch these
+    files and kill a cgroup when pressure stays high. AgentCgroup's fallback controller reads
+    <code>total</code> too, as you will see.</p>
+
+    <h3>Where eBPF comes in</h3>
+    <p><a href="05-program-types-and-hooks.html">Chapter 05</a> covered the classic cgroup BPF
+    programs (<code>cgroup/connect4</code>, <code>cgroup/dev</code>, <code>cgroup_skb</code>, …).
+    Those are allow/deny hooks. They cannot change how much CPU or memory a cgroup gets.
+    AgentCgroup uses two newer mechanisms based on struct_ops instead, both also introduced in
+    chapter 05:</p>
+    <ul>
+      <li><strong>sched_ext</strong> (<a href="#ref-scx-doc">kernel doc</a>,
+      <a href="#ref-lwn-scx">LWN</a>): the whole CPU scheduling policy is a BPF
+      <code>struct sched_ext_ops</code>. If the BPF scheduler misbehaves, the kernel falls
+      back to the default scheduler. It is in mainline since 6.12.</li>
+      <li><strong><code>memcg_bpf_ops</code></strong>: a struct_ops for the memory controller,
+      proposed by Hui Zhu in the RFC series "mm: memcontrol: Add BPF hooks for memory
+      controller" (<a href="#ref-lwn-memcg">v3 on LWN</a>, <a href="#ref-lore-memcg">v6 on
+      lore</a>). It is <strong>not in mainline</strong>: when we checked on 2026-11-06,
+      <code>mm/bpf_memcontrol.c</code> on torvalds/master had no <code>memcg_bpf_ops</code>.
+      The repository ships the v6 series as <code>agentcg/memcg/patches.mbox</code>.</li>
+    </ul>
+
+    <figure>
+      <svg viewBox="0 0 900 400" role="img" aria-label="cgroup hierarchy used by AgentCgroup: /sys/fs/cgroup/agentcg with session_high (cpu.weight 150, memcg high_mcg_ops) containing ephemeral tool cgroups, and session_low (cpu.weight 50, low_mcg_ops)">
+        <style>
+          .b25{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .h25{fill:var(--bg3);stroke:var(--accent);stroke-width:2}
+          .l25{fill:var(--bg3);stroke:var(--accent2);stroke-width:2}
+          .e25{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 4}
+          .tx25{fill:var(--fg);font:13px sans-serif}
+          .mo25{fill:var(--fg);font:12px monospace}
+          .mu25{fill:var(--muted);font:12px sans-serif}
+          .ln25{stroke:var(--fg);stroke-width:1.3;fill:none}
+        </style>
+        <rect class="b25" x="320" y="15" width="260" height="58" rx="6"/>
+        <text class="mo25" x="334" y="38">/sys/fs/cgroup/agentcg/</text>
+        <text class="mu25" x="334" y="58">subtree_control: +memory +cpu</text>
+        <path class="ln25" d="M450,73 V95 H205 V115 M450,95 H695 V115"/>
+        <rect class="h25" x="40" y="115" width="330" height="92" rx="6"/>
+        <text class="mo25" x="54" y="138">session_high/</text>
+        <text class="mu25" x="54" y="158">cpu.weight = 150 · subtree_control: +memory +cpu</text>
+        <text class="mu25" x="54" y="176">memcg: high_mcg_ops (below_low, below_min)</text>
+        <text class="mu25" x="54" y="194">agent framework (Node.js), ~185 MB baseline</text>
+        <rect class="l25" x="530" y="115" width="330" height="92" rx="6"/>
+        <text class="mo25" x="544" y="138">session_low/</text>
+        <text class="mu25" x="544" y="158">cpu.weight = 50</text>
+        <text class="mu25" x="544" y="176">memcg: low_mcg_ops (get_high_delay_ms)</text>
+        <text class="mu25" x="544" y="194">another tenant's agent</text>
+        <path class="ln25" d="M205,207 V230 H95 V250 M205,230 V250 M205,230 H315 V250"/>
+        <rect class="e25" x="30" y="250" width="130" height="84" rx="6"/>
+        <text class="mo25" x="40" y="272">tool_412_…/</text>
+        <text class="mu25" x="40" y="292">git status</text>
+        <text class="mu25" x="40" y="310">hint memory:low</text>
+        <text class="mu25" x="40" y="326">memory.high 256M</text>
+        <rect class="e25" x="170" y="250" width="70" height="84" rx="6"/>
+        <text class="mu25" x="190" y="296">…</text>
+        <rect class="e25" x="250" y="250" width="130" height="84" rx="6"/>
+        <text class="mo25" x="260" y="272">tool_977_…/</text>
+        <text class="mu25" x="260" y="292">pytest tests/</text>
+        <text class="mu25" x="260" y="310">hint memory:high</text>
+        <text class="mu25" x="260" y="326">memory.high max</text>
+        <text class="mu25" x="30" y="362">dashed = ephemeral: created by bash_wrapper.sh before the command, removed after it</text>
+        <text class="mu25" x="30" y="382">memcg_bpf_ops attached to session_high is inherited by each new child (memcontrol_bpf_online)</text>
+      </svg>
+      <figcaption>Figure 25.1 — The cgroup tree that <code>agentcgroupd.py</code> and
+      <code>bash_wrapper.sh</code> build. Values are the defaults in the code at
+      <code>551ca168</code>.</figcaption>
+    </figure>
+
+    <h2>The characterization study</h2>
+    <p>The first half of the paper is a measurement study. Everything in this section comes
+    from the paper's v3 text (§3, §4) unless another path is given.</p>
+
+    <h3>What was measured</h3>
+    <p>The workload is Claude Code solving tasks from SWE-rebench
+    (<a href="#ref-swerebench">Badertdinov et al., 2025</a>), a continuously collected,
+    decontaminated set of real GitHub issues with ready-made Docker images. Each task ran in
+    its own Podman container from the official image (2.9–17.3 GB) with <em>no resource
+    limits</em>. Claude Code was bind-mounted from the host. Two model back ends were used:
+    Claude Haiku 4.5 through the cloud API, and GLM-4.7-Flash on a local GPU. The paper counts
+    111 GLM tasks and 33 Haiku tasks; the Haiku tasks are a subset of the GLM ones, so
+    cross-model comparisons use the overlap. The machine was an Intel Core Ultra 9 285K
+    (24 cores, 128 GB DDR5) running Ubuntu 24.04 with Linux 6.15.11 and cgroup v2.</p>
+
+    <p>CPU and memory were sampled once per second, and each tool call's type and timestamps
+    were recorded. In the repository the sampler is a thread in
+    <code>scripts/run_swebench.py</code> that shells out to <code>podman stats</code>:</p>
+    <pre data-file="scripts/run_swebench.py"><code class="language-python">    def _get_sample(self) -&gt; Optional[dict]:
+        """Get a single resource sample."""
+        try:
+            result = subprocess.run(
+                ["podman", "stats", "--no-stream", "--format",
+                 "{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}", self.container_id],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split('\t')
+                if len(parts) &gt;= 3:
+                    return {
+                        "timestamp": datetime.now().isoformat(),
+                        "epoch": time.time(),
+                        "mem_usage": parts[0],
+                        "mem_percent": parts[1],
+                        "cpu_percent": parts[2]
+                    }
+        except Exception as e:
+            pass  # Container may have stopped
+        return None</code></pre>
+    <p>Two consequences follow. The data is per container, not per tool call. And a burst
+    shorter than a second can be missed or blurred. The repo's own Chinese-language summary
+    (<code>analysis/data_analysis_summary.md</code>) points this out and suggests 100 ms
+    sampling as future work. Each task directory under <code>experiments/all_images_haiku/</code>
+    and <code>experiments/all_images_local/</code> holds <code>trace.jsonl</code>,
+    <code>resources.json</code>, <code>tool_calls.json</code>, <code>results.json</code> and a
+    plot (<code>experiments/README.md</code>).</p>
+
+    <h3>Findings</h3>
+    <p>The paper groups its findings under three questions: what granularity resources vary
+    at, how fast they change, and how predictable they are.</p>
+    <table>
+      <thead><tr><th>Finding</th><th>Numbers reported (paper v3)</th></tr></thead>
+      <tbody>
+        <tr><td>Where the time goes</td><td>OS-level work (container/agent initialization plus tool execution) is 55–60% of end-to-end latency. LLM reasoning is 40–45%, initialization 31–48%, tool execution 13–24% of the full lifecycle. Tasks run 5–11 minutes (GLM mean 10.8, Haiku mean 5.8).</td></tr>
+        <tr><td>Which tools</td><td>Bash and sub-agent calls are over 90% of Haiku tool time (80.6% and 17.3%). GLM's tool time is 98.8% Bash. Test execution is the largest Bash category (Haiku 73.3%, GLM 44.5%).</td></tr>
+        <tr><td>Memory, not CPU, limits density</td><td>Average CPU is low (Haiku 13.2%, GLM 7.6% of one core). Peaks of 2–4 GB mean 128 GB fits only 32–64 instances if each gets its peak, while CPU stays below 36% of capacity.</td></tr>
+        <tr><td>Two-layer memory</td><td>A stable ~185 MB framework baseline (Haiku 183, GLM 188) plus tool-call bursts of 500 MB–2 GB. Peak memory differs 13.7× across Bash calls depending on the command. Test execution's P95 spike is 518 MB (Haiku) / 234 MB (GLM); file exploration and git average 4.5 MB and 13.5 MB.</td></tr>
+        <tr><td>Bursts sit inside tool calls</td><td>In Haiku, tool calls cover 28.5% of samples but contain 98.5% of memory bursts above 300 MB. In GLM, 35.8% of time contains 67.3% of bursts.</td></tr>
+        <tr><td>Bursts are tall and short</td><td>Bursts last 1–2 s. pydicom/pydicom peaks at 4060 MB against a 264 MB average: 15.4× peak-to-average. Memory changes by up to 2.9 GB in one 1-s interval.</td></tr>
+        <tr><td>Retries accumulate</td><td>85% (28/33) of Haiku and 97% (108/111) of GLM tasks have retry groups (three or more consecutive runs of the same test command), up to 56 in a row, with up to 502 MB left unreleased in the worst case.</td></tr>
+        <tr><td>Unpredictable</td><td>Peak memory ranges from 197 MB to 4 GB across tasks (CV 147%). Three runs of iterative/dvc took 402, 222 and 259 s (1.8×) with different solutions. Conversation rounds do not predict peak memory (r &lt; 0.11). CPU–memory correlation ranges from −0.84 to +0.50.</td></tr>
+        <tr><td>Heavy images</td><td>Images average 3.5 GB (range 2.9–17.3 GB over 114 deduplicated images).</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn"><span class="label">Watch the numbers</span><p>Two caveats
+    from the repository itself. First, the repo's earlier analysis summary
+    (<code>analysis/data_analysis_summary.md</code>, dated 2026-02-06) uses different datasets
+    (18 and 102 tasks) and reports different figures, such as a 1.7× vs 3.9× CPU ratio
+    between models. Quote the paper's numbers, not that file's. Second, open
+    <a href="#ref-pr11">PR #11</a> (2026-10-28) fixes a parser in
+    <code>analysis/analyze_new_insights.py</code> that turned Podman readings such as
+    <code>193MB</code> into 19 MB. The PR body says the paper's affected §3.3/§4 results "may
+    require a separate correction once the updated analyses are rerun". At the time of
+    writing that rerun has not landed.</p></div>
+
+    <h3>Three mismatches</h3>
+    <p>The paper compares these properties with serverless (Azure Functions,
+    <a href="#ref-shahrad">Shahrad et al., ATC '20</a>), microservice/VM and batch workloads,
+    and names three ways in which today's controls do not fit:</p>
+    <div class="grid">
+      <div class="card"><h4>Granularity</h4><p>Demand varies per tool call, but limits are set
+      per container. Setting <code>memory.max</code> to the peak "wastes over 90% of allocated
+      memory"; setting it near the average OOM-kills tool bursts. A single
+      <code>memory.high</code> cannot tell <code>git status</code> (13.5 MB) from
+      <code>pytest</code> (518 MB P95).</p></div>
+      <div class="card"><h4>Responsiveness</h4><p>Bursts last 1–2 s and arrive at
+      unpredictable times. A PSI-driven daemon needs a signal, a wake-up, a decision and a
+      control-file write; the paper puts that loop at "tens of milliseconds", by which time
+      the burst may be over or the kernel has already intervened. PSI is also per cgroup, not
+      per tool call.</p></div>
+      <div class="card"><h4>Adaptability</h4><p>History-based sizing (Borg, Autopilot,
+      Kubernetes VPA) assumes repeatable demand. Agents vary 1.8× between runs of the same
+      task, and killing and restarting one loses all its context and takes a different
+      path. The paper argues for degrading gracefully (throttle, freeze) instead of
+      killing.</p></div>
+    </div>
+    <p>The insight behind the design is that agents, unlike a web server, can read English.
+    They can state their intent before a command and change strategy after a failure. The
+    controller can use both.</p>
+
+    <h2>Architecture</h2>
+    <p>The paper's §5 maps the three mismatches to three mechanisms: <em>fine-grained resource
+    domains</em> (a cgroup per tool call) for granularity, <em>in-kernel eBPF
+    enforcement</em> for responsiveness, and <em>intent-driven coordination</em> (hints up,
+    feedback down) for adaptability. The code in <code>agentcg/</code> implements them with
+    five parts:</p>
+    <table>
+      <thead><tr><th>Part</th><th>File</th><th>Runs as</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td>bash wrapper</td><td><code>agentcg/bash_wrapper.sh</code></td><td>replaces <code>/usr/bin/bash</code> in the container</td><td>one ephemeral cgroup per <code>bash -c</code>, hint → <code>memory.high</code>, OOM feedback, JSONL log</td></tr>
+        <tr><td>daemon</td><td><code>agentcg/agentcgroupd.py</code></td><td>root, Python</td><td>builds the tree, sets <code>cpu.weight</code>, starts the three BPF tools, logs events</td></tr>
+        <tr><td>CPU scheduler</td><td><code>agentcg/scheduler/scx_flatcg.bpf.c</code></td><td>sched_ext struct_ops</td><td>weighted, flattened cgroup CPU sharing</td></tr>
+        <tr><td>memory priority</td><td><code>agentcg/memcg/memcg_priority.bpf.c</code></td><td>memcg_bpf_ops struct_ops + tracepoint</td><td>protect HIGH from reclaim, delay LOW over <code>memory.high</code></td></tr>
+        <tr><td>process monitor</td><td><code>agentcg/process/process.bpf.c</code></td><td>tracepoints + uretprobe</td><td>exec/exit/open/readline events as JSON lines</td></tr>
+      </tbody>
+    </table>
+
+    <figure>
+      <svg viewBox="0 0 900 420" role="img" aria-label="AgentCgroup control loop: the LLM emits a bash tool call with an optional resource hint; the bash wrapper creates a tool cgroup and sets memory.high; in the kernel, sched_ext and memcg_bpf_ops act on every scheduling decision and allocation; on OOM the wrapper writes feedback to stderr that returns to the LLM">
+        <style>
+          .b25b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .k25b{fill:none;stroke:var(--accent);stroke-width:2}
+          .u25b{fill:none;stroke:var(--accent2);stroke-width:2}
+          .tx25b{fill:var(--fg);font:13px sans-serif}
+          .mo25b{fill:var(--fg);font:12px monospace}
+          .mu25b{fill:var(--muted);font:12px sans-serif}
+          .ar25b{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah25b)}
+          .ag25b{stroke:var(--accent2);stroke-width:1.5;fill:none;marker-end:url(#ah25b);stroke-dasharray:6 4}
+          .ln25b{stroke:var(--border);stroke-width:1;stroke-dasharray:5 4}
+        </style>
+        <defs><marker id="ah25b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="mu25b" x="10" y="20">agent</text>
+        <text class="mu25b" x="10" y="135">user space</text>
+        <text class="mu25b" x="10" y="275">kernel</text>
+        <line class="ln25b" x1="0" y1="105" x2="900" y2="105"/>
+        <line class="ln25b" x1="0" y1="245" x2="900" y2="245"/>
+        <rect class="b25b" x="60" y="30" width="250" height="60" rx="6"/>
+        <text class="tx25b" x="72" y="54">LLM + agent framework</text>
+        <text class="mo25b" x="72" y="76">AGENT_RESOURCE_HINT=memory:high</text>
+        <rect class="b25b" x="590" y="30" width="270" height="60" rx="6"/>
+        <text class="tx25b" x="602" y="54">tool result (stdout/stderr)</text>
+        <text class="mo25b" x="602" y="76">[Resource] Command killed (OOM…</text>
+        <rect class="u25b" x="60" y="120" width="330" height="110" rx="6"/>
+        <text class="tx25b" x="72" y="142">bash_wrapper.sh (per bash -c)</text>
+        <text class="mu25b" x="72" y="162">1 mkdir tool_&lt;pid&gt;_&lt;ns&gt;/, write memory.high</text>
+        <text class="mu25b" x="72" y="180">2 echo $$ &gt; cgroup.procs; run real-bash</text>
+        <text class="mu25b" x="72" y="198">3 read memory.peak; exit 137 → feedback</text>
+        <text class="mu25b" x="72" y="216">4 append JSONL log, move back, rmdir</text>
+        <rect class="u25b" x="530" y="120" width="330" height="110" rx="6"/>
+        <text class="tx25b" x="542" y="142">agentcgroupd.py (root)</text>
+        <text class="mu25b" x="542" y="162">creates session_high / session_low</text>
+        <text class="mu25b" x="542" y="180">cpu.weight 150 / 50</text>
+        <text class="mu25b" x="542" y="198">starts scx_flatcg, memcg_priority, process</text>
+        <text class="mu25b" x="542" y="216">(or cgroup-v2 fallback polling PSI)</text>
+        <rect class="k25b" x="40" y="260" width="840" height="140" rx="8"/>
+        <rect class="b25b" x="60" y="285" width="240" height="95" rx="6"/>
+        <text class="tx25b" x="72" y="307">cgroup v2 core</text>
+        <text class="mo25b" x="72" y="327">memory.high / .peak</text>
+        <text class="mo25b" x="72" y="345">cpu.weight</text>
+        <text class="mo25b" x="72" y="363">memory.events, PSI</text>
+        <rect class="b25b" x="330" y="285" width="250" height="95" rx="6"/>
+        <text class="tx25b" x="342" y="307">sched_ext: scx_flatcg</text>
+        <text class="mu25b" x="342" y="327">cgroup_set_weight, enqueue,</text>
+        <text class="mu25b" x="342" y="345">dispatch: per-cgroup DSQs by</text>
+        <text class="mu25b" x="342" y="363">compounded hweight</text>
+        <rect class="b25b" x="610" y="285" width="250" height="95" rx="6"/>
+        <text class="tx25b" x="622" y="307">memcg_bpf_ops (RFC)</text>
+        <text class="mo25b" x="622" y="327">below_low / below_min</text>
+        <text class="mo25b" x="622" y="345">get_high_delay_ms</text>
+        <text class="mu25b" x="622" y="363">+ tp memcg/count_memcg_events</text>
+        <path class="ar25b" d="M185,90 V118"/>
+        <path class="ar25b" d="M225,230 V283"/>
+        <path class="ar25b" d="M695,230 V283"/>
+        <path class="ar25b" d="M300,332 H328"/>
+        <path class="ar25b" d="M580,332 H608"/>
+        <path class="ag25b" d="M390,140 C470,120 520,100 588,70"/>
+        <text class="mu25b" x="420" y="100">downward feedback</text>
+        <path class="ag25b" d="M590,48 C450,10 380,10 312,48"/>
+        <text class="mu25b" x="400" y="22">agent re-plans (e.g. run one test file)</text>
+      </svg>
+      <figcaption>Figure 25.2 — The control loop. Solid arrows are configuration and
+      attachment. Dashed arrows are the "intent-driven" channel: a hint goes up with the
+      command, and feedback comes down in the tool result.</figcaption>
+    </figure>
+
+    <h2>Mapping tool calls to cgroups: the bash wrapper</h2>
+    <p>How do you learn where one tool call starts and ends without modifying Claude Code?
+    AgentCgroup's answer: almost every agent framework runs shell commands as
+    <code>bash -c "&lt;command&gt;"</code>. So rename the real bash to
+    <code>/usr/bin/real-bash</code> and install a script as <code>/usr/bin/bash</code>. Every
+    <code>-c</code> invocation is then a tool call. Interactive shells and scripts pass straight
+    through. Note the shebang: the wrapper itself runs on <code>real-bash</code>, or it would
+    recurse.</p>
+    <pre data-file="agentcg/bash_wrapper.sh"><code class="language-bash">#!/usr/bin/real-bash
+# AgentCgroup Bash Wrapper
+/* ... */
+REAL_BASH="/usr/bin/real-bash"
+CGROUP_ROOT="${AGENTCG_ROOT:-/sys/fs/cgroup/agentcg/session_high}"
+LOG_FILE="${AGENTCG_LOG:-/tmp/agentcg_tools.jsonl}"
+
+# If disabled, pass through directly
+if [ "${AGENTCG_DISABLE:-0}" = "1" ]; then
+    exec "$REAL_BASH" "$@"
+fi
+
+# Non "-c" invocations pass through (interactive bash, source scripts, etc.)
+if [ "$1" != "-c" ]; then
+    exec "$REAL_BASH" "$@"
+fi
+
+# --- Per-tool-call cgroup creation ---
+
+TOOL_CG="${CGROUP_ROOT}/tool_$$_$(date +%s%N 2&gt;/dev/null || echo $$)"
+IN_CG=0
+
+# Parse resource hint (upward: Agent → System)
+HINT="${AGENT_RESOURCE_HINT:-}"
+MEM_HIGH="max"
+case "$HINT" in
+    memory:low)     MEM_HIGH=$((256 * 1024 * 1024)) ;;
+    memory:medium)  MEM_HIGH=$((1024 * 1024 * 1024)) ;;
+    memory:high)    MEM_HIGH="max" ;;
+    memory:*[gG])
+        NUM="${HINT#memory:}"
+        NUM="${NUM%[gG]}"
+        # Use shell arithmetic; fall back to max on error
+        MEM_HIGH=$(( NUM * 1024 * 1024 * 1024 )) 2&gt;/dev/null || MEM_HIGH="max"
+        ;;
+/* ... memory:*[mM] handled the same way ... */
+esac
+
+# Create ephemeral child cgroup
+if mkdir -p "$TOOL_CG" 2&gt;/dev/null; then
+    # Apply memory.high if hint was provided
+    if [ "$MEM_HIGH" != "max" ] &amp;&amp; [ -f "$TOOL_CG/memory.high" ]; then
+        echo "$MEM_HIGH" &gt; "$TOOL_CG/memory.high" 2&gt;/dev/null
+    fi
+    # Move self into child cgroup
+    if echo $$ &gt; "$TOOL_CG/cgroup.procs" 2&gt;/dev/null; then
+        IN_CG=1
+    fi
+fi</code></pre>
+    <p>The design choices are visible here. The cgroup name is
+    <code>tool_&lt;pid&gt;_&lt;nanoseconds&gt;</code>, so concurrent calls never collide. The
+    hint only ever sets <code>memory.high</code>, the throttle boundary, never
+    <code>memory.max</code>: a wrong guess slows the command down instead of killing it. A
+    hint of <code>memory:low</code> means 256 MiB, <code>memory:medium</code> 1 GiB, and
+    <code>memory:high</code> or no hint means no per-call limit. And every step fails open: if
+    <code>mkdir</code> or the PID write fails, the command still runs, just untracked.</p>
+
+    <p>Then the wrapper runs the command, collects metrics and talks back:</p>
+    <pre data-file="agentcg/bash_wrapper.sh"><code class="language-bash"># --- Execute the actual command ---
+"$REAL_BASH" "$@"
+EXIT_CODE=$?
+/* ... */
+if [ "$IN_CG" = "1" ]; then
+    PEAK_MEM=$(cat "$TOOL_CG/memory.peak" 2&gt;/dev/null || echo "")
+    CURRENT_MEM=$(cat "$TOOL_CG/memory.current" 2&gt;/dev/null || echo "")
+fi
+
+# --- Downward feedback: System → Agent ---
+if [ $EXIT_CODE -eq 137 ] &amp;&amp; [ "$IN_CG" = "1" ]; then
+    PEAK_MB=""
+    if [ -n "$PEAK_MEM" ]; then
+        PEAK_MB=$((PEAK_MEM / 1024 / 1024))
+    fi
+    echo "[Resource] Command killed (OOM, exit 137). Peak memory: ${PEAK_MB:-unknown}MB." &gt;&amp;2
+    echo "[Resource] The command exceeded the available memory budget." &gt;&amp;2
+    echo "[Resource] Suggestions: run more targeted operations (e.g., specific test" &gt;&amp;2
+    echo "  files instead of full test suite), reduce data size, or split into" &gt;&amp;2
+    echo "  smaller steps. You can also request more memory by setting" &gt;&amp;2
+    echo "  AGENT_RESOURCE_HINT=\"memory:&lt;size&gt;g\" before the command." &gt;&amp;2
+fi
+/* ... JSONL logging: ts, pid, cgroup, cmd (200 chars), exit, duration_ms, peak_mem ... */
+
+# --- Cleanup: move back to parent cgroup, remove child ---
+if [ "$IN_CG" = "1" ]; then
+    echo $$ &gt; "$CGROUP_ROOT/cgroup.procs" 2&gt;/dev/null
+    rmdir "$TOOL_CG" 2&gt;/dev/null
+fi
+
+exit $EXIT_CODE</code></pre>
+    <p>Exit code 137 is 128 + 9, a process killed by SIGKILL, which is what the OOM killer
+    sends. The feedback is ordinary text on stderr, so it arrives in the tool result the model
+    reads next. No agent-side change is needed. Because <code>memory.peak</code> is read from
+    a cgroup that existed only for this command, the log gives exactly the per-tool-call
+    attribution that the container-level characterization lacked.</p>
+
+    <div class="callout warn"><span class="label">Read the clean-up carefully</span><p>The
+    clean-up moves the wrapper's PID back into <code>session_high</code>. But the daemon has
+    enabled <code>+memory +cpu</code> in <code>session_high/cgroup.subtree_control</code>, and
+    the no-internal-process rule forbids processes in such a non-root cgroup. By our reading,
+    that write should fail, so the <code>rmdir</code> runs while the wrapper is still inside
+    <code>tool_…/</code> and also fails, leaving an empty directory behind when the wrapper
+    exits. The repo's 14 wrapper tests run against simulated directories
+    (<code>bash_wrapper_local.sh</code> uses a tmpdir and <code>/proc</code>), so they would
+    not show this. We did not run the wrapper on a real cgroup v2 system, so treat this as
+    unverified. If you deploy it, check for leftover <code>tool_*</code> directories, which
+    the daemon's own scanner (<code>_manage_tool_cgroups</code>) would also see.</p></div>
+
+    <p>The daemon's process monitor is not involved in placing processes. The comment in
+    <code>handle_event</code> says it plainly: "With bash wrapper, tool-call processes
+    self-assign to child cgroups. Daemon only logs the event for observability."</p>
+
+    <h2>The daemon: building the tree</h2>
+    <p><code>agentcgroupd.py</code> is small (351 lines). It must run as root. Its setup
+    function is the whole cgroup policy of the prototype:</p>
+    <pre data-file="agentcg/agentcgroupd.py"><code class="language-python">def setup_cgroup_hierarchy(root: str) -&gt; bool:
+    """Create the cgroup hierarchy with session_high and session_low.
+
+    Enables subtree_control on session_high to allow per-tool-call
+    child cgroups created by the bash wrapper.
+    """
+    high = os.path.join(root, "session_high")
+    low = os.path.join(root, "session_low")
+
+    if not cgroup_create(high) or not cgroup_create(low):
+        return False
+
+    # Enable controllers on root
+    cgroup_write(root, "cgroup.subtree_control", "+memory +cpu")
+
+    # Enable subtree_control on session_high for per-tool-call child cgroups
+    cgroup_write(high, "cgroup.subtree_control", "+memory +cpu")
+
+    # Set CPU weights (higher = more CPU time)
+    cgroup_write(high, "cpu.weight", "150")
+    cgroup_write(low, "cpu.weight", "50")
+
+    log.info("Cgroup hierarchy ready at %s (per-tool-call subtree enabled)", root)
+    return True</code></pre>
+    <p>For <code>cgroup_write(root, "cgroup.subtree_control", …)</code> to work, the parent of
+    <code>agentcg/</code> (here the real root) must already delegate <code>cpu</code> and
+    <code>memory</code>, which systemd hosts normally do. Then <code>start()</code> launches
+    the components in order: <code>scheduler/scx_flatcg -i 5</code> (print stats every
+    5 s), the memory controller, a one-second pause "for BPF programs to attach", and
+    <code>process/process -m 2 -c python,bash,pytest,node,npm</code>, whose JSON lines on
+    stdout drive the event loop. If the scheduler or memcg component fails to start, the
+    daemon logs a warning and carries on without it. If the process monitor dies, the daemon
+    exits.</p>
+
+    <h3>Two memory back ends</h3>
+    <p><code>memcg_controller.py</code> hides the choice of memory mechanism behind one
+    interface, because the BPF one needs a patched kernel:</p>
+    <pre data-file="agentcg/memcg_controller.py"><code class="language-python">def create_memcg_controller(script_dir: str) -&gt; MemcgController:
+    """Auto-detect: use BPF if binary exists, otherwise cgroup v2 fallback."""
+    bpf_bin = os.path.join(script_dir, "memcg", "memcg_priority")
+    if os.path.isfile(bpf_bin) and os.access(bpf_bin, os.X_OK):
+        log.info("Using BPF memcg controller (%s)", bpf_bin)
+        return BpfMemcgController(bpf_bin)
+    log.info("BPF memcg binary not found, using cgroup v2 fallback")
+    return CgroupMemcgController()</code></pre>
+    <p>The BPF back end just runs <code>memcg/memcg_priority --high … --low … --delay-ms 50
+    --threshold 1 --below-low</code> (the defaults in <code>MemcgConfig</code>) and watches
+    that it stays alive. The fallback, <code>CgroupMemcgController</code>, is a classic
+    user-space controller and a useful contrast. On every loop iteration it checks three
+    signals, in order: the <code>high</code> counter in <code>memory.events</code> of
+    <code>session_high</code> grew; the PSI <code>some … total=</code> of the parent grew; or
+    the parent's <code>memory.current</code> is at least 85% of its
+    <code>memory.max</code>. Any one of these turns protection on for a one-second window:</p>
+    <pre data-file="agentcg/memcg_controller.py"><code class="language-python">    def _activate_protection(self) -&gt; None:
+        """Enter protection: shield HIGH from reclaim, throttle LOW."""
+        if not self._config:
+            return
+
+        # Determine memory limits from parent cgroup
+        parent = os.path.dirname(self._config.high_cgroup)
+        total = self._read_memory_limit(parent)
+
+        if total and total &gt; 0:
+            # Protect 80% for HIGH
+            high_low = int(total * 0.8)
+            # Restrict LOW to 50%
+            low_high = int(total * 0.5)
+        else:
+            # Fallback: use a large value for protection, small for throttle
+            high_low = 1 &lt;&lt; 30  # 1 GiB
+            low_high = 512 &lt;&lt; 20  # 512 MiB
+
+        _cgroup_write(self._config.high_cgroup, "memory.low", str(high_low))
+        for low in self._config.low_cgroups:
+            _cgroup_write(low, "memory.high", str(low_high))</code></pre>
+    <p>This is exactly the pattern the paper calls too slow. The daemon learns about pressure
+    only after it has built up, and only as fast as its loop runs. Since that loop also
+    blocks on <code>proc.stdout.readline()</code> from the process monitor, the polling rate
+    depends on how often process events arrive. The BPF back end moves the same decision
+    ("is HIGH busy right now? then protect it and slow LOW down") into the kernel's reclaim
+    and throttling paths.</p>
+
+    <h2>Memory: memcg_bpf_ops</h2>
+
+    <h3>The kernel side (RFC patches)</h3>
+    <p>The v6 series in <code>agentcg/memcg/patches.mbox</code> (12 patches; 7 by Hui Zhu
+    and 5 taken from Roman Gushchin's <a href="#ref-bpf-oom">"mm: BPF OOM"</a> series, which
+    adds the ability to attach struct_ops to a cgroup) defines a new struct_ops type with five
+    callbacks:</p>
+    <pre data-file="agentcg/memcg/patches.mbox"><code class="language-c">+struct memcg_bpf_ops {
++	void (*handle_cgroup_online)(struct mem_cgroup *memcg);
++
++	void (*handle_cgroup_offline)(struct mem_cgroup *memcg);
++
++	bool (*below_low)(struct mem_cgroup *memcg);
++
++	bool (*below_min)(struct mem_cgroup *memcg);
++
++	unsigned int (*get_high_delay_ms)(struct mem_cgroup *memcg);
++};</code></pre>
+    <p>Each <code>struct mem_cgroup</code> gets a <code>bpf_ops</code> pointer. The callbacks
+    are invoked through a macro that keeps the common no-BPF case to a single load and branch,
+    and uses SRCU so the ops can be detached safely:</p>
+    <pre data-file="agentcg/memcg/patches.mbox"><code class="language-c">+#define BPF_MEMCG_CALL(memcg, op, default_val) ({		\
++	typeof(default_val) __ret = (default_val);		\
++	struct memcg_bpf_ops *__ops;				\
++	int __idx;						\
++								\
++	if (unlikely(READ_ONCE((memcg)-&gt;bpf_ops))) {		\
++		__idx = srcu_read_lock(&amp;memcg_bpf_srcu);	\
++		__ops = READ_ONCE((memcg)-&gt;bpf_ops);		\
++		if (__ops &amp;&amp; __ops-&gt;op)				\
++			__ret = __ops-&gt;op(memcg);		\
++		srcu_read_unlock(&amp;memcg_bpf_srcu, __idx);	\
++	}							\
++	__ret;							\
++})
+/* ... */
+@@ -625,6 +731,9 @@ static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
+ 	if (mem_cgroup_unprotected(target, memcg))
+ 		return false;
+ 
++	if (bpf_memcg_below_low(memcg))
++		return true;
++
+ 	return READ_ONCE(memcg-&gt;memory.elow) &gt;=
+ 		page_counter_read(&amp;memcg-&gt;memory);
+ }</code></pre>
+    <p>So <code>below_low</code> returning true makes reclaim treat the cgroup as if it were
+    within its <code>memory.low</code>, whatever its real usage. <code>below_min</code> does
+    the same for <code>memory.min</code>. <code>get_high_delay_ms</code> plugs into
+    <code>__mem_cgroup_handle_over_high()</code>, the function that puts over-high allocators
+    to sleep:</p>
+    <pre data-file="agentcg/memcg/patches.mbox"><code class="language-c">-	penalty_jiffies = calculate_high_delay(memcg, nr_pages,
+-					       mem_find_max_overage(memcg));
++	if (nr_pages) {
++		penalty_jiffies = calculate_high_delay(
++			memcg, nr_pages, mem_find_max_overage(memcg));
+ 
+-	penalty_jiffies += calculate_high_delay(memcg, nr_pages,
+-						swap_find_max_overage(memcg));
++		penalty_jiffies += calculate_high_delay(
++			memcg, nr_pages, swap_find_max_overage(memcg));
++	} else
++		penalty_jiffies = 0;
++	penalty_jiffies = max(penalty_jiffies, bpf_high_delay);</code></pre>
+    <p>The BPF value can only lengthen the built-in penalty, never shorten it, and it still
+    passes the kernel's existing clamp on the maximum delay per return to user space. Two more
+    properties matter for AgentCgroup. When a child memcg comes online,
+    <code>memcontrol_bpf_online()</code> copies the parent's <code>bpf_ops</code> ("Inherit
+    the BPF program from the parent cgroup"), so ops attached to <code>session_high</code>
+    also cover every new <code>tool_*</code> child with no extra work. And the hook only acts
+    when the cgroup is <em>over</em> <code>memory.high</code>: a LOW session with
+    <code>memory.high = max</code> is never delayed by it.</p>
+
+    <h3>The BPF program</h3>
+    <p><code>agentcg/memcg/memcg_priority.bpf.c</code> (209 lines) is close to the sample
+    program in the patch series (<code>samples/bpf/memcg.bpf.c</code>). It has one
+    tracepoint and two struct_ops maps. The tracepoint decides when the HIGH session is
+    "active":</p>
+    <pre data-file="agentcg/memcg/memcg_priority.bpf.c"><code class="language-c">SEC("tp/memcg/count_memcg_events")
+int handle_count_memcg_events(struct trace_event_raw_memcg_rstat_events *ctx)
+{
+	__u32 key = 0;
+	struct AggregationData *data;
+	__u64 current_ts;
+
+	/* Only count page faults from HIGH priority cgroup */
+	/* PGFAULT = 23 in the kernel enum */
+	if (ctx-&gt;id != local_config.high_cgroup_id || ctx-&gt;item != 23)
+		return 0;
+
+	data = bpf_map_lookup_elem(&amp;aggregation_map, &amp;key);
+	if (!data)
+		return 0;
+
+	current_ts = bpf_ktime_get_ns();
+
+	/* Reset window if more than 1 second has passed */
+	if (current_ts - data-&gt;window_start_ts &lt; ONE_SECOND_NS) {
+		data-&gt;sum += ctx-&gt;val;
+	} else {
+		data-&gt;window_start_ts = current_ts;
+		data-&gt;sum = ctx-&gt;val;
+	}
+
+	/* If threshold exceeded, record trigger timestamp */
+	if (data-&gt;sum &gt; local_config.threshold) {
+		bpf_map_update_elem(&amp;trigger_ts_map, &amp;key, &amp;current_ts, BPF_ANY);
+		data-&gt;sum = 0;
+		data-&gt;window_start_ts = current_ts;
+	}
+
+	return 0;
+}</code></pre>
+    <p>Then every struct_ops callback asks one question, "did HIGH cross the page-fault
+    threshold within the last second?":</p>
+    <pre data-file="agentcg/memcg/memcg_priority.bpf.c"><code class="language-c">static __always_inline bool need_protection(void)
+{
+	/* ... */
+	trigger_ts = bpf_map_lookup_elem(&amp;trigger_ts_map, &amp;key);
+	if (!trigger_ts || *trigger_ts == 0)
+		return false;
+
+	current_ts = bpf_ktime_get_ns();
+
+	/* Protection window is 1 second */
+	return (current_ts - *trigger_ts &lt; ONE_SECOND_NS);
+}
+/* ... */
+SEC("struct_ops/get_high_delay_ms")
+unsigned int get_high_delay_ms_impl(struct mem_cgroup *memcg)
+{
+	/* ... stats counter ... */
+	if (local_config.over_high_ms &amp;&amp; need_protection()) {
+		/* ... */
+		return local_config.over_high_ms;
+	}
+
+	return 0;
+}
+
+SEC(".struct_ops.link")
+struct memcg_bpf_ops high_mcg_ops = {
+	.below_low = (void *)below_low_impl,
+	.below_min = (void *)below_min_impl,
+};
+
+SEC(".struct_ops.link")
+struct memcg_bpf_ops low_mcg_ops = {
+	.get_high_delay_ms = (void *)get_high_delay_ms_impl,
+};</code></pre>
+    <p>Two maps of the same type are defined because each cgroup gets its own attachment.
+    The HIGH session gets <code>high_mcg_ops</code> (reclaim protection). Each LOW session
+    gets <code>low_mcg_ops</code> (extra delay). The whole policy is: when the important
+    agent is actively faulting in memory, protect it and slow the others down, for one
+    second at a time. Nothing waits for a user-space daemon.</p>
+
+    <h3>Loading and attaching</h3>
+    <p>The loader is a normal libbpf skeleton program (see
+    <a href="06-btf-core-libbpf.html">chapter 06</a>), except for the attach call. Upstream
+    libbpf attaches a struct_ops map globally. The patch series adds
+    <code>bpf_map__attach_struct_ops_opts()</code>, whose <code>relative_fd</code> names the
+    target cgroup:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Attach (memcg_priority.c)"><pre data-file="agentcg/memcg/memcg_priority.c"><code class="language-c">	/* Configure BPF program */
+	skel-&gt;bss-&gt;local_config.high_cgroup_id = get_cgroup_id(high_path);
+	skel-&gt;bss-&gt;local_config.threshold = threshold;
+	skel-&gt;bss-&gt;local_config.over_high_ms = delay_ms;
+	skel-&gt;bss-&gt;local_config.use_below_low = use_below_low;
+	skel-&gt;bss-&gt;local_config.use_below_min = use_below_min;
+	/* ... */
+	err = memcg_priority__load(skel);
+	/* ... */
+	tp_link = bpf_program__attach(skel-&gt;progs.handle_count_memcg_events);
+	/* ... */
+	map = bpf_object__find_map_by_name(skel-&gt;obj, "high_mcg_ops");
+	/* ... */
+	opts.relative_fd = high_fd;
+	high_link = bpf_map__attach_struct_ops_opts(map, &amp;opts);
+	/* ... */
+	for (i = 0; i &lt; low_count; i++) {
+		opts.relative_fd = low_fds[i];
+		low_links[i] = bpf_map__attach_struct_ops_opts(map, &amp;opts);
+		/* ... */
+	}</code></pre></div>
+      <div class="tab-panel" data-label="Cgroup id"><pre data-file="agentcg/memcg/memcg_priority.c"><code class="language-c">static __u64 get_cgroup_id(const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &amp;st) &lt; 0) {
+		fprintf(stderr, "Failed to stat %s: %s\n", path, strerror(errno));
+		return 0;
+	}
+
+	/* The cgroup ID is the inode number */
+	return st.st_ino;
+}</code></pre>
+      <p>On 64-bit systems the inode number of a cgroup v2 directory is the cgroup's
+      kernfs id, the same value the tracepoint reports as <code>id</code>.</p></div>
+      <div class="tab-panel" data-label="Options"><pre data-file="agentcg/memcg/memcg_priority.c"><code class="language-c">	static struct option long_options[] = {
+		{"high", required_argument, 0, 'H'},
+		{"low", required_argument, 0, 'L'},
+		{"delay-ms", required_argument, 0, 'd'},
+		{"threshold", required_argument, 0, 't'},
+		{"below-low", no_argument, 0, 'l'},
+		{"below-min", no_argument, 0, 'm'},
+		{"verbose", no_argument, 0, 'v'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};</code></pre></div>
+    </div>
+    <p>Two details are worth noticing when reading this program. The page-fault item number
+    is hard-coded (<code>ctx-&gt;item != 23</code>, "PGFAULT = 23 in the kernel enum"), so it
+    depends on the exact <code>vm_event_item</code> layout of the patched kernel. And the
+    filter matches only <code>session_high</code>'s own id. As far as we can tell from
+    reading the code, faults charged to a <code>tool_*</code> child carry the child's id, so
+    whether tool-call faults trigger protection when the wrapper is in use depends on how
+    the tracepoint reports them. We did not test this. In the paper's evaluation the replayed
+    workloads ran directly in the HIGH and LOW cgroups.</p>
+
+    <h2>CPU: scx_flatcg under sched_ext</h2>
+    <p>The CPU side reuses <code>scx_flatcg</code>, the "flattened cgroup hierarchy
+    scheduler" that ships with the kernel in <code>tools/sched_ext/</code>
+    (<a href="#ref-flatcg-up">upstream source</a>). A diff against torvalds/master shows the
+    copy in <code>agentcg/scheduler/</code> is the same algorithm. The differences are
+    compatibility changes (for example <code>__COMPAT_scx_bpf_task_cgroup()</code> and a
+    one-argument <code>scx_bpf_dsq_move_to_local()</code>), a <code>-d</code> option to dump
+    cgroups, and using online rather than possible CPUs for <code>nr_cpus</code>. Its header
+    comment explains the idea:</p>
+    <pre data-file="agentcg/scheduler/scx_flatcg.bpf.c"><code class="language-c">/*
+ * A demo sched_ext flattened cgroup hierarchy scheduler. It implements
+ * hierarchical weight-based cgroup CPU control by flattening the cgroup
+ * hierarchy into a single layer by compounding the active weight share at each
+ * level. Consider the following hierarchy with weights in parentheses:
+ *
+ * R + A (100) + B (100)
+ *   |         \ C (100)
+ *   \ D (200)
+ * ...
+ * So, instead of hierarchically scheduling level-by-level, we can consider it
+ * as B, C and D competing each other with respective share of 1/6, 1/6 and 2/3
+ * and keep updating the eventual shares as the cgroups' runnable states change.
+ */</code></pre>
+    <p>Each cgroup gets its own dispatch queue (DSQ) whose id is the cgroup id, created in
+    <code>cgroup_init</code>. Cgroups wait in a red-black tree ordered by cgroup virtual time.
+    Each one is charged slice time divided by its compounded weight (<code>hweight</code>), so
+    a cgroup with twice the share runs twice as often. Weight changes from
+    <code>cpu.weight</code> arrive through the <code>cgroup_set_weight</code> callback:</p>
+    <pre data-file="agentcg/scheduler/scx_flatcg.bpf.c"><code class="language-c">void BPF_STRUCT_OPS(fcg_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
+{
+	struct fcg_cgrp_ctx *cgc, *pcgc = NULL;
+
+	cgc = find_cgrp_ctx(cgrp);
+	if (!cgc)
+		return;
+
+	if (cgrp-&gt;level) {
+		pcgc = find_ancestor_cgrp_ctx(cgrp, cgrp-&gt;level - 1);
+		if (!pcgc)
+			return;
+	}
+
+	bpf_spin_lock(&amp;cgv_tree_lock);
+	if (pcgc &amp;&amp; cgc-&gt;nr_active)
+		pcgc-&gt;child_weight_sum += (s64)weight - cgc-&gt;weight;
+	cgc-&gt;weight = weight;
+	bpf_spin_unlock(&amp;cgv_tree_lock);
+}
+/* ... */
+SCX_OPS_DEFINE(flatcg_ops,
+	       .select_cpu		= (void *)fcg_select_cpu,
+	       .enqueue			= (void *)fcg_enqueue,
+	       .dispatch		= (void *)fcg_dispatch,
+	       /* ... runnable, running, stopping, quiescent, init_task ... */
+	       .cgroup_set_weight	= (void *)fcg_cgroup_set_weight,
+	       .cgroup_init		= (void *)fcg_cgroup_init,
+	       .cgroup_exit		= (void *)fcg_cgroup_exit,
+	       .cgroup_move		= (void *)fcg_cgroup_move,
+	       .init			= (void *)fcg_init,
+	       .exit			= (void *)fcg_exit,
+	       .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_ENQ_EXITING,
+	       .name			= "flatcg");</code></pre>
+    <p>With the daemon's weights, <code>session_high</code> (150) gets three times the CPU of
+    <code>session_low</code> (50) when both are runnable. Tool cgroups start at the default
+    weight of 100 and share <code>session_high</code>'s portion among themselves. Note what
+    this does <em>not</em> do. The paper's §5 says the CPU side maintains "per-workload and
+    per-tool-call metadata in BPF maps, prioritizing latency-sensitive tool calls". In the
+    code at <code>551ca168</code> there is no agent-specific logic in the scheduler. The
+    priority comes entirely from <code>cpu.weight</code>, which is the cgroup interface a
+    standard kernel's fair scheduler also honours. What sched_ext adds here is the flattened
+    hierarchy (cheaper with deep trees) and a place where agent-aware logic could go
+    later.</p>
+
+    <h2>The process monitor</h2>
+    <p><code>agentcg/process/process.bpf.c</code> comes from the AgentSight lineage
+    (<a href="23-agentsight.html">chapter 23</a>). It attaches to
+    <code>tp/sched/sched_process_exec</code>, <code>tp/sched/sched_process_exit</code>,
+    <code>tp/syscalls/sys_enter_openat</code> and <code>sys_enter_open</code>, plus a uretprobe
+    on bash's <code>readline</code> (<code>SEC("uretprobe//usr/bin/bash:readline")</code>)
+    that captures interactive command lines. Events go through a 256 KB ring buffer, and the
+    user-space side filters by command name (<code>-c</code>) and mode (<code>-m 2</code> is
+    "filter": report only tracked processes and their descendants). In AgentCgroup it is
+    observability only: the daemon logs EXEC and EXIT with durations.</p>
+
+    <h2>One tool call, step by step</h2>
+    <div class="stepper">
+      <div class="step"><h4>1. The model chooses a command</h4><p>Claude Code decides to run
+      the test suite and emits a Bash tool call. If the agent was told about the protocol (the
+      live test in <code>test_live_agent.sh</code> puts it in the prompt), the command
+      carries <code>AGENT_RESOURCE_HINT="memory:high"</code>.</p></div>
+      <div class="step"><h4>2. The framework forks bash</h4><p>The framework runs
+      <code>bash -c "pytest tests/"</code>. <code>/usr/bin/bash</code> is the wrapper. It sees
+      <code>-c</code>, computes <code>tool_&lt;pid&gt;_&lt;ns&gt;</code>, and maps the hint
+      (<code>memory:high</code> means no per-call limit, <code>memory:low</code> would mean
+      256 MiB).</p></div>
+      <div class="step"><h4>3. A new cgroup is born</h4><p><code>mkdir</code> under
+      <code>session_high/</code>. The kernel brings the memcg online, and
+      <code>memcontrol_bpf_online()</code> copies <code>high_mcg_ops</code> from the parent.
+      sched_ext calls <code>fcg_cgroup_init</code>, which creates a DSQ for the new cgroup.
+      The wrapper writes its PID to <code>cgroup.procs</code>; sched_ext sees
+      <code>cgroup_move</code>.</p></div>
+      <div class="step"><h4>4. pytest runs and allocates</h4><p>All children of the wrapper
+      inherit the cgroup. Page faults are charged to it, and the scheduler accounts its CPU
+      time against <code>session_high</code>'s 150 weight. If a LOW tenant is over its
+      <code>memory.high</code> while HIGH is active, <code>get_high_delay_ms</code> returns
+      the configured delay (50 ms by default from the daemon) and the LOW allocator
+      sleeps.</p></div>
+      <div class="step"><h4>5. Reclaim protects the agent</h4><p>When memory runs short,
+      reclaim walks the cgroups. For <code>session_high</code> and its children,
+      <code>below_low</code> returns true during the protection window, so reclaim takes
+      memory from elsewhere first.</p></div>
+      <div class="step"><h4>6. The command ends</h4><p>The wrapper reads
+      <code>memory.peak</code> and <code>memory.current</code>. If the exit code is 137, it
+      prints the <code>[Resource] …</code> lines to stderr. It appends one JSON line to
+      <code>$AGENTCG_LOG</code> and tries to move back and remove the cgroup.</p></div>
+      <div class="step"><h4>7. The model reads the result</h4><p>The tool result includes the
+      feedback text. The model might now run one test file instead of the whole suite, or
+      retry with <code>AGENT_RESOURCE_HINT="memory:2g"</code>. That is the "adaptability"
+      mechanism: no history, just a conversation.</p></div>
+    </div>
+
+    <h2>Directory map</h2>
+    <pre><code class="language-plaintext">agentcgroup/                    (@ 551ca168, 2026-07-22; ~84 MB, mostly data)
+├── README.md                   overview, build steps (some paths predate a Feb-2026 move, see below)
+├── agentcg/                    the controller
+│   ├── bash_wrapper.sh         per-tool-call cgroup, hints, OOM feedback, JSONL log
+│   ├── bash_wrapper_local.sh   same logic on a tmpdir, no root (for tests)
+│   ├── agentcgroupd.py         daemon: hierarchy, cpu.weight, starts the three tools
+│   ├── memcg_controller.py     BPF back end + cgroup-v2/PSI fallback
+│   ├── test_agentcgroupd.py    43 Python unit tests
+│   ├── test_bash_wrapper.sh    14 wrapper tests;  test_live_agent.sh: Claude Code haiku run
+│   ├── test_e2e_cgroup.sh, test_integration.py, test_semantic_validation.sh
+│   ├── Makefile                make = scheduler + process;  make memcg separately
+│   ├── scheduler/              scx_flatcg.bpf.c / .c / .h (sched_ext), eval/ (tests, workloads)
+│   ├── memcg/                  memcg_priority.bpf.c / .c / .h, patches.mbox (RFC v6),
+│   │   │                       EXPERIMENT_REPORT.md, AGENT_EXPERIMENT_DESIGN.md
+│   │   └── multi_tenant_test/  run_isolation_comparison.sh, run_overhead_experiment.sh,
+│   │                           trace_replay.py, memory_stress.py, isolation_results/
+│   └── process/                process.bpf.c / .c (exec/exit/open + bash readline)
+├── scripts/                    run_swebench.py (Podman + Claude Code + podman stats sampler),
+│                               batch_test_swebench.py, replay_trace.py, run_all_swebench_images.py
+├── analysis/                   characterization.py (main), analyze_*.py, *_figures/ (paper plots)
+├── experiments/                all_images_haiku/, all_images_local/, batch_swebench_18tasks/,
+│                               replays/, empirical_study_20260305_full/, branchfs_motivation/
+├── docs/                       REPRODUCING.md, EXPERIMENTS.md, design/design_v1..v3.md,
+│                               PLAN_per_tool_call_cgroup(_en).md, exp_log2_per_tool_call.md
+├── task_list.json              SWE-rebench task list
+├── third_party/                submodules: sched-ext/scx, libbpf/bpftool
+├── agentsight/                 submodule: eunomia-bpf/agentsight
+└── paper-repo/                 submodule: LaTeX source</code></pre>
+    <p>The repository is mostly data: per-task traces, resource samples and plots. The
+    controller itself is a few thousand lines. Much of the design and experiment
+    documentation (<code>docs/design/*</code>, <code>agentcg/memcg/*.md</code>,
+    <code>multi_tenant_test/RESULTS_SUMMARY.md</code>) is written in Chinese.</p>
+
+    <h2>Build and use</h2>
+    <h3>Requirements</h3>
+    <p>From <code>README.md</code> and <code>docs/REPRODUCING.md</code>: Linux 6.12+ with
+    sched_ext and cgroup v2, clang, gcc, make, libbpf-dev, libelf-dev (zlib1g-dev for the
+    BPF parts), Python 3.10+, Docker or Podman for the container experiments, and root for
+    anything that touches cgroups or BPF. The memory component additionally needs a kernel
+    built with the <code>memcg_bpf_ops</code> patches. The paper's prototype ran on 6.15
+    with them and its evaluation used a patched 6.19.0-rc5 from bpf-next. The Makefiles
+    build libbpf and bpftool from the submodules, so clone recursively.</p>
+
+    <h3>Build</h3>
+    <pre><code class="language-bash">git clone --recurse-submodules https://github.com/eunomia-bpf/agentcgroup.git
+cd agentcgroup
+python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install -r requirements.txt
+
+cd agentcg
+make            # scheduler + process monitor
+make memcg      # only on a kernel with memcg_bpf_ops
+make test       # python3 -m unittest test_agentcgroupd -v</code></pre>
+    <div class="callout tip"><span class="label">Stale paths</span><p>The top-level
+    <code>README.md</code> still shows <code>cd scx_flatcg &amp;&amp; make</code> and
+    <code>cd memcg/multi_tenant_test/bpf_loader &amp;&amp; make</code>, and
+    <code>docs/REPRODUCING.md</code> repeats them. Commit <code>9fa4deec</code> ("remove old
+    scx_flatcg/ and memcg/ directories", 2026-02-21) moved everything under
+    <code>agentcg/</code>, and there is no <code>bpf_loader/</code> directory any more. Use
+    <code>agentcg/scheduler</code>, <code>agentcg/memcg</code> and
+    <code>agentcg/memcg/multi_tenant_test</code> instead. The README's clone URL also still
+    points at <code>yunwei37/agentcgroup</code>; the org URL above works.</p></div>
+
+    <h3>Run the controller</h3>
+    <pre><code class="language-bash"># host side (root)
+cd agentcg
+sudo python3 agentcgroupd.py [--cgroup-root PATH] [--no-scheduler] [--no-memcg] \
+                             [--commands python,bash,pytest,node,npm] [-v]
+
+# inside the container: replace bash with the wrapper
+cp /usr/bin/bash /usr/bin/real-bash
+cp bash_wrapper.sh /usr/bin/bash
+chmod +x /usr/bin/bash
+export AGENTCG_ROOT="/sys/fs/cgroup/agentcg/session_high"</code></pre>
+    <p>The wrapper reads four environment variables: <code>AGENTCG_ROOT</code> (parent
+    cgroup), <code>AGENTCG_LOG</code> (default <code>/tmp/agentcg_tools.jsonl</code>),
+    <code>AGENT_RESOURCE_HINT</code> and <code>AGENTCG_DISABLE=1</code> (pass-through). The
+    agent then uses hints like the README's examples:</p>
+    <pre><code class="language-bash">AGENT_RESOURCE_HINT="memory:low"  bash -c "git status"       # lightweight
+AGENT_RESOURCE_HINT="memory:high" bash -c "pytest tests/"     # heavy
+AGENT_RESOURCE_HINT="memory:2g"   bash -c "python train.py"   # explicit</code></pre>
+    <p>No root and no patched kernel? The local variant simulates the tree in a tmpdir:</p>
+    <pre><code class="language-bash">export AGENTCG_ROOT="/tmp/agentcg_sim/session_high"
+export AGENTCG_LOG="/tmp/agentcg_tools.jsonl"
+bash bash_wrapper_local.sh -c "your command here"
+bash test_bash_wrapper.sh       # 14 wrapper tests</code></pre>
+    <p>Each wrapped call appends a line like this one from <code>agentcg/README.md</code>
+    (the <code>mem_high</code> field is written only by the local variant):</p>
+    <pre data-file="agentcg/README.md"><code class="language-json">{
+  "ts": 1771352900389526404,
+  "pid": 1278268,
+  "cgroup": "/sys/fs/cgroup/agentcg/session_high/tool_1278268_1771352900384005799",
+  "cmd": "python3 -m unittest test_calculator -v",
+  "exit": 0,
+  "duration_ms": 47,
+  "peak_mem": "3801088",
+  "current_mem": "3801088",
+  "hint": "memory:high",
+  "mem_high": "max"
+}</code></pre>
+    <p>To collect SWE-bench traces with the wrapper installed, <code>scripts/run_swebench.py
+    &lt;image&gt; --enable-wrapper</code> bind-mounts <code>agentcg/bash_wrapper.sh</code> into
+    the container and swaps it in before Claude Code starts. Its other options are
+    <code>--prompt</code>, <code>--run-tests</code>, <code>--memory</code> (default
+    <code>4g</code>), <code>--cpus</code> (default <code>2</code>) and <code>--model</code>
+    (default <code>haiku</code>).</p>
+
+    <h3>Reproduce the paper</h3>
+    <pre><code class="language-bash"># Characterization (§3 in v3; pre-collected traces, no root needed)
+python analysis/characterization.py
+python analysis/characterization.py --skip-extended --skip-rq   # fast mode
+python analysis/analyze_haiku_vs_qwen.py
+
+# CPU scheduler tests (sched_ext kernel, root)
+cd agentcg/scheduler/eval
+sudo ./setup.sh
+sudo ./tests/test_weight_fairness.sh   # weights 100:200:300, expect ~1:2:3
+sudo ./tests/test_hierarchy.sh         # A(100){B,C} + D(200): 1/6, 1/6, 2/3
+sudo ./tests/test_isolation.sh         # noisy neighbour, CFS vs flatcg P99
+
+# Memory isolation + overhead (memcg_bpf_ops kernel, root)
+cd agentcg/memcg/multi_tenant_test
+sudo ./run_isolation_comparison.sh [--total-mb 1024] [--speed 10] [--runs 3]
+sudo ./run_overhead_experiment.sh</code></pre>
+    <p>The commands come from <code>docs/REPRODUCING.md</code> and
+    <code>agentcg/scheduler/eval/README.md</code>, with paths corrected to
+    <code>agentcg/</code>. <code>run_isolation_comparison.sh</code> looks for the loader at
+    <code>$SCRIPT_DIR/../memcg_priority</code>, so run <code>make memcg</code> first. We did
+    not run any of these: the orb's kernel has neither the memcg patches nor root access to
+    cgroupfs, and the submodules were not fetched.</p>
+
+    <h2>Evaluation</h2>
+    <p>The paper's §6 is labelled "preliminary". It replays real memory traces from the
+    study at 50× speed on a 4-core, 16 GB laptop-class machine (Intel Core Ultra 7 258V) with
+    the patched 6.19.0-rc5 kernel. Three replays run concurrently: dask/dask as HIGH (peak
+    421 MB, <code>memory.high = max</code>) and two sigmavirus24/github3.py instances as LOW
+    (peak 406 MB each, <code>memory.high = 400 MB</code>). The comparison is against no
+    isolation.</p>
+    <table>
+      <thead><tr><th>Scenario</th><th>No isolation</th><th>BPF</th></tr></thead>
+      <tbody>
+        <tr><td>Tight memory: 1100 MB for ~1233 MB demand</td><td>one LOW process OOM-killed (66% survival)</td><td>all finish (100%); 239 delay triggers; HIGH +2.8% time</td></tr>
+        <tr><td>Moderate memory: 1300 MB, HIGH P95 allocation latency</td><td>70.97 ms</td><td>50.14 ms (−29%)</td></tr>
+        <tr><td>Overhead</td><td colspan="2">P50 latency +0.3%, total completion −1.1%</td></tr>
+        <tr><td>Throttle precision (kernel selftest, 2000 ms delay)</td><td colspan="2">2.000 ± 0.046 s measured (&lt;2.3% error)</td></tr>
+      </tbody>
+    </table>
+    <p>The same numbers appear in <code>agentcg/memcg/EXPERIMENT_REPORT.md</code>, which adds
+    per-process times (LOW finishing at 4.40 s and 4.39 s against 2.12–2.17 s without
+    isolation) and P99/max latencies (192 → 184 ms, 268 → 210 ms). The wrapper's cost was
+    measured separately in <code>docs/exp_log2_per_tool_call.md</code>: creating and removing
+    a cgroup adds 1–4 ms per call, and in a live run Claude Haiku chose the expected hint for
+    5 out of 5 commands (<code>memory:low</code> for <code>cat</code>/<code>git</code>,
+    <code>memory:high</code> for tests).</p>
+    <p>Keep the scope in mind. The evaluation is memory only. It uses three replayed traces,
+    not live agents. It compares against no isolation, not against a tuned
+    <code>memory.low</code>/<code>memory.high</code> setup or the repo's own PSI fallback. It
+    does not exercise the per-tool-call cgroups or the hint and feedback channel under
+    contention. An earlier experiment in <code>multi_tenant_test/RESULTS_SUMMARY.md</code>,
+    with a 2000 ms delay and 150 MB <code>memory.high</code>, found a milder effect (LOW/HIGH
+    completion ratio 1.29× vs 1.01×) and notes that the delay hook returned a non-zero value
+    on only 272 of 1644 calls.</p>
+
+    <h2>Benefits and limitations</h2>
+    <h3>What works well</h3>
+    <ul>
+      <li><strong>Attribution for free.</strong> One cgroup per <code>bash -c</code> gives
+      exact per-command <code>memory.peak</code>, with no agent changes and a few
+      milliseconds of overhead. That alone is useful for measuring agents.</li>
+      <li><strong>Kernel-speed priority.</strong> The memcg callbacks run inside reclaim and
+      the over-high path. They answer from a map lookup and a timestamp comparison. There is
+      no wake-up and no control-file write.</li>
+      <li><strong>Degrade, do not kill.</strong> Hints set <code>memory.high</code>, not
+      <code>memory.max</code>, and the BPF policy delays LOW tenants instead of OOM-killing
+      them. That fits a workload whose death costs all its context.</li>
+      <li><strong>Agents as participants.</strong> Hints and stderr feedback treat the agent
+      as something that can cooperate, an idea no classic resource manager could use.</li>
+      <li><strong>Safe fallbacks.</strong> sched_ext reverts to the default scheduler on
+      error, the daemon runs without missing components, and the memory controller falls back
+      to plain cgroup v2.</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>Needs an unmerged kernel interface.</strong> <code>memcg_bpf_ops</code> and
+      <code>bpf_map__attach_struct_ops_opts()</code> exist only in the RFC series. Their names
+      and semantics may change, and on a stock kernel you get the user-space fallback.</li>
+      <li><strong>Code is narrower than the paper.</strong> At <code>551ca168</code> we found
+      no use of <code>cgroup.freeze</code> (the paper's "throttling … then freezing") and no
+      per-tool-call logic in the scheduler. The CPU policy is two static weights.</li>
+      <li><strong>Only two priority classes</strong>, hard-wired as
+      <code>session_high</code>/<code>session_low</code>. Nothing assigns a real agent session
+      to either; the daemon creates the directories and the wrapper uses
+      <code>session_high</code>.</li>
+      <li><strong>Interception is shallow.</strong> Only <code>bash -c</code> is wrapped.
+      Tools that exec programs directly, long-lived language servers, or framework-internal
+      work (a sub-agent, a web fetch) stay in whatever cgroup they started in. Replacing
+      <code>/usr/bin/bash</code> also changes a system binary in the container.</li>
+      <li><strong>Hints are advisory and unauthenticated.</strong> Any process can set
+      <code>AGENT_RESOURCE_HINT</code>. Since a hint can only lower <code>memory.high</code>
+      for its own call, a lying agent mostly hurts itself, but the scheme does not protect
+      against a hostile one.</li>
+      <li><strong>Fragile details</strong> found by reading: the hard-coded
+      <code>PGFAULT = 23</code>, the HIGH-only id filter versus faults in tool children, and
+      the move-back-then-<code>rmdir</code> sequence under the no-internal-process rule (all
+      unverified on a live kernel).</li>
+      <li><strong>Study scope.</strong> One agent framework (Claude Code), one benchmark,
+      1-second container-level sampling, and a parser bug under review (PR #11). The paper
+      says so itself: "the characterization covers one agent framework and one
+      benchmark".</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>User-space pressure controllers.</strong> <a href="#ref-oomd">oomd</a> and
+      <a href="#ref-systemd-oomd">systemd-oomd</a> act on PSI from user space and kill whole
+      cgroups. Meta's <a href="#ref-tmo">TMO</a> (ASPLOS '22) uses PSI to drive proactive
+      memory offloading. AgentCgroup's fallback controller is in this family; its BPF path is
+      an attempt to move the decision into the kernel.</li>
+      <li><strong>BPF for memory management.</strong> Roman Gushchin's
+      <a href="#ref-bpf-oom">"mm: BPF OOM"</a> series adds a struct_ops for OOM handling,
+      memcg kfuncs and PSI struct_ops. It also supplies the attach-struct_ops-to-cgroup
+      support that <code>memcg_bpf_ops</code> builds on.</li>
+      <li><strong>BPF schedulers.</strong> <a href="#ref-scx">sched-ext/scx</a> collects
+      production sched_ext schedulers (scx_layered, scx_lavd, scx_rusty, …).
+      <code>scx_flatcg</code> is one of the kernel's example schedulers. The org's
+      LLM-for-scheduler work is in <a href="30-llm-kernel-tooling.html">chapter 30</a>.</li>
+      <li><strong>Workload characterization.</strong> The paper positions itself against
+      studies of serverless (<a href="#ref-shahrad">Shahrad et al.</a>), Azure VMs (Resource
+      Central, SOSP '17) and Borg/Autopilot.</li>
+      <li><strong>Agent systems.</strong> <a href="23-agentsight.html">AgentSight</a> observes
+      agents with eBPF and is the code base the prototype extends.
+      <a href="24-actplane.html">ActPlane</a> enforces information-flow rules on the same kind
+      of process tree. <a href="26-reward-guard-and-safe-change.html">Chapter 26</a> and
+      <a href="27-actime-and-akeep.html">chapter 27</a> cover the org's other agent-safety
+      tools.</li>
+    </ul>
+
+    <h2>Recent development</h2>
+    <p>From <code>gh api repos/eunomia-bpf/agentcgroup/commits</code> (default branch
+    <code>main</code>, queried 2026-11-06). The repository was created on 2026-01-31.</p>
+    <ul>
+      <li><strong>Feb 2026, the paper sprint.</strong> Isolation and overhead experiments
+      (2026-02-08, e.g. <code>0118eea8</code>, <code>a751d8b1</code>), several Overleaf sync
+      branches, then <code>70ec9b39</code> (2026-02-14) consolidating eval and experiment data
+      into <code>agentcg/</code>.</li>
+      <li><strong>Per-tool-call cgroups.</strong> <code>386d06b4</code> (plan),
+      <code>2c05f82c</code> ("implement per-tool-call cgroup via bash wrapper + bidirectional
+      resource negotiation", 2026-02-17) and <code>53621a3b</code> (experiment log). This
+      landed after arXiv v1 (10 Feb) and before v2 (21 Feb).</li>
+      <li><strong>Clean-up.</strong> <code>9fa4deec</code> removed the old top-level
+      <code>scx_flatcg/</code> and <code>memcg/</code>; <code>7fdadd54</code> (PR #2) fixed
+      hard-coded paths in the README.</li>
+      <li><strong>March 2026.</strong> A "branch context" motivation study (plans in
+      <code>docs/PLAN_branchcontext_motivation_experiments.md</code>), a cgroup-aware
+      SWE-bench tracing pipeline (<code>207f0995</code>), an eBPF cross-analysis script
+      (<code>4211cc79</code>), and an AgentSight submodule bump (<code>5af9e7b8</code>,
+      PR #6).</li>
+      <li><strong>July 2026.</strong> <code>551ca168</code> (PR #8, 2026-07-22) "Correct nested
+      sub-agent timing analysis", touching the analysis scripts, the regenerated figures and
+      both reports. arXiv v3 appeared the same day.</li>
+      <li><strong>Open.</strong> Issue #10 and <a href="#ref-pr11">PR #11</a> (2026-10-28) on
+      the Podman memory-unit parser. GitHub shows a push on 2026-10-28, but <code>main</code>
+      is still at <code>551ca168</code>.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Why does the wrapper map a hint to
+      <code>memory.high</code> instead of <code>memory.max</code>?</p>
+        <button class="opt">Because <code>memory.max</code> cannot be set on child cgroups</button>
+        <button class="opt" data-right>Going over <code>memory.high</code> throttles and reclaims but never invokes the OOM killer, so a wrong hint slows the command instead of killing it</button>
+        <button class="opt">Because sched_ext reads only <code>memory.high</code></button>
+        <div class="why">The kernel doc: memory.high is a "throttle limit" and going over it
+        "never invokes the OOM killer". memory.max is the hard limit that triggers OOM. For an
+        agent, an OOM kill loses context, so the soft boundary is the safer target.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Which eBPF mechanisms enforce AgentCgroup's
+      priorities in the kernel?</p>
+        <button class="opt">cgroup_skb and cgroup/sysctl programs attached to session_high</button>
+        <button class="opt">A BPF-LSM hook that denies allocations</button>
+        <button class="opt" data-right>A sched_ext scheduler (scx_flatcg) for CPU and memcg_bpf_ops struct_ops (below_low, below_min, get_high_delay_ms) plus a memcg tracepoint for memory</button>
+        <div class="why">Classic cgroup programs only allow or deny operations. AgentCgroup
+        uses struct_ops-based interfaces: <code>sched_ext_ops</code> and the RFC
+        <code>memcg_bpf_ops</code>.</div></div>
+      <div class="q"><p><strong>Q3.</strong> In <code>memcg_priority.bpf.c</code>, when does
+      <code>get_high_delay_ms</code> return a non-zero delay for a LOW cgroup?</p>
+        <button class="opt">Whenever the LOW cgroup allocates memory</button>
+        <button class="opt" data-right>When the LOW cgroup is over its memory.high and the HIGH cgroup's page faults crossed the threshold within the last second</button>
+        <button class="opt">When PSI <code>full</code> exceeds 10%</button>
+        <div class="why">The kernel calls the hook from the over-high path only. The program
+        then returns <code>over_high_ms</code> only if <code>need_protection()</code> sees a
+        trigger timestamp less than one second old, set by the
+        <code>count_memcg_events</code> tracepoint.</div></div>
+      <div class="q"><p><strong>Q4.</strong> A new <code>tool_*</code> cgroup is created
+      under <code>session_high</code>, which has <code>high_mcg_ops</code> attached. What
+      happens?</p>
+        <button class="opt">Nothing; the daemon must attach the ops to every new child</button>
+        <button class="opt" data-right>memcontrol_bpf_online() copies the parent's bpf_ops into the child, so the protection applies to it too</button>
+        <button class="opt">The child fails to be created until the ops are detached</button>
+        <div class="why">The RFC patch's online handler says "Inherit the BPF program from
+        the parent cgroup". The paper relies on this: ops on the parent cover all tool
+        children "requiring no BPF code changes".</div></div>
+      <div class="q"><p><strong>Q5.</strong> According to the paper, which resource limits
+      how many agent sandboxes fit on one machine?</p>
+        <button class="opt">CPU, because tests saturate all cores</button>
+        <button class="opt" data-right>Memory: average CPU is 7.6–13.2% of a core, but peaks of 2–4 GB allow only 32–64 instances in 128 GB if each gets its peak</button>
+        <button class="opt">Disk I/O from 3.5 GB images</button>
+        <div class="why">§3.3: "Memory, not CPU, is the primary bottleneck for multi-tenant
+        concurrency density." CPU stays below 36% of capacity at that density.</div></div>
+      <div class="q"><p><strong>Q6.</strong> What does the agent see when a wrapped command
+      is OOM-killed?</p>
+        <button class="opt">Only exit status 137</button>
+        <button class="opt">A signal delivered by the BPF program</button>
+        <button class="opt" data-right>Lines on stderr starting with <code>[Resource]</code>, with the peak memory and suggestions such as running specific test files or setting AGENT_RESOURCE_HINT</button>
+        <div class="why">When <code>EXIT_CODE</code> is 137 and the call was in its cgroup,
+        the wrapper reads <code>memory.peak</code> and prints the feedback to stderr, which
+        becomes part of the tool result.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li id="ref-repo"><a href="https://github.com/eunomia-bpf/agentcgroup">eunomia-bpf/agentcgroup</a>, studied at commit <a href="https://github.com/eunomia-bpf/agentcgroup/tree/551ca1689b7d2d30db6b8a8613414750103cc68b"><code>551ca168</code></a> (2026-07-22): <code>README.md</code>, <code>agentcg/</code>, <code>scripts/run_swebench.py</code>, <code>analysis/</code>, <code>docs/REPRODUCING.md</code>, <code>docs/exp_log2_per_tool_call.md</code>, <code>agentcg/memcg/EXPERIMENT_REPORT.md</code>. GPL-2.0.</li>
+      <li id="ref-paper">Y. Zheng, J. Fan, Q. Fu, Y. Yang, W. Zhang, A. Quinn, <a href="https://arxiv.org/abs/2602.09345">"AgentCgroup: Understanding and Controlling OS Resources of AI Agents"</a>, arXiv:2602.09345 [cs.OS], v1 Feb 2026, v3 Jul 2026 (<a href="https://doi.org/10.48550/arXiv.2602.09345">DOI</a>). Section numbers in this chapter follow v3.</li>
+      <li id="ref-cgv2"><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Control Group v2</a>, Linux kernel documentation.</li>
+      <li id="ref-psi"><a href="https://docs.kernel.org/accounting/psi.html">PSI — Pressure Stall Information</a>, Linux kernel documentation.</li>
+      <li id="ref-scx-doc"><a href="https://docs.kernel.org/scheduler/sched-ext.html">Extensible Scheduler Class</a>, Linux kernel documentation.</li>
+      <li id="ref-lwn-scx">J. Corbet, <a href="https://lwn.net/Articles/922405/">"The extensible scheduler class"</a>, LWN.net, 2023.</li>
+      <li id="ref-flatcg-up"><a href="https://github.com/torvalds/linux/blob/master/tools/sched_ext/scx_flatcg.bpf.c"><code>tools/sched_ext/scx_flatcg.bpf.c</code></a>, Linux kernel source (torvalds/linux, master).</li>
+      <li id="ref-scx"><a href="https://github.com/sched-ext/scx">sched-ext/scx</a>, sched_ext schedulers and tools (an AgentCgroup submodule).</li>
+      <li id="ref-lwn-memcg">H. Zhu, <a href="https://lwn.net/Articles/1055698/">"[RFC PATCH bpf-next v3 00/12] mm: memcontrol: Add BPF hooks for memory controller"</a>, LWN.net mailing-list archive, 23 Jan 2026 (the version the paper cites).</li>
+      <li id="ref-lore-memcg">H. Zhu, <a href="https://lore.kernel.org/all/cover.1770194182.git.zhuhui@kylinos.cn/">"[RFC PATCH bpf-next v6 00/12] mm: memcontrol: Add BPF hooks for memory controller"</a>, lore.kernel.org, 4 Feb 2026 (the version in <code>agentcg/memcg/patches.mbox</code>).</li>
+      <li id="ref-bpf-oom">R. Gushchin, <a href="https://lore.kernel.org/lkml/20251027231727.472628-1-roman.gushchin@linux.dev/">"[PATCH v2 00/23] mm: BPF OOM"</a>, lore.kernel.org, 27 Oct 2025.</li>
+      <li id="ref-oomd"><a href="https://github.com/facebookincubator/oomd">oomd</a>, a userspace out-of-memory killer (Meta).</li>
+      <li id="ref-systemd-oomd"><a href="https://www.freedesktop.org/software/systemd/man/systemd-oomd.service.html">systemd-oomd.service</a>, systemd documentation.</li>
+      <li id="ref-tmo">J. Weiner et al., <a href="https://doi.org/10.1145/3503222.3507731">"TMO: Transparent Memory Offloading in Datacenters"</a>, ACM ASPLOS 2022.</li>
+      <li id="ref-shahrad">M. Shahrad et al., <a href="https://www.usenix.org/conference/atc20/presentation/shahrad">"Serverless in the Wild: Characterizing and Optimizing the Serverless Workload at a Large Cloud Provider"</a>, USENIX ATC 2020.</li>
+      <li id="ref-swerebench">I. Badertdinov et al., <a href="https://arxiv.org/abs/2505.20411">"SWE-rebench: An Automated Pipeline for Task Collection and Decontaminated Evaluation of Software Engineering Agents"</a>, arXiv:2505.20411, 2025.</li>
+      <li id="ref-swebench">C. E. Jimenez et al., <a href="https://arxiv.org/abs/2310.06770">"SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"</a>, ICLR 2024.</li>
+      <li id="ref-agentsight">Y. Zheng, Y. Hu, T. Yu, A. Quinn, <a href="https://arxiv.org/abs/2508.02736">"AgentSight: System-Level Observability for AI Agents Using eBPF"</a>, arXiv:2508.02736, 2025. See <a href="23-agentsight.html">chapter 23</a>.</li>
+      <li id="ref-pr11"><a href="https://github.com/eunomia-bpf/agentcgroup/pull/11">agentcgroup PR #11</a>, "fix: parse Podman memory units without dropping digits" (open, 2026-10-28).</li>
+      <li><a href="https://docs.kernel.org/bpf/libbpf/libbpf_overview.html">libbpf Overview</a>, Linux kernel documentation (skeletons and struct_ops maps used by the loaders).</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="24-actplane.html"><small>Previous</small>24 · ActPlane</a>
+      <a class="next" href="26-reward-guard-and-safe-change.html"><small>Next</small>26 · reward-guard and safe change</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

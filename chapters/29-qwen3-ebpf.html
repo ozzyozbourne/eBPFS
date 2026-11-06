@@ -1,0 +1,1545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>29 · qwen3-ebpf: an LLM forward pass inside eBPF · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="29">
+<meta name="chapter-part" content="Part VII · Kernel extension research">
+<meta name="chapter-summary" content="How qwen3-ebpf runs all 28 decoder layers of Qwen3-0.6B as verifier-accepted BPF programs (fixed-point matmuls, bpf_loop batches, a BPF KV cache, BF16 weights in a BPF arena, XDP plus a BPF workqueue) and what its measurements say about the limits of eBPF as a compute engine.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/qwen3-ebpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VII · Kernel extension research › 29 · qwen3-ebpf</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 29</div>
+      <h1>qwen3-ebpf: a language model forward pass inside eBPF</h1>
+      <p class="lede">Can the kernel's verified BPF virtual machine do the arithmetic of a real
+      0.6-billion-parameter language model, rather than just watch one run? The eunomia-bpf
+      experiment <code>qwen3-ebpf</code> says yes. All 28 decoder layers of Qwen3-0.6B, a KV cache,
+      the 151,936-row vocabulary projection and the final argmax run as BPF programs that a stock
+      Linux 6.17 verifier accepts. The project then measures why you would not want to do this. This
+      chapter teaches just enough about transformers to follow the code. Then it shows how the repo
+      maps each piece onto maps, arenas, <code>bpf_loop</code>, XDP and a BPF workqueue, and what the
+      experiment says about where eBPF stops.</p>
+      <div class="meta"><span>Prerequisites: <a href="03-verifier.html">03</a> (verifier limits),
+      <a href="04-maps-helpers-kfuncs.html">04</a> (maps, <code>bpf_loop</code>, arena, kfuncs),
+      <a href="07-networking-xdp-tc.html">07</a> (XDP)</span>
+      <span>Repo: <a href="https://github.com/eunomia-bpf/qwen3-ebpf">eunomia-bpf/qwen3-ebpf</a>
+      (studied at commit <code>3999b88</code>, 2026-10-27)</span><span>~55 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Most eBPF programs are small and quick. They count a system call, drop a packet or pick a
+    CPU, and they finish in microseconds. When the kernel community talks about "machine learning
+    in the kernel", it usually means a decision tree or a tiny quantized network that makes one
+    decision per event. Large language models stay in user space, on a GPU or in a CPU inference
+    engine, and eBPF at most traces them (see <a href="22-xpu-perf.html">22 · xpu-perf</a>) or feeds
+    them signals.</p>
+    <p><code>qwen3-ebpf</code> turns the question around and pushes it as far as it goes. Its
+    four-page report, <em>Can eBPF Run a Real Language Model? Lessons from a Kernel-Resident Qwen3
+    Forward Pass</em>, calls the system <strong>bpfllm</strong>. The point is not to serve chat from
+    the kernel. The point is to find out which limit binds first when verified BPF code tries to do
+    dense numerical work:</p>
+    <ul>
+      <li>the <strong>verifier</strong>, with its one-million-instruction budget, bounded loops and
+      512-byte stack (<a href="03-verifier.html">chapter 03</a>);</li>
+      <li>the <strong>instruction set</strong>, which has 64-bit integer arithmetic but no floating
+      point and no vector instructions (<a href="02-ebpf-isa-and-vm.html">chapter 02</a>);</li>
+      <li>the <strong>execution model</strong>: programs run to completion from a hook, and every
+      trip from user space into a BPF program is a system call.</li>
+    </ul>
+    <p>The answer the repo reaches is worth knowing before you read the code. The verifier shaped the
+    code but never stopped it. Crossing the user/kernel boundary mattered at first, then stopped
+    mattering. What finally limits speed is the instruction set: one ordinary CPU core running the
+    BF16 model in PyTorch was 1.8 to 4.8 times faster than the eBPF path on the sequences the
+    authors measured.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+    <p>A transformer forward pass is mostly matrix-vector products plus a few small nonlinear steps.
+    qwen3-ebpf rewrites every step in integer fixed-point arithmetic and splits it into bounded units
+    (128 matrix rows, a 128-element tile, one attention head) that a <code>bpf_loop</code> callback
+    can do. A scheduler then chains those units together: a C loop in user space, or a BPF
+    workqueue item that requeues itself.</p></div>
+
+    <div class="callout warn"><span class="label">Research prototype</span>
+    <p>The README is explicit: "Do not use this on production kernels." The recorded test host was
+    Linux 6.17 on arm64. No model weights are in the repository. Everything below that cites a
+    number comes from the repo's <code>docs/experiments.md</code> or its report. Those are mostly
+    single runs on a shared host, and the authors describe them that way.</p></div>
+
+    <h2>Transformer forward pass in fifteen minutes</h2>
+    <p>You do not need deep learning background to read this repo. You do need to know what one
+    "forward pass" computes, because every BPF program in the repo implements one line of the
+    following recipe. The model is <a href="https://huggingface.co/Qwen/Qwen3-0.6B">Qwen3-0.6B</a>,
+    the smallest dense model described in the
+    <a href="https://arxiv.org/abs/2505.09388">Qwen3 Technical Report</a> (arXiv 2505.09388, 2025).
+    The report says Qwen3's dense models use grouped-query attention, SwiGLU, rotary position
+    embeddings and RMSNorm with pre-normalization, drop the QKV bias of Qwen2, and add QK-Norm.</p>
+
+    <h3>The shape of Qwen3-0.6B</h3>
+    <p>These are the constants hard-coded in <code>src/infer.c</code> and
+    <code>include/qwen3_tile.h</code>. They match the model's published configuration:</p>
+    <table>
+      <thead><tr><th>Quantity</th><th>Value</th><th>Where it shows up in the repo</th></tr></thead>
+      <tbody>
+        <tr><td>Decoder layers</td><td>28</td><td><code>QWEN3_LAYERS</code></td></tr>
+        <tr><td>Hidden width <em>d</em></td><td>1,024</td><td><code>QWEN3_HIDDEN_SIZE</code></td></tr>
+        <tr><td>Query heads / key-value heads</td><td>16 / 8</td><td><code>QWEN3_Q_HEADS</code>, <code>QWEN3_KV_HEADS</code></td></tr>
+        <tr><td>Head dimension</td><td>128 (so Q is 2,048 wide)</td><td><code>QWEN3_TILE_WIDTH</code>, <code>QWEN3_ATTENTION_WIDTH</code></td></tr>
+        <tr><td>MLP intermediate width</td><td>3,072</td><td><code>QWEN3_INTERMEDIATE</code></td></tr>
+        <tr><td>Vocabulary</td><td>151,936 tokens</td><td><code>QWEN3_VOCAB</code></td></tr>
+        <tr><td>Position limit</td><td>40,960</td><td><code>QWEN3_CONTEXT_LIMIT</code></td></tr>
+        <tr><td>RoPE base θ</td><td>1,000,000</td><td><code>pow(1000000.0, -i/64)</code> in <code>kernel_rope</code></td></tr>
+        <tr><td>Output head</td><td>tied to the embedding matrix</td><td>logits use <code>model.embed_tokens.weight</code></td></tr>
+        <tr><td>Weight file</td><td>BF16 safetensors, 1,503,300,328 bytes</td><td><code>docs/experiments.md</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Step by step</h3>
+    <p>A <strong>token</strong> is an integer ID produced by the tokenizer (for example, the text
+    <code>Hello, world!</code> becomes <code>[9707, 11, 1879, 0]</code> with the official tokenizer).
+    To predict the next token, the model does the following for each input position:</p>
+    <ol>
+      <li><strong>Embedding.</strong> Look up row <em>token_id</em> of a 151,936 × 1,024 table. The
+      result is the 1,024-element <em>hidden vector</em> <code>h</code>. This is a memory read, not
+      arithmetic.</li>
+      <li><strong>RMSNorm.</strong> Before each sub-block, rescale the vector so its root mean square
+      is 1, then multiply element-wise by a learned weight vector <em>g</em>:
+      <code>y<sub>i</sub> = g<sub>i</sub> · x<sub>i</sub> / sqrt(mean(x²) + ε)</code>, with
+      ε = 10<sup>-6</sup>. You need a sum of squares, a square root and a division.</li>
+      <li><strong>Q, K, V projections.</strong> Three matrix-vector products turn the normalized
+      vector into a query (2,048 values = 16 heads × 128), a key (1,024 = 8 heads × 128) and a value
+      (1,024 = 8 heads × 128).</li>
+      <li><strong>QK-Norm.</strong> Qwen3 applies a second RMSNorm to each 128-wide query and key head,
+      with its own small weight vectors.</li>
+      <li><strong>RoPE (rotary position embedding).</strong> Position is encoded by rotating pairs of
+      query/key coordinates by an angle that depends on the token's position <em>p</em> and the pair
+      index <em>i</em>: angle = <em>p</em> · θ<sup>−i/64</sup>. Each pair (a, b) becomes
+      (a cos − b sin, b cos + a sin). Dot products between rotated queries and keys then depend on
+      the relative distance between positions.</li>
+      <li><strong>Causal attention with GQA.</strong> For each query head, compute a score against
+      the key of every earlier position (and the current one): <code>q·k / sqrt(128)</code>. Turn the
+      scores into weights with softmax, and output the weighted sum of the value vectors. In
+      <em>grouped-query attention</em> (GQA), several query heads share one key/value head. Qwen3-0.6B
+      has 16 query heads and 8 KV heads, so query heads 2<em>j</em> and 2<em>j</em>+1 both read KV
+      head <em>j</em>.</li>
+      <li><strong>Output projection and residual.</strong> A 1,024 × 2,048 matrix maps the
+      concatenated heads back to 1,024 values, which are <em>added</em> to <code>h</code> (the
+      residual connection).</li>
+      <li><strong>SwiGLU MLP.</strong> RMSNorm again, then two 3,072 × 1,024 projections called
+      <em>gate</em> and <em>up</em>. Apply SiLU to the gate (SiLU(x) = x · sigmoid(x)), multiply
+      element-wise by <em>up</em>, project back down with a 1,024 × 3,072 matrix, and add the result
+      to <code>h</code>.</li>
+      <li><strong>Repeat</strong> steps 2–8 for all 28 layers, each with its own weights.</li>
+      <li><strong>Logits and argmax.</strong> A final RMSNorm, then multiply by the 151,936 × 1,024
+      embedding matrix again (Qwen3-0.6B ties input and output embeddings). The result is one score
+      ("logit") per vocabulary entry. Greedy decoding picks the largest.</li>
+    </ol>
+
+    <h3>The KV cache</h3>
+    <p>Step 6 needs the keys and values of all earlier positions. Recomputing them for every new token
+    would repeat the whole prompt each time, so inference engines keep a <strong>KV cache</strong>:
+    after computing K and V for a position, they store them per layer and per KV head. The next token
+    only computes its own Q/K/V and reads the history. In Qwen3-0.6B one position adds 28 layers × 8
+    KV heads × (128 + 128) values. qwen3-ebpf stores each value as a 4-byte integer, which gives the
+    repo's figure of 1 KiB per (position, layer, head) slot and about 224 KiB per position.</p>
+
+    <h3>Quantization in one paragraph</h3>
+    <p>The official weights are <strong>BF16</strong> ("brain float 16"): the top 16 bits of an IEEE
+    float32, with 1 sign bit, 8 exponent bits and 7 mantissa bits. Quantization means storing numbers
+    in a cheaper format. <em>Integer quantization</em> (INT8, INT4) stores small integers plus a
+    floating-point <em>scale</em> per group of weights. <em>Fixed point</em> (Q<em>n</em>) stores a
+    real number <em>x</em> as the integer round(<em>x</em> · 2<sup><em>n</em></sup>). A Q16 value of
+    65,536 means 1.0. Fixed point needs no floating-point unit at all: adding two Q16 numbers is an
+    integer add, and multiplying a Q16 by a Q24 gives a Q40 product that you shift right by 24 to get
+    back to Q16. That is the trick the whole repo depends on.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 560" role="img" aria-label="Data flow of one Qwen3-0.6B token: embedding lookup, then 28 decoder layers each with RMSNorm, Q K V projections, QK norm, RoPE, grouped-query attention reading and writing the KV cache, output projection plus residual, RMSNorm, gate and up projections, SiLU and multiply, down projection plus residual; then final norm, tied vocabulary projection and argmax. Each box is labelled with the repo's BPF program.">
+        <style>
+          .f1b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .f1m{fill:none;stroke:var(--accent);stroke-width:2}
+          .f1k{fill:none;stroke:var(--accent2);stroke-width:2;stroke-dasharray:6 4}
+          .f1t{fill:var(--fg);font:600 13px sans-serif}
+          .f1c{fill:var(--fg);font:11.5px monospace}
+          .f1s{fill:var(--muted);font:11.5px sans-serif}
+          .f1a{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah29a)}
+          .f1r{stroke:var(--accent2);stroke-width:1.5;fill:none;marker-end:url(#ah29b)}
+        </style>
+        <defs>
+          <marker id="ah29a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="ah29b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <!-- embedding -->
+        <rect class="f1b" x="20" y="20" width="200" height="56" rx="8"/>
+        <text class="f1t" x="32" y="42">token_id → embedding</text>
+        <text class="f1s" x="32" y="62">row of 151,936 × 1,024 (C)</text>
+        <path class="f1a" d="M220,48 L262,48"/>
+        <!-- layer frame -->
+        <rect x="262" y="12" width="500" height="452" rx="12" fill="none" stroke="var(--border)" stroke-width="2" stroke-dasharray="4 4"/>
+        <text class="f1s" x="606" y="32">decoder layer × 28</text>
+        <!-- attention block -->
+        <rect class="f1b" x="280" y="40" width="200" height="40" rx="6"/>
+        <text class="f1t" x="292" y="58">RMSNorm</text><text class="f1c" x="292" y="73">qwen3_rms_full</text>
+        <path class="f1a" d="M380,80 L380,96"/>
+        <rect class="f1m" x="280" y="96" width="200" height="54" rx="6"/>
+        <text class="f1t" x="292" y="114">Q 2048×1024, K, V 1024×1024</text>
+        <text class="f1c" x="292" y="130">qwen3_batch_rows</text>
+        <text class="f1s" x="292" y="144">16 + 8 + 8 batches of 128 rows</text>
+        <path class="f1a" d="M380,150 L380,166"/>
+        <rect class="f1b" x="280" y="166" width="200" height="40" rx="6"/>
+        <text class="f1t" x="292" y="184">QK-Norm (24 heads)</text><text class="f1c" x="292" y="199">qwen3_qk_norm_heads</text>
+        <path class="f1a" d="M380,206 L380,222"/>
+        <rect class="f1b" x="280" y="222" width="200" height="40" rx="6"/>
+        <text class="f1t" x="292" y="240">RoPE (16 Q + 8 K heads)</text><text class="f1c" x="292" y="255">qwen3_rope_apply</text>
+        <path class="f1a" d="M380,262 L380,278"/>
+        <rect class="f1b" x="280" y="278" width="200" height="54" rx="6"/>
+        <text class="f1t" x="292" y="296">GQA attention</text>
+        <text class="f1c" x="292" y="312">qwen3_attention_all_heads</text>
+        <text class="f1s" x="292" y="326">online softmax, 256 positions/call</text>
+        <path class="f1a" d="M380,332 L380,348"/>
+        <rect class="f1m" x="280" y="348" width="200" height="54" rx="6"/>
+        <text class="f1t" x="292" y="366">O proj 1024×2048, + h</text>
+        <text class="f1c" x="292" y="382">batch_rows + vector_add</text>
+        <!-- KV cache -->
+        <rect class="f1k" x="40" y="250" width="200" height="82" rx="8"/>
+        <text class="f1t" x="52" y="272">KV cache (BPF array)</text>
+        <text class="f1c" x="52" y="290">slot=(pos·28+layer)·8+kv</text>
+        <text class="f1s" x="52" y="308">1 KiB per slot</text>
+        <text class="f1s" x="52" y="324">≈224 KiB per position</text>
+        <path class="f1r" d="M280,300 L242,300"/>
+        <path class="f1r" d="M242,316 L280,316"/>
+        <!-- MLP block -->
+        <path class="f1a" d="M480,375 L520,375 L520,60 L540,60"/>
+        <rect class="f1b" x="540" y="40" width="200" height="40" rx="6"/>
+        <text class="f1t" x="552" y="58">RMSNorm</text><text class="f1c" x="552" y="73">qwen3_rms_full</text>
+        <path class="f1a" d="M640,80 L640,96"/>
+        <rect class="f1m" x="540" y="96" width="200" height="54" rx="6"/>
+        <text class="f1t" x="552" y="114">gate, up 3072×1024</text>
+        <text class="f1c" x="552" y="130">qwen3_batch_rows</text>
+        <text class="f1s" x="552" y="144">24 + 24 batches</text>
+        <path class="f1a" d="M640,150 L640,166"/>
+        <rect class="f1b" x="540" y="166" width="200" height="54" rx="6"/>
+        <text class="f1t" x="552" y="184">SiLU(gate) ⊙ up</text>
+        <text class="f1c" x="552" y="200">qwen3_silu_apply</text>
+        <text class="f1c" x="552" y="214">qwen3_vector_multiply</text>
+        <path class="f1a" d="M640,220 L640,236"/>
+        <rect class="f1m" x="540" y="236" width="200" height="54" rx="6"/>
+        <text class="f1t" x="552" y="254">down 1024×3072, + h</text>
+        <text class="f1c" x="552" y="270">batch_rows + vector_add</text>
+        <path class="f1a" d="M640,290 L640,420 L380,420 L380,412"/>
+        <text class="f1s" x="420" y="440">next layer (C loop or BPF workqueue)</text>
+        <!-- head -->
+        <path class="f1a" d="M762,250 L792,250"/>
+        <rect class="f1b" x="792" y="170" width="150" height="56" rx="8"/>
+        <text class="f1t" x="804" y="192">final RMSNorm</text>
+        <text class="f1c" x="804" y="210">qwen3_rms_full</text>
+        <path class="f1a" d="M867,226 L867,250"/>
+        <rect class="f1m" x="792" y="250" width="150" height="80" rx="8"/>
+        <text class="f1t" x="804" y="272">vocab projection</text>
+        <text class="f1s" x="804" y="290">151,936 × 1,024 (tied)</text>
+        <text class="f1s" x="804" y="306">1,187 batches</text>
+        <text class="f1c" x="804" y="322">+ fused argmax</text>
+        <path class="f1a" d="M867,330 L867,360"/>
+        <rect class="f1b" x="792" y="360" width="150" height="46" rx="8"/>
+        <text class="f1t" x="804" y="388">next token_id</text>
+        <!-- legend -->
+        <rect class="f1m" x="30" y="486" width="22" height="14" rx="3"/><text class="f1s" x="60" y="498">matrix–vector product (≈ all the arithmetic)</text>
+        <rect class="f1b" x="360" y="486" width="22" height="14" rx="3"/><text class="f1s" x="390" y="498">small nonlinear / element-wise step</text>
+        <rect class="f1k" x="640" y="486" width="22" height="14" rx="3"/><text class="f1s" x="670" y="498">state kept across tokens</text>
+        <text class="f1s" x="30" y="534">Monospace names are the BPF programs used by the default operator path (src/bpf/*.bpf.c).</text>
+      </svg>
+      <figcaption>Figure 29.1 — One token through Qwen3-0.6B, labelled with the qwen3-ebpf program
+      that computes each step. Accent boxes are matrix–vector products. Batch counts are for
+      128-row batches.</figcaption>
+    </figure>
+
+    <h3>Where the arithmetic is</h3>
+    <p>Count the multiply-accumulates (MACs). Per layer: Q 2,048×1,024 + K and V 1,024×1,024 each + O
+    1,024×2,048 + gate, up and down 3,072×1,024 each = about 15.7 million. Over 28 layers that is about
+    440 million, and the vocabulary projection adds 151,936 × 1,024 ≈ 155.6 million. The total is
+    about 596 million MACs per token, which matches the report's figure ("about 596 million ... 26% of
+    them in the vocabulary projection"). Attention itself is tiny for short contexts: 16 heads × 128
+    MACs per earlier position for the scores, plus the same again for the values. So this is a
+    <em>matrix–vector product machine</em> with some decoration. Every weight is read once per token,
+    which is about 1.2 GB of BF16 per token.</p>
+
+    <h2>What is in the repository</h2>
+    <p>The repo is small: about 1 MB, most of it the report PDF. The C is split into a host side
+    (model loading, tokenizer, scheduling) and a set of independent BPF objects, one per operator.
+    There is no kernel module and no patched kernel.</p>
+<pre><code class="language-text">qwen3-ebpf/
+├── Makefile                    default build = build/infer + six operator objects
+├── src/
+│   ├── infer.c                 CLI: loads weights, runs the 28-layer loop, calls BPF_PROG_RUN
+│   ├── serve_xdp.c             standalone loader for the XDP/arena/workqueue path
+│   ├── safetensors.c           mmap the .safetensors file; BF16 → Q24 lookup conversion
+│   ├── qwen3_tokenizer.c       ByteLevel BPE tokenizer (json-c + Oniguruma), user space only
+│   └── bpf/
+│       ├── qwen3_batch.bpf.c       128 matrix rows per call (+ fused argmax)
+│       ├── qwen3_norm.bpf.c        RMSNorm (1,024) and QK-Norm (24 heads × 128)
+│       ├── qwen3_rope.bpf.c        rotate 24 heads with C-supplied sin/cos
+│       ├── qwen3_attention.bpf.c   online-softmax attention + the BPF KV cache map
+│       ├── qwen3_silu.bpf.c        integer SiLU over 3,072 values
+│       ├── qwen3_vector.bpf.c      residual add / element-wise multiply
+│       └── qwen3_arena_bf16.bpf.c  optional: BF16 weights in a BPF arena, XDP entry,
+│                                   bpf_wq state machine for all 28 layers (≈1,000 lines)
+├── include/                    structs shared by C and BPF (the map value layouts)
+├── experiments/                matvec tile, INT4, INT8, arena-INT4 operators (not used by infer)
+├── tests/                      *-smoke.c differential tests vs C references; xdp-client.c;
+│                               reference_score.py (PyTorch/Transformers BF16 reference)
+├── docs/                       architecture.md, usage.md, experiments.md (all recorded numbers)
+└── paper/                      bpfllm.tex / bpfllm.pdf (four-page report)</code></pre>
+
+    <div class="grid">
+      <div class="card"><h4>Operator mode (default)</h4><p><code>make</code> builds
+      <code>build/infer</code>. C owns the schedule: for every layer it fills a memory-mapped map,
+      runs one BPF program with <code>BPF_PROG_RUN</code>, and reads the result. Needs only
+      <code>bpf_loop</code> (Linux 5.17+) and mmapable array maps.</p></div>
+      <div class="card"><h4>Arena operator mode (optional)</h4><p><code>make build/infer-arena-bf16</code>.
+      The same C schedule, but the full BF16 model is copied once into a BPF arena and the BPF matrix
+      program converts weights itself. Needs arena support (Linux 6.9+), Clang 19 and an
+      arena-capable libbpf/bpftool.</p></div>
+      <div class="card"><h4>Event mode (optional)</h4><p><code>make build/serve-xdp</code>. A UDP
+      packet hitting XDP queues a BPF workqueue item, which walks all 28 layers and the vocabulary
+      head with no user-space dispatch, and the result comes back through <code>XDP_TX</code>. Needs
+      <code>bpf_wq</code> (Linux 6.10+) as well.</p></div>
+    </div>
+
+    <h2>What eBPF does not give you</h2>
+    <p>Before the code, list the constraints the design has to work around. Each is covered in an
+    earlier chapter. Here is what each one means for a model with 596 million MACs per token:</p>
+    <table>
+      <thead><tr><th>Constraint</th><th>Consequence for an LLM</th><th>How qwen3-ebpf responds</th></tr></thead>
+      <tbody>
+        <tr><td>No floating-point or vector instructions in the BPF ISA (<a href="02-ebpf-isa-and-vm.html">02</a>)</td>
+        <td>BF16 weights cannot be used directly; no <code>exp</code>, <code>sqrt</code>,
+        <code>sin</code>; no SIMD</td>
+        <td>Fixed point everywhere (Q16 activations, Q24 weights, Q20 norm scales); integer square
+        root, integer exp, lookup tables</td></tr>
+        <tr><td>Verifier explores paths, budget of 1,000,000 processed instructions (<a href="03-verifier.html">03</a>)</td>
+        <td>A loop over 3,072 columns × 128 rows cannot be unrolled or simulated row by row</td>
+        <td>Inner loops stay rolled (<code>unroll(disable)</code>); the row loop is a
+        <code>bpf_loop</code> callback that is verified once</td></tr>
+        <tr><td>512-byte stack</td><td>A single 1,024-element vector is 4 KiB</td>
+        <td>Every vector and matrix lives in a single-entry array map value (or the arena)</td></tr>
+        <tr><td>Programs must terminate, and run from a hook</td>
+        <td>One program cannot "run the model"</td>
+        <td>Work split into bounded calls, chained by a C loop or a self-requeuing <code>bpf_wq</code></td></tr>
+        <tr><td>Each user-space trigger is a <code>bpf()</code> syscall</td>
+        <td>Thousands of calls per token</td>
+        <td>Bigger batches, memory-mapped maps, fused steps (4,169 calls per token at the end)</td></tr>
+        <tr><td>Map sizes are fixed at creation</td><td>The KV cache cannot grow</td>
+        <td>The loader resizes the <code>kv</code> map to the requested length before load</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Integer arithmetic for a float model</h2>
+    <p>The report summarizes the number formats in one sentence: "Activations use Q16, matrix
+    weights Q24 and normalization scales Q20, because some official norm weights are too large for
+    Q24 in 32 bits. Products accumulate in 64 bits." A Q16 activation times a Q24 weight is a Q40
+    product. Summing up to 3,072 of them in a signed 64-bit accumulator and shifting right by 24 gives
+    a Q16 result.</p>
+    <p>Why Q24 and not the INT8 that every inference engine uses? The repo measured it on one real
+    row of the layer-0 Q projection. The BF16 reference dot product was <code>-0.00837016106</code>.
+    Q24 gave <code>-0.0083770752</code>. Q8 gave <code>-0.0366821289</code>, more than four times too
+    large, because large terms cancel and the rounding errors do not. The experiments that tried
+    group-scaled INT8 and INT4 across the whole model changed the generated tokens (more on that
+    under <a href="#performance">performance</a>), so the default path keeps
+    Q24.</p>
+
+    <h3>The matrix operator</h3>
+    <p>Here is the program that does nearly all of the arithmetic in operator mode. The map value is
+    a 1.51 MiB struct holding one input vector, 128 rows of Q24 weights and 128 outputs:</p>
+<pre data-file="include/qwen3_batch.h"><code class="language-c">#define QWEN3_BATCH_ROWS 128
+#define QWEN3_BATCH_COLS 3072
+
+/* One BPF invocation computes up to 128 complete rows. */
+struct qwen3_batch_work {
+    __s32 input_q16[QWEN3_BATCH_COLS];
+    __s32 weight_q24[QWEN3_BATCH_ROWS][QWEN3_BATCH_COLS];
+    __s64 output_q16[QWEN3_BATCH_ROWS];
+    __u32 rows;
+    __u32 cols;
+    __u32 completed;
+    __u32 track_argmax;
+    __u32 base_index;
+    __u32 best_index;
+    __s64 best_q16;
+};</code></pre>
+<pre data-file="src/bpf/qwen3_batch.bpf.c"><code class="language-c">struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct qwen3_batch_work);
+} batch SEC(".maps");
+
+static long compute_row(__u32 row, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_batch_work *work = bpf_map_lookup_elem(&amp;batch, &amp;key);
+    __s64 sum = 0;
+    __u32 bounded_row = row &amp; (QWEN3_BATCH_ROWS - 1);
+    int i;
+
+    (void)ctx;
+    if (!work || row &gt;= work-&gt;rows)
+        return 1;
+#pragma clang loop unroll(disable)
+    for (i = 0; i &lt; QWEN3_BATCH_COLS; i++) {
+        if (i &gt;= work-&gt;cols)
+            break;
+        sum += (__s64)work-&gt;input_q16[i] * work-&gt;weight_q24[bounded_row][i];
+    }
+    work-&gt;output_q16[bounded_row] = sum &gt;&gt; 24;
+    if (work-&gt;track_argmax &amp;&amp; work-&gt;output_q16[bounded_row] &gt; work-&gt;best_q16) {
+        work-&gt;best_q16 = work-&gt;output_q16[bounded_row];
+        work-&gt;best_index = work-&gt;base_index + row;
+    }
+    work-&gt;completed++;
+    return 0;
+}
+
+SEC("socket")
+int qwen3_batch_rows(struct __sk_buff *skb)
+{
+    const __u32 key = 0;
+    struct qwen3_batch_work *work = bpf_map_lookup_elem(&amp;batch, &amp;key);
+    __u32 callback_ctx = 0;
+
+    (void)skb;
+    if (!work || !work-&gt;rows || work-&gt;rows &gt; QWEN3_BATCH_ROWS ||
+        !work-&gt;cols || work-&gt;cols &gt; QWEN3_BATCH_COLS)
+        return 0;
+    bpf_loop(work-&gt;rows, compute_row, &amp;callback_ctx, 0);
+    return 0;
+}</code></pre>
+    <p>Read it with the verifier in mind (<a href="03-verifier.html">chapter 03</a>):</p>
+    <ul>
+      <li><strong><code>bpf_loop(work-&gt;rows, compute_row, ...)</code></strong>: the row loop is
+      not BPF code at all. The kernel helper calls <code>compute_row</code> up to <em>rows</em> times.
+      The verifier checks the callback once with an unknown <code>row</code> argument instead of
+      walking 128 iterations (see <code>bpf_loop</code> in
+      <a href="04-maps-helpers-kfuncs.html">chapter 04</a>).</li>
+      <li><strong><code>row &amp; (QWEN3_BATCH_ROWS - 1)</code></strong>: <code>row</code> is only
+      known to be some <code>u32</code>. Masking with 127 gives the verifier a provable bound for the
+      2D array index. The earlier <code>row &gt;= work-&gt;rows</code> check is against a value in
+      map memory, which the verifier cannot use as a constant bound.</li>
+      <li><strong><code>#pragma clang loop unroll(disable)</code></strong> keeps the 3,072-iteration
+      column loop as a real bounded loop (Linux 5.3+). Unrolled, it would be thousands of
+      instructions per callback.</li>
+      <li><strong>Fused argmax.</strong> For the vocabulary projection, C sets
+      <code>track_argmax</code>, and the callback keeps the best logit as it goes. That removed a
+      separate pass and cut one-token <code>bpf()</code> calls from 16,043 to 12,482.</li>
+      <li><strong>The program type is a lie, on purpose.</strong> <code>SEC("socket")</code> makes it
+      a socket filter, but it is never attached to a socket. A socket filter is simply a program type
+      that <code>BPF_PROG_RUN</code> can execute on demand with a dummy packet.</li>
+    </ul>
+
+    <h3>Square roots, exponentials and SiLU without floats</h3>
+    <p>RMSNorm needs 1/sqrt(mean(x²) + ε). The norm program sums squares of Q16 values (giving Q32),
+    adds ε in Q32 (10<sup>-6</sup> · 2<sup>32</sup> ≈ 4,295), and runs a fixed 24-iteration Newton
+    square root:</p>
+<pre data-file="src/bpf/qwen3_norm.bpf.c"><code class="language-c">static __always_inline __u64 isqrt64(__u64 value)
+{
+    __u64 root = 1ULL &lt;&lt; 20;
+    int i;
+
+#pragma clang loop unroll(disable)
+    for (i = 0; i &lt; 24; i++) {
+        root = (root + value / root) &gt;&gt; 1;
+        root |= 1;
+    }
+    return root;
+}
+/* ... accumulate_tile() and apply_tile() are bpf_loop callbacks over 128-wide tiles ... */
+
+SEC("socket")
+int qwen3_rms_full(struct __sk_buff *skb)
+{
+    /* ... */
+    bpf_loop(work-&gt;total_tiles, accumulate_tile, &amp;callback_ctx, 0);
+    if (work-&gt;completed_tiles != work-&gt;total_tiles)
+        return 0;
+    /* eps=1e-6, expressed in Q32 as 4295. */
+    root = isqrt64(work-&gt;sum_sq_q32 /
+                   (work-&gt;total_tiles * QWEN3_TILE_WIDTH) + 4295);
+    work-&gt;inv_rms_q16 = (1ULL &lt;&lt; 32) / root;
+    if (!work-&gt;inv_rms_q16)
+        return 0;
+    bpf_loop(work-&gt;total_tiles, apply_tile, &amp;callback_ctx, 0);
+    return 0;
+}</code></pre>
+    <p>Note the <code>root |= 1</code>: it keeps the divisor nonzero, which matters because the
+    verifier does not reject division by zero. BPF defines <code>x / 0 = 0</code>, but a zero root
+    would silently produce garbage. The shape of the program (two <code>bpf_loop</code> passes around
+    a scalar step) was forced by the verifier. <code>docs/architecture.md</code> records that "An
+    earlier monolithic implementation exceeded the verifier's one-million-instruction processing
+    budget on the test kernel; the callback-based version passed."</p>
+    <p>SiLU needs sigmoid, which needs e<sup>−|x|</sup>. The repo uses the textbook limit
+    e<sup>−a</sup> = lim (1 − a/n)<sup>n</sup> with n = 1,024 = 2<sup>10</sup>, so the power is just
+    ten squarings in Q32:</p>
+<pre data-file="src/bpf/qwen3_silu.bpf.c"><code class="language-c">static __always_inline __s32 silu_q16(__s32 x)
+{
+    __u64 magnitude = x &lt; 0 ? -(__s64)x : x;
+    __u64 exponential, denominator, sigmoid;
+    int i;
+
+    if (!x)
+        return 0;
+    if (magnitude &gt;= (16ULL &lt;&lt; 16))
+        return x &gt; 0 ? x : 0;
+    /* exp(-|x|) = lim_n (1 - |x|/n)^n, n=1024, in Q32. */
+    exponential = (1ULL &lt;&lt; 32) - (magnitude &lt;&lt; 6);
+#pragma clang loop unroll(disable)
+    for (i = 0; i &lt; 10; i++)
+        exponential = (exponential * exponential) &gt;&gt; 32;
+    denominator = (1ULL &lt;&lt; 32) + exponential;
+    sigmoid = x &gt;= 0
+        ? (1ULL &lt;&lt; 48) / denominator
+        : (exponential &lt;&lt; 16) / denominator;
+    return (__s32)(((__s64)x * (__s64)sigmoid) &gt;&gt; 16);
+}</code></pre>
+    <p><code>magnitude &lt;&lt; 6</code> is |x|/1,024 converted from Q16 to Q32
+    (2<sup>32</sup>/2<sup>16</sup>/2<sup>10</sup> = 2<sup>6</sup>). Beyond |x| ≥ 16, SiLU is treated
+    as x or 0. The repo's smoke test reports a maximum absolute error of 0.000634 over
+    [−8, 8] against a C floating-point reference. The same exponential, as
+    <code>exp_negative_q32</code>, drives the attention softmax. You can try the exact integer
+    algorithm below. The widget is a JavaScript port of <code>silu_q16</code> using
+    <code>BigInt</code>, so its rounding matches the BPF code bit for bit.</p>
+
+    <div class="card" id="silu-widget">
+      <h4>Try it: <code>silu_q16</code> versus real SiLU</h4>
+      <p><label>x = <input id="silu-x" type="number" step="0.01" value="1.25" style="width:7em"></label>
+      <input id="silu-range" type="range" min="-12" max="12" step="0.01" value="1.25" style="width:16em"></p>
+      <pre><code id="silu-out" class="language-text">…</code></pre>
+      <p class="muted" style="font-size:0.9em">Illustrative port written for this chapter (not repo
+      code). Q16 input = round(x · 65536); output shown as Q16 integer and as a real number.</p>
+    </div>
+
+    <h3>Converting weights: the 65,536-entry table</h3>
+    <p>The weights arrive as BF16. On the default path, C converts each active matrix row to Q24
+    before handing it to BPF. Because BF16 has only 65,536 bit patterns, <code>safetensors.c</code>
+    builds a table of all of them once and converts a row with one load per weight. An exhaustive
+    test checks that the table matches the floating-point formula for every finite pattern. The repo
+    measured this change at 1.425/1.576/1.476 s → 1.154/1.258/1.049 s per token, with byte-identical
+    logits. The same table is what made BF16 weights usable <em>inside</em> BPF. The report says
+    "Converting BF16 to Q24 inside the 3,072-column loop failed with 'The sequence of 8193 jumps is
+    too complex'; a 65,536-entry lookup table indexed by the BF16 bit pattern replaced the branches
+    with a single load." In the arena path, that table (<code>q24_by_bf16</code>, 256 KiB) lives in
+    the arena next to the weights.</p>
+
+    <h2>Operator mode: C schedules, BPF computes</h2>
+    <p>The default <code>build/infer</code> keeps the model's control flow in user space. Think of
+    the six BPF objects as a tiny instruction set of "kernel ops" (matrix batch, RMSNorm, QK-Norm,
+    RoPE, attention, SiLU, add, multiply). <code>src/infer.c</code> is the program that calls them in
+    order. The architecture doc is careful about the boundary: "C chooses the operator order and
+    supplies the current weights and vectors." It also says the user-space driver "cannot substitute
+    user-space model math for kernel forward computation". Embeddings and RoPE sin/cos values are
+    prepared in C, and every multiply-accumulate happens in BPF.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 430" role="img" aria-label="Operator mode. User space infer.c mmaps the BF16 safetensors file read-only, converts active rows to Q24, writes them into memory-mapped BPF array maps, and calls BPF_PROG_RUN on socket-filter programs. In the kernel, six BPF objects each own a single-entry mmapable array map; the attention object also owns the KV cache array map, which only BPF writes.">
+        <style>
+          .f2b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .f2m{fill:none;stroke:var(--accent);stroke-width:2}
+          .f2k{fill:none;stroke:var(--accent2);stroke-width:2;stroke-dasharray:6 4}
+          .f2t{fill:var(--fg);font:600 13px sans-serif}
+          .f2c{fill:var(--fg);font:11.5px monospace}
+          .f2s{fill:var(--muted);font:11.5px sans-serif}
+          .f2a{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah29c)}
+          .f2x{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#ah29d)}
+        </style>
+        <defs>
+          <marker id="ah29c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="ah29d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+        </defs>
+        <text class="f2t" x="20" y="24">user space</text>
+        <text class="f2t" x="520" y="24">kernel</text>
+        <line x1="490" y1="10" x2="490" y2="420" stroke="var(--border)" stroke-width="2" stroke-dasharray="5 5"/>
+        <rect class="f2b" x="20" y="40" width="440" height="70" rx="8"/>
+        <text class="f2t" x="32" y="62">model.safetensors (BF16, 1.5 GB)</text>
+        <text class="f2c" x="32" y="82">mmap(PROT_READ, MAP_PRIVATE)</text>
+        <text class="f2s" x="32" y="100">one mapping; no per-row read()/lseek()</text>
+        <path class="f2a" d="M240,110 L240,132"/>
+        <rect class="f2m" x="20" y="132" width="440" height="190" rx="8"/>
+        <text class="f2t" x="32" y="154">src/infer.c main loop</text>
+        <text class="f2c" x="32" y="176">for position: load_embedding()   // C, BF16→Q16</text>
+        <text class="f2c" x="44" y="194">for layer in 0..27:</text>
+        <text class="f2c" x="56" y="212">kernel_norm / kernel_matrix ×3</text>
+        <text class="f2c" x="56" y="230">kernel_qk_norm / kernel_rope</text>
+        <text class="f2c" x="56" y="248">kernel_attention_heads</text>
+        <text class="f2c" x="56" y="266">kernel_matrix + kernel_vector …</text>
+        <text class="f2c" x="44" y="284">final norm + vocab kernel_matrix</text>
+        <text class="f2c" x="32" y="304">next_id = batch_work-&gt;best_index</text>
+        <rect class="f2b" x="20" y="340" width="440" height="66" rx="8"/>
+        <text class="f2t" x="32" y="362">per call</text>
+        <text class="f2c" x="32" y="382">memcpy → mmap'd map value</text>
+        <text class="f2c" x="32" y="398">bpf_prog_test_run_opts(fd, 64-byte dummy packet)</text>
+        <!-- kernel side objects -->
+        <rect class="f2b" x="520" y="40" width="200" height="56" rx="6"/>
+        <text class="f2c" x="532" y="62">qwen3_batch.bpf.o</text><text class="f2s" x="532" y="82">map batch (1.51 MiB)</text>
+        <rect class="f2b" x="740" y="40" width="200" height="56" rx="6"/>
+        <text class="f2c" x="752" y="62">qwen3_norm.bpf.o</text><text class="f2s" x="752" y="82">maps norm, qk_norm</text>
+        <rect class="f2b" x="520" y="110" width="200" height="56" rx="6"/>
+        <text class="f2c" x="532" y="132">qwen3_rope.bpf.o</text><text class="f2s" x="532" y="152">map rope</text>
+        <rect class="f2b" x="740" y="110" width="200" height="56" rx="6"/>
+        <text class="f2c" x="752" y="132">qwen3_silu.bpf.o</text><text class="f2s" x="752" y="152">map silu</text>
+        <rect class="f2b" x="520" y="180" width="200" height="56" rx="6"/>
+        <text class="f2c" x="532" y="202">qwen3_vector.bpf.o</text><text class="f2s" x="532" y="222">map vector (add, multiply)</text>
+        <rect class="f2b" x="740" y="180" width="200" height="56" rx="6"/>
+        <text class="f2c" x="752" y="202">qwen3_attention.bpf.o</text><text class="f2s" x="752" y="222">maps attention_heads, kv</text>
+        <rect class="f2k" x="640" y="270" width="300" height="76" rx="8"/>
+        <text class="f2t" x="652" y="292">kv: BPF_MAP_TYPE_ARRAY</text>
+        <text class="f2s" x="652" y="310">max_entries = positions × 28 × 8 (set before load)</text>
+        <text class="f2s" x="652" y="328">written and read only by BPF (store_current_kv)</text>
+        <path class="f2a" d="M840,236 L840,270"/>
+        <rect class="f2b" x="520" y="360" width="420" height="50" rx="8"/>
+        <text class="f2s" x="532" y="380">all programs: SEC("socket"), never attached;</text>
+        <text class="f2s" x="532" y="398">all work maps: ARRAY, max_entries 1, BPF_F_MMAPABLE</text>
+        <path class="f2x" d="M460,388 L520,300 L520,240"/>
+        <text class="f2s" x="470" y="290" transform="rotate(-62 470 290)">BPF_PROG_RUN</text>
+        <path class="f2x" d="M460,210 L516,70"/>
+        <text class="f2s" x="498" y="128">shared</text><text class="f2s" x="498" y="142">pages</text>
+      </svg>
+      <figcaption>Figure 29.2 — Operator mode. Weights and activations go in through
+      memory-mapped array maps. Each operator runs with one <code>BPF_PROG_RUN</code> call. Only
+      the KV cache stays in the kernel between calls, and only BPF writes it.</figcaption>
+    </figure>
+
+    <p>Three pieces of host code make this work. First, the "run one operator" primitive. It is the
+    standard <code>BPF_PROG_RUN</code> test-run command with a zeroed 64-byte packet, because a
+    socket filter needs <em>some</em> packet:</p>
+<pre data-file="src/infer.c"><code class="language-c">static int call_kernel(int fd)
+{
+    const uint8_t packet[64] = {0};
+    struct bpf_test_run_opts opts = {
+        .sz = sizeof(opts),
+        .data_in = packet,
+        .data_size_in = sizeof(packet),
+        .repeat = 1,
+    };
+    return bpf_prog_test_run_opts(fd, &amp;opts);
+}
+
+static int open_operator(struct kernel_operator *op, const char *path,
+                         const char *map_name, const char *const *programs,
+                         int count, uint32_t kv_slots)
+{
+    /* ... */
+    op-&gt;object = bpf_object__open_file(path, NULL);
+    /* ... */
+    if (kv_slots) {
+        kv_map = bpf_object__find_map_by_name(op-&gt;object, "kv");
+        if (!kv_map || bpf_map__set_max_entries(kv_map, kv_slots))
+            return -1;
+    }
+    if (bpf_object__load(op-&gt;object))
+        return -1;
+    /* ... */
+}
+
+static void *map_shared(int fd, size_t bytes, size_t *length)
+{
+    /* ... round bytes up to whole pages ... */
+    mapping = mmap(NULL, *length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    return mapping == MAP_FAILED ? NULL : mapping;
+}</code></pre>
+    <p><code>bpf_map__set_max_entries</code> between open and load is how the KV cache gets its size:
+    libbpf creates the map with the new size when the object is loaded. Second, the matrix wrapper
+    streams a weight matrix through the 128-row work map. C fills rows from the memory-mapped
+    safetensors file, converting BF16 to Q24 by table lookup, then runs the program:</p>
+<pre data-file="src/infer.c"><code class="language-c">    for (row = 0; row &lt; rows; row += QWEN3_BATCH_ROWS) {
+        work-&gt;rows = (uint32_t)(rows - row &lt; QWEN3_BATCH_ROWS
+            ? rows - row : QWEN3_BATCH_ROWS);
+        work-&gt;base_index = (uint32_t)row;
+        work-&gt;completed = 0;
+        for (batch_row = 0; batch_row &lt; (int)work-&gt;rows; batch_row++) {
+            if (safetensors_read_bf16_q24_at(&amp;engine-&gt;model, first_byte,
+                    (uint64_t)(row + batch_row) * cols,
+                    (size_t)cols, work-&gt;weight_q24[batch_row])) {
+                /* ... */
+            }
+        }
+        if (call_kernel(engine-&gt;batch.program_fd[0])) {
+            perror("BPF matrix batch");
+            /* ... */
+        }
+        if (work-&gt;completed != work-&gt;rows)
+            goto done;
+        /* ... copy work-&gt;output_q16[] to output[row + batch_row] ... */
+    }</code></pre>
+    <p>The <code>completed</code> counter is a cheap integrity check. <code>bpf_loop</code> stops
+    early if a callback returns 1, and the C side refuses results unless every row ran. Third, the
+    layer loop itself reads like any textbook transformer, with every arithmetic step a kernel
+    call:</p>
+<pre data-file="src/infer.c"><code class="language-c">        for (layer = 0; layer &lt; QWEN3_LAYERS; layer++) {
+        snprintf(name, sizeof(name),
+                 "model.layers.%d.input_layernorm.weight", layer);
+        if (kernel_norm(&amp;engine, name, hidden, QWEN3_HIDDEN_SIZE, normed))
+            goto layer_fail;
+        /* ... */
+        if (kernel_matrix(&amp;engine, name, QWEN3_ATTENTION_WIDTH,
+                          QWEN3_HIDDEN_SIZE, normed, 0, query))
+            goto layer_fail;
+        /* ... k_proj, v_proj ... */
+        if (kernel_qk_norm(&amp;engine, layer, query, key_vectors))
+            goto layer_fail;
+        if (kernel_rope(&amp;engine, query, key_vectors, position))
+            goto layer_fail;
+        if (kernel_attention_heads(&amp;engine, layer, position, query,
+                                   key_vectors, v, attended))
+            goto layer_fail;
+        /* ... o_proj + residual, post-attention norm, gate, up ... */
+        if (kernel_matrix(&amp;engine, name, QWEN3_INTERMEDIATE,
+                          QWEN3_HIDDEN_SIZE, normed, 0, up) ||
+            kernel_silu(&amp;engine, gate, QWEN3_INTERMEDIATE, activated) ||
+            kernel_vector(&amp;engine, 1, activated, up,
+                          QWEN3_INTERMEDIATE, product))
+            goto layer_fail;
+        /* ... down_proj + residual ... */
+        }
+        /* ... */
+        engine.batch_work-&gt;track_argmax = 1;
+        engine.batch_work-&gt;best_q16 = INT32_MIN;
+        engine.batch_work-&gt;best_index = 0;
+        if (kernel_norm(&amp;engine, "model.norm.weight", hidden,
+                    QWEN3_HIDDEN_SIZE, normed) ||
+            kernel_matrix(&amp;engine, "model.embed_tokens.weight",
+                      QWEN3_VOCAB, QWEN3_HIDDEN_SIZE,
+                      normed, 0, logits)) {
+            /* ... */
+        }
+        next_id = engine.batch_work-&gt;best_index;</code></pre>
+    <p>So where are the weights? On this path they never become kernel-resident. They sit in the
+    page cache behind a read-only file mapping, and C copies 128 converted rows at a time into the
+    <code>batch</code> map. Output comes back the same way: C reads <code>output_q16[]</code> and
+    <code>best_index</code> straight from the shared pages, with no <code>bpf_map_lookup_elem</code>
+    syscall. Reading results is just a memory load.</p>
+
+    <h3>One token through the operator programs</h3>
+    <p>Step through what happens for one token at position <em>p</em> &lt; 256 on the default path.
+    The call counts per layer are my own count from <code>src/infer.c</code>, using 128-row batches.
+    They add up to about 105 program runs per layer plus 1,188 for the output head, about 4,128 in
+    total. That is consistent with the 4,169 <code>bpf()</code> calls the repo measured, which also
+    include setup.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Embedding (C)</h4><p><code>load_embedding()</code> reads row
+      <code>token_id</code> of <code>model.embed_tokens.weight</code> from the mapped file and converts
+      its 1,024 BF16 values to Q16. No BPF runs yet. This is a lookup, not arithmetic.</p></div>
+      <div class="step"><h4>2. Input RMSNorm — 1 run</h4><p>C writes the hidden vector and the
+      layer's norm weights (as Q20) into the mmapped <code>norm</code> map and runs
+      <code>qwen3_rms_full</code>. Two <code>bpf_loop</code>s over eight 128-wide tiles do the sum of
+      squares and the scaling, with <code>isqrt64</code> in between.</p></div>
+      <div class="step"><h4>3. Q, K, V projections — 32 runs</h4><p><code>qwen3_batch_rows</code>
+      runs 16 times for Q (2,048 rows) and 8 times each for K and V (1,024 rows). Each run is a
+      <code>bpf_loop</code> over 128 rows of 1,024 Q24 weights: 131,072 MACs per run.</p></div>
+      <div class="step"><h4>4. QK-Norm and RoPE — 2 runs</h4><p><code>qwen3_qk_norm_heads</code>
+      normalizes all 16 query and 8 key heads in one call (24 callback iterations).
+      <code>qwen3_rope_apply</code> rotates the same 24 heads. C computed the 64 cos/sin pairs for
+      position <em>p</em> with <code>libm</code> and stored them as Q20.</p></div>
+      <div class="step"><h4>5. Attention and KV cache — 1 run per 256 positions</h4><p>
+      <code>qwen3_attention_all_heads</code> first stores the new K/V for all 8 KV heads into the
+      <code>kv</code> map at slot <code>(p·28 + layer)·8 + h</code>. Then it walks positions
+      <code>0..p</code> with <code>bpf_loop</code>. Each KV pair it looks up feeds two query heads
+      (GQA), using an online softmax so no score array is needed.</p></div>
+      <div class="step"><h4>6. Output projection and residual — 9 runs</h4><p>8 batch runs for
+      the 1,024 × 2,048 O matrix, then <code>qwen3_vector_add</code> adds the result into the hidden
+      vector (8 tiles in one call).</p></div>
+      <div class="step"><h4>7. MLP — 60 runs</h4><p>Post-attention RMSNorm (1), gate and up
+      projections (24 + 24 batch runs of 3,072 rows in total each), <code>qwen3_silu_apply</code> over
+      3,072 values (1), <code>qwen3_vector_multiply</code> (1), down projection (8 runs of 128 rows ×
+      3,072 columns, the widest callbacks) and the second residual add (1).</p></div>
+      <div class="step"><h4>8. Repeat 28 times</h4><p>Steps 2–7 run for layers 0–27, each with
+      its own tensors named <code>model.layers.N.*</code>. The KV map now holds this position's keys
+      and values for every layer, ready for the next token.</p></div>
+      <div class="step"><h4>9. Output head — 1,188 runs</h4><p>Final RMSNorm (1 run), then 1,187
+      batch runs over the 151,936 rows of the tied embedding matrix with
+      <code>track_argmax = 1</code>. Each callback compares its logit with
+      <code>best_q16</code>.</p></div>
+      <div class="step"><h4>10. Read the answer</h4><p>C reads <code>best_index</code> and
+      <code>best_q16</code> from the mmapped <code>batch</code> map. With <code>--tokenizer</code>,
+      it decodes the ID to bytes in user space. With <code>--generate N</code>, the ID becomes the
+      next input and the loop runs again from step 1. Only the new position is computed, because the
+      history is in the KV map.</p></div>
+    </div>
+
+    <h2>Getting a transformer past the verifier</h2>
+    <p>The report's headline lesson is "The verifier shapes the code but is not a wall." It names
+    only two rejections that needed a redesign: the monolithic RMSNorm (over the one-million
+    budget) and in-loop BF16 conversion ("8193 jumps is too complex"). The rest is a set of habits
+    applied to every program. Here they are as a checklist you can reuse for any heavy BPF code:</p>
+    <ol>
+      <li><strong>Size the unit of work for one callback.</strong> A <code>bpf_loop</code> callback is
+      verified once, whatever the iteration count. The repo batches 128 matrix rows, up to eight
+      RMSNorm tiles, 24 Q/K heads, 24 SiLU tiles or 256 attention positions per invocation. The
+      architecture doc gives the reason: "Bounded units keep verifier complexity and per-invocation
+      runtime manageable."</li>
+      <li><strong>Keep inner loops rolled.</strong> Every fixed-trip loop carries
+      <code>#pragma clang loop unroll(disable)</code>. The verifier's bounded-loop support handles
+      it, and the instruction count stays small.</li>
+      <li><strong>Mask indexes to powers of two.</strong> <code>row &amp; 127</code>,
+      <code>head &amp; 31</code>, <code>index &amp; 4095u</code>. The vector map even uses a capacity
+      of 4,096 for a maximum of 3,072 elements, with the comment "Power-of-two backing keeps callback
+      indices verifier-bounded."</li>
+      <li><strong>Stop the compiler from undoing the mask.</strong> When Clang can prove a mask is
+      redundant, it deletes it, and the verifier then sees an unbounded index. The arena code uses an
+      empty <code>asm volatile</code> as an optimization barrier:
+<pre data-file="src/bpf/qwen3_arena_bf16.bpf.c"><code class="language-c">static __always_inline __u32 event_q_slot(__u32 base, __u32 offset)
+{
+    __u32 index = base + offset;
+
+    asm volatile ("" : "+r"(index));
+    return index &amp; 2047;
+}</code></pre></li>
+      <li><strong>No large stack objects.</strong> All vectors live in single-entry array map
+      values. Each callback looks the map up again (<code>bpf_map_lookup_elem(&amp;work, &amp;key)</code>)
+      instead of receiving a pointer through <code>ctx</code>, so the verifier sees a fresh map-value
+      pointer of known size in every callback.</li>
+      <li><strong>Replace branchy math with tables.</strong> The BF16 decode became a lookup; the RoPE
+      inverse frequencies in the XDP path are a 64-entry constant table
+      (<code>rope_freq_q48</code>).</li>
+      <li><strong>Split across programs, not tail calls.</strong> The repo never uses
+      <code>bpf_tail_call</code> or BPF-to-BPF calls beyond the <code>bpf_loop</code> callbacks.
+      "Program splitting" means separate BPF objects per operator, chained by a scheduler outside
+      the program.</li>
+    </ol>
+
+    <h3>What the verifier actually processed (measured in this orb)</h3>
+    <p>I built the repo's operators with Clang 14 and ran its smoke tests on this orb's Linux 6.1
+    kernel, which has <em>no BPF JIT</em> (details under <a href="#build-and-run">build and run</a>).
+    The interesting part is what the verifier log reported before load failed for another reason:</p>
+    <table>
+      <thead><tr><th>Program</th><th>Verifier "processed insns" (limit 1,000,000)</th><th>Peak states</th></tr></thead>
+      <tbody>
+        <tr><td><code>qwen3_int4_rows</code> (experiment)</td><td>115,291</td><td>1,033</td></tr>
+        <tr><td><code>qwen3_int8_rows</code> (experiment)</td><td>79,983</td><td>776</td></tr>
+        <tr><td><code>qwen3_batch_rows</code></td><td>52,325</td><td>447</td></tr>
+        <tr><td><code>qwen3_silu_apply</code></td><td>22,562</td><td>97</td></tr>
+        <tr><td><code>qwen3_attention_cached</code></td><td>5,480</td><td>70</td></tr>
+        <tr><td><code>qwen3_rope_apply</code></td><td>2,114</td><td>22</td></tr>
+        <tr><td><code>qwen3_vector_add</code></td><td>1,478</td><td>21</td></tr>
+      </tbody>
+    </table>
+    <p>The largest default operator uses about 5% of the budget, even though at run time it does
+    128 × 3,072 = 393,216 MACs. That gap between verification cost and execution cost is the whole
+    point of <code>bpf_loop</code> plus rolled loops. These counts are from Clang 14 on 6.1 x86-64.
+    The repo's own toolchain (Ubuntu 24.04, Linux 6.17 arm64) may produce different numbers.</p>
+
+    <h2>Attention and the KV cache in BPF</h2>
+    <p>Softmax over scores s<sub>0</sub> … s<sub>p</sub> normally needs all scores first (to find the
+    maximum, for numerical stability), then a second pass. qwen3-ebpf uses the <em>online</em> form
+    (Milakov and Gimelshein, 2018) that also underlies FlashAttention. Keep a running maximum
+    <em>m</em>, a running mass <em>d</em> = Σ e<sup>s−m</sup> and a running output <em>o</em>. When a
+    new score arrives, rescale what you have if the maximum grew, then blend the new value vector in
+    with weight α = w / (d + w). Only O(head_dim) state per head is needed, however long the
+    history:</p>
+<pre data-file="src/bpf/qwen3_attention.bpf.c"><code class="language-c">static __always_inline void attention_accumulate(struct qwen3_attention_state *work,
+                                                  const __s32 *key_q16,
+                                                  const __s32 *value_q16)
+{
+    /* ... */
+#pragma clang loop unroll(disable)
+    for (i = 0; i &lt; QWEN3_TILE_WIDTH; i++)
+        dot += (__s64)work-&gt;query_q16[i] * key_q16[i];
+    /* Q16 dot scaled by 1/sqrt(128), also Q16 (5793/65536). */
+    score = ((dot &gt;&gt; 16) * 5793) &gt;&gt; 16;
+    /* ... first position: output = value, max = score, mass = 1.0 ... */
+    delta = score - work-&gt;max_score_q16;
+    if (delta &gt; 0) {
+        __u64 factor = exp_negative_q32((__u32)delta);
+        mass = ((work-&gt;mass_q16 &gt;&gt; 16) * factor) &gt;&gt; 16;
+        mass += ((work-&gt;mass_q16 &amp; 65535) * factor) &gt;&gt; 32;
+        weight = 1ULL &lt;&lt; 16;
+        work-&gt;max_score_q16 = work-&gt;score_q16;
+    } else {
+        mass = work-&gt;mass_q16;
+        weight = exp_negative_q32((__u32)-delta) &gt;&gt; 16;
+    }
+    new_mass = mass + weight;
+    if (!new_mass)
+        return;
+    alpha_q24 = (weight &lt;&lt; 24) / new_mass;
+#pragma clang loop unroll(disable)
+    for (i = 0; i &lt; QWEN3_TILE_WIDTH; i++) {
+        __s64 difference = (__s64)value_q16[i] - work-&gt;output_q16[i];
+        __s64 next = (__s64)work-&gt;output_q16[i] +
+                     ((difference * (__s64)alpha_q24) &gt;&gt; 24);
+        work-&gt;output_q16[i] = (__s32)next;
+    }
+    work-&gt;mass_q16 = new_mass;
+    work-&gt;seen++;
+}</code></pre>
+    <p>5,793 / 65,536 ≈ 0.08839 ≈ 1/√128. The blend <code>o += (v − o) · α</code> is the running
+    weighted average written so that only one division per position is needed. GQA appears in the
+    callback that walks the history: one KV lookup per KV head feeds two query-head states.</p>
+<pre data-file="src/bpf/qwen3_attention.bpf.c"><code class="language-c">struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct qwen3_kv_pair);
+} kv SEC(".maps");
+/* ... */
+static long cached_all_heads_step(__u32 index, void *ctx)
+{
+    /* ... */
+    past = work-&gt;base_position + index;
+    if (past &gt;= QWEN3_ATTENTION_CONTEXT_LIMIT ||
+        work-&gt;layer &gt;= QWEN3_ATTENTION_LAYERS)
+        return 1;
+#pragma clang loop unroll(disable)
+    for (kv_head = 0; kv_head &lt; QWEN3_ATTENTION_KV_HEADS; kv_head++) {
+        __u32 bounded_kv_head = (__u32)kv_head &amp;
+                               (QWEN3_ATTENTION_KV_HEADS - 1);
+        slot = (past * QWEN3_ATTENTION_LAYERS + work-&gt;layer) *
+               QWEN3_ATTENTION_KV_HEADS + bounded_kv_head;
+        pair = bpf_map_lookup_elem(&amp;kv, &amp;slot);
+        if (!pair)
+            return 1;
+        attention_accumulate(&amp;work-&gt;heads[bounded_kv_head * 2],
+                             pair-&gt;key_q16, pair-&gt;value_q16);
+        attention_accumulate(&amp;work-&gt;heads[bounded_kv_head * 2 + 1],
+                             pair-&gt;key_q16, pair-&gt;value_q16);
+    }
+    work-&gt;completed_positions++;
+    return 0;
+}</code></pre>
+    <p>The <code>kv</code> map is declared with <code>max_entries 1</code> and resized by the loader to
+    positions × 28 × 8 slots. Each <code>qwen3_kv_pair</code> is 128 keys plus 128 values of 4 bytes,
+    so 1 KiB per slot, 224 KiB per position, and, as the docs note, 8.75 GiB for the full
+    40,960-position limit "before weights and other buffers". The map is an ordinary array, not
+    mmapable. Since a later revision, the host no longer touches it. The attention program stores
+    the new K/V (<code>store_current_kv</code>) before scanning, so the cache is truly
+    kernel-owned.</p>
+    <p>Accuracy of these pieces, from the repo's operator tests: online attention max abs error
+    0.000905 over 1–257 positions (257 crosses the 256-position chunk boundary), Q/K RMSNorm
+    0.000597, RoPE 1.56e-05, layer-0 input RMSNorm 7.4e-05.</p>
+
+    <h2>Event mode: XDP, a BPF arena and a self-requeuing workqueue</h2>
+    <p>Operator mode leaves an obvious objection standing: user space still runs the model loop, so
+    is this really "in the kernel"? The optional <code>src/bpf/qwen3_arena_bf16.bpf.c</code> answers
+    it. After loading, a packet starts inference, BPF schedules all 28 layers itself, and the answer
+    goes back in a packet. The README states the boundary: "Neither path calls a user-space LLM from
+    an eBPF hook", and on the XDP path "A loader must remain running to hold the XDP link."</p>
+
+    <h3>Where the weights live: a 1.5 GB BPF arena</h3>
+    <p>A BPF arena (<code>BPF_MAP_TYPE_ARENA</code>, Linux 6.9; see the arena section of
+    <a href="04-maps-helpers-kfuncs.html">chapter 04</a>) is a region of pages shared between a BPF
+    program and user space. Pointers into it are valid on both sides. Pointers are tagged with
+    <code>__arena</code>, which is <code>address_space(1)</code>, and the verifier relaxes its
+    pointer checks inside it. The repo declares an arena large enough for the whole model, plus
+    globals that Clang 19 places in the arena: a 128-row staging buffer and three 65,536-entry
+    BF16 lookup tables (to Q24, Q16 and Q20):</p>
+<pre data-file="src/bpf/qwen3_arena_bf16.bpf.c"><code class="language-c">#define __arena __attribute__((address_space(1)))
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARENA);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __uint(max_entries, QWEN3_ARENA_MODEL_MAX_BF16 / 2048u + 512u);
+#ifdef __TARGET_ARCH_arm64
+    __ulong(map_extra, 0x1ull &lt;&lt; 32);
+#else
+    __ulong(map_extra, 0x1ull &lt;&lt; 44);
+#endif
+} arena SEC(".maps");
+
+__u16 __arena weight_bf16[QWEN3_ARENA_BF16_ROWS][QWEN3_ARENA_BF16_COLS];
+__s32 __arena q24_by_bf16[1 &lt;&lt; 16];
+__s32 __arena q16_by_bf16[1 &lt;&lt; 16];
+__s32 __arena q20_by_bf16[1 &lt;&lt; 16];
+__u16 __arena *model_bf16;
+/* ... */
+SEC("syscall")
+int qwen3_arena_allocate_model(void *ctx)
+{
+    /* ... */
+    pages = (state-&gt;model_elements + 2047u) / 2048u;
+    model_bf16 = (__u16 __arena *)bpf_arena_alloc_pages(&amp;arena, 0,
+                                                        pages, -1, 0);
+    return model_bf16 ? 0 : -1;
+}</code></pre>
+    <p><code>max_entries</code> counts pages: 768 Mi BF16 elements / 2,048 per 4 KiB page, plus 512
+    pages for the globals. <code>map_extra</code> is the user-space address where the arena is
+    mapped. The loading sequence in <code>src/serve_xdp.c</code> is short:</p>
+<pre data-file="src/serve_xdp.c"><code class="language-c">    skel = qwen3_arena_bf16_bpf__open_and_load();
+    /* ... mmap the work map ... */
+    work-&gt;model_elements = bytes / 2;
+    load_lookup_tables(skel);
+    if (bpf_prog_test_run_opts(bpf_program__fd(
+            skel-&gt;progs.qwen3_arena_allocate_model), &amp;opts) ||
+        opts.retval || !skel-&gt;bss-&gt;model_bf16)
+        goto done;
+    memcpy(skel-&gt;bss-&gt;model_bf16, model, bytes);
+    /* ... resolve tensor offsets; for each of 28 layers: */
+        if (layer_offsets(&amp;file, layer, &amp;weights) ||
+            validate_layer_matrices(model, bytes, &amp;weights) ||
+            bpf_map_update_elem(bpf_map__fd(skel-&gt;maps.event_layer_weights),
+                                &amp;layer, &amp;weights, BPF_ANY))
+            goto done;
+    /* ... set work-&gt;event_* flags ... */
+    if (bpf_prog_test_run_opts(bpf_program__fd(skel-&gt;progs.qwen3_event_init),
+                               &amp;opts) || opts.retval)
+        goto done;
+    link = bpf_program__attach_xdp(skel-&gt;progs.qwen3_event_xdp, ifindex);</code></pre>
+    <p>Note the pattern: a <code>SEC("syscall")</code> program, run once with
+    <code>BPF_PROG_RUN</code>, calls the <code>bpf_arena_alloc_pages</code> kfunc. User space then reads
+    the returned arena pointer out of <code>.bss</code> and <code>memcpy</code>s the raw safetensors
+    payload straight into kernel-backed pages. That works because the arena is mapped at the same
+    address in both worlds. The weights stay BF16 in the arena. A map
+    (<code>event_layer_weights</code>) holds, for each layer, the element offsets of its eleven
+    tensors, and BPF converts each weight with one load from <code>q24_by_bf16</code> as it
+    multiplies:</p>
+<pre data-file="src/bpf/qwen3_arena_bf16.bpf.c"><code class="language-c">#pragma clang loop unroll(disable)
+    for (i = 0; i &lt; QWEN3_ARENA_BF16_COLS; i += 2) {
+        if (i &gt;= state-&gt;cols)
+            break;
+        even += (__s64)state-&gt;input_q16[i] * q24_by_bf16[weights[i]];
+        if (i + 1 &lt; state-&gt;cols)
+            odd += (__s64)state-&gt;input_q16[i + 1] *
+                   q24_by_bf16[weights[i + 1]];
+    }
+    state-&gt;output_q16[bounded_row] = (even + odd) &gt;&gt; 24;</code></pre>
+    <p>The two accumulators are a late micro-optimization. Splitting one serial dependency chain into
+    two cut a 131-token run's median from 93.170 s to 87.149 s (about 6.5%) with identical outputs.
+    The report reads this as evidence that the loop is limited by instruction latency.</p>
+
+    <h3>Which hook triggers computation: XDP, then <code>bpf_wq</code></h3>
+    <p>XDP runs in the driver's receive path in softirq context (<a href="07-networking-xdp-tc.html">chapter 07</a>),
+    where you cannot spend hundreds of milliseconds. So the XDP program only validates the request,
+    claims the single global session with a compare-and-swap, and starts a BPF workqueue item.
+    <code>bpf_wq</code> (Linux 6.10) is a <code>struct bpf_wq</code> embedded in a map value. You
+    give it a callback with <code>bpf_wq_set_callback_impl</code> and start it with
+    <code>bpf_wq_start</code>. The callback runs later from a kernel workqueue, in process context.
+    Here is the end of the XDP handler:</p>
+<pre data-file="src/bpf/qwen3_arena_bf16.bpf.c"><code class="language-c">    old_status = __sync_val_compare_and_swap(&amp;job-&gt;status,
+                                              QWEN3_EVENT_READY,
+                                              QWEN3_EVENT_RUNNING);
+    if (old_status != QWEN3_EVENT_READY &amp;&amp;
+        (old_status != QWEN3_EVENT_DONE ||
+         __sync_val_compare_and_swap(&amp;job-&gt;status,
+                                      QWEN3_EVENT_DONE,
+                                      QWEN3_EVENT_RUNNING) !=
+                                      QWEN3_EVENT_DONE))
+        return XDP_PASS;
+    state-&gt;base_index = 0;
+    state-&gt;event_token_id = token_id;
+    state-&gt;event_position = position;
+    state-&gt;event_emit_logits = payload[3] == 'P';
+    /* ... */
+    if (state-&gt;event_qkv) {
+        if (event_begin_layer(state, 0)) {
+            job-&gt;status = QWEN3_EVENT_ERROR;
+            return XDP_PASS;
+        }
+    }
+    /* ... */
+    job-&gt;requests++;
+    job-&gt;start_ns = bpf_ktime_get_ns();
+    /* ... */
+    if (bpf_wq_start(&amp;job-&gt;work, 0))
+        job-&gt;status = QWEN3_EVENT_ERROR;
+    return XDP_PASS;</code></pre>
+    <p>The callback <code>event_callback</code> is a state machine over
+    <code>event_stage</code> = Q, K, V, ATTENTION, O, GATE, UP, DOWN, FINAL_NORM, LOGITS. One
+    invocation does <em>one bounded step</em>: one 128-row matrix batch, or one past position of
+    attention for all 16 heads. Then it records where it is and calls <code>bpf_wq_start</code> on
+    itself again. When a matrix finishes, it moves to the next stage. When DOWN finishes, it calls
+    <code>event_begin_layer(layer + 1)</code>, which loads the next layer's tensor offsets. After
+    layer 27 it runs the final norm and 1,187 vocabulary batches with argmax tracking:</p>
+<pre data-file="src/bpf/qwen3_arena_bf16.bpf.c"><code class="language-c">            if (state-&gt;event_layer_count &amp;&amp;
+                state-&gt;event_layer + 1 &lt; state-&gt;event_layer_count) {
+                if (event_begin_layer(state, state-&gt;event_layer + 1) ||
+                    bpf_wq_start(&amp;job-&gt;work, 0))
+                    job-&gt;status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            /* ... final RMSNorm, then: */
+                state-&gt;event_stage = QWEN3_EVENT_STAGE_LOGITS;
+                state-&gt;weight_first_bf16 = state-&gt;embedding_first_bf16;
+                state-&gt;matrix_total_rows = QWEN3_EVENT_VOCAB;
+                /* ... */
+                state-&gt;track_argmax = 1;
+                state-&gt;best_q16 = -2147483648LL;
+                state-&gt;best_index = 0;
+                if (bpf_wq_start(&amp;job-&gt;work, 0))
+                    job-&gt;status = QWEN3_EVENT_ERROR;
+                return 0;
+    /* ... */
+        job-&gt;finish_ns = bpf_ktime_get_ns();
+        job-&gt;completed_requests++;
+        job-&gt;status = QWEN3_EVENT_DONE;
+        return 0;
+    }
+    state-&gt;base_index = base;
+    state-&gt;rows = total - base &lt; QWEN3_ARENA_BF16_ROWS ?
+        total - base : QWEN3_ARENA_BF16_ROWS;
+    if (bpf_wq_start(&amp;job-&gt;work, 0))
+        job-&gt;status = QWEN3_EVENT_ERROR;
+    return 0;
+}</code></pre>
+    <p>This is the "loop" of the whole model expressed without a loop. No single BPF invocation does
+    more than one bounded step, so each stays inside what the verifier analyzed. The total amount of
+    work is unbounded in principle, and is bounded in practice by the stage logic and the 256-entry
+    position cap. The same callback also computes the RoPE sin/cos itself, from
+    <code>rope_freq_q48</code>. It reduces the angle into [−π/2, π/2] and then runs a Taylor series
+    (the first term plus six more) in Q30. In operator mode, C did that
+    with <code>libm</code>.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 470" role="img" aria-label="Event mode. A UDP packet Q3BP or Q3BF to port 49002 reaches the XDP program, which validates token and position, compare-and-swaps the session status to RUNNING, and calls bpf_wq_start, returning XDP_PASS. The workqueue callback runs one bounded step per invocation through stages Q, K, V, attention, O, gate, up, down for each of 28 layers, then final norm and logits, requeuing itself with bpf_wq_start. It reads BF16 weights and lookup tables from the arena and keys and values from the event_kv map. A later Q3BR poll packet is answered by XDP with XDP_TX carrying Q3BA token and logit or Q3BK.">
+        <style>
+          .f3b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .f3m{fill:none;stroke:var(--accent);stroke-width:2}
+          .f3k{fill:none;stroke:var(--accent2);stroke-width:2;stroke-dasharray:6 4}
+          .f3t{fill:var(--fg);font:600 13px sans-serif}
+          .f3c{fill:var(--fg);font:11.5px monospace}
+          .f3s{fill:var(--muted);font:11.5px sans-serif}
+          .f3a{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah29e)}
+          .f3x{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#ah29f)}
+        </style>
+        <defs>
+          <marker id="ah29e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="ah29f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+        </defs>
+        <!-- client -->
+        <rect class="f3b" x="16" y="30" width="170" height="150" rx="8"/>
+        <text class="f3t" x="28" y="52">client</text>
+        <text class="f3c" x="28" y="74">build/xdp-client</text>
+        <text class="f3s" x="28" y="96">UDP → port 49002</text>
+        <text class="f3c" x="28" y="118">Q3BP tok pos</text>
+        <text class="f3c" x="28" y="136">Q3BF tok pos</text>
+        <text class="f3c" x="28" y="154">Q3BR counter</text>
+        <path class="f3a" d="M186,90 L240,90"/>
+        <!-- XDP -->
+        <rect class="f3m" x="240" y="30" width="230" height="150" rx="8"/>
+        <text class="f3t" x="252" y="52">SEC("xdp") qwen3_event_xdp</text>
+        <text class="f3s" x="252" y="74">P/F: parse eth/ip/udp, check token,</text>
+        <text class="f3s" x="252" y="90">position == next_position</text>
+        <text class="f3c" x="252" y="110">CAS status → RUNNING</text>
+        <text class="f3c" x="252" y="128">bpf_wq_start(); XDP_PASS</text>
+        <text class="f3s" x="252" y="150">R: if DONE and counter matches,</text>
+        <text class="f3c" x="252" y="168">swap MAC/IP/port → XDP_TX</text>
+        <path class="f3a" d="M240,160 L186,160"/>
+        <text class="f3s" x="190" y="196">Q3BA token+logit / Q3BK</text>
+        <path class="f3x" d="M355,180 L355,230"/>
+        <!-- wq state machine -->
+        <rect class="f3m" x="240" y="230" width="460" height="220" rx="10"/>
+        <text class="f3t" x="252" y="252">bpf_wq callback event_callback (process context)</text>
+        <g>
+          <rect class="f3b" x="256" y="268" width="56" height="30" rx="4"/><text class="f3c" x="276" y="288">Q</text>
+          <rect class="f3b" x="318" y="268" width="56" height="30" rx="4"/><text class="f3c" x="338" y="288">K</text>
+          <rect class="f3b" x="380" y="268" width="56" height="30" rx="4"/><text class="f3c" x="400" y="288">V</text>
+          <rect class="f3b" x="442" y="268" width="80" height="30" rx="4"/><text class="f3c" x="450" y="288">ATTN×(p+1)</text>
+          <rect class="f3b" x="528" y="268" width="56" height="30" rx="4"/><text class="f3c" x="548" y="288">O</text>
+          <rect class="f3b" x="590" y="268" width="96" height="30" rx="4"/><text class="f3c" x="598" y="288">GATE UP DOWN</text>
+        </g>
+        <text class="f3s" x="256" y="322">each box = N invocations of one bounded step (128 rows or one past position)</text>
+        <text class="f3s" x="256" y="340">QK-Norm, RoPE (sin/cos computed in BPF) and KV store happen at end of V</text>
+        <path class="f3a" d="M638,298 L638,360 L284,360 L284,302"/>
+        <text class="f3s" x="380" y="378">event_begin_layer(layer+1) × 28</text>
+        <rect class="f3b" x="256" y="396" width="200" height="40" rx="4"/><text class="f3c" x="266" y="420">FINAL_NORM → LOGITS×1187</text>
+        <text class="f3c" x="470" y="420">→ DONE, completed_requests++</text>
+        <path class="f3x" d="M700,300 C760,300 760,250 700,250"/>
+        <text class="f3c" x="716" y="246">bpf_wq_start(self)</text>
+        <!-- memory -->
+        <rect class="f3k" x="740" y="30" width="204" height="150" rx="8"/>
+        <text class="f3t" x="752" y="52">BPF arena</text>
+        <text class="f3s" x="752" y="74">model_bf16: full payload</text>
+        <text class="f3s" x="752" y="90">(≈1.5 GB, copied once)</text>
+        <text class="f3s" x="752" y="110">q24/q16/q20_by_bf16</text>
+        <text class="f3s" x="752" y="126">(3 × 256 KiB tables)</text>
+        <text class="f3s" x="752" y="150">event_layer_weights map:</text>
+        <text class="f3s" x="752" y="166">28 × 11 tensor offsets</text>
+        <rect class="f3k" x="740" y="330" width="204" height="100" rx="8"/>
+        <text class="f3t" x="752" y="352">event_kv (ARRAY)</text>
+        <text class="f3s" x="752" y="372">28 × 256 × 8 slots</text>
+        <text class="f3s" x="752" y="390">(layer·256 + pos)·8 + head</text>
+        <text class="f3s" x="752" y="408">≈56 MiB, one session</text>
+        <path class="f3a" d="M760,180 L700,240"/>
+        <path class="f3a" d="M740,380 L702,380"/>
+      </svg>
+      <figcaption>Figure 29.3 — Event mode. XDP only admits a request and queues work. The
+      workqueue callback advances one bounded step per invocation and requeues itself through all
+      28 layers and the vocabulary head. A later poll packet is answered from XDP with
+      <code>XDP_TX</code>.</figcaption>
+    </figure>
+
+    <h3>How the result is read back</h3>
+    <p>Because the work item finishes long after the request packet has been passed up the stack,
+    XDP cannot rewrite <em>that</em> packet into a reply. The protocol therefore has a poll step
+    (from <code>docs/usage.md</code>):</p>
+    <table>
+      <thead><tr><th>Request (UDP/49002)</th><th>Payload</th><th>What BPF does</th><th>Reply</th></tr></thead>
+      <tbody>
+        <tr><td><code>Q3BP</code></td><td>big-endian token ID, position</td><td>all 28 layers, KV update, final norm, 151,936 logits, argmax</td><td>none (passes up the stack)</td></tr>
+        <tr><td><code>Q3BF</code></td><td>same</td><td>28 layers and KV update only (prompt prefill)</td><td>none</td></tr>
+        <tr><td><code>Q3BR</code></td><td>20 bytes, expected completed-request counter in bytes 4–7</td><td>if done and counter matches, rewrite packet in place</td><td><code>Q3BA</code> + token (4 B) + signed Q16 logit (8 B) + counter, or <code>Q3BK</code> for prefill, via <code>XDP_TX</code></td></tr>
+      </tbody>
+    </table>
+    <p>The reply path swaps MAC addresses, IP addresses and UDP ports and zeroes the UDP checksum,
+    which IPv4 allows. Valid polls that arrive too early are dropped rather than passed up, because
+    passing them produced ICMP port-unreachable replies from the unbound port. Positions must be
+    consecutive: a position-zero packet starts a new sequence. The KV map holds 256 positions, and
+    there is one global session.</p>
+
+    <h2 id="performance">Performance: what the repo measured</h2>
+    <p>Every number in this section is copied from <code>docs/experiments.md</code> or the report,
+    which takes all its numbers from that file. The host was Linux 6.17 on an arm64 machine with
+    Cortex-X925 and Cortex-A725 cores. Most results are single runs or medians of three on a shared
+    host, and the authors say plainly that they are "not a controlled throughput benchmark". None of
+    them were reproduced here (see the next section).</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Fidelity">
+        <ul>
+          <li>Token <code>0</code> → <code>9</code> and token <code>1</code> → <code>14582</code>,
+          matching Hugging Face Transformers BF16. Over all 151,936 logits, mean absolute error was
+          0.052 / 0.030 and RMSE 0.065 / 0.038, and the top three IDs agreed.</li>
+          <li><code>Hello, world!</code> (<code>[9707, 11, 1879, 0]</code>) → <code>1096</code>
+          (" This"), the same as BF16, with all top-five IDs agreeing. MAE 0.035.</li>
+          <li>Two WikiText-2 excerpts (131 and 125 tokens) through the live XDP path, compared with
+          one-token-at-a-time BF16: 251 of 256 per-prefix argmax IDs matched. Four of the five
+          differences were BF16 top-score ties, and the fifth differed by 0.125 BF16 logit.</li>
+          <li>Perplexity on the same excerpts (operator mode): 24.819 vs 24.006 for BF16 (423 scored
+          tokens) and 17.216 vs 15.876 (124 tokens). The fixed-point path is slightly worse on
+          both.</li>
+          <li>Naive INT4 (group-128) changed the first generated token for all three test inputs
+          (<code>9</code> → <code>284</code>, for example), with logit MAE 0.98–1.84. Group-32 INT8
+          changed <code>Hello, world!</code>'s answer to <code>20166</code>. Neither was
+          integrated.</li>
+        </ul>
+      </div>
+      <div class="tab-panel" data-label="Kernel crossings">
+        <p>One-token <code>bpf()</code> syscalls in operator mode as the design evolved (report
+        Table 1 and experiments log):</p>
+        <table>
+          <thead><tr><th>Change</th><th><code>bpf()</code> calls / token</th><th>Time</th></tr></thead>
+          <tbody>
+            <tr><td>Tile driver, file read with <code>lseek</code>/<code>read</code></td><td>143,667 (+ 496,730 lseek, 291,467 read)</td><td>2.912 s</td></tr>
+            <tr><td>Weight file memory-mapped</td><td>143,667</td><td>2.695 s</td></tr>
+            <tr><td>4 → 16 rows per matrix call</td><td>50,667</td><td>1.605 s</td></tr>
+            <tr><td>One call per RMSNorm</td><td>43,171</td><td>within noise</td></tr>
+            <tr><td>128 rows per call</td><td>16,043</td><td>no stable gain</td></tr>
+            <tr><td>Fused argmax</td><td>12,482</td><td>no stable gain</td></tr>
+            <tr><td>Whole-vector add/multiply, RoPE, SiLU per call</td><td>9,205 → 7,217 → 5,229</td><td>no stable gain</td></tr>
+            <tr><td>All Q/K-norm heads per call</td><td>4,587</td><td>1.20 → 1.21 s</td></tr>
+            <tr><td>All query heads per attention chunk</td><td>4,169</td><td>≈1.02 s</td></tr>
+            <tr><td>BF16 → Q24 by lookup table (no crossing change)</td><td>unchanged</td><td>1.48 → 1.15 s</td></tr>
+          </tbody>
+        </table>
+        <p>The report's reading: "Below roughly 50,000 crossings per token, arithmetic dominates."</p>
+      </div>
+      <div class="tab-panel" data-label="Latency">
+        <table>
+          <thead><tr><th>Workload (after model load)</th><th>Event (XDP + wq)</th><th>Operator (arena CLI)</th><th>BF16 PyTorch, 1 core</th></tr></thead>
+          <tbody>
+            <tr><td>1 token, X925 core</td><td>580.090–580.711 ms</td><td>0.813–0.817 s</td><td>—</td></tr>
+            <tr><td>1 token, A725 core</td><td>1221.6–1222.5 ms</td><td>1.858–1.860 s</td><td>—</td></tr>
+            <tr><td>10 tokens</td><td>5.713 s</td><td>4.784–5.706 s</td><td>—</td></tr>
+            <tr><td>131-token prompt, prefill (median of 3)</td><td>60.964 s</td><td>57.631 s</td><td>—</td></tr>
+            <tr><td>131 tokens, logits at every position</td><td>88.794–93.170 s</td><td>—</td><td>19.240–26.924 s</td></tr>
+            <tr><td>125 tokens, logits at every position</td><td>85.207 s</td><td>—</td><td>43.918–46.173 s</td></tr>
+          </tbody>
+        </table>
+        <p>Batched four-core BF16 scored a 423-token excerpt in 6.407 s, against 401.580 s for
+        operator mode scoring one position at a time. The two setups are not matched, as the docs
+        stress.</p>
+      </div>
+    </div>
+
+    <p>So event mode beats operator mode for a single token, by 29% on the X925 core and 34% on
+    the A725 core, because no user-space dispatch sits between steps. That advantage disappears
+    over sequences. Against ordinary user-space BF16 inference on one core, the eBPF path was
+    1.8–4.8× slower. The report's explanation is per-MAC cost. By its own derived count, event mode
+    sustained about 1.0 billion MACs per second, while one-core BF16 PyTorch sustained 2.9–4.1
+    billion. At 580 ms per token the model reads about 2 GB/s of weights, "far below what the
+    memory system delivers, so the loop is limited by instructions rather than by bandwidth." Each
+    BPF MAC is a chain of scalar instructions: load the BF16 bits, load their Q24 value from the
+    table, a 64-bit multiply, an add, and a loop bound check. A user-space engine does the same work
+    with SIMD fused multiply-adds.</p>
+
+    <h2 id="build-and-run">Build and run</h2>
+    <h3>The documented commands</h3>
+    <p>From <code>README.md</code> and <code>docs/usage.md</code> (Ubuntu 24.04 packages):</p>
+<pre data-file="docs/usage.md"><code class="language-bash">sudo apt-get install build-essential clang libbpf-dev libelf-dev zlib1g-dev \
+  libjson-c-dev libonig-dev
+make
+make test                                  # synthetic operator checks, needs BPF privileges
+make test-model MODEL=/path/to/model.safetensors
+make test-tokenizer TOKENIZER=/path/to/tokenizer.json
+
+./build/infer /path/to/model.safetensors 0
+./build/infer /path/to/model.safetensors 0 1 --generate 2
+./build/infer /path/to/model.safetensors \
+  --tokenizer /path/to/tokenizer.json --prompt "Hello, world!" --generate 2
+./build/infer /path/to/model.safetensors 0 --dump-logits logits.i32
+./build/infer /path/to/model.safetensors \
+  --tokenizer /path/to/tokenizer.json --score-file excerpt.txt</code></pre>
+    <p><code>model.safetensors</code> and <code>tokenizer.json</code> come from the official
+    <a href="https://huggingface.co/Qwen/Qwen3-0.6B/tree/main">Qwen3-0.6B Hugging Face repo</a>. The
+    repo distributes neither. For the event path (Clang 19, arena-capable libbpf and bpftool,
+    Linux 6.10+), use a disposable interface or network namespace:</p>
+<pre data-file="docs/usage.md"><code class="language-bash">make build/serve-xdp
+make build/xdp-client
+sudo ./build/serve-xdp /path/to/model.safetensors lo
+# In another shell, against that fresh loader instance:
+./build/xdp-client 127.0.0.1 9707 11 1879 0
+./build/xdp-client 127.0.0.1 --prefill --tokenizer /path/to/tokenizer.json \
+  --prompt "Hello, world!"</code></pre>
+
+    <h3>What happened in this orb</h3>
+    <p>This chapter was written in an Amp orb running Linux 6.1.189 on x86-64, with Debian
+    Clang 14.0.6 and libbpf 1.1. Unlike the repo's test host, this kernel has <strong>no BPF
+    JIT</strong> (there is no <code>/proc/sys/net/core/bpf_jit_enable</code>), so every program runs
+    in the interpreter. Here is what was tried:</p>
+    <ol>
+      <li><code>make</code>: all six operator objects compiled with Clang 14. Linking
+      <code>build/infer</code> first needed <code>libjson-c-dev</code> and <code>libonig-dev</code>.</li>
+      <li><code>sudo make test</code>: <code>tests/batch-smoke.c</code> calls
+      <code>bpf_map_get_info_by_fd</code>, which libbpf 1.1 does not have (it arrived in a later
+      libbpf). Without editing the repo, I passed
+      <code>CFLAGS="-O2 -Wall -Wextra -Dbpf_map_get_info_by_fd=bpf_obj_get_info_by_fd"</code>.</li>
+      <li>The pure-C conversion test and the callback-free matvec tile passed:
+<pre><code class="language-text">./build/safetensors-smoke
+BF16 to Q24: all 65,536 bit patterns matched
+./build/matvec-smoke build/qwen3_matvec.bpf.o
+kernel matvec mode=0: 3072 MACs, sum=-2294, tiles=24 (matches C reference)</code></pre></li>
+      <li>Every operator that uses <code>bpf_loop</code> was refused <em>after</em> the verifier had
+      accepted it:
+<pre><code class="language-text">./build/batch-smoke build/qwen3_batch.bpf.o
+libbpf: prog 'qwen3_batch_rows': BPF program load failed: Invalid argument
+libbpf: prog 'qwen3_batch_rows': -- BEGIN PROG LOAD LOG --
+callbacks are not allowed in non-JITed programs
+processed 52325 insns (limit 1000000) max_states_per_insn 4 total_states 447 peak_states 447 mark_read 441
+-- END PROG LOAD LOG --</code></pre></li>
+    </ol>
+    <p>The message comes from <code>fixup_call_args()</code> in
+    <a href="https://github.com/torvalds/linux/blob/v6.1/kernel/bpf/verifier.c">kernel/bpf/verifier.c</a>.
+    When JIT compilation is not done, it rejects any program with a callback ("interpreter doesn't
+    support them yet"), and in the same function it rejects kfunc calls ("calling kernel functions
+    are not allowed in non-JITed programs"). So on a kernel without a JIT, neither path can load:
+    the default path needs <code>bpf_loop</code> callbacks, and the event path needs the arena and
+    <code>bpf_wq</code> kfuncs. Linux 6.1 also predates arenas (6.9) and BPF workqueues (6.10).
+    Because nothing past the matvec tile could load, I did not download the 1,503,300,328-byte
+    model, which is also just over the 1.5 GB limit set for this chapter. <strong>No inference was
+    run, and no repo number was reproduced here.</strong></p>
+
+    <div class="callout tip"><span class="label">Lesson for your own projects</span>
+    <p><code>bpf_loop</code>, <code>bpf_for_each_map_elem</code>, timers, workqueues and every kfunc
+    quietly assume a JIT. Distribution kernels almost always ship with the JIT enabled (often with
+    <code>CONFIG_BPF_JIT_ALWAYS_ON</code>), but containers, sandboxes and some embedded kernels may
+    not. If your heavy BPF code has to run there, check <code>bpf_jit_enable</code> first, or keep
+    a callback-free fallback such as the repo's <code>experiments/qwen3_matvec.bpf.c</code>.</p></div>
+
+    <h2>What the experiment teaches about eBPF's limits</h2>
+    <div class="grid">
+      <div class="card"><h4>The verifier is a design constraint, not a wall</h4><p>Bounded
+      callbacks, rolled loops, masks and lookup tables were enough for every operator, including
+      softmax, square roots and a KV cache. The largest default program used about 5% of the
+      instruction budget in this orb's build.</p></div>
+      <div class="card"><h4>Crossings matter, until they don't</h4><p>Going from 143,667 to 50,667
+      syscalls per token roughly halved latency. Going a further 12× lower, to 4,169, changed
+      nothing measurable. Removing user-space scheduling altogether (event mode) helped single
+      tokens, not sequences.</p></div>
+      <div class="card"><h4>The ISA sets the ceiling</h4><p>No floats and no SIMD means several
+      scalar instructions per weight. The report suggests vector instructions or verified kfuncs for
+      matrix kernels as the way forward, and calls how to add them without weakening the verifier's
+      guarantees an open question.</p></div>
+      <div class="card"><h4>Memory is the other limit</h4><p>A dense integer KV cache costs
+      224 KiB per position. The event path caps it at 256 positions and one session. The arena holds
+      a 1.5 GB kernel-resident copy of the weights on top of the file mapping.</p></div>
+    </div>
+    <h3>Benefits</h3>
+    <ul>
+      <li>A concrete, reproducible upper bound on what verified BPF can compute, with every
+      operator differential-tested against an independent C reference. That testing even caught a
+      signed/unsigned bug in the C reference itself, at layer four.</li>
+      <li>A reusable event pattern: XDP admits a request, a self-requeuing <code>bpf_wq</code>
+      computes, and a poll answered with <code>XDP_TX</code> returns the result, with no user-space
+      worker. The report suggests it suits "a small model that makes one decision per packet or per
+      kernel event far better than it suits LLM serving."</li>
+      <li>A worked catalogue of verifier-friendly numerical kernels (integer sqrt, exp, SiLU, online
+      softmax, Taylor sin/cos) that apply to much smaller in-kernel models too.</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li>No speed benefit over one-core user-space BF16 inference. The README says this in bold.</li>
+      <li>Validated on one kernel and architecture (6.17, arm64). Verifier acceptance on other
+      kernels and compilers is unverified, and a JIT is required.</li>
+      <li>The tokenizer stays in user space, and so do (in operator mode) the schedule, the
+      embedding lookup and the RoPE trigonometry.</li>
+      <li>Event mode: one session, 256 positions, a fresh loader per sequence, raw token IDs.</li>
+      <li>Fidelity evidence is a handful of prompts and two text excerpts, not a benchmark.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>ML in the kernel.</strong> LiteFlow (SIGCOMM 2022) runs integer-quantized neural
+      network snapshots in the kernel datapath. LAKE (ASPLOS 2023) offloads kernel ML to GPUs. KML
+      brings a small ML framework into the kernel for storage tuning. Bachl et al. run decision
+      trees in eBPF for intrusion detection. All of these models are orders of magnitude smaller
+      than Qwen3-0.6B.</li>
+      <li><strong>Integer inference.</strong> I-BERT shows integer-only approximations of GELU,
+      softmax and LayerNorm for transformers. Its motivation is close to this repo's fixed-point
+      operators.</li>
+      <li><strong>Small engines.</strong> <a href="https://github.com/adriancable/qwen3.c">qwen3.c</a>
+      (CPU, single file C) and <a href="https://github.com/gigit0000/qwen3.cu">qwen3.cu</a> (CUDA)
+      implement the same model. The bpf-developer-tutorial's
+      <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/blob/main/src/xpu/flamegraph/README.md">CUDA
+      Qwen3 profiling example</a> uses eBPF only to observe it (<a href="09-bpf-developer-tutorial.html">chapter 09</a>).</li>
+      <li><strong>The opposite placement.</strong> <a href="https://github.com/pie-314/KernelX">KernelX</a>
+      feeds eBPF signals to a user-space LLM, which is closer to the org's LLM-for-kernel tools in
+      <a href="30-llm-kernel-tooling.html">chapter 30</a>.</li>
+      <li><strong>Other ways to run BPF outside the kernel.</strong> If what you want is
+      eBPF-programmable compute without the kernel's ISA ceiling, see the userspace runtime
+      <a href="14-bpftime-architecture.html">bpftime</a> and the LLVM-based
+      <a href="16-llvmbpf.html">llvmbpf</a>, whose JIT/AOT and GPU targets address exactly the
+      "no vector instructions" problem.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> In the default <code>build/infer</code> path, where are
+      the model's matrix weights while a token is computed?</p>
+        <button class="opt">Kernel-resident in a BPF arena, loaded once at startup</button>
+        <button class="opt" data-right>In a read-only mmap of the safetensors file; C converts 128 rows at a time to Q24 and copies them into an mmapable array map</button>
+        <button class="opt">In a BPF hash map keyed by tensor name</button>
+        <div class="why">Operator mode never makes the weights kernel-resident. Only the optional
+        arena builds (<code>infer-arena-bf16</code>, <code>serve-xdp</code>) copy the BF16 payload into
+        a BPF arena.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Why do the matrix weights use Q24 rather than Q8?</p>
+        <button class="opt">The verifier rejects 8-bit loads</button>
+        <button class="opt" data-right>On a real projection row, Q8 gave −0.0367 against a BF16 result of −0.00837 because large terms cancel; Q24 gave −0.00838</button>
+        <button class="opt">Q24 makes the program faster</button>
+        <div class="why">Precision, not speed or verifier rules. The whole-model INT4 and INT8
+        experiments also changed generated tokens.</div></div>
+      <div class="q"><p><strong>Q3.</strong> How does event mode run all 28 layers when XDP must
+      finish quickly?</p>
+        <button class="opt">It chains tail calls from the XDP program through 28 programs</button>
+        <button class="opt">It runs everything inline in XDP within the verifier's budget</button>
+        <button class="opt" data-right>XDP only queues a <code>bpf_wq</code> item; its callback does one bounded step, records the stage and calls <code>bpf_wq_start</code> on itself again</button>
+        <div class="why">The repo uses no tail calls. The workqueue callback is a state machine
+        (Q, K, V, ATTENTION, O, GATE, UP, DOWN, then FINAL_NORM and LOGITS) that requeues itself.</div></div>
+      <div class="q"><p><strong>Q4.</strong> On this chapter's 6.1 kernel without a JIT, why did
+      <code>qwen3_batch_rows</code> fail to load?</p>
+        <button class="opt">It exceeded the one-million-instruction limit</button>
+        <button class="opt" data-right>The verifier accepted it (52,325 insns processed), but the interpreter cannot run <code>bpf_loop</code> callbacks, so <code>fixup_call_args()</code> refused it</button>
+        <button class="opt">Socket filter programs cannot be run with BPF_PROG_RUN</button>
+        <div class="why">"callbacks are not allowed in non-JITed programs". The same function
+        rejects kfunc calls without a JIT, which rules out the arena/workqueue path too.</div></div>
+      <div class="q"><p><strong>Q5.</strong> According to the repo's measurements, what finally
+      limits speed?</p>
+        <button class="opt">The number of <code>bpf()</code> syscalls per token</button>
+        <button class="opt">Memory bandwidth for reading 1.2 GB of weights</button>
+        <button class="opt" data-right>The BPF instruction set: scalar integer instructions per MAC, about 1.0 billion MACs/s versus 2.9–4.1 billion for one-core BF16</button>
+        <div class="why">Reducing crossings below about 50,000 stopped helping. The roughly 2 GB/s
+        of weight reads is far below memory bandwidth. A lookup-table change and an extra
+        accumulator, which changed no crossings, did help.</div></div>
+      <div class="q"><p><strong>Q6.</strong> How does the event path return a token to the client?</p>
+        <button class="opt">It writes the result into a ring buffer that the client reads</button>
+        <button class="opt" data-right>The client sends a <code>Q3BR</code> poll; when the job is done and the counter matches, XDP rewrites the poll into <code>Q3BA</code> (token, Q16 logit, counter), swaps addresses and returns <code>XDP_TX</code></button>
+        <button class="opt">The workqueue callback transmits a new packet directly</button>
+        <div class="why">The original request packet has long since passed up the stack, so a
+        later poll packet is turned around in place.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/qwen3-ebpf">eunomia-bpf/qwen3-ebpf</a> — source,
+      <code>docs/architecture.md</code>, <code>docs/usage.md</code>, <code>docs/experiments.md</code>
+      (commit 3999b887d5af, 2026-10-27).</li>
+      <li>Y. Zheng. <a href="https://github.com/eunomia-bpf/qwen3-ebpf/blob/main/paper/bpfllm.pdf"><em>Can eBPF
+      Run a Real Language Model? Lessons from a Kernel-Resident Qwen3 Forward Pass</em></a>. Four-page
+      report in the repository (not a peer-reviewed publication), 2026.</li>
+      <li>eunomia blog, <a href="https://eunomia.dev/blog/2026/09/24/qwen3-ebpf-in-kernel-inference/">"Can a
+      language model run in Linux eBPF?"</a>, 2026-09-24.</li>
+      <li>A. Yang et al. (Qwen Team). <a href="https://arxiv.org/abs/2505.09388">Qwen3 Technical
+      Report</a>. arXiv:2505.09388, 2025.</li>
+      <li><a href="https://huggingface.co/Qwen/Qwen3-0.6B">Qwen3-0.6B model card and configuration</a>,
+      Hugging Face.</li>
+      <li>J. Ainslie et al. <a href="https://arxiv.org/abs/2305.13245">GQA: Training Generalized
+      Multi-Query Transformer Models from Multi-Head Checkpoints</a>. EMNLP 2023 (arXiv:2305.13245).</li>
+      <li>J. Su et al. <a href="https://arxiv.org/abs/2104.09864">RoFormer: Enhanced Transformer with
+      Rotary Position Embedding</a>. arXiv:2104.09864, 2021.</li>
+      <li>M. Milakov, N. Gimelshein. <a href="https://arxiv.org/abs/1805.02867">Online normalizer
+      calculation for softmax</a>. arXiv:1805.02867, 2018.</li>
+      <li>S. Kim et al. <a href="https://arxiv.org/abs/2101.01321">I-BERT: Integer-only BERT
+      Quantization</a>. ICML 2021 (arXiv:2101.01321).</li>
+      <li>J. Zhang et al. <a href="https://doi.org/10.1145/3544216.3544229">LiteFlow: Towards
+      High-Performance Adaptive Neural Networks for Kernel Datapath</a>. ACM SIGCOMM 2022.</li>
+      <li>H. Fingler et al. <a href="https://doi.org/10.1145/3575693.3575697">Towards a Machine
+      Learning-Assisted Kernel with LAKE</a>. ASPLOS 2023.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/verifier.html">eBPF
+      verifier</a>.</li>
+      <li>Linux v6.1 <a href="https://github.com/torvalds/linux/blob/v6.1/kernel/bpf/verifier.c"><code>kernel/bpf/verifier.c</code></a>,
+      <code>fixup_call_args()</code> (callbacks and kfuncs rejected without a JIT).</li>
+      <li>J. Corbet, <a href="https://lwn.net/Articles/877062/">A different approach to BPF loops</a>
+      (<code>bpf_loop</code>), LWN, 2021.</li>
+      <li>A. Starovoitov, <a href="https://lwn.net/Articles/961128/">bpf: Introduce BPF arena</a>
+      (patch series), and <a href="https://lwn.net/Articles/961941/">A proposal for shared memory in
+      BPF programs</a>, LWN, 2024.</li>
+      <li><a href="https://docs.ebpf.io/linux/kfuncs/bpf_wq_start/">KFunc <code>bpf_wq_start</code></a>,
+      eBPF Docs (since v6.10).</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="28-namei-ext.html"><small>Previous</small>28 · namei_ext</a>
+      <a class="next" href="30-llm-kernel-tooling.html"><small>Next</small>30 · LLM kernel tooling</a>
+    </div>
+</main>
+</div>
+<script>
+/* Chapter-specific widget: BigInt port of silu_q16() from src/bpf/qwen3_silu.bpf.c. */
+(function () {
+  var xin = document.getElementById('silu-x');
+  var rng = document.getElementById('silu-range');
+  var out = document.getElementById('silu-out');
+  if (!xin || !rng || !out) return;
+  var M64 = (1n << 64n) - 1n;
+  function siluQ16(x) {
+    var mag = x < 0n ? -x : x, e, den, sig, i, prod;
+    if (x === 0n) return 0n;
+    if (mag >= (16n << 16n)) return x > 0n ? x : 0n;
+    e = (1n << 32n) - (mag << 6n);
+    for (i = 0; i < 10; i++) e = ((e * e) & M64) >> 32n;
+    den = (1n << 32n) + e;
+    sig = x >= 0n ? (1n << 48n) / den : (e << 16n) / den;
+    prod = x * sig;                       /* signed 64-bit, no overflow in range */
+    return prod >> 16n;                   /* BigInt >> is arithmetic, like BPF ARSH */
+  }
+  function update(v) {
+    var x = Number(v);
+    if (!isFinite(x)) return;
+    var q = BigInt(Math.round(x * 65536));
+    if (q > 2147483647n) q = 2147483647n;
+    if (q < -2147483648n) q = -2147483648n;
+    var r = siluQ16(q), real = (Number(q) / 65536) / (1 + Math.exp(-Number(q) / 65536));
+    var got = Number(r) / 65536;
+    out.textContent =
+      'input   x_q16 = ' + q + '   (' + (Number(q) / 65536).toFixed(6) + ')\n' +
+      'BPF     silu_q16(x) = ' + r + '   (' + got.toFixed(6) + ')\n' +
+      'float   x*sigmoid(x) = ' + real.toFixed(6) + '\n' +
+      'abs error = ' + Math.abs(got - real).toExponential(3);
+  }
+  xin.addEventListener('input', function () { rng.value = xin.value; update(xin.value); });
+  rng.addEventListener('input', function () { xin.value = rng.value; update(rng.value); });
+  update(xin.value);
+})();
+</script>
+</body>
+</html>

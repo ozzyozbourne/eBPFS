@@ -1,0 +1,1415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>28 · namei_ext: BPF policy inside VFS path resolution · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="28">
+<meta name="chapter-part" content="Part VII · Kernel extension research">
+<meta name="chapter-summary" content="How namei_ext adds a cgroup-scoped eBPF hook to Linux pathname lookup and readdir so a policy can pass, rename, hide, or swap in an existing object, while the VFS and the real filesystem keep handling everything else.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/namei_ext">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VII · Kernel extension research › 28 · namei_ext</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 28</div>
+      <h1>namei_ext: programmable VFS name resolution</h1>
+      <p class="lede">Agent sandboxes, build systems and service launchers often need the same pathname to mean different
+        files for different processes, and they want that switch to happen right away. Today they get it with bind
+        mounts, OverlayFS, symlink farms, or a FUSE daemon. <code>namei_ext</code> is a research prototype that tries
+        something narrower: a cgroup-scoped eBPF program runs inside the kernel's path walk and picks
+        <em>which existing object</em> a name resolves to. The VFS and the real filesystem still handle everything
+        after that choice.</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="05-program-types-and-hooks.html">05</a>, <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/namei_ext">eunomia-bpf/namei_ext</a></span><span>~45 min</span></div>
+    </section>
+
+    <div class="callout warn"><span class="label">Status</span>
+      <p>This is a fast-moving research prototype, not a merged kernel feature. It needs a <strong>modified Linux
+      kernel</strong> (the fork <code>eunomia-bpf/kernel_nameiext</code>, based on Linux 7.1-rc7) built with
+      <code>CONFIG_NAMEI_EXT=y</code> and booted in KVM. It cannot run in the orb used to write this chapter, which
+      runs a stock 6.1 kernel. The only thing checked here was compiling the BPF policies with clang. Everything in
+      this chapter comes from repository HEAD <code>3f67fcbd663a</code> (2026-10-11) and the kernel fork at
+      <code>b07117a3cb41</code> (2026-08-01). The kernel diff was read through the GitHub compare API; the fork was not cloned.</p></div>
+
+    <h2>Why this matters</h2>
+    <p>Some workloads keep asking the same question: <em>which file should this pathname mean right now, for this
+    process?</em></p>
+    <ul>
+      <li>An <strong>AI coding agent</strong> works in <code>/work/ws</code>. When it forks, checkpoints or rolls back,
+        the orchestrator wants <code>/work/ws</code> to point at a different snapshot of the tree. Two agents running
+        at once should each see their own snapshot under the <em>same</em> path, because their tools, caches and
+        prompts have that path baked in.</li>
+      <li>A <strong>build action</strong> in a sandbox should see only its declared inputs. An undeclared file should
+        not exist from its point of view, even if it exists on disk.</li>
+      <li>A <strong>toolchain manager</strong> wants <code>/opt/py/bin/python</code> to mean Python 3.10 for one group
+        of processes and 3.12 for another, and wants to switch and roll back without rewriting the tree.</li>
+      <li>A <strong>checkpoint/restart</strong> system restores a program whose remembered paths now live somewhere
+        else.</li>
+    </ul>
+    <p>Linux already has several ways to build these "views". They all bundle the <em>choice</em> of object together
+    with something heavier. Mount namespaces and bind mounts build the view ahead of time, as mount-table state.
+    OverlayFS builds a merged filesystem. FUSE sends every operation to a user-space daemon, which then owns caching,
+    errors and availability. A custom or stackable filesystem means writing (and maintaining) a whole set of VFS
+    methods. The <code>namei_ext</code> authors argue that many of these workloads only need the choice. After
+    lookup, reads, writes, permissions, page cache and persistence could all stay with ext4 or tmpfs as usual.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p><strong>Dynamic filesystem views are a pathname <em>late-binding</em> problem, not necessarily a
+      new-filesystem problem.</strong> namei_ext places one bounded eBPF decision function at three VFS spots:
+      component lookup, final-component lookup in <code>open()</code>, and directory iteration. The function returns
+      one of four actions: <code>PASS</code>, <code>REDIRECT</code>, <code>HIDE</code> or <code>SELECT_TARGET</code>.
+      The kernel checks the action and then carries on with the normal path walk. The authors compare this to
+      <a href="05-program-types-and-hooks.html">sched_ext</a>: BPF supplies the policy, and the kernel keeps the
+      machinery.</p></div>
+
+    <p>This chapter assumes you know what a BPF program type, an attach point and a map are (<a href="04-maps-helpers-kfuncs.html">chapter 04</a>,
+    <a href="05-program-types-and-hooks.html">chapter 05</a>). It first covers how Linux resolves a pathname, because
+    that is where the hook lives. Then it reads the kernel patch and the policies, and ends with what the repository's
+    own evaluation reports.</p>
+
+    <h2>Background: how Linux turns a string into a file</h2>
+
+    <h3>Dentries, inodes, mounts and <code>struct path</code></h3>
+    <p>The Virtual File System (VFS) is the layer between system calls and individual filesystems. It caches names in
+    <strong>dentries</strong> (directory entries). A dentry links a name inside a parent directory to an
+    <strong>inode</strong>, the filesystem's object for a file or directory. Many dentries together form the
+    <em>dcache</em>. One directory tree can be mounted in several places, so a dentry alone does not say "where" you
+    are. The kernel pairs it with a <code>struct vfsmount</code>, and that pair, <code>struct path { mnt, dentry }</code>,
+    is the kernel's idea of a location. Keep this in mind: <strong>namei_ext's <code>SELECT_TARGET</code> action works
+    by swapping in a different <code>struct path</code> halfway through a walk.</strong></p>
+
+    <h3>The path walk: <code>link_path_walk</code> and <code>walk_component</code></h3>
+    <p>The kernel calls pathname resolution "namei" (name-to-inode). The code is in <code>fs/namei.c</code>. Neil
+    Brown's kernel document <em>Pathname lookup</em> and his three LWN articles from 2015 describe it in detail. The
+    outline goes like this. A <code>struct nameidata</code> holds the walk state: the current <code>path</code>, the
+    component being looked at (<code>nd-&gt;last</code>, a <code>qstr</code> holding name, length and hash), lookup
+    flags, the root, a symlink stack, and sequence numbers. <code>link_path_walk()</code> splits the string at
+    <code>/</code>. For each component except the last, it calls <code>walk_component()</code>, which:</p>
+    <ol>
+      <li>handles <code>.</code> and <code>..</code> separately (<code>handle_dots</code>), because <code>..</code> has to
+        respect the process root and mount boundaries;</li>
+      <li>tries <code>lookup_fast()</code> in the dcache, and on a miss falls back to <code>lookup_slow()</code>, which
+        calls the filesystem's <code>-&gt;lookup</code> inode operation;</li>
+      <li>calls <code>step_into()</code> to cross mount points and follow symlinks.</li>
+    </ol>
+    <p>The <strong>last</strong> component gets different handling, because what to do with it depends on the system
+    call: <code>stat</code> wants the object, <code>open(O_CREAT)</code> may create it, <code>unlink</code> wants the
+    parent. For <code>open</code>, the final step is <code>open_last_lookups()</code>, called from
+    <code>path_openat()</code>.</p>
+
+    <h3>RCU-walk and ref-walk</h3>
+    <p>Taking a reference count on every dentry along a path makes cache lines bounce between CPUs. So Linux first
+    tries <strong>RCU-walk</strong>. It walks without taking references or locks, relying on RCU to keep objects alive,
+    and checks per-dentry and per-mount sequence counters (<code>d_seq</code>, <code>mount_lock</code>) to catch
+    concurrent renames or unmounts. If something would need to block, or a sequence check fails, the walk tries
+    <code>try_to_unlazy()</code> to switch to <strong>ref-walk</strong> in place, taking real references. If that also
+    fails, the whole walk returns <code>-ECHILD</code> and restarts from the beginning in ref-walk mode. This matters
+    for namei_ext for two reasons. A BPF program can run on the RCU fast path, and a full restart means
+    <strong>the policy can run more than once for the same system call</strong>.</p>
+
+    <h3>Mount namespaces and <code>openat2()</code> RESOLVE_* flags</h3>
+    <p>A <strong>mount namespace</strong> gives a group of processes its own mount table, so bind mounts and overlay
+    mounts can differ per container. This is the standard Linux way to give processes different views. But the view
+    is <em>built ahead of time</em>: changing it means mounting or unmounting, it covers whole subtrees, and it applies
+    to everything in the namespace.</p>
+    <p><code>openat2(2)</code> (Linux 5.6) lets a caller <em>restrict</em> resolution with <code>RESOLVE_*</code>
+    flags. <code>RESOLVE_BENEATH</code> rejects any path that escapes the starting directory.
+    <code>RESOLVE_IN_ROOT</code> treats the directory as the root. <code>RESOLVE_NO_XDEV</code> forbids crossing
+    mounts. <code>RESOLVE_NO_SYMLINKS</code> and <code>RESOLVE_NO_MAGICLINKS</code> limit link following.
+    <code>RESOLVE_CACHED</code> (5.12) fails with <code>EAGAIN</code> unless everything is already in the dcache, which
+    in practice forces an RCU-walk-only lookup. Inside the kernel, the first two flags become <code>LOOKUP_BENEATH</code>
+    and <code>LOOKUP_IN_ROOT</code> (together <code>LOOKUP_IS_SCOPED</code>), and the third becomes
+    <code>LOOKUP_NO_XDEV</code>. As shown below, namei_ext has to honour these flags when it swaps objects. Otherwise
+    a policy could break a sandbox that the caller asked the kernel to enforce.</p>
+
+    <h3>Landlock and BPF LSM: the access-control neighbours</h3>
+    <p><strong>Landlock</strong> lets an unprivileged process sandbox itself. It builds a ruleset of allowed access
+    rights on file hierarchies and then restricts itself irrevocably. <strong>BPF LSM</strong> (<a href="05-program-types-and-hooks.html">chapter 05</a>)
+    attaches BPF programs to LSM hooks such as <code>file_open</code> and returns allow or <code>-EPERM</code>. Both are
+    <em>mediation</em>: the name has already resolved to an object, and the hook only decides whether the access may go
+    ahead. Neither can make <code>/work/ws</code> mean a different directory, or hide an entry from <code>readdir</code>
+    while keeping the parent listable. namei_ext deliberately sits next to them, not on top of them: it changes
+    <em>which</em> object a name denotes, and leaves the permission check on the result to the normal path.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 230" role="img" aria-label="Design-space spectrum: from materialized namespaces, through eBPF LSM and namei_ext, to FUSE and custom filesystems, with increasing ownership of filesystem semantics">
+        <style>
+          .b28{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .h28{fill:var(--bg3);stroke:var(--accent);stroke-width:2.5}
+          .t28{fill:var(--fg);font:13px sans-serif}
+          .m28{fill:var(--muted);font:12px sans-serif}
+          .a28{stroke:var(--accent2);stroke-width:2;fill:none;marker-end:url(#ah28s)}
+        </style>
+        <defs><marker id="ah28s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent2)"/></marker></defs>
+        <line class="a28" x1="30" y1="200" x2="870" y2="200"/>
+        <text class="m28" x="30" y="222">less owned by the extension</text>
+        <text class="m28" x="690" y="222">more owned by the extension</text>
+        <rect class="b28" x="20" y="20" width="195" height="160" rx="8"/>
+        <text class="t28" x="32" y="44" style="font-weight:600">Materialized views</text>
+        <text class="m28" x="32" y="66">bind mounts, mount ns,</text>
+        <text class="m28" x="32" y="84">OverlayFS, symlink farms,</text>
+        <text class="m28" x="32" y="102">copies, projected volumes</text>
+        <text class="m28" x="32" y="130">view built before lookup;</text>
+        <text class="m28" x="32" y="148">changing it = remount/copy</text>
+        <rect class="b28" x="235" y="20" width="195" height="160" rx="8"/>
+        <text class="t28" x="247" y="44" style="font-weight:600">eBPF LSM / Landlock</text>
+        <text class="m28" x="247" y="66">hook after the name has</text>
+        <text class="m28" x="247" y="84">resolved; returns allow</text>
+        <text class="m28" x="247" y="102">or -EPERM</text>
+        <text class="m28" x="247" y="130">mediates access, cannot</text>
+        <text class="m28" x="247" y="148">pick a different object</text>
+        <rect class="h28" x="450" y="20" width="195" height="160" rx="8"/>
+        <text class="t28" x="462" y="44" style="font-weight:600">namei_ext</text>
+        <text class="m28" x="462" y="66">BPF runs during lookup</text>
+        <text class="m28" x="462" y="84">and readdir: PASS,</text>
+        <text class="m28" x="462" y="102">REDIRECT, HIDE, SELECT</text>
+        <text class="m28" x="462" y="130">VFS + lower FS keep</text>
+        <text class="m28" x="462" y="148">data, perms, page cache</text>
+        <rect class="b28" x="665" y="20" width="215" height="160" rx="8"/>
+        <text class="t28" x="677" y="44" style="font-weight:600">FUSE / stackable / custom FS</text>
+        <text class="m28" x="677" y="66">FUSE, FUSE-BPF, ExtFUSE,</text>
+        <text class="m28" x="677" y="84">Wrapfs, Bento</text>
+        <text class="m28" x="677" y="130">extension owns inodes,</text>
+        <text class="m28" x="677" y="148">file ops, daemon, caching</text>
+      </svg>
+      <figcaption>Figure 28.1 — Where namei_ext sits in the design space. The repository states the ordering as
+      "bind/Overlay/materialization &lt; eBPF LSM &lt; namei_ext &lt; FUSE/custom FS" (README of <code>docs/paper</code>).</figcaption>
+    </figure>
+
+    <h2>What namei_ext adds to the kernel</h2>
+
+    <p>One fact first, because a reader who has seen <a href="20-gpu-ext.html">gpu_ext</a> or sched_ext might expect
+    otherwise: <strong>namei_ext is not a <code>struct_ops</code> interface, and it does not add kfuncs.</strong> It is
+    a classic <em>new program type plus cgroup attach type</em>, built the same way as <code>cgroup/sysctl</code> or
+    <code>cgroup/dev</code>:</p>
+    <ul>
+      <li>program type <code>BPF_PROG_TYPE_NAMEI_EXT</code>, attach type <code>BPF_CGROUP_NAMEI_EXT</code>;</li>
+      <li>libbpf section name <code>SEC("cgroup/namei_ext")</code>;</li>
+      <li>one context struct, <code>struct bpf_namei_ext_ctx</code>, with a fixed 64-byte name buffer;</li>
+      <li>the program's <strong>return value is the action</strong>, and the verifier limits it to the range 0–3;</li>
+      <li>the program is attached to a cgroup v2 directory with <code>bpf_prog_attach()</code>. It governs every task in
+        that cgroup (and in descendants, through the effective program array).</li>
+    </ul>
+    <p>The design document says this on purpose: "the kernel-facing BPF ABI exposes one decision function. Lookup and
+    directory enumeration are event types passed to that one function." A <code>struct_ops</code> table with many
+    callbacks was not the goal. The goal was one decision with a small fixed output.</p>
+
+    <h3>The diff at a glance</h3>
+    <p>Comparing the fork's last upstream merge (<code>062871f1371b</code>, "Merge tag 'pinctrl-v7.1-3'", 2026-06-13)
+    with the pinned submodule commit (<code>b07117a3cb41</code>) gives 12 commits across 20 files:</p>
+    <div class="grid">
+      <div class="card"><h4>VFS</h4><p><code>fs/namei.c</code> (+230/−13): wrap <code>walk_component</code> and
+        <code>open_last_lookups</code>. <code>fs/readdir.c</code> (+7/−1): wrap <code>iterate_dir</code>.
+        <code>fs/namei_ext.c</code> (new, 909 lines): target registry, parent scope index, context building, action
+        validation, readdir filter. <code>fs/Kconfig</code>: <code>CONFIG_NAMEI_EXT</code>.</p></div>
+      <div class="card"><h4>BPF core</h4><p><code>include/uapi/linux/bpf.h</code> (+32): prog type, attach type, ctx,
+        enums. <code>kernel/bpf/cgroup.c</code> (+196): run loop, owner tracking, verifier ops.
+        <code>syscall.c</code> (+20/−1): attach/detach/query plumbing. <code>verifier.c</code> (+4): return
+        range.</p></div>
+      <div class="card"><h4>Tools</h4><p>libbpf (<code>libbpf.c</code>, <code>bpf.c</code>, <code>libbpf_probes.c</code>):
+        section name and type names. bpftool <code>cgroup.c</code> and <code>common.c</code>: one line each so
+        <code>bpftool cgroup</code> knows the attach type.</p></div>
+    </div>
+
+    <p>The kernel fork's own history tells the story of the mechanism (from <code>gh api repos/eunomia-bpf/kernel_nameiext/commits</code>):</p>
+    <pre><code class="language-plaintext">31a33d22c212 2026-06-13 bpf: add namei_ext redirect prototype
+9f6695adf237 2026-07-03 namei_ext: expose parent identity in BPF ctx
+309a05d87e98 2026-07-27 namei_ext: isolate attached lookup slow paths
+c28220593eb0 2026-07-27 namei_ext: keep pass decisions in RCU walk
+c7af99f67609 2026-07-27 namei_ext: scope policy dispatch to exact parents
+8fd1fb52fa8d 2026-07-27 namei_ext: skip unmanaged parents before dispatch
+83d52c2168e2 2026-07-27 namei_ext: make target lookup RCU-safe
+bdc9a83e3dfb 2026-07-27 namei_ext: keep selected targets in RCU walk
+1e81d4793c78 2026-07-29 namei_ext: reject zero target before walk mode
+621aff8d1bb5 2026-07-29 namei_ext: support registered final file targets
+b07117a3cb41 2026-08-01 namei_ext: expose stat-compatible parent device</code></pre>
+    <p>(One more commit in the range, <code>6641100ef134</code> on 2026-07-18, has the message "bubui".) The order is
+    worth noting. It started as a name-redirect prototype. Then came parent identity, so policies can key on "this
+    name in <em>this</em> directory". The late-July burst was about performance and correctness on the hot path:
+    keeping the RCU walk, filtering unmanaged parents before any dispatch, and making selected targets safe under RCU.
+    Final-file targets came last.</p>
+
+    <h2>Where the hook sits in the path walk</h2>
+
+    <figure>
+      <svg viewBox="0 0 900 470" role="img" aria-label="Path walk with namei_ext hook points: openat enters path_openat and link_path_walk; each component goes through walk_component, which checks the static key and the managed-parent filter before calling the namei_ext slow path and the BPF program; the final component goes through open_last_lookups with the same gate; readdir goes through iterate_dir with a filtering actor">
+        <style>
+          .b28{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .k28{fill:var(--bg3);stroke:var(--accent);stroke-width:2}
+          .p28{fill:var(--bg3);stroke:var(--accent2);stroke-width:2}
+          .t28{fill:var(--fg);font:13px sans-serif}
+          .o28{fill:var(--fg);font:12px monospace}
+          .m28{fill:var(--muted);font:12px sans-serif}
+          .r28{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah28w)}
+          .g28{stroke:var(--accent);stroke-width:1.8;fill:none;marker-end:url(#ah28w)}
+          .d28{stroke:var(--border);stroke-width:1;stroke-dasharray:5 4}
+        </style>
+        <defs><marker id="ah28w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="m28" x="10" y="18">syscalls</text>
+        <rect class="b28" x="30" y="28" width="230" height="36" rx="6"/><text class="o28" x="42" y="51">openat / stat / execve ...</text>
+        <rect class="b28" x="600" y="28" width="260" height="36" rx="6"/><text class="o28" x="612" y="51">getdents64 (ls, readdir)</text>
+        <line class="d28" x1="0" y1="78" x2="900" y2="78"/>
+        <text class="m28" x="10" y="96">fs/namei.c</text>
+        <rect class="b28" x="30" y="104" width="230" height="36" rx="6"/><text class="o28" x="42" y="127">path_openat / link_path_walk</text>
+        <line class="r28" x1="145" y1="64" x2="145" y2="102"/>
+        <rect class="b28" x="30" y="166" width="230" height="56" rx="6"/><text class="o28" x="42" y="188">walk_component()</text><text class="m28" x="42" y="208">each non-final component</text>
+        <line class="r28" x1="145" y1="140" x2="145" y2="164"/>
+        <rect class="b28" x="300" y="166" width="250" height="56" rx="6"/><text class="o28" x="312" y="188">open_last_lookups()</text><text class="m28" x="312" y="208">final component of open()</text>
+        <line class="r28" x1="260" y1="122" x2="420" y2="164"/>
+        <rect class="k28" x="30" y="250" width="520" height="50" rx="6"/>
+        <text class="t28" x="42" y="271">gate: namei_ext_enabled() &amp;&amp; namei_ext_parent_maybe_managed(&amp;nd-&gt;path)</text>
+        <text class="m28" x="42" y="290">static key (any prog attached?) + RCU exact-parent index; false → unchanged stock code</text>
+        <line class="r28" x1="145" y1="222" x2="145" y2="248"/>
+        <line class="r28" x1="420" y1="222" x2="420" y2="248"/>
+        <rect class="b28" x="30" y="330" width="250" height="56" rx="6"/><text class="o28" x="42" y="352">*_common()</text><text class="m28" x="42" y="372">lookup_fast / slow, step_into</text>
+        <line class="r28" x1="100" y1="300" x2="100" y2="328"/><text class="m28" x="108" y="320">no</text>
+        <rect class="k28" x="300" y="330" width="250" height="56" rx="6"/><text class="o28" x="312" y="352">*_namei_ext() (noinline)</text><text class="m28" x="312" y="372">namei_ext_lookup(ctx)</text>
+        <line class="g28" x1="420" y1="300" x2="420" y2="328"/><text class="m28" x="428" y="320">yes</text>
+        <line class="d28" x1="0" y1="404" x2="900" y2="404"/>
+        <text class="m28" x="580" y="96">fs/readdir.c</text>
+        <rect class="b28" x="600" y="104" width="260" height="36" rx="6"/><text class="o28" x="612" y="127">iterate_dir()</text>
+        <line class="r28" x1="730" y1="64" x2="730" y2="102"/>
+        <rect class="k28" x="600" y="166" width="260" height="56" rx="6"/><text class="o28" x="612" y="188">namei_ext_iterate_dir()</text><text class="m28" x="612" y="208">same gate on file-&gt;f_path</text>
+        <line class="g28" x1="730" y1="140" x2="730" y2="164"/>
+        <rect class="k28" x="600" y="250" width="260" height="50" rx="6"/><text class="o28" x="612" y="271">namei_ext_filldir()</text><text class="m28" x="612" y="290">BPF called once per entry</text>
+        <line class="g28" x1="730" y1="222" x2="730" y2="248"/>
+        <rect class="p28" x="300" y="416" width="560" height="44" rx="6"/>
+        <text class="t28" x="312" y="436">cgroup/namei_ext BPF program (task's cgroup v2)</text>
+        <text class="o28" x="312" y="452">return PASS | REDIRECT | HIDE | SELECT_TARGET</text>
+        <line class="g28" x1="420" y1="386" x2="420" y2="414"/>
+        <line class="g28" x1="730" y1="300" x2="730" y2="414"/>
+        <line class="r28" x1="155" y1="386" x2="155" y2="440"/><text class="m28" x="40" y="455">filesystem -&gt;lookup, ext4/tmpfs</text>
+      </svg>
+      <figcaption>Figure 28.2 — The three hook points. Every hook is behind a gate. If no program is attached
+      anywhere (the static key is off), or the current parent directory is not in the managed set, the kernel runs
+      the original code path.</figcaption>
+    </figure>
+
+    <p>Here is the real change to <code>walk_component()</code>. The original body moved into
+    <code>walk_component_common()</code>. The dispatcher keeps the <code>.</code>/<code>..</code> special case
+    <em>before</em> the hook, so a policy never sees, and can never redirect, the dot entries.</p>
+
+    <pre data-file="kernel/fs/namei.c"><code class="language-c">static __always_inline const char *walk_component(struct nameidata *nd, int flags)
+{
+	/*
+	 * "." and ".." are special - ".." especially so because it has
+	 * to be able to know about the current root directory and
+	 * parent relationships.
+	 */
+	if (unlikely(nd-&gt;last_type != LAST_NORM)) {
+		if (unlikely(nd-&gt;depth) &amp;&amp; !(flags &amp; WALK_MORE))
+			put_link(nd);
+		return handle_dots(nd, nd-&gt;last_type);
+	}
+	if (namei_ext_enabled() &amp;&amp;
+	    namei_ext_parent_maybe_managed(&amp;nd-&gt;path))
+		return walk_component_namei_ext(nd, flags);
+	return walk_component_common(nd, flags);
+}</code></pre>
+
+    <p><code>namei_ext_enabled()</code> is just <code>cgroup_bpf_enabled(CGROUP_NAMEI_EXT)</code>, the same
+    static-key test every cgroup-BPF hook uses. When nothing is attached anywhere, it compiles down to a patched-out
+    jump. <code>namei_ext_parent_maybe_managed()</code> is the second, finer filter that commit <code>8fd1fb52f</code>
+    added. It looks up the current parent <code>struct path</code> in a global RCU hash of "managed parents" and
+    returns true only if some attached policy declared that exact directory, or if some policy runs in "global"
+    scope. The design document spells out the contract: "A positive prefilter result still runs the authoritative
+    attachment and scope checks; a false negative is forbidden." The slow-path function is marked
+    <code>noinline</code>, so its stack frame and code stay out of the hot <code>walk_component</code>.</p>
+
+    <h3>Inside the slow path</h3>
+    <p>When the gate passes, <code>walk_component_namei_ext()</code> builds a context, runs the program, and applies
+    the result. The code is short enough to read whole:</p>
+
+    <pre data-file="kernel/fs/namei.c"><code class="language-c">static noinline const char *
+walk_component_namei_ext(struct nameidata *nd, int flags)
+{
+	struct namei_ext_redirect redirect;
+	struct qstr saved_last;
+	struct qstr redirected_last;
+	bool redirected;
+	const char *res;
+	int error;
+
+	error = namei_ext_lookup(&amp;nd-&gt;path, nd-&gt;inode, &amp;nd-&gt;last,
+				 NAMEI_EXT_LOOKUP, nd-&gt;flags &amp; ~LOOKUP_RCU,
+				 &amp;redirect);
+	if (unlikely(error)) {
+		if ((nd-&gt;flags &amp; LOOKUP_RCU) &amp;&amp; !try_to_unlazy(nd))
+			return ERR_PTR(-ECHILD);
+		return ERR_PTR(error);
+	}
+	if (redirect.target_pending) {
+		error = namei_ext_resolve_target(&amp;redirect,
+						 nd-&gt;flags &amp; LOOKUP_RCU);
+		/* ... same error handling ... */
+	}
+	if (redirect.active &amp;&amp; (nd-&gt;flags &amp; LOOKUP_RCU) &amp;&amp;
+	    !try_to_unlazy(nd))
+		return ERR_PTR(-ECHILD);
+	if (redirect.target_active) {
+		error = namei_ext_apply_target(nd, &amp;redirect,
+					       flags &amp; WALK_TRAILING);
+		if (unlikely(error))
+			return ERR_PTR(error);
+		if (unlikely(nd-&gt;depth) &amp;&amp; !(flags &amp; WALK_MORE))
+			put_link(nd);
+		return NULL;
+	}
+
+	redirected = namei_ext_apply_redirect(nd, &amp;redirect, &amp;saved_last,
+					      &amp;redirected_last);
+	if (redirected) {
+		error = namei_ext_hash_redirect(nd);
+		/* ... restore nd-&gt;last on error ... */
+	}
+	res = walk_component_common(nd, flags);
+	if (redirected)
+		nd-&gt;last = saved_last;
+	return res;
+}</code></pre>
+
+    <p>Three details are worth noting.</p>
+    <ul>
+      <li><strong>PASS stays on RCU-walk.</strong> If the program returns PASS, nothing is active and the function
+        drops straight into <code>walk_component_common()</code> in whatever mode the walk was in. That is commit
+        <code>c28220593eb0</code>, "keep pass decisions in RCU walk".</li>
+      <li><strong>REDIRECT leaves RCU-walk.</strong> Before swapping <code>nd-&gt;last</code> for the new name, it calls
+        <code>try_to_unlazy()</code>. The redirected name is then rehashed (with the filesystem's
+        <code>d_hash</code> if it has one, for case-insensitive filesystems for example), looked up through the
+        <em>normal</em> code in the <em>same parent directory</em>, and the original name is restored afterwards.
+        REDIRECT is "same-parent rename at lookup time", not "jump anywhere".</li>
+      <li><strong>SELECT_TARGET returns <code>NULL</code> without calling <code>step_into</code>.</strong> The walk
+        continues from the swapped-in <code>nd-&gt;path</code>, so the next component is looked up inside the selected
+        directory.</li>
+    </ul>
+    <p><code>open_last_lookups_namei_ext()</code> has the same shape for the final component of <code>open()</code>.
+    It first ORs in <code>op-&gt;intent</code>, so the policy sees whether this is a create (<code>LOOKUP_CREATE</code>),
+    and then calls <code>open_last_lookups_common()</code>, which is the original open/create code.</p>
+
+    <h3>Turning a BPF return value into a kernel action</h3>
+    <p><code>namei_ext_lookup()</code> in the new <code>fs/namei_ext.c</code> runs the program and checks what it
+    asked for. This function is where "bounded actions" gets its meaning:</p>
+
+    <pre data-file="kernel/fs/namei_ext.c"><code class="language-c">	namei_ext_init_ctx(&amp;ctx, parent, parent_inode, event, lookup_flags, name);
+	action = __cgroup_bpf_run_namei_ext(&amp;ctx, parent);
+	if (action &lt; 0)
+		return action;
+
+	switch (action) {
+	case BPF_NAMEI_EXT_PASS:
+		return 0;
+	case BPF_NAMEI_EXT_REDIRECT:
+		if (lookup_flags &amp; LOOKUP_CREATE)
+			return -EOPNOTSUPP;
+		if (!namei_ext_redirect_valid(&amp;ctx))
+			return -EINVAL;
+		namei_ext_fill_redirect(parent, &amp;ctx, redirect);
+		return 0;
+	case BPF_NAMEI_EXT_HIDE:
+		return -ENOENT;
+	case BPF_NAMEI_EXT_SELECT_TARGET:
+		if (lookup_flags &amp; LOOKUP_CREATE)
+			return -EOPNOTSUPP;
+		redirect-&gt;target_cgroup_id = ctx.cgroup_id;
+		redirect-&gt;target_id = ctx.target_id;
+		redirect-&gt;target_pending = true;
+		return 0;
+	default:
+		return -EINVAL;
+	}</code></pre>
+
+    <p><code>namei_ext_redirect_valid()</code> rejects an empty name, a name longer than 64 bytes, <code>"."</code>,
+    <code>".."</code>, and any name containing <code>'/'</code> or NUL. So REDIRECT can never climb out of the parent
+    or inject a multi-component path. HIDE is just <code>-ENOENT</code>: the process gets the same error as for a
+    file that does not exist. Both object-changing actions refuse <code>O_CREAT</code>-style lookups with
+    <code>-EOPNOTSUPP</code>, so a policy cannot redirect a <em>create</em> to somewhere else.</p>
+
+    <h3>Accepting a policy-selected object</h3>
+    <p>The authors call <code>SELECT_TARGET</code> the hard part, and the reason is in the code. A BPF program cannot
+    return a pointer or a path string. It returns a small integer <code>target_id</code>. The kernel looks the ID up
+    in a registry of <code>struct path</code>s that user space registered earlier (see below), keyed by
+    <em>(cgroup id, target id)</em>. Before the walk accepts that object, <code>namei_ext_apply_target()</code>
+    enforces the caller's own constraints:</p>
+
+    <pre data-file="kernel/fs/namei.c"><code class="language-c">	borrowed = redirect-&gt;target_borrowed;
+	if (unlikely(nd-&gt;flags &amp; LOOKUP_IS_SCOPED))
+		goto err_exdev;
+	if (unlikely((nd-&gt;flags &amp; LOOKUP_NO_XDEV) &amp;&amp;
+		     nd-&gt;path.mnt != redirect-&gt;target.mnt))
+		goto err_exdev;
+	if (unlikely(!d_can_lookup(redirect-&gt;target.dentry) &amp;&amp;
+		     !d_is_reg(redirect-&gt;target.dentry))) {
+		error = -EOPNOTSUPP;
+		goto err_target;
+	}
+	if (unlikely(!d_can_lookup(redirect-&gt;target.dentry) &amp;&amp;
+		     (!final || (nd-&gt;flags &amp; LOOKUP_DIRECTORY)))) {
+		error = -ENOTDIR;
+		goto err_target;
+	}
+
+	if (borrowed) {
+		if (WARN_ON_ONCE(!(nd-&gt;flags &amp; LOOKUP_RCU))) {
+			/* ... */
+			return -EINVAL;
+		}
+		nd-&gt;seq = read_seqcount_begin(&amp;redirect-&gt;target.dentry-&gt;d_seq);
+	} else {
+		path_put(&amp;nd-&gt;path);
+	}
+	nd-&gt;path = redirect-&gt;target;
+	nd-&gt;inode = nd-&gt;path.dentry-&gt;d_inode;
+	nd-&gt;state |= ND_JUMPED;</code></pre>
+
+    <p>Reading the checks in order:</p>
+    <ul>
+      <li>An <code>openat2()</code> caller that asked for <code>RESOLVE_BENEATH</code> or <code>RESOLVE_IN_ROOT</code>
+        gets <code>-EXDEV</code>. A teleport to a registered object cannot be proved to stay beneath the start
+        directory, so it is refused outright. <code>RESOLVE_NO_XDEV</code> is refused only when the target is on a
+        different mount. The functional test suite checks all three (<code>select_file_no_xdev_rejected</code>,
+        <code>select_file_beneath_rejected</code>, <code>select_file_in_root_rejected</code>, all expecting
+        <code>EXDEV</code>).</li>
+      <li>Only directories and regular files can be targets. A regular file is allowed only as the <em>final</em>
+        component and only when the caller did not ask for <code>O_DIRECTORY</code>.</li>
+      <li>In RCU-walk the registry entry is <em>borrowed</em>: no reference is taken, and the walk records the
+        target dentry's <code>d_seq</code> so the usual legitimization step can either take real references or fail
+        the walk. In ref-walk, <code>namei_ext_get_target()</code> already took a <code>path_get</code>, and the old
+        position is <code>path_put</code>.</li>
+      <li><code>ND_JUMPED</code> is the flag the kernel already sets when a walk jumps (for example through a
+        <code>/proc/self/fd</code> magic link). Setting it tells later code that the walk did not simply descend.</li>
+    </ul>
+    <p>After this, the selected object goes through ordinary VFS processing: permission checks on its inode and mount,
+    <code>may_open</code>, the filesystem's <code>open</code>, and so on. The registry's comment in the design
+    document is precise about what this does <em>not</em> do: "lookup does not replay traversal through the target's
+    physical parents." If you could not search the target's real parent directory, you can still reach the target
+    through the logical name. That is a deliberate grant of reachability, and it is why registration is a privileged
+    operation.</p>
+
+    <h3>Lifetime: the registry under RCU</h3>
+    <p>Registry replacement uses the textbook RCU pattern. The writer swaps the hash-list node, waits a grace period,
+    and only then drops the old <code>struct path</code>:</p>
+    <pre data-file="kernel/fs/namei_ext.c"><code class="language-c">	hash_for_each_possible(namei_ext_targets, target, node, key) {
+		if (target-&gt;cg_id != cg_id ||
+		    target-&gt;target_id != target_id)
+			continue;
+		hlist_replace_rcu(&amp;target-&gt;node, &amp;new_target-&gt;node);
+		old_target = target;
+		break;
+	}
+	if (!old_target)
+		hash_add_rcu(namei_ext_targets, &amp;new_target-&gt;node, key);
+out_unlock:
+	mutex_unlock(&amp;namei_ext_targets_lock);
+	if (ret) {
+		kfree(new_target);
+	} else if (old_target) {
+		synchronize_rcu();
+		path_put(&amp;old_target-&gt;path);
+		kfree(old_target);
+	}</code></pre>
+    <p>So an RCU-walk that borrowed the old path before the swap can still use it safely until it either legitimizes
+    (takes its own references) or drops out of RCU. The implementation notes describe a Phase 1 test that replaces a
+    target 128 times while another process reads through it continuously, and a deterministic tracing-BPF "litmus" for
+    the race window. The notes say the litmus had <em>no repaired KVM result</em> yet at the time they were written.</p>
+
+    <div class="callout warn"><span class="label">At-least-once</span>
+      <p>The design document states the semantics outright: in-place RCU-to-ref conversion reuses the saved action,
+      but if namei returns <code>-ECHILD</code> and the VFS restarts the whole walk, "policy again" runs. "The ABI is
+      therefore at-least-once across a full VFS restart; policy-visible side effects must be idempotent." Counting
+      lookups in a map is fine. A policy that, say, grants one-shot access and then revokes it on first use is not.</p></div>
+
+    <h3>Directory listings: <code>iterate_dir</code></h3>
+    <p>A view that hides <code>secret</code> on lookup but still lists it in <code>ls</code> is inconsistent, and tools
+    notice. namei_ext therefore also hooks directory iteration. In <code>fs/readdir.c</code> the call to
+    <code>file-&gt;f_op-&gt;iterate_shared</code> is wrapped behind the same gate. The wrapper swaps in its own
+    <code>dir_context</code> whose actor runs the BPF program once for each entry the lower filesystem emits:</p>
+    <pre data-file="kernel/fs/namei_ext.c"><code class="language-c">	namei_ext_init_ctx(&amp;bpf_ctx, &amp;namei_ctx-&gt;file-&gt;f_path,
+			   file_inode(namei_ctx-&gt;file),
+			   BPF_NAMEI_EXT_READDIR, 0, &amp;qname);
+	action = __cgroup_bpf_run_namei_ext_cgroup(namei_ctx-&gt;cgrp, &amp;bpf_ctx);
+
+	switch (action) {
+	case BPF_NAMEI_EXT_PASS:
+		/* ... forward entry unchanged to the caller's actor ... */
+		return true;
+	case BPF_NAMEI_EXT_REDIRECT:
+		if (!namei_ext_redirect_valid(&amp;bpf_ctx)) {
+			namei_ctx-&gt;error = -EINVAL;
+			return false;
+		}
+		/* ... forward entry under bpf_ctx.redirect_name ... */
+		return true;
+	case BPF_NAMEI_EXT_HIDE:
+		return true;
+	case BPF_NAMEI_EXT_SELECT_TARGET:
+		namei_ctx-&gt;error = -EOPNOTSUPP;
+		return false;
+	default:
+		namei_ctx-&gt;error = action &lt; 0 ? action : -EINVAL;
+		return false;
+	}</code></pre>
+    <p>HIDE in readdir skips the entry ("return true" means "keep iterating"). REDIRECT renames the entry in the
+    listing. SELECT_TARGET makes no sense for a single listed name and fails the <code>getdents</code> call. Note who
+    is responsible for consistency: the <strong>kernel does not tie lookup and readdir together</strong>. The design
+    document says plainly that "the policy, not the kernel, is responsible for making directory visibility agree with
+    lookup selection". That is why the sample policies handle both events. The prototype also cannot
+    <em>add</em> a synthetic entry. The design says that "synthetic parent-directory aliases such as listing an
+    otherwise nonexistent <code>ws</code> entry from its parent fail closed or remain unsupported."</p>
+
+    <h2>Policy decision: one function, four actions</h2>
+
+    <figure>
+      <svg viewBox="0 0 900 400" role="img" aria-label="Policy decision flow: the kernel fills bpf_namei_ext_ctx with event, name, parent identity, cgroup id and flags; the BPF program looks up maps and returns an action; the kernel validates PASS, REDIRECT, HIDE and SELECT_TARGET with the listed checks and outcomes">
+        <style>
+          .b28{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .k28{fill:var(--bg3);stroke:var(--accent);stroke-width:2}
+          .p28{fill:var(--bg3);stroke:var(--accent2);stroke-width:2}
+          .t28{fill:var(--fg);font:13px sans-serif}
+          .o28{fill:var(--fg);font:12px monospace}
+          .m28{fill:var(--muted);font:12px sans-serif}
+          .r28{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah28p)}
+        </style>
+        <defs><marker id="ah28p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <rect class="k28" x="20" y="20" width="260" height="170" rx="8"/>
+        <text class="t28" x="32" y="42" style="font-weight:600">kernel fills ctx</text>
+        <text class="o28" x="32" y="64">event   LOOKUP | READDIR</text>
+        <text class="o28" x="32" y="82">name[64], name_len, hash</text>
+        <text class="o28" x="32" y="100">parent_dev, parent_ino,</text>
+        <text class="o28" x="32" y="118">parent_generation</text>
+        <text class="o28" x="32" y="136">cgroup_id (task cgroup)</text>
+        <text class="o28" x="32" y="154">flags (LOOKUP_*, no RCU)</text>
+        <text class="m28" x="32" y="178">read-only except 3 out fields</text>
+        <rect class="p28" x="320" y="20" width="260" height="170" rx="8"/>
+        <text class="t28" x="332" y="42" style="font-weight:600">BPF policy</text>
+        <text class="m28" x="332" y="64">SEC("cgroup/namei_ext")</text>
+        <text class="m28" x="332" y="84">match name / parent,</text>
+        <text class="m28" x="332" y="102">look up maps updated by</text>
+        <text class="m28" x="332" y="120">the controller in user space</text>
+        <text class="m28" x="332" y="144">may write: target_id,</text>
+        <text class="o28" x="332" y="162">redirect_name[], _len</text>
+        <text class="m28" x="332" y="180">returns 0..3 (verifier-checked)</text>
+        <line class="r28" x1="280" y1="105" x2="318" y2="105"/>
+        <rect class="b28" x="620" y="20" width="260" height="170" rx="8"/>
+        <text class="t28" x="632" y="42" style="font-weight:600">user-space controller</text>
+        <text class="m28" x="632" y="64">bpf_prog_attach(cgroup)</text>
+        <text class="m28" x="632" y="84">map updates (grants, views)</text>
+        <text class="m28" x="632" y="104">debugfs register_target:</text>
+        <text class="o28" x="632" y="122">"&lt;id&gt; &lt;O_PATH fd&gt;"</text>
+        <text class="m28" x="632" y="142">debugfs policy_parent:</text>
+        <text class="o28" x="632" y="160">exact|add|clear|global</text>
+        <line class="r28" x1="620" y1="105" x2="582" y2="105"/>
+        <line class="r28" x1="450" y1="190" x2="450" y2="214"/>
+        <rect class="b28" x="20" y="216" width="200" height="170" rx="8"/>
+        <text class="t28" x="32" y="238" style="font-weight:600">PASS (0)</text>
+        <text class="m28" x="32" y="260">normal lookup / entry</text>
+        <text class="m28" x="32" y="278">stays in RCU-walk</text>
+        <rect class="b28" x="240" y="216" width="200" height="170" rx="8"/>
+        <text class="t28" x="252" y="238" style="font-weight:600">REDIRECT (1)</text>
+        <text class="m28" x="252" y="260">look up redirect_name</text>
+        <text class="m28" x="252" y="278">in the SAME parent</text>
+        <text class="m28" x="252" y="302">EINVAL: "", ".", "..",</text>
+        <text class="m28" x="252" y="320">'/', NUL, &gt;64 bytes</text>
+        <text class="m28" x="252" y="338">EOPNOTSUPP on create</text>
+        <text class="m28" x="252" y="362">readdir: rename entry</text>
+        <rect class="b28" x="460" y="216" width="200" height="170" rx="8"/>
+        <text class="t28" x="472" y="238" style="font-weight:600">HIDE (2)</text>
+        <text class="m28" x="472" y="260">lookup: ENOENT</text>
+        <text class="m28" x="472" y="278">readdir: skip entry</text>
+        <text class="m28" x="472" y="302">consistent lookup/readdir</text>
+        <text class="m28" x="472" y="320">is the policy's job</text>
+        <rect class="b28" x="680" y="216" width="200" height="170" rx="8"/>
+        <text class="t28" x="692" y="238" style="font-weight:600">SELECT_TARGET (3)</text>
+        <text class="m28" x="692" y="260">swap nd-&gt;path for the</text>
+        <text class="m28" x="692" y="278">registered (cgroup, id)</text>
+        <text class="m28" x="692" y="302">ENOENT: unregistered id</text>
+        <text class="m28" x="692" y="320">EXDEV: scoped / NO_XDEV</text>
+        <text class="m28" x="692" y="338">ENOTDIR: file mid-path</text>
+        <text class="m28" x="692" y="356">EOPNOTSUPP: create, readdir</text>
+        <text class="m28" x="692" y="374">returns &gt; 3 → EINVAL</text>
+      </svg>
+      <figcaption>Figure 28.3 — The decision contract. Inputs come from the walk; outputs are a return code plus at
+      most three writable fields; the kernel validates every action before using it.</figcaption>
+    </figure>
+
+    <h3>The context and the verifier</h3>
+    <p>The UAPI struct is the whole interface:</p>
+    <pre data-file="bpf/include/namei_ext.h"><code class="language-c">#define BPF_NAMEI_EXT_NAME_MAX 64
+
+#define BPF_NAMEI_EXT_LOOKUP 0
+#define BPF_NAMEI_EXT_READDIR 1
+
+#define BPF_NAMEI_EXT_PASS 0
+#define BPF_NAMEI_EXT_REDIRECT 1
+#define BPF_NAMEI_EXT_HIDE 2
+#define BPF_NAMEI_EXT_SELECT_TARGET 3
+
+struct bpf_namei_ext_ctx {
+	__u32 event;
+	__u32 flags;
+	__u32 name_len;
+	__u32 name_hash;
+	__u64 cgroup_id;
+	__u8 name[BPF_NAMEI_EXT_NAME_MAX];
+	__u32 redirect_name_len;
+	__u32 target_id;
+	__u8 redirect_name[BPF_NAMEI_EXT_NAME_MAX];
+	__u64 parent_dev;
+	__u64 parent_ino;
+	__u32 parent_generation;
+	__u32 parent_flags;
+};</code></pre>
+    <p>The repository ships its own copy of this header for the policies (with hand-written <code>__u32</code>
+    typedefs and a <code>SEC</code> macro, so policies build without <code>vmlinux.h</code> or libbpf headers). The
+    kernel's <code>namei_ext_is_valid_access()</code> enforces the read/write split. Programs may read every field.
+    <code>name[]</code> and <code>redirect_name[]</code> may only be read one byte at a time. Writes are allowed only to
+    <code>redirect_name_len</code>, <code>target_id</code> and bytes of <code>redirect_name[]</code>. The verifier's
+    return-range check, added in <code>verifier.c</code>, pins the return value to
+    <code>[BPF_NAMEI_EXT_PASS, BPF_NAMEI_EXT_SELECT_TARGET]</code>. As a second line of defence, the run loop turns
+    anything above 3 into <code>-EINVAL</code>. Helpers are the cgroup-common set plus
+    <code>bpf_perf_event_output</code> and the base protos (maps, atomics, and so on). There are no
+    filesystem-specific helpers or kfuncs: <strong>a policy cannot read file contents or walk dentries
+    itself.</strong></p>
+    <p>Names longer than 64 bytes are truncated in <code>name[]</code>, but <code>name_len</code> holds the true length,
+    so an exact-match policy that compares <code>name_len</code> first (as all the shipped helpers do) will never
+    match a truncated long name by mistake.</p>
+
+    <h3>Which program runs: cgroups, owners and parent scopes</h3>
+    <p>Dispatch in <code>kernel/bpf/cgroup.c</code> uses the calling task's default-hierarchy (v2) cgroup:</p>
+    <pre data-file="kernel/kernel/bpf/cgroup.c"><code class="language-c">int __cgroup_bpf_run_namei_ext(struct bpf_namei_ext_ctx *ctx,
+			       const struct path *parent)
+{
+	struct cgroup *cgrp;
+	struct cgroup *owner;
+	int action = BPF_NAMEI_EXT_PASS;
+
+	rcu_read_lock_dont_migrate();
+	cgrp = task_dfl_cgroup(current);
+	owner = rcu_dereference(cgrp-&gt;bpf.namei_ext_owner);
+	if (owner &amp;&amp; namei_ext_policy_parent_matches(owner, parent))
+		action = cgroup_bpf_run_namei_ext_locked(cgrp, ctx);
+	rcu_read_unlock_migrate();
+	return action;
+}</code></pre>
+    <p>The <em>owner</em> is the nearest ancestor cgroup (or the cgroup itself) that actually has a namei_ext program
+    attached. <code>activate_effective_progs()</code> recomputes it on every attach and detach. The owner's
+    <em>parent scope</em> is a list of up to eight exact directories (<code>NAMEI_EXT_MAX_POLICY_PARENTS</code>), or
+    "global" (empty list, so every parent matches). User space sets it through
+    <code>/sys/kernel/debug/namei_ext/policy_parent</code>. The run loop goes through the effective program array, and
+    the first non-PASS result wins. It also stamps <code>ctx-&gt;cgroup_id</code>, so the policy can key maps by
+    cgroup and give each cgroup its own view.</p>
+    <p>Attach semantics are kept simple. <code>bpf_prog_attach()</code> must pass zero <code>attach_flags</code>,
+    <code>relative_fd</code> and <code>expected_revision</code>, and <code>BPF_LINK_CREATE</code> returns
+    <code>-EOPNOTSUPP</code>, so there is no <code>bpf_link</code> support yet. The fork lists the type in
+    <code>is_net_admin_prog_type()</code>, the same bucket as the other cgroup program types, so loading one needs the
+    corresponding admin capability.</p>
+
+    <h2>Walkthrough: one lookup, step by step</h2>
+    <p>Take an agent-workspace setup modelled on the repository's <code>agent_workspace_source_task</code> policy.
+    The logical path is <code>/work/view/ws/src/main.py</code>. The policy is attached to cgroup <code>agentA</code>,
+    with parent scope <code>exact /work/view</code>. The controller has registered target ID 1 as
+    <code>/snap/a</code> (an O_PATH fd to a real directory on ext4) and put <code>(agentA, /work/view, "ws") → 1</code>
+    into the <code>agent_source_task_views</code> map. A process in <code>agentA</code> calls
+    <code>open("/work/view/ws/src/main.py", O_RDONLY)</code>.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Enter the walk</h4><p><code>do_sys_openat2</code> → <code>path_openat</code> →
+        <code>link_path_walk</code>, starting in RCU-walk at <code>/</code>. The string is split into
+        <code>work</code>, <code>view</code>, <code>ws</code>, <code>src</code> and the final <code>main.py</code>.</p></div>
+      <div class="step"><h4>2. "work" and "view": unmanaged parents</h4><p>For each component,
+        <code>walk_component</code> tests the gate. The static key is on (some program is attached somewhere), but
+        <code>namei_ext_parent_maybe_managed()</code> finds neither <code>/</code> nor <code>/work</code> in the
+        exact-parent index. No context is built, no cgroup is looked up, and stock
+        <code>walk_component_common</code> runs. This is the "skip unmanaged parents before dispatch" fast path.</p></div>
+      <div class="step"><h4>3. "ws": managed parent, program runs</h4><p>The parent is now <code>/work/view</code>,
+        which is in the index, so control goes to <code>walk_component_namei_ext</code>.
+        <code>namei_ext_init_ctx</code> copies <code>"ws"</code>, its length and hash, and the parent's
+        <code>s_dev</code>/<code>i_ino</code>/<code>i_generation</code>. The dispatcher finds the task's cgroup,
+        its owner (<code>agentA</code>), checks that <code>/work/view</code> matches the owner's scope, sets
+        <code>cgroup_id</code>, and runs the program.</p></div>
+      <div class="step"><h4>4. The policy decides</h4><p>The program checks <code>namei_ext_is(ctx, "ws")</code>,
+        builds a <code>namei_ext_component_key</code> (cgroup, parent dev/ino, name), finds value 1 in the map, writes
+        <code>ctx-&gt;target_id = 1</code>, and returns <code>BPF_NAMEI_EXT_SELECT_TARGET</code>. Had the map entry been
+        missing, it would have returned HIDE, and the open would fail with <code>ENOENT</code> right here.</p></div>
+      <div class="step"><h4>5. Kernel resolves the target in RCU mode</h4><p><code>namei_ext_lookup</code> marks the
+        target pending (this is not a create, so no <code>EOPNOTSUPP</code>). <code>namei_ext_resolve_target</code>
+        runs under RCU, finds <code>(agentA, 1)</code> in the registry hash, and <em>borrows</em> its
+        <code>struct path</code> without taking a reference. If the ID were unregistered, the result would be
+        <code>ENOENT</code>.</p></div>
+      <div class="step"><h4>6. Validate and swap</h4><p><code>namei_ext_apply_target</code> checks: no
+        <code>LOOKUP_IS_SCOPED</code>, no cross-mount <code>LOOKUP_NO_XDEV</code>, the target is a directory, and this
+        is an intermediate component so a directory is required. It records the target's <code>d_seq</code>, sets
+        <code>nd-&gt;path = /snap/a</code>, and marks <code>ND_JUMPED</code>. <code>walk_component</code> returns
+        <code>NULL</code>, so there is no symlink to follow.</p></div>
+      <div class="step"><h4>7. "src" inside the selected tree</h4><p>The parent is now <code>/snap/a</code>. It is
+        not a managed parent, so stock lookup runs again and finds <code>/snap/a/src</code> in the dcache. The policy
+        is not called.</p></div>
+      <div class="step"><h4>8. Final component and open</h4><p><code>open_last_lookups</code> for <code>main.py</code>:
+        the parent <code>/snap/a/src</code> is unmanaged, so the original code runs. Legitimization converts the RCU
+        walk into references. If a sequence check fails because a writer replaced target 1 in the meantime, the walk
+        either drops to ref-walk in place or restarts with <code>-ECHILD</code>. On a restart, the policy runs again.
+        <code>may_open</code> checks ext4 permissions on the real inode, and the file is opened.</p></div>
+      <div class="step"><h4>9. After open</h4><p>The descriptor refers to an ordinary ext4 file. Reads, writes,
+        mmap, fsync and page cache are all ext4's. The BPF program never sees them. The RQ3 experiment states this
+        directly: "an already selected <code>namei_ext</code> descriptor continued through lower-file operations
+        without re-entering BPF." A process in <code>agentB</code> opening the same string meanwhile gets whatever
+        <em>its</em> map entry selects, for example <code>/snap/b</code>.</p></div>
+    </div>
+
+    <h2>How the repository is organized</h2>
+    <p>The repo is large (about 120 MB on GitHub, roughly 219 commits since 2026-06-13). Most of the bulk is
+    <code>results/</code> and <code>docs/</code>. The mechanism code is small. The Linux fork is a git submodule
+    (<code>kernel/</code>, pinned at <code>b07117a3cb41</code>) that a <code>--depth 1</code> clone leaves empty.</p>
+    <pre><code class="language-plaintext">namei_ext/
+├── AGENTS.md            project invariants: Make-only control plane, fail fast, KVM-only Phase 1
+├── Makefile             top-level entrypoints (phase1, experiments, formal-*)
+├── kernel/              submodule → eunomia-bpf/kernel_nameiext (Linux 7.1-rc7 + namei_ext)
+├── bpf/
+│   ├── include/         namei_ext.h (ABI copy), namei_ext_policy.h (key struct, name helpers)
+│   ├── policies/        24 *.bpf.c policies, one SEC("cgroup/namei_ext") program each
+│   └── tracing/         FUSE counter used only by a comparison experiment
+├── runner/              libnamei_ext_harness.a: load/attach, cgroup moves, target registration
+├── tests/
+│   ├── abi/             header/layout checks
+│   ├── policy_load/     load + attach + detach in the guest
+│   ├── policy_semantic/ per-policy semantics
+│   └── functional/      2,167-line C suite: stat/open/access/readdir/openat2 cases
+├── experiments/         one focused runner per case study (agent_workspace*, application_file_sharing,
+│                        build_action_sandboxing, checkpoint_restore, kubernetes_configmap_*, spindle_staging,
+│                        toolchain_environment, service_config_rotation, semantic_continuation, ...)
+├── bench/               fxmark, mdtest, workloads
+├── mk/                  kernel.mk, kvm.mk, results.mk, multi_boot.mk, experiments/*.mk, benchmarks/*.mk
+├── configs/             kvm, benchmark matrices, publication index
+├── analysis/            per-experiment statistics and figures from raw observations
+├── results/             raw observations (run.json, observations.jsonl, dmesg, kernel config ...)
+├── thirdparty/          Wrapfs source used for the RQ3 stackable-filesystem comparison
+└── docs/
+    ├── idea-story.md    hypothesis, RQs, evidence highlights
+    ├── design.md        policy contract and proof obligations
+    ├── implementation.md, evaluation.md, background-related-work.md
+    └── paper/           main.tex, sections/*.tex, namei_ext.pdf (draft)</code></pre>
+    <p><code>AGENTS.md</code> is worth reading even if you never run the code, because it shows how the project wants
+    evidence handled. "A policy is an eBPF program under <code>bpf/policies/*.bpf.c</code>, not a YAML/JSON policy
+    file"; "Phase 1 validation must run the modified kernel in KVM. Host-kernel-only checks are useful but do not count";
+    "missing capability, unsupported flags, verifier failures, syscall failures, and declared workload failures are
+    hard failures". The file also records process failures from an earlier run and the rules adopted afterwards, such
+    as treating completed result directories as immutable.</p>
+
+    <h2>The BPF policies</h2>
+    <p>The policies are plain C with no CO-RE and no BTF-typed kernel pointers, because the context is a flat UAPI
+    struct. Start with the two smallest. <code>pass_only.bpf.c</code> (returns PASS) exists to measure the cost of an
+    attached program that does nothing. <code>hide_secret.bpf.c</code> is the "hello world":</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="hide_secret.bpf.c"><pre data-file="bpf/policies/hide_secret.bpf.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0
+
+#include "namei_ext_policy.h"
+
+SEC("cgroup/namei_ext")
+int namei_ext_policy(struct bpf_namei_ext_ctx *ctx)
+{
+	if ((ctx-&gt;event == BPF_NAMEI_EXT_LOOKUP ||
+	     ctx-&gt;event == BPF_NAMEI_EXT_READDIR) &amp;&amp;
+	    namei_ext_is(ctx, "secret"))
+		return BPF_NAMEI_EXT_HIDE;
+
+	return BPF_NAMEI_EXT_PASS;
+}
+
+char _license[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="compiled (llvm-objdump)"><pre><code class="language-plaintext">$ make -C bpf OUTPUT=/tmp/ne28/bpfout        # built in the orb with clang; no kernel needed
+$ llvm-objdump -d /tmp/ne28/bpfout/hide_secret.bpf.o
+Disassembly of section cgroup/namei_ext:
+
+0000000000000000 &lt;namei_ext_policy&gt;:
+       0:	b7 00 00 00 00 00 00 00	r0 = 0
+       1:	61 12 00 00 00 00 00 00	r2 = *(u32 *)(r1 + 0)      ; ctx-&gt;event
+       2:	25 02 10 00 01 00 00 00	if r2 &gt; 1 goto +16 &lt;LBB0_9&gt;
+       3:	61 12 08 00 00 00 00 00	r2 = *(u32 *)(r1 + 8)      ; ctx-&gt;name_len
+       4:	55 02 0d 00 06 00 00 00	if r2 != 6 goto +13 &lt;LBB0_8&gt;
+       5:	71 12 18 00 00 00 00 00	r2 = *(u8 *)(r1 + 24)      ; ctx-&gt;name[0]
+       6:	55 02 0b 00 73 00 00 00	if r2 != 115 goto +11 &lt;LBB0_8&gt;   ; 's'
+       ...
+      15:	b7 00 00 00 02 00 00 00	r0 = 2                     ; HIDE
+      16:	71 11 1d 00 00 00 00 00	r1 = *(u8 *)(r1 + 29)
+      17:	15 01 01 00 74 00 00 00	if r1 == 116 goto +1 &lt;LBB0_9&gt;   ; 't'
+      18:	b7 00 00 00 00 00 00 00	r0 = 0                     ; PASS
+      19:	95 00 00 00 00 00 00 00	exit</code></pre>
+        <p>The comments after <code>;</code> are added here for reading. The unrolled loop in
+        <code>namei_ext_is()</code> becomes six byte compares, each a one-byte load from <code>name[]</code>, which
+        is the only access width the kernel allows there.</p></div>
+      <div class="tab-panel" data-label="namei_ext_is() helper"><pre data-file="bpf/include/namei_ext_policy.h"><code class="language-c">static __inline int namei_ext_name_is(const struct bpf_namei_ext_ctx *ctx,
+				      const __u8 *name, __u32 len)
+{
+	__u32 i;
+
+	if (ctx-&gt;name_len != len)
+		return 0;
+#pragma clang loop unroll(full)
+	for (i = 0; i &lt; BPF_NAMEI_EXT_NAME_MAX; i++) {
+		if (i &gt;= len)
+			break;
+		if (ctx-&gt;name[i] != name[i])
+			return 0;
+	}
+	return 1;
+}
+/* ... */
+#define namei_ext_is(ctx, literal) \
+	namei_ext_name_is((ctx), (const __u8 *)(literal), sizeof(literal) - 1)</code></pre></div>
+    </div>
+
+    <p>Because the program handles both <code>LOOKUP</code> and <code>READDIR</code>, <code>stat secret</code>,
+    <code>open secret</code> and <code>access secret</code> all get <code>ENOENT</code>, and <code>ls</code> does not
+    list it. The functional suite checks exactly this (<code>hide_secret_stat</code>,
+    <code>hide_secret_open</code>, <code>hide_secret_access</code>, <code>expect_readdir_hidden</code>). It then
+    exercises the parent scopes: with <code>exact root</code> only <code>root/secret</code> is hidden and
+    <code>other/secret</code> stays visible; <code>add other</code> hides both; <code>clear</code> makes both
+    visible; <code>global</code> hides both again.</p>
+
+    <h3>REDIRECT and SELECT_TARGET in their smallest form</h3>
+    <div class="tabs">
+      <div class="tab-panel" data-label="redirect_alias.bpf.c (trimmed)"><pre data-file="bpf/policies/redirect_alias.bpf.c"><code class="language-c">/* ... name_is_tool(), name_is_tool_real(), redirect_to_tool*() write
+ *     redirect_name[] byte by byte and set redirect_name_len ... */
+
+SEC("cgroup/namei_ext")
+int namei_ext_policy(struct bpf_namei_ext_ctx *ctx)
+{
+	if (ctx-&gt;event == BPF_NAMEI_EXT_LOOKUP &amp;&amp; name_is_tool(ctx)) {
+		redirect_to_tool_real(ctx);
+		return BPF_NAMEI_EXT_REDIRECT;
+	}
+
+	if (ctx-&gt;event == BPF_NAMEI_EXT_READDIR &amp;&amp; name_is_tool_real(ctx)) {
+		redirect_to_tool(ctx);
+		return BPF_NAMEI_EXT_REDIRECT;
+	}
+
+	return BPF_NAMEI_EXT_PASS;
+}</code></pre>
+        <p>Looking up <code>tool</code> opens the sibling <code>tool.real</code>. Listing the directory shows
+        <code>tool.real</code> under the name <code>tool</code>. The two directions mirror each other, so the view is
+        consistent.</p></div>
+      <div class="tab-panel" data-label="select_portal.bpf.c"><pre data-file="bpf/policies/select_portal.bpf.c"><code class="language-c">SEC("cgroup/namei_ext")
+int namei_ext_policy(struct bpf_namei_ext_ctx *ctx)
+{
+	if (ctx-&gt;event == BPF_NAMEI_EXT_LOOKUP &amp;&amp;
+	    namei_ext_is(ctx, "portal")) {
+		ctx-&gt;target_id = 1;
+		return BPF_NAMEI_EXT_SELECT_TARGET;
+	}
+	if (ctx-&gt;event == BPF_NAMEI_EXT_LOOKUP &amp;&amp;
+	    namei_ext_is(ctx, "selected-file")) {
+		ctx-&gt;target_id = 2;
+		return BPF_NAMEI_EXT_SELECT_TARGET;
+	}
+	/* ... "selected-exec" → 3, "pinned-file" → 4 ... */
+
+	return BPF_NAMEI_EXT_PASS;
+}</code></pre>
+        <p>The program knows only numbers. What <code>1</code> means (a directory) and <code>2</code> means (a regular
+        file) is up to the controller's registrations. Note that <code>portal</code> does not have to exist on disk
+        under its parent: a lookup of a name with no real dentry can still resolve, because the swap happens before the
+        dcache lookup. That is why the functional suite checks <code>select_portal_before_attach</code> expecting
+        <code>ENOENT</code>, and the same path succeeding afterwards.</p></div>
+    </div>
+
+    <h3>A stateful policy: per-agent workspace views</h3>
+    <p>The headline case study is <code>agent_workspace_source_task.bpf.c</code>. It turns the abstract question
+    ("can two agents see different trees at one path?") into a map lookup keyed by cgroup, parent identity and name.
+    Counters are kept so experiments can show that the policy actually took part:</p>
+    <pre data-file="bpf/policies/agent_workspace_source_task.bpf.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, NAMEI_EXT_POLICY_MAX_STATE);
+	__type(key, struct namei_ext_component_key);
+	__type(value, __u32);
+} agent_source_task_views SEC(".maps");
+/* ... counter arrays, count_array() ... */
+
+SEC("cgroup/namei_ext")
+int namei_ext_policy(struct bpf_namei_ext_ctx *ctx)
+{
+	struct namei_ext_component_key key = {};
+	__u32 *target_id;
+
+	/* ... count total / lookup / readdir ... */
+	if (!namei_ext_is(ctx, "ws")) {
+		count_array(&amp;agent_source_task_counters, AST_COUNTER_PASS);
+		return BPF_NAMEI_EXT_PASS;
+	}
+
+	namei_ext_build_component_key(ctx, &amp;key);
+	key.event = 0;
+	target_id = bpf_map_lookup_elem(&amp;agent_source_task_views, &amp;key);
+	if (!target_id || !*target_id) {
+		/* ... count hide ... */
+		return BPF_NAMEI_EXT_HIDE;
+	}
+
+	if (ctx-&gt;event == BPF_NAMEI_EXT_READDIR) {
+		count_array(&amp;agent_source_task_counters, AST_COUNTER_PASS);
+		return BPF_NAMEI_EXT_PASS;
+	}
+
+	ctx-&gt;target_id = *target_id;
+	count_array(&amp;agent_source_task_counters, AST_COUNTER_SELECT);
+	/* ... per-target hit counter ... */
+	return BPF_NAMEI_EXT_SELECT_TARGET;
+}</code></pre>
+    <p>Look at the readdir branch. When a view exists, the <code>ws</code> entry is listed as-is (PASS); when it does
+    not, it is hidden. Lookup and listing agree. Switching an agent to another snapshot means one map update. Rolling
+    back means another. Withdrawing the workspace means deleting the entry, after which <code>ws</code> disappears from
+    both <code>stat</code> and <code>ls</code> for that cgroup only. The key includes <code>cgroup_id</code>, so one
+    attached program serves many cgroups with different views. This is the "per-agent view of the filesystem" in its
+    most literal form. Compare <a href="25-agentcgroup.html">chapter 25</a>, where cgroups are used to account agent
+    resources, and <a href="24-actplane.html">chapter 24</a>, where BPF LSM blocks agent actions. namei_ext uses the
+    same cgroup grouping to choose what the agent <em>sees</em>.</p>
+
+    <h3>The other policies</h3>
+    <p>Each case study has its own policy, and the README stresses that they "intentionally contain different bounded
+    decision structures tied to workload semantics":</p>
+    <div class="grid">
+      <div class="card"><h4>application_file_sharing</h4><p>Modelled on Flatpak's <code>xdg-document-portal</code>.
+        A <code>sharing_scopes</code> map (keyed with <code>cgroup_id = 0</code>) marks a managed document by parent
+        and name. A <code>sharing_grants</code> map keyed by the application's cgroup either selects the document or
+        hides it. Revoking a grant means deleting one map entry.</p></div>
+      <div class="card"><h4>build_action_sandboxing</h4><p>Modelled on Bazel sandboxes: two concurrent actions see
+        different declared-input roots at one logical path, and undeclared inputs are hidden in both lookup and
+        listing.</p></div>
+      <div class="card"><h4>toolchain_environment</h4><p>Nix-style environment selection: one logical interpreter
+        path, two installed trees, per-process-group switch and rollback.</p></div>
+      <div class="card"><h4>kubernetes_configmap_publication</h4><p>Selects among already-written ConfigMap
+        payload generations (V0/V1) under a stable root, mirroring kubelet's <code>AtomicWriter</code>.</p></div>
+      <div class="card"><h4>checkpoint_restore_migration</h4><p>After a DMTCP restart, a remembered path is mapped from
+        generation A to generation B.</p></div>
+      <div class="card"><h4>spindle_staging</h4><p>Maps exact source components to node-local cache files that the
+        Spindle HPC loader populated.</p></div>
+      <div class="card"><h4>rq3_invalid_action / rq3_invalid_ctx_write / rq3_fault_injection</h4><p>Deliberately
+        broken policies. Two must be rejected by the verifier (a return value out of range, and a write to a read-only
+        ctx field). The rest exercise runtime failures such as unregistered IDs and bad redirect names.</p></div>
+      <div class="card"><h4>table_redirect, *_view families</h4><p>An older exact-table design that the project has
+        retired (the docs say so explicitly), plus earlier policy families for build graphs, fixtures, checkpoints
+        and cache locality.</p></div>
+    </div>
+
+    <h2>The user-space side</h2>
+    <p>There is no daemon and no policy language. User space does three things: load and attach the program, publish
+    the objects it may select, and update maps. All of it is in <code>runner/src/namei_ext_harness.c</code>, a 700-line
+    static library that the experiment runners share.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="load + attach"><pre data-file="runner/src/namei_ext_harness.c"><code class="language-c">	object = bpf_object__open_file(obj_path, NULL);
+	err = libbpf_get_error(object);
+	/* ... */
+	err = bpf_object__load(object);
+	/* ... */
+	program = bpf_object__next_program(object, NULL);
+	/* ... */
+	program_fd = bpf_program__fd(program);
+	/* ... */
+	cgroup_fd = open(cgroup_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (cgroup_fd &lt; 0)
+		goto close_object;
+	err = bpf_prog_attach(program_fd, cgroup_fd, BPF_CGROUP_NAMEI_EXT, 0);</code></pre>
+        <p>This is the standard libbpf flow (<a href="06-btf-core-libbpf.html">chapter 06</a>), except that it needs
+        the fork's libbpf and UAPI headers, which define <code>BPF_CGROUP_NAMEI_EXT</code>. Detach uses
+        <code>bpf_prog_detach2(prog_fd, cgroup_fd, BPF_CGROUP_NAMEI_EXT)</code>.</p></div>
+      <div class="tab-panel" data-label="register a target"><pre data-file="runner/src/namei_ext_harness.c"><code class="language-c">static int namei_ext_register_target_fd(
+	int register_fd, const struct namei_ext_target_registration *target)
+{
+	char register_buf[64];
+	ssize_t nwritten;
+	int target_fd;
+	int len;
+	int ret = 0;
+
+	target_fd = open(target-&gt;path, O_PATH | O_CLOEXEC);
+	if (target_fd &lt; 0)
+		return -errno;
+	len = snprintf(register_buf, sizeof(register_buf), "%u %d\n",
+		       target-&gt;target_id, target_fd);
+	/* ... */
+	nwritten = write(register_fd, register_buf, len);
+	/* ... */
+}
+/* ... caller forks; the child moves itself into the cgroup, then: ... */
+		register_fd = open("/sys/kernel/debug/namei_ext/register_target",
+				   O_WRONLY | O_CLOEXEC);</code></pre>
+        <p>The registry is keyed by the <em>writer's</em> cgroup, so the harness forks a child, moves it into the
+        target cgroup, and has the child write <code>"&lt;id&gt; &lt;fd&gt;\n"</code>. The kernel turns the fd into a
+        pinned <code>struct path</code>. Writing <code>"clear"</code> drops all of that cgroup's targets. Passing an
+        fd instead of a path string means the kernel never parses a path on behalf of the policy.</p></div>
+      <div class="tab-panel" data-label="update a view map"><pre data-file="runner/src/namei_ext_harness.c"><code class="language-c">static int fill_component_key(struct namei_ext_component_key *key,
+			      uint64_t cgroup_id, const char *parent,
+			      const char *name)
+{
+	struct stat st;
+	size_t name_len = strlen(name);
+
+	if (name_len &gt; sizeof(key-&gt;name))
+		return -ENAMETOOLONG;
+	if (stat(parent, &amp;st))
+		return -errno;
+	memset(key, 0, sizeof(*key));
+	key-&gt;name_len = name_len;
+	key-&gt;cgroup_id = cgroup_id;
+	key-&gt;parent_dev = st.st_dev;
+	key-&gt;parent_ino = st.st_ino;
+	memcpy(key-&gt;name, name, name_len);
+	return 0;
+}</code></pre>
+        <p>The kernel fills <code>parent_dev</code> with <code>huge_encode_dev(sb-&gt;s_dev)</code>. The latest kernel
+        commit, "expose stat-compatible parent device", makes that match <code>st_dev</code> from
+        <code>stat(2)</code>, so user space can build keys from an ordinary <code>stat</code>. The cgroup ID comes from
+        <code>name_to_handle_at()</code> on the cgroup directory.</p></div>
+    </div>
+
+    <p>One more control file, <code>/sys/kernel/debug/namei_ext/policy_parent</code>, sets the owner cgroup's scope:
+    <code>exact &lt;fd&gt;</code>, <code>add &lt;fd&gt;</code>, <code>clear</code>, or <code>global</code>. Both
+    debugfs files are created with mode <code>0200</code>, which means root-only. Using debugfs as the control plane
+    marks this as a prototype. A mainline version would presumably use a syscall, a map type, or bpf_link
+    attributes, but the repository does not discuss which.</p>
+
+    <h2>Building and running it</h2>
+    <p>Every workflow goes through Make, and the project's rules forbid shell-script control planes. On a suitable
+    host (KVM available, enough RAM and disk to build a kernel), the documented entrypoints are:</p>
+    <pre><code class="language-bash">git clone --recurse-submodules https://github.com/eunomia-bpf/namei_ext   # kernel/ is the Linux fork
+cd namei_ext
+make phase1        # ABI, BPF objects, userspace tests, kernel objects, KVM boot,
+                   # policy load/attach, and the functional suite in the guest
+make experiments   # development gates for the implemented case studies
+make formal-case-studies    # paper-facing RQ1/RQ2/RQ3 case studies
+make formal-performance     # paper-facing performance matrices
+make experiment-agent-workspace-rq2   # e.g. the ten-pair namei_ext vs FUSE lifecycle</code></pre>
+    <p><code>mk/kernel.mk</code> checks that the built kernel's <code>.config</code> has <code>CONFIG_NAMEI_EXT=y</code>,
+    <code>CONFIG_BPF_SYSCALL=y</code>, <code>CONFIG_BPF_JIT=y</code>, <code>CONFIG_CGROUP_BPF=y</code>,
+    <code>CONFIG_FUSE_FS=y</code> and <code>CONFIG_DEBUG_INFO_BTF=y</code>. It also builds the fork's bpftool and checks
+    that the binary knows the string <code>cgroup/namei_ext</code>.</p>
+    <p>What you can do <strong>without</strong> the custom kernel is compile the policies. The BPF Makefile is a single
+    clang rule (<code>clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -Iinclude -c</code>), and the policy headers are
+    self-contained. For this chapter, <code>make -C bpf OUTPUT=/tmp/ne28/bpfout</code> produced all 25 objects (24
+    policies plus one tracing program) in the orb. Loading them fails on any stock kernel, because
+    <code>BPF_PROG_TYPE_NAMEI_EXT</code> does not exist there.</p>
+
+    <div class="callout danger"><span class="label">Do not try this on your workstation kernel</span>
+      <p>The mechanism exists only in the fork. Building and booting a patched 7.1-rc kernel is real work: the project
+      runs it inside KVM guests, never on the host. The orb used for this curriculum could not do it (stock 6.1
+      kernel, no nested KVM), so nothing in this chapter was observed running. All runtime behaviour described here
+      comes from reading the code and the repository's recorded results.</p></div>
+
+    <h2>Evaluation: what the repository reports</h2>
+    <p>The evaluation is set up as three research questions (from <code>docs/idea-story.md</code> and
+    <code>docs/paper/sections/05-evaluation.tex</code>):</p>
+    <ul>
+      <li><strong>RQ1, expressiveness:</strong> can the narrow hook express real, state-dependent path-view policies?
+        The evidence is seven industrial workflows (W1–W7), each checked against a correctness "oracle" derived from
+        the real source system, through the real <code>cgroup/namei_ext</code> attach path in KVM.</li>
+      <li><strong>RQ2, cost versus FUSE:</strong> the same policy implemented as a feature-equivalent FUSE service and
+        held to the same oracle.</li>
+      <li><strong>RQ3, ownership boundary:</strong> compared with a stackable filesystem (a port of Wrapfs to the same
+        kernel), which filesystem methods and runtime responsibilities each one takes on.</li>
+    </ul>
+    <p>The numbers below are copied from the paper draft's evaluation section. Each comes from a result root under
+    <code>results/</code>. None was reproduced here.</p>
+
+    <table>
+      <thead><tr><th>Experiment</th><th>Setup (as reported)</th><th>Result (as reported)</th></tr></thead>
+      <tbody>
+        <tr><td>Agent workspace lifecycle, namei_ext vs FUSE</td><td>Ten paired blocks, 20 KVM boots, 10,000 samples per
+          mechanism; 960/960 oracles passed</td><td>Lifecycle p50 5.51 µs vs 62.64 µs; paired FUSE/namei_ext ratio
+          11.32× [11.24, 11.64]</td></tr>
+        <tr><td>FxMark cache-hot path walks (MRPL/MRPM/MRPH)</td><td>Stock, patched-unattached, attached PASS,
+          same-filesystem SELECT, multithreaded cached FUSE; 50 boots, 450/450 observations</td><td>SELECT/FUSE
+          1.052–1.088×, every paired 95% CI above one; SELECT kept 0.895–0.931 of unattached throughput; attached PASS
+          kept 0.901–0.934</td></tr>
+        <tr><td>FxMark directory enumeration (MRDL/MRDM)</td><td>Same five conditions; 50 boots, 300/300 observations</td>
+          <td>SELECT/FUSE 2.20–3.66× with CIs above one in five of six cells; shared-directory four-worker cell
+          1.018 [0.907, 1.135]; overall verdict "mixed"</td></tr>
+        <tr><td>Unused fast path</td><td>Stock vs patched-unattached cache-hot MRPL, 30 paired blocks, 60 boots</td>
+          <td>Unattached/stock 1.0009 [0.9921, 1.0036], 1.0083 [0.9950, 1.0179], 1.0007 [0.9918, 1.0139] at 1/2/4
+          workers</td></tr>
+        <tr><td>RQ3 vs Wrapfs-derived stackable FS</td><td>Same 37-row workspace oracle, three boots; 2 verifier + 19
+          runtime fault cells</td><td>37/37 oracles for both; Wrapfs port registers 34 unique VFS slots and 13 method
+          classes executed; 21/21 fault cells passed per boot</td></tr>
+        <tr><td>Released agent task (SWE-Factory-Gym <code>pallets__click-2622</code>)</td><td>Two concurrent process
+          groups, same pathname, different roots; three boots</td><td>Base view 39/40 tests, completed view 40/40;
+          12/12 policy-backed states, 6/6 physical controls</td></tr>
+      </tbody>
+    </table>
+
+    <p>How to read these numbers:</p>
+    <ul>
+      <li>The <strong>11× lifecycle</strong> result is a mechanism microbenchmark of view operations, not an
+        end-to-end agent speedup. The draft says so itself: "a mechanism-level lifecycle comparison, not an end-to-end
+        agent-task speedup."</li>
+      <li>Against a <em>cached</em> FUSE (metadata and kernel caching on; the draft reports "only 0–19 measured requests
+        per cell"), the cache-hot path-walk advantage is about 5–9%. That is a fair comparison, because FUSE is not
+        being made to pay a daemon round trip on every lookup.</li>
+      <li>The cost of <em>having</em> a policy attached on a managed path is real. Attached PASS keeps 90–93% of
+        unattached throughput on these walk-heavy microbenchmarks. Selecting a target adds little on top of PASS
+        (SELECT/PASS 0.981–0.999).</li>
+      <li>The <strong>unused fast path</strong> result is what makes it plausible to put such a hook on a system-wide
+        hot path: a patched kernel with nothing attached is statistically indistinguishable from stock on this
+        benchmark and host. The draft limits the claim accordingly: "cold caches, other operations, tail latency, and
+        other machines remain open."</li>
+      <li>The readdir result is reported honestly as <strong>mixed</strong>: with four workers sharing one directory,
+        all variants converge and the advantage disappears.</li>
+    </ul>
+    <p>The RQ1 table in the draft lists seven workflows: application file sharing against the official
+    <code>xdg-document-portal</code> 1.18.4, agent workspaces, Bazel build-action sandboxing, toolchain environments,
+    Kubernetes ConfigMap publication, DMTCP checkpoint/restart, and Spindle HPC file staging. Each is reported as passing
+    three fresh KVM boots. The documents disagree on the count, though. The abstract says "Six of the seven
+    required … workflows … pass reviewed KVM oracles", and <code>research/STATE.md</code> (2026-08-02) still calls the
+    Spindle case incomplete. Meanwhile the evaluation section and commit <code>945b68c9f8</code> ("complete
+    seven-workload rq1 evaluation", 2026-08-02) say all seven are done. Treat the seventh row as the project's latest
+    claim, not a settled one.</p>
+    <p>Many results are scoped narrowly. Examples: "The W4 Kubernetes result covers already-materialized payload
+    selection and visibility, not ConfigMap retrieval, symlink/inotify behavior, or application reload." A historical
+    ccache build matrix (FUSE/namei_ext 2.18×, native/namei_ext 0.945×) is explicitly demoted to "supporting macro
+    evidence" because "it lacks independent-run uncertainty".</p>
+
+    <h3>Recent activity</h3>
+    <p>From <code>gh api repos/eunomia-bpf/namei_ext/commits</code>. The kernel fork has been quiet since
+    2026-08-01, so recent work is all on evaluation:</p>
+    <ul>
+      <li><strong>2026-10-11:</strong> "docs: archive and summarize untracked raw results before deletion" (current HEAD).</li>
+      <li><strong>2026-09-06:</strong> "docs: add RQ2 official-portal latency re-entry experiment plan", the next
+        RQ2 comparison against the real xdg-document-portal.</li>
+      <li><strong>2026-08-08:</strong> about 30 commits in one day. A quantitative Kubernetes ConfigMap comparison
+        (including "test: validate batched target registration" and "experiment: batch configmap target setup"), a
+        Bazel build-action RQ2 re-entry, and a Spindle RQ2 FUSE comparison. Several of the Spindle commits record
+        failed or rejected formal runs ("docs: reject confounded spindle formal run", "docs: record spindle formal02
+        failure"), kept in the history as the project's rules require.</li>
+      <li><strong>2026-08-02:</strong> "experiment: complete seven-workload rq1 evaluation", plus DMTCP checkpoint
+        repair and result publication.</li>
+    </ul>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefits</h4>
+        <ul>
+          <li><strong>Native semantics after selection.</strong> Once a name resolves, the file is an ordinary
+            ext4/tmpfs object: page cache, mmap, locking, permissions and xattrs behave as usual, with no FUSE
+            round trips on data.</li>
+          <li><strong>Instant, per-cgroup views.</strong> Switching, rolling back or withdrawing a view is a map
+            update. Two cgroups can see different objects at one path without separate mount namespaces.</li>
+          <li><strong>Small, verifiable policy surface.</strong> Four actions, three writable fields, and a
+            verifier-checked return range. The kernel validates every result (redirect names, target types,
+            <code>openat2</code> scoping) and fails closed.</li>
+          <li><strong>Near-zero cost when unused</strong>, as measured on the reported host: a static key plus an
+            exact-parent filter keep unrelated lookups on the stock path.</li>
+          <li><strong>Consistent model across lookup and listing</strong>, since one function handles both events.</li>
+        </ul></div>
+      <div class="card"><h4>Limitations</h4>
+        <ul>
+          <li><strong>Out-of-tree kernel patch</strong> against 7.1-rc7. The repository links no upstream submission, there is no
+            bpf_link support, and the control plane is debugfs.</li>
+          <li><strong>Selection only.</strong> No synthetic files or entries, no content transformation, no create
+            redirection (<code>LOOKUP_CREATE</code> → <code>EOPNOTSUPP</code>), no symlink or special-file targets, and
+            no cross-path transactions. The design document lists all of these.</li>
+          <li><strong>Consistency is the policy's job.</strong> The kernel does not stop a policy that hides on lookup
+            but lists on readdir.</li>
+          <li><strong>At-least-once execution</strong> across <code>-ECHILD</code> restarts, so side effects must be
+            idempotent.</li>
+          <li><strong>Reachability grant.</strong> A registered target is reachable through the logical name even if
+            the caller could not traverse its physical parents. Registration is therefore root-only (debugfs 0200),
+            and a rename or unlink of the target does not revoke it: "the controller must replace or clear it."</li>
+          <li><strong>Scoped walks refuse SELECT.</strong> <code>RESOLVE_BENEATH</code>/<code>IN_ROOT</code> callers get
+            <code>EXDEV</code>, so sandboxed runtimes that resolve with those flags cannot use selected objects.</li>
+          <li><strong>64-byte names</strong> in the context; up to eight exact managed parents per owner cgroup.</li>
+          <li><strong>Evaluation scope</strong> is cache-hot microbenchmarks plus case-study oracles on one host, with
+            cold-cache, tail latency and multi-host results still open (per the draft).</li>
+        </ul></div>
+    </div>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>Mount namespaces, bind mounts, OverlayFS.</strong> These are the standard kernel tools for
+        per-container views. They build the view before lookup, at subtree granularity. namei_ext's authors treat
+        them as related work rather than direct competitors, because changing a view means changing mount state.</li>
+      <li><strong><code>openat2()</code> RESOLVE_* flags.</strong> These <em>restrict</em> resolution for one call.
+        namei_ext <em>changes</em> resolution for a cgroup, and defers to these restrictions when both apply.</li>
+      <li><strong>Landlock and BPF LSM</strong> (<a href="05-program-types-and-hooks.html">chapter 05</a>,
+        <a href="24-actplane.html">chapter 24</a>). These mediate access to an already-resolved object.
+        namei_ext's design document calls BPF LSM "the neighboring security hook, not the same abstraction".</li>
+      <li><strong>sched_ext</strong> (<a href="05-program-types-and-hooks.html">chapter 05</a>) is the design analogy:
+        BPF supplies policy inside a subsystem whose mechanism stays in the kernel. sched_ext uses
+        <code>struct_ops</code> with many callbacks. namei_ext deliberately uses a single decision function.</li>
+      <li><strong>FUSE, ExtFUSE (USENIX ATC '19), FUSE-BPF.</strong> These are the closest mechanisms. ExtFUSE lets
+        eBPF handlers serve some FUSE requests in the kernel. FUSE-BPF (Android, discussed at LSFMM+BPF 2023) makes
+        FUSE a stacked filesystem with BPF pre- and post-filters, and one of its uses is hiding directories. The
+        namei_ext design document admits that FUSE-BPF's passthrough mode means "daemon elimination is not the
+        distinction". The remaining difference it claims is that there is no mounted FUSE instance, no FUSE inodes,
+        and no operation forwarding.</li>
+      <li><strong>Stackable and custom filesystems: Wrapfs, Bento (FAST '21).</strong> Fully expressive, but the
+        developer owns the filesystem methods. The RQ3 experiment quantifies this for one workload: 34 VFS slots
+        registered by the Wrapfs port, against lookup and readdir decisions only.</li>
+      <li><strong>"To FUSE or Not to FUSE" (FAST '17)</strong> is the standard reference for FUSE overheads.
+        <strong>FxMark (USENIX ATC '16)</strong> is the benchmark suite used for the path-walk and readdir
+        matrices.</li>
+      <li>Within this curriculum, <a href="20-gpu-ext.html">gpu_ext</a> is the sister project that applies the same
+        "BPF policy, kernel mechanism" idea to GPU memory and scheduling.</li>
+    </ul>
+
+    <h2>Try the policy: a toy simulator</h2>
+    <p>The widget below is <strong>illustrative JavaScript, not repository code</strong>. It mimics the decision logic
+    of <code>agent_workspace_source_task.bpf.c</code> together with the kernel-side checks described above. Pick a
+    cgroup, a path and an operation to see which component the policy is called on and what the kernel does with the
+    answer.</p>
+    <div class="card" id="ne28-sim">
+      <p>
+        <label>cgroup <select id="ne28-cg"><option value="agentA">agentA (view → target 1 = /snap/a)</option><option value="agentB">agentB (view → target 2 = /snap/b)</option><option value="agentC">agentC (attached, no view)</option><option value="other">other (no policy)</option></select></label>
+        <label>path <select id="ne28-path"><option>/work/view/ws/src/main.py</option><option>/work/view/ws</option><option>/work/view/README</option></select></label>
+        <label>operation <select id="ne28-op"><option value="open">open(O_RDONLY)</option><option value="creat">open(O_CREAT) on ws</option><option value="beneath">openat2(dirfd=/work/view, RESOLVE_BENEATH)</option><option value="ls">ls /work/view</option></select></label>
+      </p>
+      <pre><code class="language-plaintext" id="ne28-out"></code></pre>
+    </div>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> How does a namei_ext policy get into the kernel?</p>
+        <button class="opt">As a <code>struct_ops</code> map with lookup and readdir callbacks, like sched_ext</button>
+        <button class="opt">As a BPF LSM program on the <code>inode_permission</code> hook</button>
+        <button class="opt" data-right>As a new program type attached to a cgroup with <code>bpf_prog_attach(..., BPF_CGROUP_NAMEI_EXT, 0)</code>, section <code>cgroup/namei_ext</code></button>
+        <button class="opt">As a set of kfuncs called from an fentry program on <code>walk_component</code></button>
+        <div class="why">The fork adds <code>BPF_PROG_TYPE_NAMEI_EXT</code> and <code>BPF_CGROUP_NAMEI_EXT</code>, built
+        like the other cgroup program types. The program's return value is the action. No struct_ops and no
+        kfuncs.</div></div>
+      <div class="q"><p><strong>Q2.</strong> A policy returns <code>REDIRECT</code> with <code>redirect_name = "../etc"</code>. What happens?</p>
+        <button class="opt">The walk moves to the grandparent's <code>etc</code> directory</button>
+        <button class="opt" data-right>The kernel rejects it with <code>-EINVAL</code>: redirect names must not be "."/".." or contain '/'</button>
+        <button class="opt">The verifier rejects the program at load time</button>
+        <button class="opt">The redirect is ignored and the lookup passes</button>
+        <div class="why"><code>namei_ext_redirect_valid()</code> rejects empty names, names over 64 bytes,
+        <code>.</code>, <code>..</code>, and any <code>/</code> or NUL byte. REDIRECT only renames a lookup within
+        the same parent. The verifier cannot see string contents written at run time, so the check happens in the
+        kernel at lookup.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does a policy that hides <code>secret</code> need to handle the <code>READDIR</code> event too?</p>
+        <button class="opt">Because the kernel refuses HIDE for lookup unless readdir also returns HIDE</button>
+        <button class="opt" data-right>Because the kernel does not tie the two together: if only lookup hides it, <code>ls</code> still lists a name that <code>stat</code> says does not exist</button>
+        <button class="opt">Because readdir is the only event that can return HIDE</button>
+        <button class="opt">It does not; HIDE on lookup automatically filters getdents</button>
+        <div class="why">The design document says "the policy, not the kernel, is responsible for making directory
+        visibility agree with lookup selection". That is why the shipped policies check both
+        events.</div></div>
+      <div class="q"><p><strong>Q4.</strong> A program increments a map counter and, on its first call for a given name, flips a one-shot "grant" off. Why is the second part risky?</p>
+        <button class="opt">Maps cannot be written from namei_ext programs</button>
+        <button class="opt">The counter will overflow</button>
+        <button class="opt" data-right>A failed RCU-walk can restart the whole path walk with <code>-ECHILD</code> and run the policy again, so it is at-least-once and side effects must be idempotent</button>
+        <button class="opt">readdir and lookup run on different CPUs</button>
+        <div class="why">Converting in place from RCU-walk to ref-walk reuses the saved action, but a full restart calls
+        the program again. The second call would see the grant already spent and hide the file from the same
+        system call.</div></div>
+      <div class="q"><p><strong>Q5.</strong> A sandboxed runtime opens files with <code>openat2(..., RESOLVE_BENEATH)</code>, and the policy returns <code>SELECT_TARGET</code> for a component. What does the caller see?</p>
+        <button class="opt">The selected object, since registration was done by root</button>
+        <button class="opt" data-right><code>EXDEV</code>: scoped lookups refuse policy-selected objects</button>
+        <button class="opt"><code>ENOENT</code>, as if the name were hidden</button>
+        <button class="opt"><code>EAGAIN</code>, so the caller retries without RCU</button>
+        <div class="why"><code>namei_ext_apply_target()</code> returns <code>-EXDEV</code> whenever
+        <code>LOOKUP_IS_SCOPED</code> (BENEATH or IN_ROOT) is set, and for <code>RESOLVE_NO_XDEV</code> when the target
+        is on another mount. The functional tests check all three cases.</div></div>
+      <div class="q"><p><strong>Q6.</strong> What keeps namei_ext nearly free on a busy system where most paths are not managed?</p>
+        <button class="opt">The BPF program is JIT-compiled</button>
+        <button class="opt">Policies are cached per dentry in the dcache</button>
+        <button class="opt" data-right>A cgroup-BPF static key plus an RCU index of exact managed parent directories, both checked before any context is built or cgroup looked up</button>
+        <button class="opt">The hook only runs in ref-walk mode</button>
+        <div class="why">The gate <code>namei_ext_enabled() &amp;&amp; namei_ext_parent_maybe_managed()</code> sends
+        everything else down the unchanged stock path. The repo's 60-boot experiment reports patched-unattached/stock
+        throughput of about 1.00 with confidence intervals spanning 1.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/namei_ext">eunomia-bpf/namei_ext</a>: repository (studied at
+        <code>3f67fcbd663a</code>, 2026-10-11); see <code>docs/design.md</code>, <code>docs/idea-story.md</code>,
+        <code>docs/implementation.md</code>, and <code>docs/paper/</code> ("namei_ext: Programmable VFS Name Resolution
+        without Filesystem Ownership", unpublished draft).</li>
+      <li><a href="https://github.com/eunomia-bpf/kernel_nameiext/compare/062871f1371b...b07117a3cb41">eunomia-bpf/kernel_nameiext,
+        compare 062871f1371b...b07117a3cb41</a>: the namei_ext kernel patch on Linux 7.1-rc7.</li>
+      <li><a href="https://docs.kernel.org/filesystems/path-lookup.html">Pathname lookup</a>, Linux kernel documentation (Neil Brown).</li>
+      <li><a href="https://docs.kernel.org/filesystems/vfs.html">Overview of the Linux Virtual File System</a>, Linux kernel documentation.</li>
+      <li>Neil Brown, <a href="https://lwn.net/Articles/649115/">Pathname lookup in Linux</a>, LWN.net, 2015.</li>
+      <li>Neil Brown, <a href="https://lwn.net/Articles/649729/">RCU-walk: faster pathname lookup in Linux</a>, LWN.net, 2015.</li>
+      <li>Neil Brown, <a href="https://lwn.net/Articles/650786/">A walk among the symlinks</a>, LWN.net, 2015.</li>
+      <li><a href="https://man7.org/linux/man-pages/man2/openat2.2.html">openat2(2)</a>, Linux manual page (RESOLVE_* flags).</li>
+      <li><a href="https://lwn.net/Articles/796868/">Restricting path name lookup with openat2()</a>, LWN.net, 2019.</li>
+      <li><a href="https://man7.org/linux/man-pages/man7/mount_namespaces.7.html">mount_namespaces(7)</a>, Linux manual page.</li>
+      <li><a href="https://docs.kernel.org/filesystems/overlayfs.html">Overlay Filesystem</a>, Linux kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/userspace-api/landlock.html">Landlock: unprivileged access control</a>, Linux kernel documentation.</li>
+      <li><a href="https://lwn.net/Articles/859908/">Landlock (finally) sets sail</a>, LWN.net, 2021.</li>
+      <li><a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>, Linux kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/scheduler/sched-ext.html">Extensible Scheduler Class (sched_ext)</a>, Linux kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/filesystems/fuse/index.html">FUSE (Filesystem in Userspace) Technical Documentation</a>, Linux kernel documentation.</li>
+      <li>Jake Edge, <a href="https://lwn.net/Articles/937433/">The FUSE BPF filesystem</a>, LWN.net, 2023 (LSFMM+BPF).</li>
+      <li>Ashish Bijlani and Umakishore Ramachandran, <a href="https://www.usenix.org/conference/atc19/presentation/bijlani">Extension Framework for File Systems in User space</a> (ExtFUSE), USENIX ATC 2019.</li>
+      <li>Bharath Kumar Reddy Vangoor, Vasily Tarasov, Erez Zadok, <a href="https://www.usenix.org/conference/fast17/technical-sessions/presentation/vangoor">To FUSE or Not to FUSE: Performance of User-Space File Systems</a>, USENIX FAST 2017.</li>
+      <li>Samantha Miller et al., <a href="https://www.usenix.org/conference/fast21/presentation/miller">High Velocity Kernel File Systems with Bento</a>, USENIX FAST 2021.</li>
+      <li>Changwoo Min et al., <a href="https://www.usenix.org/conference/atc16/technical-sessions/presentation/min">Understanding Manycore Scalability of File Systems</a> (FxMark), USENIX ATC 2016.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="27-actime-and-akeep.html"><small>Previous</small>27 · actime and akeep</a>
+      <a class="next" href="29-qwen3-ebpf.html"><small>Next</small>29 · qwen3-ebpf</a>
+    </div>
+  </main>
+</div>
+<script>
+(function () {
+  var cg = document.getElementById('ne28-cg'), pa = document.getElementById('ne28-path'),
+      op = document.getElementById('ne28-op'), out = document.getElementById('ne28-out');
+  if (!cg) return;
+  var views = { agentA: { id: 1, root: '/snap/a' }, agentB: { id: 2, root: '/snap/b' } };
+  function run() {
+    var c = cg.value, p = pa.value, o = op.value, L = [];
+    var attached = c !== 'other', view = views[c];
+    if (o === 'ls') {
+      L.push('getdents64(/work/view): parent /work/view is managed');
+      if (!attached) { L.push('  no policy for cgroup "' + c + '" -> stock listing: README  ws'); }
+      else {
+        L.push('  BPF(READDIR, "README") -> PASS');
+        L.push('  BPF(READDIR, "ws")     -> ' + (view ? 'PASS (view exists)' : 'HIDE (no view)'));
+        L.push('  listing: README' + (view ? '  ws' : ''));
+      }
+      out.textContent = L.join('\n'); return;
+    }
+    var parts = p.split('/').filter(Boolean), cur = '';
+    if (o === 'beneath') { parts = parts.slice(2); cur = '/work/view'; L.push('(relative walk starting at dirfd /work/view)'); }
+    for (var i = 0; i < parts.length; i++) {
+      var name = parts[i], parent = cur || '/', last = i === parts.length - 1;
+      var managed = parent === '/work/view';
+      var where = last ? 'open_last_lookups' : 'walk_component';
+      if (!managed || !attached) {
+        L.push(where + '("' + name + '") parent ' + parent + ': ' +
+          (managed ? 'no policy owner -> stock lookup' : 'unmanaged parent -> stock lookup'));
+        cur = (cur === '' ? '' : cur) + '/' + name; continue;
+      }
+      if (name !== 'ws') { L.push(where + '("' + name + '") parent ' + parent + ': BPF -> PASS'); cur += '/' + name; continue; }
+      if (!view) { L.push(where + '("ws"): BPF -> HIDE'); L.push('=> ENOENT'); out.textContent = L.join('\n'); return; }
+      L.push(where + '("ws"): BPF sets target_id=' + view.id + ' -> SELECT_TARGET');
+      if (o === 'creat' && last) { L.push('  LOOKUP_CREATE set -> kernel rejects'); L.push('=> EOPNOTSUPP'); out.textContent = L.join('\n'); return; }
+      if (o === 'beneath') { L.push('  LOOKUP_IS_SCOPED set -> kernel rejects'); L.push('=> EXDEV'); out.textContent = L.join('\n'); return; }
+      L.push('  registry (' + c + ', ' + view.id + ') -> ' + view.root + ' (borrowed under RCU), checks pass');
+      L.push('  nd->path = ' + view.root + ', ND_JUMPED');
+      cur = view.root;
+    }
+    if (o === 'creat') { L.push('(O_CREAT only differs on the final "ws" component)'); }
+    L.push('=> opened ' + cur + ' on the lower filesystem; later reads/writes never call BPF');
+    out.textContent = L.join('\n');
+  }
+  [cg, pa, op].forEach(function (e) { e.addEventListener('change', run); });
+  run();
+})();
+</script>
+</body>
+</html>

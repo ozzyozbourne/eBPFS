@@ -399,8 +399,22 @@ git sparse-checkout set --no-cone '/*.md' '/Makefile' '/extension/' '/tools/' '/
       <tr><td><code>kernel-open/nvidia-uvm/uvm_pmm_test.c</code>, <code>kernel-open/tests/transition-validator/</code></td><td>+520, new</td><td>Tests for the validators.</td></tr>
     </table>
     <p>The paper's description, "lightweight instrumentation (~100 LOC)" in NVIDIA's modules plus
-    "a standalone file (~1 KLOC)" for hook registration, matches this shape. The later safety work
+    "a standalone file (~1 KLOC)" for hook registration, roughly matches this shape. (The arXiv text
+    says that file extends "the kernel"; in the repositories the registration code lives in the module
+    fork, <code>uvm_bpf_struct_ops.c</code> and <code>nv-gpu-sched-hooks.c</code>, and uses the upstream
+    <code>register_bpf_struct_ops()</code> API, so no Linux patch was found.) The later safety work
     (validators and tests) added much more.</p>
+
+    <div class="callout warn"><span class="label">Paper vs. code</span><p>Both paper versions show an
+    interface that differs from the code. The arXiv design section lists <code>struct gpu_mem_ops</code> with
+    <code>gpu_activate</code>/<code>gpu_access</code>/<code>gpu_evict_prepare</code>/<code>gpu_prefetch</code>
+    taking <code>gdrv_mem_*_ctx_t</code> contexts, kfuncs <code>bpf_gpu_move_head</code>/<code>_move_tail</code>,
+    a <code>struct gpu_sched_ops</code> with <code>task_init</code>/<code>task_destroy</code>, and kfuncs
+    <code>bpf_gpu_set_attr</code> and <code>gdrv_sched_preempt</code>. The camera-ready implementation section
+    still names <code>bpf_gpu_set_attr</code> and <code>bpf_gpu_prefetch_async</code>. None of these names exist in
+    the pinned fork. Read the paper's listings as a vendor-neutral sketch and the headers quoted in this chapter
+    as the real ABI. Neither paper defines new BPF program types: the code uses ordinary
+    <code>BPF_PROG_TYPE_STRUCT_OPS</code>, plus kprobe/uprobe programs that call the kfuncs.</p></div>
 
     <h2>How the driver hooks work</h2>
 
@@ -629,7 +643,8 @@ static struct bpf_struct_ops gpu_mem_ops_struct_ops = {
                                           &amp;pmm-&gt;root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]);
     }</code></pre>
     <p>A policy cannot choose a victim directly. It can only ask for the current chunk to go to the
-    head of the used list (evict sooner) or the tail (evict later). The paper says handlers "may
+    head (evict sooner) or the tail (evict later) of one of the two allocation lists, used or unused.
+    The policies in the repo almost always use the used list. The paper says handlers "may
     reorder but never remove regions in the kernel-maintained eviction list". The kernel keeps
     eviction authority under memory pressure. With only head/tail moves, many textbook algorithms can
     only be approximated. <code>SAFE_POLICY_ROUTES.md</code> says its 2Q is "best described as two-hit
@@ -682,7 +697,8 @@ BTF_KFUNCS_END(uvm_bpf_kfunc_ids_set)</code></pre>
     snapshot: the owning PMM, the root chunk identity, the list it is on and a <em>generation</em>
     counter that changes whenever the chunk changes lists. After the callback, still under the PMM list
     lock, it checks that the snapshot still matches and that the request is one of the allowed moves
-    (<code>USED</code>/<code>HEAD</code> or <code>USED</code>/<code>TAIL</code>). Only then does it move
+    (destination <code>USED</code> or <code>UNUSED</code>, position <code>HEAD</code> or
+    <code>TAIL</code>; <code>nv_gpu_transition_validate_pmm()</code>). Only then does it move
     the chunk once, through the same helper the native code uses. For prefetch, the region must lie
     inside <code>max_prefetch_region</code> and fit the page-index type. An invalid initial request
     falls back to native prefetching. The pointer is marked <code>KF_TRUSTED_ARGS</code>, so the
@@ -737,15 +753,16 @@ extern void bpf_nv_gpu_reject_bind(struct nv_gpu_bind_ctx *ctx) __weak __ksym;</
     <code>kchangrpSetInterleaveLevel()</code>.</p>
     <p>There is one more scheduling kfunc that does not belong to the struct_ops:
     <code>bpf_nv_gpu_preempt_tsg(hClient, hTsg)</code>. It is flagged <code>KF_SLEEPABLE</code> because
-    preemption waits for the hardware, and it is registered for <code>BPF_PROG_TYPE_UNSPEC</code> so
-    that sleepable uprobes can call it. The README roadmap reports two working trigger paths: from a
+    preemption waits for the hardware, and it is registered a second time for <code>BPF_PROG_TYPE_UNSPEC</code>, which
+    the kernel treats as "every program type". The source comment says this is so that kprobe and
+    tracepoint <code>bpf_wq</code> callbacks can call it; it also lets sleepable uprobes call it. The README roadmap reports two working trigger paths: from a
     struct_ops hook through <code>bpf_wq</code>, and from a "sleepable uprobe on
     <code>cuLaunchKernel</code> (avg 312us, no bpf_wq needed)".</p>
 
     <table>
       <tr><th>kfunc</th><th>Module</th><th>Called from</th><th>Effect</th></tr>
       <tr><td><code>bpf_gpu_set_prefetch_region(ctx, first, outer)</code></td><td>nvidia-uvm</td><td><code>gpu_page_prefetch[_iter]</code></td><td>Request <code>[first, outer)</code> inside the current VA block</td></tr>
-      <tr><td><code>bpf_gpu_request_reorder(ctx, dest, pos)</code></td><td>nvidia-uvm</td><td><code>gpu_block_activate/access</code></td><td>Request move to USED head or tail</td></tr>
+      <tr><td><code>bpf_gpu_request_reorder(ctx, dest, pos)</code></td><td>nvidia-uvm</td><td><code>gpu_block_activate/access</code></td><td>Request move to the head or tail of the USED (or UNUSED) list</td></tr>
       <tr><td><code>bpf_gpu_strstr(...)</code></td><td>nvidia-uvm</td><td>any</td><td>Test only; returns −1</td></tr>
       <tr><td><code>bpf_nv_gpu_set_timeslice(ctx, us)</code></td><td>nvidia</td><td><code>on_task_init</code></td><td>Request a timeslice for the new TSG</td></tr>
       <tr><td><code>bpf_nv_gpu_set_interleave(ctx, lvl)</code></td><td>nvidia</td><td><code>on_task_init</code></td><td>Request runlist interleave level (LOW/MEDIUM/HIGH = 0/1/2)</td></tr>
@@ -1245,7 +1262,8 @@ sudo modprobe nvidia &amp;&amp; sudo modprobe nvidia_uvm</code></pre>
 sudo ./extension/eviction_lfu &amp;                    # or in the background
 sudo bpftool prog list | grep struct_ops</code></pre>
     <p>Some loaders take arguments. These examples are from <code>extension/README.md</code> and the
-    loader's <code>--help</code> text:</p>
+    loader's <code>--help</code> text. In this block and the three above, the commands are the
+    repository's, but some <code>#</code> comments were added or shortened for this chapter:</p>
     <pre data-file="gpu_ext/extension/README.md"><code class="language-bash">sudo ./prefetch_always_max_cycle_moe                     # combined policy
 sudo ./prefetch_pid_tree -p 1234 -P 20 -l 5678 -L 80      # PID-aware prefetch
 sudo ./prefetch_adaptive_sequential -d forward -n 32      # fixed 32 pages after the fault

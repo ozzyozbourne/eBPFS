@@ -11,7 +11,7 @@
 <p class="lede">A chapter-wise guide: what the Berkeley Packet Filter and its extended form are, how they work
 inside the Linux kernel, and what every actively maintained <a href="https://github.com/eunomia-bpf">eunomia-bpf</a>
 project does, with diagrams, real code, papers and quizzes.</p>
-<div class="meta"><span>23 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
+<div class="meta"><span>30 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
 <h2>Part I · Foundations</h2>
 <div class="grid">
 <a class="card" href="chapters/01-what-is-bpf.html"><h4>01 · What is BPF? From packet filter to in-kernel VM</h4><p>How a 1993 packet filter became Linux&#x27;s safe in-kernel execution engine: classic BPF, seccomp-bpf, the 2014 eBPF rewrite, and a first hello world.</p></a>
@@ -52,5 +52,18 @@ project does, with diagrams, real code, papers and quizzes.</p>
 <h2>Part VI · eBPF for AI agents</h2>
 <div class="grid">
 <a class="card" href="chapters/24-actplane.html"><h4>24 · ActPlane: information-flow enforcement for AI agents</h4><p>How ActPlane compiles a small information-flow policy language into an eBPF/BPF-LSM engine that tracks labels across an agent&#x27;s processes, files and sockets, and blocks, kills or explains rule violations.</p></a>
+<a class="card" href="chapters/25-agentcgroup.html"><h4>25 · AgentCgroup: understanding and controlling the OS resources of AI agents</h4><p>What a measurement study of 144 SWE-rebench tasks says about the CPU and memory behaviour of AI coding agents, and how AgentCgroup puts each tool call in its own cgroup and enforces priority with sched_ext and the proposed memcg_bpf_ops struct_ops.</p></a>
+<a class="card" href="chapters/26-reward-guard-and-safe-change.html"><h4>26 · RewardGuard and safe change after external operations</h4><p>How RewardGuard turns reward hacking in agent benchmarks into a runtime integrity contract enforced with AgentSight and ActPlane, and how agent-check-restore-safety keeps an external operation such as a payment from running twice or moving to a new destination when software is changed or restored.</p></a>
+<a class="card" href="chapters/27-actime-and-akeep.html"><h4>27 · Actime and Akeep: one runtime for agent policy, observability and backup</h4><p>How Actime composes the eBPF engines ActPlane and AgentSight with the Akeep session-history backup into one command and one run record, how Akeep stores agent transcripts in a content-addressed, optionally age-encrypted archive, and which of these parts actually use eBPF.</p></a>
+</div>
+<h2>Part VII · Kernel extension research</h2>
+<div class="grid">
+<a class="card" href="chapters/28-namei-ext.html"><h4>28 · namei_ext: programmable VFS name resolution</h4><p>How namei_ext adds a cgroup-scoped eBPF hook to Linux pathname lookup and readdir so a policy can pass, rename, hide, or swap in an existing object, while the VFS and the real filesystem keep handling everything else.</p></a>
+<a class="card" href="chapters/29-qwen3-ebpf.html"><h4>29 · qwen3-ebpf: a language model forward pass inside eBPF</h4><p>How qwen3-ebpf runs all 28 decoder layers of Qwen3-0.6B as verifier-accepted BPF programs (fixed-point matmuls, bpf_loop batches, a BPF KV cache, BF16 weights in a BPF arena, XDP plus a BPF workqueue) and what its measurements say about the limits of eBPF as a compute engine.</p></a>
+<a class="card" href="chapters/30-llm-kernel-tooling.html"><h4>30 · LLM agents for the kernel: schedcp, MCPtrace, GPTtrace</h4><p>How the eunomia-bpf LLM-for-kernel line works: the Model Context Protocol, schedcp&#x27;s MCP server that lets an agent pick, tune and write sched_ext schedulers (and its arXiv paper), MCPtrace&#x27;s bpftrace tools, GPTtrace&#x27;s prompt-and-retry pipeline, and the Kgent paper behind them.</p></a>
+</div>
+<h2>Appendix</h2>
+<div class="grid">
+<a class="card" href="chapters/31-org-meta.html"><h4>31 · The org behind the code: eunomia.dev, agent skills and research notes</h4><p>How eunomia.dev is built and synced, what the org&#x27;s agent-skills and research-skills encode, what the megakernel causal-profiling feasibility notes conclude, and a map of every active eunomia-bpf repo to its chapter.</p></a>
 </div>
 </main></div></body></html>

@@ -303,7 +303,7 @@ $ smt_ebpf_equiv --old mul8.ins --new shl2.ins --map empty.maps --desc constant.
 ├── tests/
 │   ├── cli_smoke.sh, smt_equiv_smoke.sh, smt_cli_integration.sh
 │   ├── real_app_corpus.sh     62 cases: compile old/new C, run ebpf-tv check, assert result
-│   └── real_apps/*.c          ~130 small XDP/TC/tracepoint/fentry/cgroup programs + common.h
+│   └── real_apps/*.c          120 small XDP/TC/tracepoint/fentry/cgroup programs + common.h
 ├── scripts/run-smt-xdp-example.sh, examples/smt-xdp/README.md
 └── docs/                      backend-contract, support-matrix, mvp-architecture, test-plan,
                                backend-dev (provenance), heimdall-notes, reproduction-notes, dependency-policy</code></pre>
@@ -371,7 +371,7 @@ doctor_smt_equiv: PASS (smt_equiv_version)</code></pre>
     <p><code>scripts/run-smt-xdp-example.sh</code> shows the intended use on ELF objects. It compiles a trivial
     XDP program with clang, then uses <code>llvm-objcopy --update-section</code> to replace its code with two
     hand-written instruction sequences:</p>
-    <pre data-file="scripts/run-smt-xdp-example.sh"><code class="language-bash">"$CLANG" -target bpf -O2 -g0 -c "$tmp/base.c" -o "$tmp/base.o"
+    <pre data-file="ebpf-correctness-verifier/scripts/run-smt-xdp-example.sh"><code class="language-bash">"$CLANG" -target bpf -O2 -g0 -c "$tmp/base.c" -o "$tmp/base.o"
 
 printf '\xB7\x00\x00\x00\x01\x00\x00\x00\x95\x00\x00\x00\x00\x00\x00\x00' \
   &gt;"$tmp/old.ins"
@@ -451,7 +451,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     <code>r_&lt;prog&gt;_&lt;block&gt;_&lt;reg&gt;_&lt;version&gt;</code>, so a block becomes a conjunction of
     equalities. This is SSA form, written as logic. <code>inst::smt_inst</code> is one large switch. Here are a
     few of its cases:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">  z3::expr curDst = sv.get_cur_reg_var(_dst_reg);
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">  z3::expr curDst = sv.get_cur_reg_var(_dst_reg);
   z3::expr curSrc = sv.get_cur_reg_var(_src_reg);
   z3::expr newDst = string_to_expr("false");
   // update register according to the opcode type
@@ -481,7 +481,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     <h3>Control flow: blocks, path conditions and no loops</h3>
     <p><code>graph::gen_graph</code> (<code>verify/cfg.cc</code>) splits the program into basic blocks and runs a
     DFS. Any back edge is an error:</p>
-    <pre data-file="lib/ebpf_smt/src/verify/cfg.cc"><code class="language-cpp">  for (size_t i = 0; i &lt; gnodes_out[cur_gnode_id].size(); i++) {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/verify/cfg.cc"><code class="language-cpp">  for (size_t i = 0; i &lt; gnodes_out[cur_gnode_id].size(); i++) {
     unsigned int next_gnode_id = gnodes_out[cur_gnode_id][i];
     if (visited[next_gnode_id] &amp;&amp; (!finished[next_gnode_id])) {
       string err_msg  = "illegal input: loop from node " + \
@@ -496,7 +496,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     model. Loop-free control flow is encoded in <code>smt_prog::gen_smt</code>. Blocks are visited in topological
     order. Each block gets its own register versions, and incoming edges are joined with an implication from the
     edge's path condition:</p>
-    <pre data-file="lib/ebpf_smt/src/verify/smt_prog.cc"><code class="language-cpp">  for (size_t i = 0; i &lt; blocks.size(); i++) {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/verify/smt_prog.cc"><code class="language-cpp">  for (size_t i = 0; i &lt; blocks.size(); i++) {
     unsigned int b = blocks[i];
     // reset register version for different basic blocks, while memory tables
     // don't need to be reset for being shared among basic blocks.
@@ -525,7 +525,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     <p>The branch condition itself comes from <code>smt_inst_jmp</code>. The taken edge gets
     <code>c_in ∧ e</code> and the fall-through edge gets <code>c_in ∧ ¬e</code>. This function will come up again
     under <a href="#limitations-measured">limitations</a>, so here it is in full:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">z3::expr inst::smt_inst_jmp(smt_var &amp; sv) const {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">z3::expr inst::smt_inst_jmp(smt_var &amp; sv) const {
   // If opcode is valid, then define curDst, curSrc, imm
   if (get_opcode_type() != OP_COND_JMP) return string_to_expr("false");
   z3::expr curDst = sv.get_cur_reg_var(_dst_reg);
@@ -555,7 +555,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     <p>The precondition fixes the starting registers. <code>r1</code> equals a symbolic <code>input</code>,
     <code>r10</code> equals the top of a 512-byte stack, and for packet programs <code>r1</code> also equals the
     packet's start address:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">z3::expr inst::smt_set_pre(z3::expr input, smt_var &amp; sv) {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst.cc"><code class="language-cpp">z3::expr inst::smt_set_pre(z3::expr input, smt_var &amp; sv) {
   z3::expr f = string_to_expr("true");
   f = (sv.get_cur_reg_var(1) == input) &amp;&amp;
       (sv.get_cur_reg_var(10) == sv.get_stack_bottom_addr()) &amp;&amp;
@@ -570,7 +570,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
   return f;
 }</code></pre>
     <p>The caller adds one more constraint. Remember it for later:</p>
-    <pre data-file="lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">void validator::smt_pre(expr&amp; pre, unsigned int prog_id, unsigned int num_regs,
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">void validator::smt_pre(expr&amp; pre, unsigned int prog_id, unsigned int num_regs,
                         unsigned int input_reg, smt_input&amp; sin, smt_var&amp; sv) {
   expr input = string_to_expr("input");
   // TODO: set input limit, need to be generalized
@@ -590,7 +590,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     the write), an address or offset, and a byte. A load compares its address against every earlier write in the
     table and takes the latest matching one. If none matches, the load reads the region's initial contents,
     which are recorded in a second list (the "urt"). Every store becomes byte stores:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">  for (int i = 0; i &lt; ids.size(); i++) {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">  for (int i = 0; i &lt; ids.size(); i++) {
     z3::expr is_valid = sv.update_is_valid();
     z3::expr cond = path_cond &amp;&amp; info_list[i].path_cond;
     f = f &amp;&amp; (is_valid == cond);
@@ -620,7 +620,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     the kernel's return codes. The interesting part is how the two programs see the <em>same</em> initial maps.
     Their read lists are tied together: if both programs look up equal keys, then either both see the key absent
     or both see it present with equal values:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">      z3::expr f_k_both_inexist = (addr_v1 == NULL_ADDR_EXPR) &amp;&amp; (addr_v2 == NULL_ADDR_EXPR);
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">      z3::expr f_k_both_inexist = (addr_v1 == NULL_ADDR_EXPR) &amp;&amp; (addr_v2 == NULL_ADDR_EXPR);
       z3::expr f_k_both_exist = (addr_v1 != NULL_ADDR_EXPR) &amp;&amp; (addr_v2 != NULL_ADDR_EXPR);
       // set the constrains on addr_v1, addr_v2, v1, v2
       f = f &amp;&amp; z3::implies((map1_urt.is_valid[i] == Z3_true) &amp;&amp;
@@ -642,7 +642,7 @@ printf '\xB7\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x01\x00\x00\x00\x95\x00
     the program cannot predict becomes a fresh symbolic value, and both programs get the same value for their
     k-th such call. The shared values are named variables, <code>rand_u32_0</code>, <code>rand_u32_1</code>, …,
     created once and handed out in call order:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_var.cc"><code class="language-cpp">void smt_var::init_static_variables() {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst_var.cc"><code class="language-cpp">void smt_var::init_static_variables() {
   randoms_u32.clear();
   for (int i = 0; i &lt; mem_t::_layout._n_randoms_u32; i++) {
     string name = "rand_u32_" + to_string(i);
@@ -656,7 +656,7 @@ z3::expr smt_var::get_next_random_u32() {
   rand_u32_cur_id++;
   return rand_u32;
 }</code></pre>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">z3::expr predicate_symbolic_u32_helper(z3::expr out, smt_var&amp; sv) {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">z3::expr predicate_symbolic_u32_helper(z3::expr out, smt_var&amp; sv) {
   z3::expr f = (out == z3::concat(to_expr((int32_t)0, 32), sv.get_next_random_u32()));
   return f;
 }
@@ -683,7 +683,7 @@ z3::expr predicate_symbolic_u64_helper(z3::expr out, smt_var&amp; sv) {
     <p>An ordinary <code>exit</code> sets <code>ret_val = r0</code> and <code>pgm_exit_type = 0</code>. A
     <code>bpf_tail_call</code> ends the program with <code>pgm_exit_type = tail_call</code> and records
     <code>r1..r3</code> as the call's arguments. The final comparison handles both cases:</p>
-    <pre data-file="lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">z3::expr smt_pgm_eq_chk(smt_var&amp; sv1, smt_var&amp; sv2, bool is_win) {
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/isa/ebpf/inst_codegen.cc"><code class="language-cpp">z3::expr smt_pgm_eq_chk(smt_var&amp; sv1, smt_var&amp; sv2, bool is_win) {
   z3::expr f = smt_pgm_mem_eq_chk(sv1, sv2, is_win);
 
   smt_output&amp; out1 = sv1.smt_out, out2 = sv2.smt_out;
@@ -715,13 +715,13 @@ z3::expr predicate_symbolic_u64_helper(z3::expr out, smt_var&amp; sv) {
     <h3>The query and the solver</h3>
     <p>With both program formulas built, <code>validator::is_equal_to</code> forms the implication and checks
     whether it is valid:</p>
-    <pre data-file="lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">  expr pre_mem_same_mem = smt_pgm_set_same_input(_post_sv_orig, post_sv_candidate, _is_win);
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">  expr pre_mem_same_mem = smt_pgm_set_same_input(_post_sv_orig, post_sv_candidate, _is_win);
   expr post = string_to_expr("true");
   smt_post(post, VLD_PROG_ID_ORIG, VLD_PROG_ID_CANDIDATE, post_sv_candidate);
   expr smt = implies(pre_mem_same_mem &amp;&amp; _pre_orig &amp;&amp; pre_candidate &amp;&amp; _pl_orig &amp;&amp; pl_candidate, post);
   /* ... */
   int is_equal = is_smt_valid(smt, mdl);</code></pre>
-    <pre data-file="lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">    z3::tactic t = z3::tactic(smt_c, "bv");
+    <pre data-file="ebpf-correctness-verifier/lib/ebpf_smt/src/verify/validator.cc"><code class="language-cpp">    z3::tactic t = z3::tactic(smt_c, "bv");
     z3::solver s = t.mk_solver();
     Z3_set_ast_print_mode(s.ctx(), Z3_PRINT_SMTLIB2_COMPLIANT);
     s.add(!smt);
@@ -745,7 +745,7 @@ z3::expr predicate_symbolic_u64_helper(z3::expr out, smt_var&amp; sv) {
     does not print the input. Adding a counterexample to the JSON output would be a natural next step for
     agent use.</p>
     <p>The wrapper maps all of this to an exit code:</p>
-    <pre data-file="tools/smt_equiv.cc"><code class="language-cpp">      convert_bpf_pgm_to_smt_pgm(old_prog, old_len);
+    <pre data-file="ebpf-correctness-verifier/tools/smt_equiv.cc"><code class="language-cpp">      convert_bpf_pgm_to_smt_pgm(old_prog, old_len);
       convert_bpf_pgm_to_smt_pgm(new_prog, new_len);
 
       inst::max_prog_len = old_len;
@@ -830,8 +830,8 @@ F: (let ((a!1 (and (and true true true)
     <h2>The result contract</h2>
     <p>The repository spends more words on its contract than on any other topic, and for an automated gate the
     contract is the product. <code>docs/backend-contract.md</code> says backends "may be incomplete, but they must
-    never turn missing evidence into <code>PASS</code>." The combiner is four lines:</p>
-    <pre data-file="tools/ebpf_tv.cc"><code class="language-cpp">std::string combine(const std::vector&lt;StageResult&gt; &amp;stages) {
+    never turn missing evidence into <code>PASS</code>." The combiner is short:</p>
+    <pre data-file="ebpf-correctness-verifier/tools/ebpf_tv.cc"><code class="language-cpp">std::string combine(const std::vector&lt;StageResult&gt; &amp;stages) {
   bool saw_unknown = false;
   for (const auto &amp;stage : stages) {
     if (stage.result == FAIL) {
@@ -886,7 +886,7 @@ F: (let ((a!1 (and (and true true true)
     <p>The corpus cases are small, but they are real C compiled by a real clang. The packet-filter trio shows
     the style:</p>
     <div class="tabs">
-      <div class="tab-panel" data-label="xdp_packet_filter_old.c"><pre data-file="tests/real_apps/xdp_packet_filter_old.c"><code class="language-c">#include "common.h"
+      <div class="tab-panel" data-label="xdp_packet_filter_old.c"><pre data-file="ebpf-correctness-verifier/tests/real_apps/xdp_packet_filter_old.c"><code class="language-c">#include "common.h"
 
 SEC("xdp")
 int prog(void *ctx) {
@@ -900,7 +900,7 @@ int prog(void *ctx) {
 }
 
 char _license[] SEC("license") = "GPL";</code></pre></div>
-      <div class="tab-panel" data-label="…_new.c (PASS)"><pre data-file="tests/real_apps/xdp_packet_filter_new.c"><code class="language-c">#include "common.h"
+      <div class="tab-panel" data-label="…_new.c (PASS)"><pre data-file="ebpf-correctness-verifier/tests/real_apps/xdp_packet_filter_new.c"><code class="language-c">#include "common.h"
 
 SEC("xdp")
 int prog(void *ctx) {
@@ -909,7 +909,7 @@ int prog(void *ctx) {
 }
 
 char _license[] SEC("license") = "GPL";</code></pre></div>
-      <div class="tab-panel" data-label="…_fail.c (FAIL)"><pre data-file="tests/real_apps/xdp_packet_filter_fail.c"><code class="language-c">#include "common.h"
+      <div class="tab-panel" data-label="…_fail.c (FAIL)"><pre data-file="ebpf-correctness-verifier/tests/real_apps/xdp_packet_filter_fail.c"><code class="language-c">#include "common.h"
 
 SEC("xdp")
 int prog(void *ctx) {
@@ -960,7 +960,9 @@ char _license[] SEC("license") = "GPL";</code></pre></div>
     RFC 9669 is missing, including <code>MOD</code>, <code>SDIV</code>/<code>SMOD</code>, <code>MOVSX</code>,
     sign-extending loads, <code>JSET</code>, <code>JLT/JLE/JSGE/JSLT/JSLE</code>, most <code>JMP32</code> compares
     and BPF-to-BPF calls. A missing ALU opcode is not translated into any constraint, so the instruction is
-    silently skipped. A missing jump is not recognised as a branch. Neither raises an error, so neither becomes
+    silently skipped: <code>opcode_2_idx()</code> maps any opcode it does not list to index 0
+    (<code>IDX_NOP</code>, type <code>OP_NOP</code>), and <code>smt_prog::smt_block()</code> only encodes
+    instructions of the ALU, load, store and call types. A missing jump is not recognised as a branch. Neither raises an error, so neither becomes
     UNKNOWN. Since LLVM 20 the default BPF CPU is <code>v3</code>, which emits <code>JMP32</code> compares
     freely, so this affects ordinary default builds. Until this is fixed, treat a PASS as trustworthy only if
     you have checked that both objects use only the opcodes listed above. One possible guard is to reject any
@@ -1029,8 +1031,8 @@ char _license[] SEC("license") = "GPL";</code></pre></div>
     <h3>Merlin (ASPLOS 2024)</h3>
     <p>Merlin, by Mao, Ding, Zhai and Ma, optimizes eBPF in two tiers: custom LLVM IR passes (alignment,
     macro-op fusion) and a bytecode rewriter that applies instruction merging and strength reduction before
-    verification. It is rule-based and fast. The authors report it is 106× faster than K2, with 73% fewer
-    instructions on their benchmarks. Its correctness rests on each rule being right, not on a per-program
+    verification. It is rule-based and fast. The authors report 73% fewer instructions than the unoptimized
+    programs, and an optimizer that runs about 10<sup>6</sup> times faster than K2. Its correctness rests on each rule being right, not on a per-program
     proof. Merlin's output is exactly the kind of old/new pair <code>ebpf-tv</code> is meant for.</p>
 
     <h3>EPSO (ASE 2025)</h3>

@@ -963,7 +963,7 @@ main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x2a4;r
 main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x385;layerNormKernel+0x50;__device_stub__Z15layerNormKernelPKfPfS0_S0_mmm+0x1ab;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z15layerNormKernelPKfPfS0_S0_mmm 53
 main+0x387;InferencePipeline::runRequest+0x4df;TransformerLayer::forward+0x45c;residualAddKernel+0x33;__device_stub__Z17residualAddKernelPKfS0_Pfm+0x152;cudaLaunchKernel;libcuda.so.575.57.08+0x51ccb5;[GPU_Kernel]_Z17residualAddKernelPKfS0_Pfm 5</code></pre>
     <p>Read it like any flame graph input. Of 419 total "samples", 318 (about 76%) are the softmax
-    kernel. At 50 per second that is about 6.4 s of GPU time, all launched from one call site in
+    kernel. At 50 per second that is about 6.4 s of GPU time (or 3.2 s if the double counting described under the limitations applies), all launched from one call site in
     <code>TransformerLayer::forward</code>. Four details are worth noting:</p>
     <ul>
       <li>The <code>__device_stub__…</code> frames are host-side stubs that nvcc generates for each
@@ -1156,12 +1156,15 @@ Wrote 6 unique stacks (2787 total samples) to /tmp/xpuburn/cpu.folded</code></pr
       CPU samples from several threads, so a merged graph's total can be more than the run time. Off-CPU
       time is not sampled (<code>OffCPUThreshold: 0</code>), so a thread blocked in a sleeping
       synchronize call disappears, while one spinning in it shows up as CPU.</li>
-      <li><strong>Possible double counting (my reading, unverified).</strong> <code>XpuPerfCallbackHandler</code>
-      calls <code>XpuPerfGetCorrelationId</code> for every runtime-API callback it gets, and CUPTI
-      runtime callbacks fire at both <code>API_ENTER</code> and <code>API_EXIT</code> with the same
-      correlation ID. <code>correlateByCorrelationID</code> adds the kernel's duration once per matching
-      trace. If both callbacks produce a trace, each kernel would count twice. I couldn't test this
-      without a GPU. A uniform factor of two would leave the proportions among GPU kernels unchanged
+      <li><strong>Likely double counting (code reading, not run on a GPU).</strong> <code>XpuPerfCallbackHandler</code>
+      calls <code>XpuPerfGetCorrelationId</code> unconditionally, before it looks at
+      <code>callbackSite</code>, for every runtime-API callback it gets. CUPTI calls it at both
+      <code>API_ENTER</code> and <code>API_EXIT</code> with the same correlation ID (the handler's own
+      <code>callbackSite == CUPTI_API_ENTER</code> test shows it expects both). Nothing downstream
+      deduplicates: <code>SimpleReporter.ReportTraceEvent</code> appends every custom trace with a non-empty
+      stack, and <code>correlateByCorrelationID</code> adds the kernel's duration once per matching
+      trace. So each kernel would be counted twice whenever both uprobe hits yield a stack. I couldn't
+      run this without a GPU, and the committed <code>gpu_trace.folded</code> cannot show it either way. A uniform factor of two would leave the proportions among GPU kernels unchanged
       but would skew the CPU-versus-GPU ratio in merge mode.</li>
       <li><strong>Many uprobe hits.</strong> With <code>cuptiEnableDomain(RUNTIME_API)</code>, every CUDA runtime
       call (not just launches) fires the uprobe and unwinds a stack. Uprobes trap into the kernel

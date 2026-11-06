@@ -64,7 +64,8 @@
     loaders, applies an optimization plan, and records raw kernel counters; (2) <strong>action backends</strong>, namely the
     <code>bpfopt</code> bytecode optimizer with an <code>LD_PRELOAD</code> shim, and <strong>kinsn</strong> (BPF-Ext) kernel modules that add
     verified native operations to the JIT; (3) a <strong>benchmark framing</strong> in which an LLM agent chooses the actions and the
-    harness is the oracle. Safety always comes from the stock kernel verifier; the optimizers only have to be correct.</p></div>
+    harness is the oracle. Safety always comes from the stock kernel verifier (plus, for kinsn, each operation's trusted native emitter); the
+    optimizers only have to be correct.</p></div>
 
     <h2>What the repository contains</h2>
     <p>The README introduces the project as an "Auto-research framework and benchmark for agentic OS kernel extension
@@ -177,7 +178,9 @@
     </figure>
 
     <h3>Where the "agent" lives</h3>
-    <p>There is no LLM driver in the source tree, and the word "agent" means two different things in the code.</p>
+    <p>There is no LLM driver in the source tree (no model API client or agent-launching script turned up in a search of the
+    tracked code at <code>193c2b9</code>; archived notes only record that Codex was run with <code>codex exec</code> from outside),
+    and the word "agent" means two different things in the code.</p>
     <ul>
       <li>The <strong>optimizing agent</strong> is an external coding agent that reads <code>AGENTS.md</code> (mirrored as
       <code>CLAUDE.md</code>) and the 21 skills under <code>.agents/skills/</code>, for example <code>auto-research-orchestrator</code>,
@@ -186,7 +189,7 @@
       <li>In <code>runner/libs/agent.py</code>, an "agent" is the <strong>eBPF application process</strong>, following the convention of
       observability "agents" such as Tetragon. <code>start_agent()</code> launches the application with the shim preloaded:</li>
     </ul>
-    <pre data-file="runner/libs/agent.py"><code class="language-python">_SHIM_PATH = "/usr/local/lib/bpfrejit/libbpfrejit_shim.so"
+    <pre data-file="bpf-benchmark/runner/libs/agent.py"><code class="language-python">_SHIM_PATH = "/usr/local/lib/bpfrejit/libbpfrejit_shim.so"
 _SHIM_SOCK_DIR = "/var/run/bpfrejit"
 # ...
 
@@ -261,7 +264,7 @@ def _shim_env_for(binary: str) -&gt; dict[str, str]:
 
     <h3>The per-program ratio</h3>
     <p>For BPF cost, the unit of comparison is one program's average time per run in each phase:</p>
-    <pre data-file="rejit/docs/evaluation.md"><code class="language-plaintext">b_avg = baseline.run_time_ns_delta   /  baseline.run_cnt_delta
+    <pre data-file="bpf-benchmark/rejit/docs/evaluation.md"><code class="language-plaintext">b_avg = baseline.run_time_ns_delta   /  baseline.run_cnt_delta
 p_avg = post_rejit.run_time_ns_delta /  post_rejit.run_cnt_delta
 ratio = p_avg / b_avg                          # &lt; 1.0 ⇒ ReJIT faster</code></pre>
     <p>Three rules follow in the same section:</p>
@@ -314,7 +317,7 @@ cil_from_netdev 500000 330000000 498000 300000000</textarea>
     <code>syscall</code> symbol in a preloaded library intercepts them. The shim forwards everything that is not <code>SYS_bpf</code>,
     with two exceptions: it tracks <code>close</code> and <code>close_range</code> so that it knows when the application drops a file descriptor,
     and it records <code>perf_event_open</code> results because perf events are an attachment path:</p>
-    <pre data-file="bpfopt/shim/libbpfrejit_shim.c"><code class="language-c">/* Intercept syscall(2). */
+    <pre data-file="bpf-benchmark/bpfopt/shim/libbpfrejit_shim.c"><code class="language-c">/* Intercept syscall(2). */
 long syscall(long number, ...) {
     /* ... */
     ensure_syms_resolved();
@@ -363,7 +366,7 @@ long syscall(long number, ...) {
     <p>Inside an intercepted load, <code>loadtime_optimize_prog_load()</code> in <code>bpfopt/shim/shim_loadtime.h</code> runs each step,
     substitutes <code>${INPUT}</code>, <code>${OUTPUT}</code>, <code>${REPORT}</code>, <code>${MAP_IDS}</code> and similar variables into the
     command template, and checks the output with a real verifier load before going on:</p>
-    <pre data-file="bpfopt/shim/shim_loadtime.h"><code class="language-c">        uint64_t elapsed_ms = 0;
+    <pre data-file="bpf-benchmark/bpfopt/shim/shim_loadtime.h"><code class="language-c">        uint64_t elapsed_ms = 0;
         if (loadtime_run_shell(resolved, step_log, &amp;elapsed_ms) != 0) {
             snprintf(err, err_sz, "loadtime bpfopt step %s failed; log=%s",
                      name[0] ? name : "&lt;unnamed&gt;", step_log);
@@ -402,7 +405,7 @@ long syscall(long number, ...) {
     <p>The C++ <code>bpfopt</code> in <code>bpfopt/llvm/</code> is built on llvmbpf from <a href="16-llvmbpf.html">Chapter 16</a>. Every pass
     lifts raw kernel bytecode to LLVM IR with llvmbpf in kernel-compatible mode, optionally rewrites the IR, runs the O3 pipeline,
     lowers it with LLVM's own BPF backend, and extracts the relocated <code>.text</code> section as the new instruction stream:</p>
-    <pre data-file="bpfopt/llvm/src/llvm_mapinline.hpp"><code class="language-cpp">std::vector&lt;uint8_t&gt; emit_bpf_object(llvm::Module &amp;module)
+    <pre data-file="bpf-benchmark/bpfopt/llvm/src/llvm_mapinline.hpp"><code class="language-cpp">std::vector&lt;uint8_t&gt; emit_bpf_object(llvm::Module &amp;module)
 {
 	auto machine = create_bpf_target_machine(llvm::CodeGenOptLevel::Aggressive);
 #if LLVM_VERSION_MAJOR &gt;= 19
@@ -458,7 +461,7 @@ std::vector&lt;uint8_t&gt; run_llvm_roundtrip(const std::vector&lt;uint8_t&gt; &
     <p>This is the surface an agent is expected to edit. Pass groups and per-platform defaults live in
     <code>corpus/config/benchmark_config.yaml</code>; each pass has a command template:</p>
     <div class="tabs">
-      <div class="tab-panel" data-label="Policy groups"><pre data-file="corpus/config/benchmark_config.yaml"><code class="language-yaml">policy:
+      <div class="tab-panel" data-label="Policy groups"><pre data-file="bpf-benchmark/corpus/config/benchmark_config.yaml"><code class="language-yaml">policy:
   groups:
     map-only: [noop, map_inline]
     map-dce:      [noop, map_inline, const_prop, dce]
@@ -477,7 +480,7 @@ std::vector&lt;uint8_t&gt; run_llvm_roundtrip(const std::vector&lt;uint8_t&gt; &
   platforms:
     x86_64: { passes: [full-x86] }
     arm64:  { passes: [full] }</code></pre></div>
-      <div class="tab-panel" data-label="branch_flip step"><pre data-file="runner/config/passes/branch_flip/default.yaml"><code class="language-yaml"># Default per-pass step config for branch_flip.
+      <div class="tab-panel" data-label="branch_flip step"><pre data-file="bpf-benchmark/runner/config/passes/branch_flip/default.yaml"><code class="language-yaml"># Default per-pass step config for branch_flip.
 # Read by runner/libs/pass_config.py at execute_plan build time.
 # Shim substitutes ${...} vars; runner sends this command verbatim.
 log_level: 1
@@ -485,14 +488,15 @@ command: |
   profile_root="${BPFREJIT_BRANCH_PROFILE_ROOT:?BPFREJIT_BRANCH_PROFILE_ROOT is required for branch_flip}";
   profile="${profile_root}/hash-${PROG_BRANCH_PROFILE_HASH}.json";
   bpfopt --pass branch_flip --input "${INPUT}" --output "${OUTPUT}" --report "${REPORT}" --prog-type "${PROG_TYPE}" -- --profile "${profile}"</code></pre></div>
-      <div class="tab-panel" data-label="kinsn targets"><pre data-file="runner/config/passes/kinsn/default.yaml"><code class="language-yaml"># Default per-pass step config for kinsn.
+      <div class="tab-panel" data-label="kinsn targets"><pre data-file="bpf-benchmark/runner/config/passes/kinsn/default.yaml"><code class="language-yaml"># Default per-pass step config for kinsn.
 # Read by runner/libs/rejit_plan.py at execute_plan build time.
 # Daemon substitutes ${...} vars; runner sends this command verbatim.
 log_level: 1
 kinsn:
   - name: bpf_arm64_ccmp_w
-  # ... 23 more arm64 operations ...
+  # ... 24 more arm64 operations (25 in total) ...
   - name: bpf_x86_bextrq
+  # ... (x86 entries below are a selection of the 37) ...
   - name: bpf_x86_cmp_cmovne
   - name: bpf_x86_leaq
   - name: bpf_x86_movbe64
@@ -581,7 +585,7 @@ kinsn:
     <p>The x86 modules live in <code>kinsn/module/x86/</code> (15 C files) and the arm64 ones in <code>kinsn/module/arm64/</code> (11).
     The rotate module shows all the parts. The kfuncs themselves are empty stubs; they exist so that the operation has a BTF id that
     programs can reference:</p>
-    <pre data-file="kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">__bpf_kfunc_start_defs();
+    <pre data-file="bpf-benchmark/kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">__bpf_kfunc_start_defs();
 __bpf_kfunc void bpf_x86_roll(void) {}
 __bpf_kfunc void bpf_x86_rolq(void) {}
 __bpf_kfunc void bpf_x86_rorxl(void) {}
@@ -598,7 +602,7 @@ BTF_KFUNCS_END(bpf_x86_rotate_kfunc_ids)</code></pre>
     That is slow, but it never runs. Its job is to be a sequence the verifier can analyse that touches no register other than
     <code>dst</code>, so it matches the register footprint of the single native instruction.</p>
     <div class="tabs">
-      <div class="tab-panel" data-label="Proof sequence (verifier sees)"><pre data-file="kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">/* Keep the shifted-out bit in control flow, not a scratch register. */
+      <div class="tab-panel" data-label="Proof sequence (verifier sees)"><pre data-file="bpf-benchmark/kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">/* Keep the shifted-out bit in control flow, not a scratch register. */
 static int instantiate_rotate_leaf(u8 width, u8 dst_reg, u8 src_reg,
 				   u8 shift, struct bpf_insn *insn_buf)
 {
@@ -617,7 +621,7 @@ static int instantiate_rotate_leaf(u8 width, u8 dst_reg, u8 src_reg,
 	}
 	return cnt;
 }</code></pre></div>
-      <div class="tab-panel" data-label="Native emit (CPU runs)"><pre data-file="kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">static void emit_rol_imm(u8 *buf, u32 *len, bool is64, u8 dst_reg, u8 imm8)
+      <div class="tab-panel" data-label="Native emit (CPU runs)"><pre data-file="bpf-benchmark/kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">static void emit_rol_imm(u8 *buf, u32 *len, bool is64, u8 dst_reg, u8 imm8)
 {
 	kinsn_emit_rex_rr(buf, len, is64, 0, dst_reg);
 	kinsn_emit_u8(buf, len, 0xC1);
@@ -629,7 +633,7 @@ static int instantiate_rotate_leaf(u8 width, u8 dst_reg, u8 src_reg,
 	emit_rol_imm(buf, &amp;len, width == 64, rot.dst_reg, rot.shift);
 
 	return kinsn_emit_finish(image, off, emit, buf, len);</code></pre></div>
-      <div class="tab-panel" data-label="Descriptor + registration"><pre data-file="kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">const struct bpf_kinsn bpf_x86_rolq_desc = {
+      <div class="tab-panel" data-label="Descriptor + registration"><pre data-file="bpf-benchmark/kinsn/module/x86/bpf_x86_rotate.c"><code class="language-c">const struct bpf_kinsn bpf_x86_rolq_desc = {
 	.owner = THIS_MODULE,
 	.max_insn_cnt = 10270,
 	.max_emit_bytes = 16,
@@ -652,7 +656,7 @@ DEFINE_KINSN_V2_MODULE(bpf_x86_rotate, "BpfReJIT x86 kinsn: ROL/RORX",
     tests on each bit of the count register (<code>instantiate_rotate_tree</code>) with a bit-by-bit leaf at every node. Proof sequences can be enormous
     because the verifier processes them once per load; the CPU never sees them.</p>
     <p>The registration macro shows how little new kernel API the module needs: it is the ordinary kfunc registration with one extra field.</p>
-    <pre data-file="kinsn/module/include/kinsn_common.h"><code class="language-c">#define DEFINE_KINSN_V2_MODULE(prefix, desc, kfunc_ids, kinsn_desc_array)	\
+    <pre data-file="bpf-benchmark/kinsn/module/include/kinsn_common.h"><code class="language-c">#define DEFINE_KINSN_V2_MODULE(prefix, desc, kfunc_ids, kinsn_desc_array)	\
 static const struct btf_kfunc_id_set prefix##_kfunc_set = {		\
 	.owner = THIS_MODULE,						\
 	.set = &amp;(kfunc_ids),						\
@@ -710,7 +714,8 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     <h3>Is there a paper?</h3>
     <p>Yes, publicly, though under two names. <code>CITATION.cff</code> and the README cite <em>BPF-Ext: Safely Extending the eBPF Compilation
     Pipeline with Native Operations</em>, accepted at the 2026 ACM SIGOPS Annual Technical Conference (ATC '26, accepted paper #1160), which
-    the artifact guide dates to November 16–18, 2026 in Hong Kong, so ten days after this survey. No proceedings page existed yet. A
+    the artifact guide dates to November 16–18, 2026 in Hong Kong, so ten days after this survey (the conference site lists
+    November 15–18, the first day being workshops). No proceedings page existed yet. A
     preprint is on arXiv as <a href="https://arxiv.org/abs/2606.24213">arXiv:2606.24213</a> (23 June 2026) under the earlier name
     <em>Kops</em>, with the same seven authors, and the camera-ready LaTeX is public in
     <a href="https://github.com/yunwei37/atc26-kinsn-camera-ready">yunwei37/atc26-kinsn-camera-ready</a>, where <code>\tool</code> expands to
@@ -728,7 +733,7 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     which is how the repository measures the JIT-versus-native gap in the first place.</p>
     <p>Each program is written so that clang emits a specific idiom. The SipHash benchmark relies on a rotate helper that clang
     compiles to "the clean 4-insn rotate pattern (mov+lsh+rsh+or) without masking", which is exactly what the rotate kinsn targets:</p>
-    <pre data-file="micro/programs/common.h"><code class="language-c">static __always_inline u64 micro_rotl64(u64 value, u32 shift)
+    <pre data-file="bpf-benchmark/micro/programs/common.h"><code class="language-c">static __always_inline u64 micro_rotl64(u64 value, u32 shift)
 {
     shift &amp;= 63U;
     if (shift == 0) {
@@ -736,7 +741,7 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     }
     return (value &lt;&lt; shift) | (value &gt;&gt; (64U - shift));
 }</code></pre>
-    <pre data-file="micro/programs/siphash_rotate64_mixer.bpf.c"><code class="language-c">#define SIPROUND(v0, v1, v2, v3)                \
+    <pre data-file="bpf-benchmark/micro/programs/siphash_rotate64_mixer.bpf.c"><code class="language-c">#define SIPROUND(v0, v1, v2, v3)                \
     do {                                        \
         (v0) += (v1);                           \
         (v1) = micro_rotl64((v1), 13U);         \
@@ -790,7 +795,7 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     <p>Intel's Last Branch Record (LBR) is a small ring of recent <code>(from, to)</code> branch addresses kept by the CPU. Since Linux 5.16,
     BPF programs can read it with the helper <code>bpf_get_branch_snapshot()</code>, provided a perf event has LBR enabled on that CPU.
     bpfprof uses both halves. First it opens a perf event on every CPU that keeps LBR recording kernel branches:</p>
-    <pre data-file="bpfprof/src/main.rs (eunomia-bpf/bpfperf)"><code class="language-rust">            let mut attr = kernel_sys::perf_event_attr {
+    <pre data-file="bpfperf/bpfprof/src/main.rs"><code class="language-rust">            let mut attr = kernel_sys::perf_event_attr {
                 type_: kernel_sys::PERF_TYPE_HARDWARE,
                 size: std::mem::size_of::&lt;kernel_sys::perf_event_attr&gt;() as u32,
                 config: kernel_sys::PERF_COUNT_HW_CPU_CYCLES as u64,
@@ -809,7 +814,7 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     <p>Then it attaches a tiny <strong>fexit</strong> program to the target BPF program itself (fentry/fexit can attach to BPF programs, not
     only kernel functions; see <a href="05-program-types-and-hooks.html">Chapter 05</a>). Every time the target returns, the sidecar
     snapshots LBR into a ring buffer record. The sidecar is not compiled from C; it is 19 hand-assembled instructions:</p>
-    <pre data-file="kernel-sys/src/lib.rs (eunomia-bpf/bpfperf)"><code class="language-rust">fn branch_snapshot_sidecar_insns(ringbuf_fd: BorrowedFd&lt;'_&gt;, prog_id: u32) -&gt; Vec&lt;bpf_insn&gt; {
+    <pre data-file="bpfperf/kernel-sys/src/lib.rs"><code class="language-rust">fn branch_snapshot_sidecar_insns(ringbuf_fd: BorrowedFd&lt;'_&gt;, prog_id: u32) -&gt; Vec&lt;bpf_insn&gt; {
     let mut insns = Vec::with_capacity(19);
     insns.extend(ld_map_fd(BPF_REG_1, ringbuf_fd.as_raw_fd()));
     insns.push(mov64_imm(BPF_REG_2, BRANCH_SNAPSHOT_EVENT_SIZE as i32));
@@ -932,7 +937,7 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     <code>context_specialize</code> intervals cross one. The document limits these to "observed baseline/policy phase differences, not
     per-site causal attribution", because the historical runs did not keep per-step reports. For <code>branch_flip</code>,
     <code>rejit/docs/design.md</code> records 1.054× on 2026-07-01 but 0.899× on a rerun three days later, "Tracee and Tetragon clearly
-    regressed", so "the paper currently cannot claim a stable speedup".</p>
+    regressed", so "the paper currently cannot claim a stable speedup" (both translated from the Chinese original).</p>
 
     <h3>The agent benchmark (draft)</h3>
     <p>The bpf-bench paper draft (<code>docs/ebpf27-bpfoptbench/main.tex</code>, submodule at <code>17588bd</code>) is a workshop-length
@@ -946,8 +951,8 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     draft's own <code>evaluation-sessions.md</code> counts 2,874 sessions rather than 2,640.</p>
 
     <h2>What the last 50 commits are about</h2>
-    <p>The task description called the repo "extremely active", and the commit log bears that out: the last 500 commits all fall between
-    1 and 6 November 2026 (65, 35, 107, 134 and 157 per day). But the activity is not benchmark work. All of the last 50 commits
+    <p>The repository is extremely active: the last 500 commits all fall between
+    1 and 6 November 2026 (65, 35, 107, 134 and 157 per day, plus 2 on the 6th). But the activity is not benchmark work. All of the last 50 commits
     (2026-11-05 17:42 to 2026-11-06 00:16 UTC) touch <code>docs/shared/implementation.md</code> (a 5-line log entry each) and
     <code>kprog/formal/README.md</code>, and many also touch <code>kprog/formal/check_paper_counts.py</code> or the private paper submodule
     <code>docs/kprog-simulator-in-ebpf</code>. Their subjects describe an agent auditing a paper against the tree:</p>
@@ -994,7 +999,7 @@ MODULE_AUTHOR("BpfReJIT")</code></pre>
     <p>The artifact guide is explicit about cost: a first kernel and runtime-image build takes "1.5–3 hours" and "25–40 GB", and the full
     suites on both architectures take "more than a day; ARM64 needs AWS". Runs need KVM, Docker, <code>vng</code> and passwordless
     <code>sudo -n</code>, and the guide recommends a disposable machine. None of the following was run for this chapter.</p>
-    <pre data-file="README.md"><code class="language-bash">git clone https://github.com/eunomia-bpf/bpf-benchmark.git
+    <pre data-file="bpf-benchmark/README.md"><code class="language-bash">git clone https://github.com/eunomia-bpf/bpf-benchmark.git
 cd bpf-benchmark
 git submodule update --init --recursive -- \
     vendor/linux-framework llvm-backend/llvm vendor/libbpf vendor/llvmbpf \
@@ -1008,7 +1013,7 @@ make -C kinsn/paper/atc26                             # the paper's numbers and 
     <p>Do not run a bare <code>git submodule update --init --recursive</code>: four submodules are private author repositories and fail
     without access. The two commands at the end need no VM. The Lean build checks the proofs; <code>make -C kinsn/paper/atc26</code>
     regenerates the paper's numbers from shipped raw data and checks them against the camera-ready text. With a KVM host:</p>
-    <pre data-file="docs/atc26-artifact-evaluation.md"><code class="language-bash">make check                                   # builds the runtime image and runs the tests
+    <pre data-file="bpf-benchmark/docs/atc26-artifact-evaluation.md"><code class="language-bash">make check                                   # builds the runtime image and runs the tests
 
 # Smallest end-to-end run: one application, one sample.
 BPFREJIT_CORPUS_APPS=katran SAMPLES=1 WORKLOAD_DURATION=10 TIMEOUT=3000 make corpus
@@ -1035,8 +1040,9 @@ SAMPLES=1 WORKLOAD_DURATION=10 TIMEOUT=7200 make corpus</code></pre>
     </div>
     <div class="callout warn"><span class="label">Safety is not correctness</span><p>The design doc says it directly (Insight 3): the verifier
     guarantees the kernel is not harmed, but "If a pass or orchestration script has a bug, program behavior may change, but kernel safety is not
-    affected". A <code>map_inline</code> that inlines a value which later changes would produce a wrong but safe program. The benchmark leans on
-    workload checks and "hidden correctness checks" against this; the general problem is the subject of Chapter 18.</p></div>
+    affected" (translated from Chinese). A <code>map_inline</code> that inlines a value which later changes would produce a wrong but safe program. The draft
+    paper says the benchmark uses "hidden correctness checks" against this, but its own README says evaluator isolation still has to be added
+    (see Limitations above); the general problem is the subject of Chapter 18.</p></div>
 
     <h2>Related work</h2>
     <ul>
@@ -1044,7 +1050,7 @@ SAMPLES=1 WORKLOAD_DURATION=10 TIMEOUT=7200 make corpus</code></pre>
       single-version. <strong>Merlin</strong> (ASPLOS '24) optimizes at the LLVM IR and bytecode tiers before loading. Both are cited in the draft as
       baselines; neither can emit instructions outside the eBPF vocabulary, which is what kinsn adds.</li>
       <li><strong>Morpheus</strong> (ASPLOS '22) is the closest prior work to speculative ReJIT: runtime, guard-protected specialization of eBPF and DPDK
-      data planes, reloaded through the verifier. <code>rejit/docs/design.md</code> says reviewers would ask "isn't this Morpheus?" and names the differences:
+      data planes, reloaded through the verifier. <code>rejit/docs/design.md</code> says (in Chinese) that reviewers would ask whether this is just Morpheus, and its English related-work paragraph names the differences:
       general eBPF rather than match-action data planes, raw bytecode via an <code>LD_PRELOAD</code> shim rather than LLVM IR inside a framework,
       and PMU and run-statistics signals.</li>
       <li><strong>Jitterbug</strong> (OSDI '20) verifies the kernel's BPF JITs. kinsn's soundness argument is a small JIT-correctness obligation per
@@ -1081,7 +1087,7 @@ SAMPLES=1 WORKLOAD_DURATION=10 TIMEOUT=7200 make corpus</code></pre>
       <div class="q"><p><strong>Q5.</strong> The arXiv preprint reports 2.358× for whole-program native Cilium; the camera-ready reports 19%. Why?</p>
         <button class="opt">The camera-ready used a slower CPU</button>
         <button class="opt">The later number includes BPF stats overhead</button>
-        <button class="opt" data-right>The old JIT arm ran with <code>POLICY_AUDIT_MODE</code> and the native traffic was being dropped, so the two arms did not do the same work; a config-parity rerun gave a median of 1.1938×</button>
+        <button class="opt" data-right>The old JIT arm ran with <code>POLICY_AUDIT_MODE</code> while the native recipe did not, and replays of that recipe drop the native traffic, so the two arms did not do the same work; a config-parity rerun gave a median of 1.1938×</button>
         <div class="why">Documented in <code>corpus/results/cilium_x86_config_parity_counterbalanced_20261010/SUMMARY.md</code>.</div></div>
       <div class="q"><p><strong>Q6.</strong> Where is the LLM agent's main action surface in the repository?</p>
         <button class="opt"><code>corpus/driver.py</code> and the workload scripts</button>

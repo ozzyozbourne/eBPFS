@@ -169,7 +169,7 @@
     to do this, and the Hu et al. analysis describes their trade-offs in detail
     (<a href="https://arxiv.org/abs/2507.04786">Demystifying NCCL</a>):</p>
     <ul>
-      <li><strong>LL</strong> (low latency): every 8-byte store carries 4 bytes of data and a 4-byte flag. The
+      <li><strong>LL</strong> (low latency): every 8 bytes written carry 4 bytes of data and a 4-byte flag. The
       pinned <code>device.h</code> defines <code>union ncclLLFifoLine</code> as <code>data1, flag1, data2,
       flag2</code>. The receiver spins on the flag and needs no separate synchronisation, so latency is very low,
       but half of the bandwidth goes to flags.</li>
@@ -452,7 +452,11 @@ static inline uint64_t nccl_policy_pack_action(uint8_t algo, uint8_t proto,
     <code>SEC("tuner")</code> program that assigns <code>ctx-&gt;algorithm</code> and
     <code>ctx-&gt;n_channels</code>. The code in the repo does not work that way. Every policy returns the packed
     <code>u64</code>, and the rank-agreement checker rejects any store to the context ("write to policy context").
-    Read the paper's listing as illustrative and the repo headers as the real ABI.</p></div>
+    Read the paper's listing as illustrative and the repo headers as the real ABI. Two more differences:
+    the paper says the tuner sets preferred cells to zero and the others to a sentinel (<code>1e9</code>), but
+    <code>apply_policy_action</code> only zeroes the chosen cell and leaves NCCL's other costs alone; and the paper
+    says the native baseline layer clamps channel requests to NCCL's maximum, which the eBPF path does not do
+    (see the channels callout below).</p></div>
 
     <h3>A real policy</h3>
     <p>This is the policy behind the paper's main GPU result, tuned for one 8×B300 NVLink node:</p>
@@ -775,6 +779,17 @@ char LICENSE[] SEC("license") = "GPL";</code></pre>
     fixpoint is reached, with a 200,000-step cap. Stores into the context or the agreed snapshot are rejected outright.
     The analysis is deliberately conservative. For example, <code>current_channels</code> could in principle be treated as
     shared by induction, since every earlier decision was checked, but today it is treated as local.</p>
+    <div class="callout danger"><span class="label">Gap found in review</span><p>The checker trusts every
+    <code>agreed_map</code> lookup, whatever the key. <code>load_memory</code> returns <code>shared</code> for any load
+    through an <code>agreed_value</code> pointer, the key's label is never checked, and a null test on that pointer is
+    exempt from the control-flow rule. So a policy can compute <code>key = ctx-&gt;last_latency_ns &amp; 1</code>
+    (no branch), look it up in a one-entry <code>agreed_map</code>, return 0 when the result is NULL and a channel
+    action otherwise. Ranks with an odd latency get NULL and return 0, the others set 4 channels. I compiled exactly
+    this program with clang 14 and fed it to <code>rank_agreement::check</code> through the same scratch harness used
+    for the table below: it was <strong>accepted</strong>. A variant keyed by <code>call_count</code> was accepted
+    too. This is a code reading plus a CPU-only test of the header. It was not run inside NCCL, and the plugin only
+    loads an object with <code>agreed_map</code> when the experimental distributed-map opt-in, the other two
+    distributed maps and a <code>dist_merge</code> section are present. Not reported upstream.</p></div>
 
     <h3>What it accepts and rejects</h3>
     <p>The repo's unit test builds tiny instruction sequences: a context load at offset 0 is accepted, offset 8 is
@@ -1133,8 +1148,8 @@ llvm-objdump -d --no-show-raw-insn nvlink_ring_mid_v2.bpf.o</code></pre>
     <h2>Related work</h2>
     <ul>
       <li><strong>Other NCCL tuners.</strong> AutoCCL (NSDI '25) searches NCCL's low-level parameters online, built on a
-      modified NCCL. Per the repo's notes, rank 0 decides and broadcasts versioned schedules, so its agreement is "a leader
-      decides". NCCLbpf's agreed map instead runs the same verified merge on every rank. NVIDIA ships an example CSV-driven
+      modified NCCL. Per the repo's notes, rank 0 decides and broadcasts versioned schedules, so its agreement comes from a leader
+      deciding (the notes: "They agree by a leader or manager deciding"). NCCLbpf's agreed map instead runs the same verified merge on every rank. NVIDIA ships an example CSV-driven
       tuner in <code>plugins/tuner/</code>.</li>
       <li><strong>Collective synthesis.</strong> TACCL (NSDI '23) and MSCCL synthesise schedules offline. NCCLbpf only picks
       among built-in algorithms, and the paper describes the two as complementary.</li>

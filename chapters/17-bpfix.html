@@ -97,7 +97,7 @@
     handles both IPv4 and IPv6. The source looks correct. It bounds-checks each header against
     <code>data_end</code> and checks the UDP header before reading it:</p>
 
-    <pre data-file="bpfix-empirical/cases/stackoverflow-53136145/prog.c"><code class="language-c">    ethertype = __constant_ntohs(eth-&gt;h_proto);
+    <pre data-file="bpfix/bpfix-empirical/cases/stackoverflow-53136145/prog.c"><code class="language-c">    ethertype = __constant_ntohs(eth-&gt;h_proto);
     if (ethertype == ETH_P_IP) {
         ipv4_hdr = (void *)eth + ETH_HLEN;
         if ((void *)(ipv4_hdr + 1) &gt; data_end)
@@ -126,7 +126,7 @@
 
     <div class="tabs">
       <div class="tab-panel" data-label="Raw verifier log (kernel 6.15)">
-<pre data-file="bpfix-empirical/cases/stackoverflow-53136145/replay-verifier.log (restored from empirical-fixtures.tar.gz)"><code class="language-plaintext">; if (ipv4_hdr) @ prog.c:263
+<pre data-file="bpfix/bpfix-empirical/cases/stackoverflow-53136145/replay-verifier.log (restored from empirical-fixtures.tar.gz)"><code class="language-plaintext">; if (ipv4_hdr) @ prog.c:263
 30: (07) r5 += 40                     ; R5_w=40
 31: (15) if r3 == 0x0 goto pc+2       ; R3=pkt(off=14,r=34)
 32: (07) r3 += 20                     ; R3_w=pkt(off=34,r=34)
@@ -214,7 +214,9 @@ help: Keep the final access on a verifier-tracked pointer; rederive it from a ch
     <p>The third tab has no source lines. bpfix does not read DWARF or BTF from the object in its
     default mode. It takes source locations from the comments the verifier writes into the log
     using the program's BTF line info. Since Linux 6.9, <code>verbose_linfo()</code> in
-    <code>kernel/bpf/log.c</code> ends each comment with <code>" @ file:line"</code>. Linux 6.8 and
+    <code>kernel/bpf/log.c</code> ends each comment with <code>" @ file:line"</code> (commit
+    <code>7cc13adbd057</code>, "bpf: emit source code file name and line number in verifier log",
+    February 2024). Linux 6.8 and
     earlier print only the source text (on 6.1 the code is in <code>verifier.c</code> and prints
     <code>"%s\n"</code>). bpfix's <code>parse_source_comment()</code> needs that suffix. On an older
     kernel you still get the error ID, class, required proof and help, but the location is a line
@@ -280,7 +282,7 @@ help: Keep the final access on a verifier-tracked pointer; rederive it from a ch
     eBPF-specific (<code>paper/tables/sec-2-mechanisms.tex</code>). The case file for the running
     example records the label and the adjudicated root cause:</p>
 
-    <pre data-file="bpfix-empirical/cases/stackoverflow-53136145/case.yaml"><code class="language-yaml">label:
+    <pre data-file="bpfix/bpfix-empirical/cases/stackoverflow-53136145/case.yaml"><code class="language-yaml">label:
   capture_id: stackoverflow-53136145__kernel-6.15.11-clang-18-log2
   taxonomy_class: lowering_artifact
   mechanism_tags:
@@ -415,7 +417,7 @@ help: Keep the final access on a verifier-tracked pointer; rederive it from a ch
     prefixes, keeps the <em>last</em> <code>-- BEGIN PROG LOAD LOG --</code> region, and then scans
     upward from the end for the first line that looks like a verifier error:</p>
 
-    <pre data-file="crates/bpfix/src/input.rs"><code class="language-rust">pub(crate) fn find_terminal_error(log: &amp;str) -&gt; Option&lt;TerminalError&gt; {
+    <pre data-file="bpfix/crates/bpfix/src/input.rs"><code class="language-rust">pub(crate) fn find_terminal_error(log: &amp;str) -&gt; Option&lt;TerminalError&gt; {
     let lines = log.lines().collect::&lt;Vec&lt;_&gt;&gt;();
     let mut idx = lines.len();
     while idx &gt; 0 {
@@ -459,7 +461,7 @@ help: Keep the final access on a verifier-tracked pointer; rederive it from a ch
     <p>The core of <code>bpfanalysis</code> is a line parser for the three shapes of state line
     the verifier prints at log level 2. The module comment lists them:</p>
 
-    <pre data-file="crates/bpfanalysis/src/verifier_log.rs"><code class="language-rust">//! The verifier emits state snapshots in a few common forms:
+    <pre data-file="bpfix/crates/bpfanalysis/src/verifier_log.rs"><code class="language-rust">//! The verifier emits state snapshots in a few common forms:
 //! - `from &lt;prev&gt; to &lt;pc&gt;: R0=... R1=...`
 //! - `&lt;pc&gt;: R0=... R1=...`
 //! - `&lt;pc&gt;: (..insn..) ... ; R0=... R1=...`
@@ -498,7 +500,7 @@ pub struct RegState {
     <p>Classification is a table of substring patterns. It is intentionally simple and gives a
     first guess that later stages can refine:</p>
 
-    <pre data-file="crates/bpfix/src/classifier.rs"><code class="language-rust">const REJECTION_PATTERNS: &amp;[RejectionPattern] = &amp;[
+    <pre data-file="bpfix/crates/bpfix/src/classifier.rs"><code class="language-rust">const REJECTION_PATTERNS: &amp;[RejectionPattern] = &amp;[
     RejectionPattern::any(
         VerifierRejectionKind::PacketBounds,
         &amp;["invalid access to packet", "outside of the packet"],
@@ -540,6 +542,7 @@ pub struct RegState {
         <tr><td>E012–E015</td><td>dynptr, kfunc, iterator, lock/RCU/IRQ protocols</td><td>modern BPF object lifecycles</td></tr>
         <tr><td>E016</td><td>instruction_or_execution_context_unsupported</td><td>JIT/opcode support, sleepable calls</td></tr>
         <tr><td>E018</td><td>loop_or_verifier_budget_limit</td><td><code>BPF program is too large</code>, back-edges</td></tr>
+        <tr><td>E019–E021, E023</td><td>dynptr helper contract, IRQ flag lifecycle, map relocation/metadata, modern BPF object protocol</td><td>more specific protocol and loader-metadata contracts (E017 and E022 are listed as historical IDs)</td></tr>
       </tbody>
     </table>
     <p>A message that matches nothing gets <code>BPFIX-E099</code> (unsupported). The benchmark
@@ -552,7 +555,7 @@ pub struct RegState {
     search. bpfix tries to fill in the concrete parameters. For packet bounds it reads
     <code>off</code>, <code>size</code> and <code>r</code> from the terminal message itself:</p>
 
-    <pre data-file="crates/bpfix/src/proof.rs"><code class="language-rust">fn packet_bounds_required_proof(message: &amp;str, register: Option&lt;u8&gt;) -&gt; RequiredProof {
+    <pre data-file="bpfix/crates/bpfix/src/proof.rs"><code class="language-rust">fn packet_bounds_required_proof(message: &amp;str, register: Option&lt;u8&gt;) -&gt; RequiredProof {
     let proven_range = parse_i64_after(message, "r=");
     let required_end = packet_required_range(message).map(i64::from);
     let description = match (register, required_end, proven_range) {
@@ -586,7 +589,7 @@ pub(crate) fn packet_required_range(message: &amp;str) -&gt; Option&lt;u32&gt; {
     "There's an <code>if</code> on line 263 just above the rejected line" is a heuristic based on
     source text. For pointer provenance, the state-based part is this function:</p>
 
-    <pre data-file="crates/bpfanalysis/src/verifier_log.rs"><code class="language-rust">pub fn reg_state_is_pointer_like(state: &amp;RegState) -&gt; bool {
+    <pre data-file="bpfix/crates/bpfanalysis/src/verifier_log.rs"><code class="language-rust">pub fn reg_state_is_pointer_like(state: &amp;RegState) -&gt; bool {
     state.reg_type != "scalar" &amp;&amp; state.reg_type != "fp"
 }
 
@@ -690,7 +693,7 @@ pub fn latest_pointer_to_scalar_transition(
     <h3>Stage 2d: map PCs to source lines</h3>
     <p>Source mapping is short code, and you need to understand it to know when it fails:</p>
 
-    <pre data-file="crates/bpfix/src/source.rs"><code class="language-rust">pub(crate) fn collect_source_events(log: &amp;str) -&gt; Vec&lt;SourceEvent&gt; {
+    <pre data-file="bpfix/crates/bpfix/src/source.rs"><code class="language-rust">pub(crate) fn collect_source_events(log: &amp;str) -&gt; Vec&lt;SourceEvent&gt; {
     let lines = log.lines().collect::&lt;Vec&lt;_&gt;&gt;();
     let mut events = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -761,7 +764,7 @@ pub(crate) fn parse_source_comment(line: &amp;str) -&gt; Option&lt;SourceLocatio
 
     <p>The header line <code>span:</code> reports how trustworthy the location is:</p>
 
-    <pre data-file="crates/bpfix/src/main.rs"><code class="language-rust">fn span_confidence(
+    <pre data-file="bpfix/crates/bpfix/src/main.rs"><code class="language-rust">fn span_confidence(
     source_span: &amp;SourceSpan,
     related_spans: &amp;[RelatedSpan],
     proof_events: &amp;[diagnostic::ProofEvent],
@@ -869,7 +872,7 @@ cargo build --release -p bpfix
     in your own loader, set <code>kernel_log_level = 2</code> and save the buffer. The repository's
     snippet:</p>
 
-    <pre data-file="examples/libbpf-c/loader-snippet.c"><code class="language-c">int load_with_bpfix_log(const char *object_path)
+    <pre data-file="bpfix/examples/libbpf-c/loader-snippet.c"><code class="language-c">int load_with_bpfix_log(const char *object_path)
 {
     static char verifier_log[1 &lt;&lt; 20];
     struct bpf_object *obj;
@@ -982,7 +985,7 @@ bpfix --doctor                           # checks clang, bpftool, llvm-objdump, 
     <code>14</code> and, further down, <code>20</code> to <code>21</code>. The oracle is a list of
     packets and expected XDP return codes:</p>
 
-    <pre data-file="bpfix-bench/cases/packet_eth_off_by_one_001/test.py"><code class="language-python">if __name__ == "__main__":
+    <pre data-file="bpfix/bpfix-bench/cases/packet_eth_off_by_one_001/test.py"><code class="language-python">if __name__ == "__main__":
     raise SystemExit(
         run_case(
             argv=sys.argv[1:],
@@ -1013,7 +1016,7 @@ bpfix --doctor                           # checks clang, bpftool, llvm-objdump, 
     oracle counts that as a pass. bpfix's output for this case on 6.15 (from the checked-in
     <code>diagnostic.txt</code>):</p>
 
-    <pre data-file="bpfix-bench/cases/packet_eth_off_by_one_001/diagnostic.txt"><code class="language-plaintext">error[BPFIX-E001]: packet bounds check is narrower than the later packet access
+    <pre data-file="bpfix/bpfix-bench/cases/packet_eth_off_by_one_001/diagnostic.txt"><code class="language-plaintext">error[BPFIX-E001]: packet bounds check is narrower than the later packet access
   = class: source_bug
   = confidence: medium
   = diagnostic: supported, help: repair_hint, span: exact_pc
@@ -1035,7 +1038,8 @@ help: Add or move a packet bounds check immediately before the access or helper 
 help: Check the exact pointer and byte length passed to the helper, not only an earlier header pointer.</code></pre>
     <p>Running a locally built 0.1.10 on the checked-in <code>verifier.log</code> reproduced this file
     exactly. Read it critically. The secondary label on line 33 says "0 bytes" while the primary label
-    and the required proof say 13. The 0 is the range before the branch, which is confusing next to
+    and the required proof say 13. The 0 is probably the range before the branch (my reading of the
+    log, not checked in the code), which is confusing next to
     the correct numbers. The help lines are right, though: widen the check to include the access
     width.</p>
 
@@ -1046,7 +1050,7 @@ help: Check the exact pointer and byte length passed to the helper, not only an 
     (<code>raw verifier log</code>, <code>BPFix plain-text diagnostic</code>, nothing for
     <code>source-only</code>, and so on):</p>
 
-    <pre data-file="bpfix-bench/tools/run_suite.py"><code class="language-python">SYSTEM_PROMPT = "You repair eBPF C verifier failures by returning a full corrected source file."
+    <pre data-file="bpfix/bpfix-bench/tools/run_suite.py"><code class="language-python">SYSTEM_PROMPT = "You repair eBPF C verifier failures by returning a full corrected source file."
 # ...
     return f"""You are fixing one eBPF verifier rejection.
 
@@ -1335,8 +1339,8 @@ Source file:
     verifier by embedding concrete states as checks. <a href="03-verifier.html#research-checking-and-replacing-the-verifier">Chapter 03</a>
     covers all three. Rex (USENIX ATC '25) moves safety into a safe Rust subset to close the
     "language-verifier gap", the very gap that causes bpfix's lowering-artifact class.
-    <a href="18-ebpf-correctness-verifier.html">Chapter 18</a> covers the org's Z3 and PREVAIL
-    translation-validation project. None of these explains a rejection to the developer, which is
+    <a href="18-ebpf-correctness-verifier.html">Chapter 18</a> covers the org's Z3-based
+    translation-validation project (its early PREVAIL stage has since been removed). None of these explains a rejection to the developer, which is
     where bpfix fits.</p>
 
     <h2>Check your understanding</h2>

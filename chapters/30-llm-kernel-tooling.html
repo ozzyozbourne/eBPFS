@@ -1,0 +1,1536 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>30 · LLM agents for the kernel: schedcp, MCPtrace, GPTtrace · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="30">
+<meta name="chapter-part" content="Part VII · Kernel extension research">
+<meta name="chapter-summary" content="How the eunomia-bpf LLM-for-kernel line works: the Model Context Protocol, schedcp's MCP server that lets an agent pick, tune and write sched_ext schedulers (and its arXiv paper), MCPtrace's bpftrace tools, GPTtrace's prompt-and-retry pipeline, and the Kgent paper behind them.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/schedcp">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part VII · Kernel extension research › 30 · LLM kernel tooling</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 30</div>
+      <h1>LLM agents for the kernel: schedcp, MCPtrace, GPTtrace</h1>
+      <p class="lede">An LLM can write a bpftrace one-liner or a sched_ext scheduler. Letting it
+      load that code into a running kernel is a different problem. You need an interface that tells
+      the model what it may do, runs the privileged step for it, checks the result, and reports back.
+      This chapter follows the eunomia-bpf projects that tried to build that interface, from a 2023
+      ChatGPT tracing script to a 2025 MCP server that tunes the Linux scheduler.</p>
+      <div class="meta"><span>Prerequisites: <a href="05-program-types-and-hooks.html">05 · program types and hooks</a> (sched_ext), <a href="08-ecosystem.html">08 · ecosystem</a> (bpftrace), <a href="17-bpfix.html">17 · bpfix</a></span><span>Repos: <a href="https://github.com/eunomia-bpf/schedcp">schedcp</a> <code>730e2589</code>, <a href="https://github.com/eunomia-bpf/MCPtrace">MCPtrace</a> <code>1bd88555</code>, <a href="https://github.com/eunomia-bpf/GPTtrace">GPTtrace</a> <code>a1f83c7b</code></span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>eBPF has two properties that make it a good fit for machine-generated code. The verifier
+    (<a href="03-verifier.html">chapter 03</a>) rejects a program before it runs if it could crash the
+    kernel. And many hooks can be attached and detached without rebooting, so trying a new
+    policy is cheap. A sched_ext scheduler goes further: if it misbehaves, the kernel ejects it and
+    moves every task back to the fair class (<a href="05-program-types-and-hooks.html">chapter 05</a>).
+    These properties are useful when the author of the code is a language model that is
+    usually right but sometimes confidently wrong.</p>
+    <p>Writing the code is not the hard part. GPTtrace showed in 2023 that GPT-3.5 can produce a
+    working bpftrace one-liner for "count page faults by process". The hard parts are around the
+    code:</p>
+    <ul>
+      <li><strong>Context.</strong> Which probes exist on <em>this</em> kernel? Which schedulers are
+      installed, and what do their flags mean? A model trained on old blog posts does not know.</li>
+      <li><strong>Privilege.</strong> Loading BPF needs root (or <code>CAP_BPF</code> plus friends). Handing
+      an agent a root shell is the naive answer, and an unsafe one.</li>
+      <li><strong>Feedback.</strong> Did the program load? Did the workload get faster? The model needs
+      measurements, not just exit codes.</li>
+      <li><strong>Cost.</strong> The schedcp paper reports that an unaided Claude Code session needed 33
+      minutes, 221 API calls and about $6 to write one basic FIFO scheduler, and succeeded in only one
+      of three attempts.</li>
+    </ul>
+    <p>The org's projects answer these questions in different ways, and the answers changed as
+    LLM tooling changed. GPTtrace (2023) hard-wires one model and one tool through OpenAI function
+    calling. Kgent (eBPF '24) adds symbolic execution to check that the program does what the user
+    asked. MCPtrace and schedcp (2025) move the model out of the tool: they are
+    <em>servers</em> that any MCP-capable agent can call, and they own the privileged steps.</p>
+
+    <div class="callout warn"><span class="label">Project status</span><p>These repositories are
+    <strong>less active</strong> than most in this curriculum. At the time of writing (survey 2026-11-06, <code>gh api</code>), the
+    last commits are: <strong>schedcp</strong> 2026-02-12 (<code>730e2589</code>, documentation);
+    <strong>MCPtrace</strong> 2026-02-12 (<code>1bd88555</code>, a stdout-logging fix);
+    <strong>GPTtrace</strong> 2026-03-07 (<code>a1f83c7b</code>, pylint and CI);
+    <strong>KEN</strong> 2024-08-07 (<code>7575d9ba</code>); <strong>GPTtrace-web</strong> 2024-08-07
+    (<code>02bc89f7</code>). The schedcp README calls itself "experimental" and "WIP", and GPTtrace's
+    README says it "is not suitable for production use". Read this chapter as a study of
+    ideas and of one research prototype, not as a guide to production tools.</p></div>
+
+    <h3>The lineage at a glance</h3>
+    <div class="grid">
+      <div class="card"><h4>GPTtrace · 2023</h4><p>Python CLI. Natural language → OpenAI function
+      call → <code>sudo bpftrace</code>. Retries on error, then explains the output.
+      275 stars.</p></div>
+      <div class="card"><h4>KEN / Kgent · 2023–24</h4><p>Research system: LLM synthesis plus program
+      comprehension plus symbolic execution. arXiv 2312.05531, then eBPF '24. Repo holds datasets and
+      evaluation scripts.</p></div>
+      <div class="card"><h4>GPTtrace-web · 2023–24</h4><p>"GPT2Bpftrace": a web page that turns a
+      sentence into a bpftrace script you copy and run yourself.</p></div>
+      <div class="card"><h4>MCPtrace · 2025</h4><p>Rust MCP server with four tools around bpftrace.
+      The agent writes the script; the server runs it under sudo with a timeout.</p></div>
+      <div class="card"><h4>schedcp · 2025</h4><p>Rust MCP server plus an <code>autotune</code> driver.
+      The agent profiles a workload, picks or writes a sched_ext scheduler, and measures it.
+      arXiv 2509.01245.</p></div>
+    </div>
+
+    <h2>The Model Context Protocol in one section</h2>
+    <p>MCPtrace and schedcp are both MCP servers, so we start with what MCP is. Anthropic announced
+    the <a href="https://www.anthropic.com/news/model-context-protocol">Model Context Protocol</a>
+    on 25 November 2024 as "an open standard for connecting AI assistants to the systems where data
+    lives". The <a href="https://modelcontextprotocol.io/specification/2025-06-18">specification</a>
+    has dated revisions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25 and 2026-07-28 (the
+    latest on the <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/releases">releases page</a>).
+    Both servers in this chapter negotiate the oldest one, <code>2024-11-05</code>.</p>
+
+    <h3>Roles</h3>
+    <p>The spec names three roles, and it helps to keep them apart:</p>
+    <ul>
+      <li><strong>Host</strong>: the LLM application the user runs, for example Claude Code or Claude
+      Desktop. It owns the conversation and the model.</li>
+      <li><strong>Client</strong>: a connector inside the host, one per server.</li>
+      <li><strong>Server</strong>: a program that offers capabilities. schedcp and MCPtrace are servers.</li>
+    </ul>
+    <p>A server can offer three kinds of feature: <em>tools</em> ("functions for the AI model to
+    execute"), <em>resources</em> (data for context) and <em>prompts</em> (templated messages). The
+    client can offer <em>sampling</em>, <em>roots</em> and <em>elicitation</em> back to the server.
+    The two kernel servers here use only <strong>tools</strong>. Nothing else is needed to
+    let a model run a scheduler.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 360" role="img" aria-label="Agent host with LLM and MCP client talks JSON-RPC over stdio to an MCP server process, which runs privileged commands (sudo bpftrace, scx_* binaries, clang and loader) that load eBPF into the Linux kernel">
+        <style>
+          .c1-box{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .c1-hl{fill:var(--bg3);stroke:var(--accent);stroke-width:1.8}
+          .c1-hl2{fill:var(--bg3);stroke:var(--accent2);stroke-width:1.8}
+          .c1-t{fill:var(--fg);font:bold 13px sans-serif}
+          .c1-s{fill:var(--muted);font:11.5px sans-serif}
+          .c1-c{fill:var(--fg);font:11px monospace}
+          .c1-ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah301)}
+          .c1-band{fill:none;stroke:var(--border);stroke-dasharray:5 4}
+          .c1-lab{fill:var(--accent);font:bold 12px sans-serif}
+        </style>
+        <defs><marker id="ah301" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <rect class="c1-band" x="10" y="30" width="250" height="310" rx="10"/>
+        <text class="c1-lab" x="20" y="22">Host (user privileges)</text>
+        <rect class="c1-band" x="320" y="30" width="270" height="310" rx="10"/>
+        <text class="c1-lab" x="330" y="22">MCP server process</text>
+        <rect class="c1-band" x="650" y="30" width="240" height="310" rx="10"/>
+        <text class="c1-lab" x="660" y="22">Kernel (root needed)</text>
+
+        <rect class="c1-box" x="25" y="50" width="220" height="70" rx="8"/>
+        <text class="c1-t" x="35" y="72">LLM (Claude, GPT, …)</text>
+        <text class="c1-s" x="35" y="92">reasons, picks a tool,</text>
+        <text class="c1-s" x="35" y="108">writes code and arguments</text>
+        <rect class="c1-hl2" x="25" y="150" width="220" height="70" rx="8"/>
+        <text class="c1-t" x="35" y="172">MCP client</text>
+        <text class="c1-s" x="35" y="192">launches server, sends</text>
+        <text class="c1-s" x="35" y="208">tools/list, tools/call</text>
+        <rect class="c1-box" x="25" y="250" width="220" height="70" rx="8"/>
+        <text class="c1-t" x="35" y="272">User</text>
+        <text class="c1-s" x="35" y="292">approves tool calls,</text>
+        <text class="c1-s" x="35" y="308">supplies the sudo password</text>
+        <path class="c1-ar" d="M135,120 L135,148"/>
+        <path class="c1-ar" d="M135,150 L135,122"/>
+
+        <path class="c1-ar" d="M245,175 L333,175"/>
+        <path class="c1-ar" d="M335,200 L247,200"/>
+        <text class="c1-c" x="252" y="168">stdin</text>
+        <text class="c1-c" x="252" y="216">stdout</text>
+
+        <rect class="c1-hl" x="335" y="50" width="240" height="110" rx="8"/>
+        <text class="c1-t" x="345" y="72">rmcp ServerHandler</text>
+        <text class="c1-c" x="345" y="92">#[tool] list_schedulers</text>
+        <text class="c1-c" x="345" y="108">#[tool] run_scheduler</text>
+        <text class="c1-c" x="345" y="124">#[tool] exec_program</text>
+        <text class="c1-s" x="345" y="146">JSON Schema from Rust structs</text>
+        <rect class="c1-box" x="335" y="180" width="240" height="70" rx="8"/>
+        <text class="c1-t" x="345" y="202">State</text>
+        <text class="c1-s" x="345" y="222">execution IDs, output buffers,</text>
+        <text class="c1-s" x="345" y="238">workload profiles (JSON file)</text>
+        <rect class="c1-box" x="335" y="265" width="240" height="60" rx="8"/>
+        <text class="c1-t" x="345" y="287">Subprocesses</text>
+        <text class="c1-c" x="345" y="307">sudo -S bpftrace / scx_*</text>
+
+        <path class="c1-ar" d="M575,295 L663,295"/>
+        <rect class="c1-hl2" x="665" y="50" width="210" height="70" rx="8"/>
+        <text class="c1-t" x="675" y="72">BPF verifier</text>
+        <text class="c1-s" x="675" y="92">accepts or rejects each</text>
+        <text class="c1-s" x="675" y="108">program at load time</text>
+        <rect class="c1-box" x="665" y="150" width="210" height="70" rx="8"/>
+        <text class="c1-t" x="675" y="172">sched_ext</text>
+        <text class="c1-s" x="675" y="192">struct_ops scheduler; ejected</text>
+        <text class="c1-s" x="675" y="208">on error or stall</text>
+        <rect class="c1-box" x="665" y="250" width="210" height="70" rx="8"/>
+        <text class="c1-t" x="675" y="272">Tracing hooks</text>
+        <text class="c1-s" x="675" y="292">kprobes, tracepoints,</text>
+        <text class="c1-s" x="675" y="308">perf events (bpftrace)</text>
+        <path class="c1-ar" d="M770,250 L770,222"/>
+        <path class="c1-ar" d="M770,150 L770,122"/>
+      </svg>
+      <figcaption>Figure 30.1 — The split that schedcp and MCPtrace use. The model never gets a shell.
+      It sees a fixed list of tools. The server process holds the sudo password and starts the
+      privileged subprocesses. The kernel's verifier and sched_ext's watchdog are the last line of
+      defence.</figcaption>
+    </figure>
+
+    <h3>The wire format</h3>
+    <p>MCP messages are <a href="https://www.jsonrpc.org/">JSON-RPC 2.0</a>. The connection is
+    stateful and starts with a handshake: the client sends <code>initialize</code> with its protocol
+    version and capabilities, the server answers with its own, and the client sends a
+    <code>notifications/initialized</code> notification. After that the client can discover tools and call
+    them. These three messages are copied from the spec's
+    <a href="https://modelcontextprotocol.io/specification/2025-06-18/server/tools">Tools page</a>
+    (the weather tool is the spec's own example, not a kernel tool):</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="tools/list response"><pre><code class="language-json">{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "tools": [
+      {
+        "name": "get_weather",
+        "title": "Weather Information Provider",
+        "description": "Get current weather information for a location",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "City name or zip code"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "nextCursor": "next-page-cursor"
+  }
+}</code></pre></div>
+      <div class="tab-panel" data-label="tools/call request"><pre><code class="language-json">{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": {
+      "location": "New York"
+    }
+  }
+}</code></pre></div>
+      <div class="tab-panel" data-label="tool error result"><pre><code class="language-json">{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Failed to fetch weather data: API rate limit exceeded"
+      }
+    ],
+    "isError": true
+  }
+}</code></pre></div>
+    </div>
+
+    <p>Three details from the spec matter for kernel tools.</p>
+    <ol>
+      <li><strong>The description is the documentation.</strong> The model decides which tool to call
+      from <code>name</code>, <code>description</code> and <code>inputSchema</code> alone. schedcp uses
+      these strings as instructions ("Always use this tool to get the info of all schedulers first").</li>
+      <li><strong>Two kinds of error.</strong> A protocol error (unknown tool, bad arguments) is a
+      JSON-RPC <code>error</code>. A tool that ran and failed returns a normal result with
+      <code>isError: true</code>, so the model can read the message and try again. A compiler error
+      from clang, or a verifier rejection, belongs in the second kind.</li>
+      <li><strong>stdio is strict.</strong> In the
+      <a href="https://modelcontextprotocol.io/specification/2025-06-18/basic/transports">stdio transport</a>
+      the client launches the server as a subprocess, messages are newline-delimited, and "the server
+      MUST NOT write anything to its <code>stdout</code> that is not a valid MCP message". Logging goes
+      to stderr. MCPtrace's last commit, "Fix stdout logging breaking MCP protocol communication",
+      fixed exactly this bug.</li>
+    </ol>
+    <div class="callout danger"><span class="label">Tools are code execution</span><p>The spec says it
+    plainly: "Tools represent arbitrary code execution and must be treated with appropriate caution",
+    and hosts "must obtain explicit user consent before invoking any tool". An
+    <code>exec_program</code> tool that runs any bpftrace script as root is root code execution
+    with one extra step. MCP gives the host a place to ask the user. It does not make the tool
+    safe.</p></div>
+
+    <h3>Writing a server in Rust with rmcp</h3>
+    <p>Both servers use <code>rmcp</code> 0.2.0, the official
+    <a href="https://github.com/modelcontextprotocol/rust-sdk">Rust SDK</a>. A server is a struct. Each
+    tool is an <code>async fn</code> marked <code>#[tool(description = …)]</code> that takes
+    <code>Parameters&lt;T&gt;</code>, where <code>T</code> derives <code>schemars::JsonSchema</code>.
+    The macro turns <code>T</code> into the tool's <code>inputSchema</code>, so the doc strings on the
+    fields become the per-argument descriptions the model reads. Here are the request types for
+    schedcp's <code>list_schedulers</code> and <code>run_scheduler</code>:</p>
+    <pre data-file="schedcp/mcp/src/lib.rs"><code class="language-rust">#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListSchedulersRequest {
+    #[schemars(description = "Filter by scheduler name (partial match). Should leave empty by default.")]
+    pub name: Option&lt;String&gt;,
+    #[schemars(description = "Filter by production readiness. Should leave empty by default.")]
+    pub production_ready: Option&lt;bool&gt;,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunSchedulerRequest {
+    #[schemars(description = "Name of the scheduler to run, it should be one of the names returned by list_schedulers")]
+    pub name: String,
+    #[schemars(description = "Arguments to pass to the scheduler as a list of strings, as listed in the list_schedulers.")]
+    #[serde(default)]
+    pub args: Vec&lt;String&gt;,
+}</code></pre>
+    <p>The server advertises only the tools capability and serves on stdio:</p>
+    <pre data-file="schedcp/mcp/src/main.rs"><code class="language-rust">#[tool_handler]
+impl ServerHandler for McpServer {
+    fn get_info(&amp;self) -&gt; ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation::from_build_env(),
+            instructions: Some("MCP server for sched-ext - provides Linux kernel scheduler management capabilities".to_string()),
+        }
+    }
+}
+/* ... in main(): */
+    let server = McpServer::new_with_sudo(sudo_password).await?;
+    let service = server.serve(stdio()).await.inspect_err(|e| {
+        error!("serving error: {:?}", e);
+    })?;
+    service.waiting().await?;</code></pre>
+    <p>A host learns how to start the server from a config file. schedcp ships a project-level
+    <code>.mcp.json</code>, which Claude Code reads when you start it in the repository root:</p>
+    <pre data-file="schedcp/.mcp.json"><code class="language-json">{
+  "mcpServers": {
+    "schedcp": {
+      "type": "stdio",
+      "command": "mcp/target/release/schedcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}</code></pre>
+
+    <h2>schedcp: an MCP control plane for sched_ext</h2>
+
+    <h3>The problem: a semantic gap</h3>
+    <p>Linux's default scheduler, EEVDF (which replaced CFS in 6.6), is one policy for every
+    workload. sched_ext (merged in 6.12; see <a href="05-program-types-and-hooks.html">chapter 05</a>)
+    lets you replace it at run time with a BPF program, and the
+    <a href="https://github.com/sched-ext/scx">sched-ext/scx</a> repository already ships many
+    schedulers: <code>scx_rusty</code> for general servers, <code>scx_lavd</code> and
+    <code>scx_bpfland</code> for interactive and gaming loads, <code>scx_layered</code> for
+    explicitly configured layers, and so on. Each has a page of flags. The question "which of these,
+    with which flags, for <em>my</em> workload?" needs two kinds of knowledge that rarely sit in one
+    person: what the application does (a parallel build, a latency-sensitive server, a batch job with
+    one straggler) and how each scheduler behaves.</p>
+    <p>The schedcp paper calls this the <em>semantic gap</em> between kernel policy and application
+    needs. Its claim is that an LLM agent can close the gap, because it can read the application's
+    code and the scheduler's documentation, if the system gives it a safe and cheap way to act.
+    Earlier learned schedulers based on reinforcement learning map numeric state to a fixed set of
+    actions. They cannot read a Makefile, and they cannot write new scheduling code.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Keep the LLM out of the scheduling
+    hot path. The agent works in the <em>control plane</em>: it reasons about the workload offline and
+    produces a choice of scheduler, a set of flags, or a new <code>.bpf.c</code> file. The
+    <em>data plane</em> is ordinary sched_ext BPF code making decisions in nanoseconds. The paper
+    describes this as "zero LLM overhead in the critical path". The name SchedCP plays on "Context
+    Protocol" (from MCP) and "Control Plane".</p></div>
+
+    <h3>The paper</h3>
+    <p><strong>Towards Agentic OS: An LLM Agent Framework for Linux Schedulers</strong>, by Yusheng
+    Zheng, Yanpeng Hu, Wei Zhang and Andi Quinn, is
+    <a href="https://arxiv.org/abs/2509.01245">arXiv:2509.01245</a> (cs.AI, cross-listed cs.MA and cs.OS).
+    v1 was posted on 1 September 2025 and v4 on 30 September 2025. arXiv lists the journal
+    reference "MLforSystem 2025". The repository README links it as "SchedCP: Towards Agentic OS" and
+    keeps a copy of v2 under <code>document/2509.01245v2.pdf</code>.</p>
+    <p>The paper has two parts:</p>
+    <ul>
+      <li><strong>SchedCP</strong>, the system interface, exposed over MCP and built from three
+      services: a <em>Workload Analysis Engine</em> (tiered access to profiling data, from cheap
+      summaries to <code>perf</code>, <code>top</code> and attachable eBPF probes, plus a feedback
+      channel), a <em>Scheduler Policy Repository</em> (scheduler code with natural-language metadata
+      and performance history, which the paper describes as a vector database), and an
+      <em>Execution Verifier</em> (checks before deployment).</li>
+      <li><strong>sched-agent</strong>, the AI side: four Claude Code subagents (Observation, Planning,
+      Execution, Learning) arranged as an "in-context reinforcement learning" loop. The agent's
+      context carries recent results, and no model weights are retrained.</li>
+    </ul>
+
+    <figure>
+      <svg viewBox="0 0 900 380" role="img" aria-label="sched-agent's four agents (Observation, Planning, Execution, Learning) in a loop above SchedCP's three services (Workload Analysis Engine, Scheduler Policy Repository, Execution Verifier), which sit above sched_ext in the Linux kernel">
+        <style>
+          .c2-box{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .c2-hl{fill:var(--bg3);stroke:var(--accent);stroke-width:1.8}
+          .c2-hl2{fill:var(--bg3);stroke:var(--accent2);stroke-width:1.8}
+          .c2-t{fill:var(--fg);font:bold 13px sans-serif}
+          .c2-s{fill:var(--muted);font:11.5px sans-serif}
+          .c2-ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah302)}
+          .c2-da{stroke:var(--accent2);stroke-width:1.4;fill:none;stroke-dasharray:4 3;marker-end:url(#ah302)}
+          .c2-band{fill:none;stroke:var(--border);stroke-dasharray:5 4}
+          .c2-lab{fill:var(--accent);font:bold 12px sans-serif}
+        </style>
+        <defs><marker id="ah302" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <rect class="c2-band" x="10" y="25" width="880" height="120" rx="10"/>
+        <text class="c2-lab" x="20" y="18">sched-agent: "what to optimize" (AI logic, Claude Code subagents)</text>
+        <rect class="c2-hl" x="30" y="45" width="185" height="80" rx="8"/>
+        <text class="c2-t" x="42" y="68">Observation</text>
+        <text class="c2-s" x="42" y="88">builds a Workload Profile</text>
+        <text class="c2-s" x="42" y="104">(NL description + goals)</text>
+        <rect class="c2-hl" x="245" y="45" width="185" height="80" rx="8"/>
+        <text class="c2-t" x="257" y="68">Planning</text>
+        <text class="c2-s" x="257" y="88">configure / patch /</text>
+        <text class="c2-s" x="257" y="104">compose new scheduler</text>
+        <rect class="c2-hl" x="460" y="45" width="185" height="80" rx="8"/>
+        <text class="c2-t" x="472" y="68">Execution</text>
+        <text class="c2-s" x="472" y="88">writes code, submits it,</text>
+        <text class="c2-s" x="472" y="104">reacts to verifier output</text>
+        <rect class="c2-hl" x="675" y="45" width="195" height="80" rx="8"/>
+        <text class="c2-t" x="687" y="68">Learning</text>
+        <text class="c2-s" x="687" y="88">reads metrics, updates</text>
+        <text class="c2-s" x="687" y="104">repository and history</text>
+        <path class="c2-ar" d="M215,85 L243,85"/>
+        <path class="c2-ar" d="M430,85 L458,85"/>
+        <path class="c2-ar" d="M645,85 L673,85"/>
+        <path class="c2-ar" d="M772,45 C772,30 120,30 120,43"/>
+
+        <rect class="c2-band" x="10" y="175" width="880" height="110" rx="10"/>
+        <text class="c2-lab" x="20" y="168">SchedCP: "how to observe and act" (MCP server)</text>
+        <rect class="c2-hl2" x="30" y="190" width="260" height="80" rx="8"/>
+        <text class="c2-t" x="42" y="212">Workload Analysis Engine</text>
+        <text class="c2-s" x="42" y="232">summaries → perf/top/eBPF</text>
+        <text class="c2-s" x="42" y="248">→ post-deployment feedback</text>
+        <rect class="c2-hl2" x="320" y="190" width="260" height="80" rx="8"/>
+        <text class="c2-t" x="332" y="212">Scheduler Policy Repository</text>
+        <text class="c2-s" x="332" y="232">code + NL metadata + history</text>
+        <text class="c2-s" x="332" y="248">(code: schedulers.json)</text>
+        <rect class="c2-hl2" x="610" y="190" width="260" height="80" rx="8"/>
+        <text class="c2-t" x="622" y="212">Execution Verifier</text>
+        <text class="c2-s" x="622" y="232">BPF verifier → static checks →</text>
+        <text class="c2-s" x="622" y="248">dynamic test → deploy</text>
+        <path class="c2-da" d="M122,127 L150,188"/>
+        <path class="c2-da" d="M337,127 L440,188"/>
+        <path class="c2-da" d="M552,127 L700,188"/>
+        <path class="c2-da" d="M772,127 L780,188"/>
+
+        <rect class="c2-box" x="250" y="310" width="400" height="55" rx="8"/>
+        <text class="c2-t" x="262" y="332">Linux kernel · sched_ext</text>
+        <text class="c2-s" x="262" y="352">BPF scheduler makes every decision; no LLM in this path</text>
+        <path class="c2-ar" d="M740,270 L600,308"/>
+        <path class="c2-ar" d="M300,308 L160,272"/>
+      </svg>
+      <figcaption>Figure 30.2 — The architecture in the schedcp paper (redrawn from its Figure 1). Solid
+      arrows are the agent loop. Dashed arrows are MCP tool use. In the code at <code>730e2589</code>
+      the four agents are prompts given to one Claude Code session, and the three services are a
+      smaller set of seven tools (next section).</figcaption>
+    </figure>
+
+    <h3>What the code actually ships</h3>
+    <p>The paper describes the design. The repository is a prototype of it, and its own
+    <code>document/AI_AGENTS.md</code> says so: "Rather than having separate code files for each
+    agent, the agent behaviors emerge from" the AI's reasoning, the MCP tools, the prompts that
+    <code>autotune</code> provides, and the structured data in <code>schedulers.json</code>. It is
+    worth knowing which parts of the design exist as code:</p>
+    <table>
+      <thead><tr><th>Paper component</th><th>In the repo at <code>730e2589</code></th></tr></thead>
+      <tbody>
+        <tr><td>Workload Analysis Engine, tier 1 (summaries)</td><td><code>system_monitor</code> tool: samples <code>/proc/stat</code>, <code>/proc/meminfo</code>, <code>/proc/schedstat</code> once per second</td></tr>
+        <tr><td>Tier 2 (sandboxed perf, top, eBPF probes)</td><td>Not a schedcp tool. The agent uses its host's own shell (Claude Code's Bash tool)</td></tr>
+        <tr><td>Tier 3 (feedback channel)</td><td><code>workload</code> tool: profiles and <code>add_history</code> entries with a free-text result, saved to <code>schedcp_workloads.json</code></td></tr>
+        <tr><td>Scheduler Policy Repository</td><td><code>scheduler/schedulers.json</code>: 20 scx schedulers (10 marked <code>production_ready</code>) with descriptions, use cases and typed tuning parameters, embedded into the binary. No vector search in <code>mcp/</code></td></tr>
+        <tr><td>Execution Verifier: kernel verifier</td><td>Yes, implicitly: <code>create_and_verify_scheduler</code> compiles with clang and loads the object</td></tr>
+        <tr><td>Scheduler-specific static analysis, micro-VM, signed deployment token, canary with circuit breaker</td><td>Not found in <code>mcp/</code> or <code>autotune/</code> (searched for <code>circuit</code>, <code>canary</code>, <code>vector</code>). The dynamic test is a 10-second run on the host</td></tr>
+        <tr><td>Four subagents</td><td>One Claude Code session started by <code>autotune</code> with a single prompt</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn"><span class="label">Design versus prototype</span><p>When you read the
+    paper's safety story (the agent "doesn't need root access", rollback through a circuit breaker),
+    remember that at this commit the agent's own host usually has a shell, and the server runs the
+    scheduler under <code>sudo</code> with a password from an environment variable. The real safety
+    net is sched_ext itself: the verifier at load, and the kernel's watchdog, which ejects a
+    scheduler that stalls runnable tasks.</p></div>
+
+    <h3>Directory map</h3>
+    <pre><code class="language-plaintext">schedcp/                         (commit 730e2589, 2026-02-12)
+├── .mcp.json                    Claude Code config: stdio server mcp/target/release/schedcp
+├── mcp/                         Rust MCP server (rmcp 0.2.0), ~4,070 lines incl. process_manager
+│   ├── src/main.rs              7 #[tool]s, ServerHandler, stdio serve, sudo detection
+│   ├── src/lib.rs               request types (JsonSchema) and *_impl functions
+│   ├── src/scheduler_manager.rs schedulers.json (rust-embed), binaries from ~/.schedcp/scxbin
+│   ├── src/scheduler_generator.rs  write .bpf.c → clang → sudo loader for 10 s
+│   ├── src/system_monitor.rs    /proc/stat, /proc/meminfo, /proc/schedstat sampler
+│   ├── src/workload_profile.rs  WorkloadProfile, ExecutionHistory
+│   ├── src/storage.rs           persists schedcp_workloads.json
+│   ├── src/cli.rs               schedcp-cli: list / run / monitor without an LLM
+│   ├── lib/process_manager/     spawn, track and stop scheduler processes (SIGTERM, then SIGKILL)
+│   └── new_sched/               loader.c, example.bpf.c, pid_filename_header.h for generated code
+├── autotune/                    Rust driver: runs a command, then launches Claude Code with a prompt
+│   └── src/prompt.rs, daemon.rs
+├── scheduler/
+│   ├── scx/                     git submodule: sched-ext/scx
+│   ├── schedulers.json          the "policy repository" the agent reads
+│   ├── sche_description/        one .md + .json per scx scheduler
+│   ├── custom_schedulers/       CXL / PMU experiments
+│   ├── template/                fifo.bpf.c, vruntime.bpf.c, loader.c
+│   └── ml-scheduler/            scx_rusty with an ML model (experiment)
+├── workloads/                   linux-build-bench, basic/schbench, processing (batch, AI-generated
+│                                schedulers), llama.cpp, cxl-micro, pytorch, redis, nginx, …
+└── document/                    paper v2 (PDF+text), design docs, AI_AGENTS.md, USAGE_GUIDE.md,
+                                 motivation_exp/ (the failed and successful Claude attempts)</code></pre>
+
+    <h3>The seven MCP tools</h3>
+    <table>
+      <thead><tr><th>Tool</th><th>What it does (from <code>mcp/src/main.rs</code> and <code>lib.rs</code>)</th></tr></thead>
+      <tbody>
+        <tr><td><code>list_schedulers</code></td><td>Returns the catalog entries (name, description, algorithm, use cases, characteristics, tuning parameters, limitations, performance profile), optionally filtered</td></tr>
+        <tr><td><code>run_scheduler</code></td><td>Stops any running scheduler, waits 500 ms, starts the named one with the given args, returns an <code>execution_id</code></td></tr>
+        <tr><td><code>stop_scheduler</code></td><td>Stops an execution, so the kernel returns to the default scheduler</td></tr>
+        <tr><td><code>get_execution_status</code></td><td>Status and captured output of a scheduler process</td></tr>
+        <tr><td><code>workload</code></td><td>One tool, four commands: <code>create</code>, <code>list</code>, <code>get_history</code>, <code>add_history</code></td></tr>
+        <tr><td><code>create_and_verify_scheduler</code></td><td>Takes BPF C source plus metadata, compiles, loads for a test run, and registers it for <code>run_scheduler</code></td></tr>
+        <tr><td><code>system_monitor</code></td><td><code>start</code>/<code>stop</code> sampling of CPU, memory and scheduler statistics; returns a summary on stop</td></tr>
+      </tbody>
+    </table>
+    <p>The tool descriptions are written as instructions for the model, and they shape its
+    behaviour as much as the code does. Two examples, verbatim:</p>
+    <pre data-file="schedcp/mcp/src/main.rs"><code class="language-rust">#[tool_router]
+impl McpServer {
+    #[tool(description = "List available sched-ext schedulers with detailed information. Always use this tool to get the info of all schedulers first when you are writing or using a scheduler.")]
+    async fn list_schedulers(
+        &amp;self,
+        Parameters(request): Parameters&lt;ListSchedulersRequest&gt;,
+    ) -&gt; Result&lt;CallToolResult, McpError&gt; {
+        /* ... */
+        let result = self.inner.list_schedulers_impl(request).await?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(description = "Run a sched-ext scheduler. After you list_schedulers, you can use this tool to run a scheduler from the list. Run a new scheduler will stop any running scheduler first.")]
+    async fn run_scheduler(
+        &amp;self,
+        Parameters(request): Parameters&lt;RunSchedulerRequest&gt;,
+    ) -&gt; Result&lt;CallToolResult, McpError&gt; {
+        /* ... */
+        // Stop any currently running schedulers first
+        {
+            let manager = self.inner.scheduler_manager.lock().await;
+            let stopped = manager.stop_running_schedulers().await;
+            /* ... */
+        }
+        // Wait a bit to ensure clean shutdown
+        sleep(Duration::from_millis(500)).await;
+        let result = self.inner.run_scheduler_impl(request).await?;
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+    /* ... */
+    #[tool(description = "Start or stop system monitoring to collect CPU, memory, and scheduler metrics. Use command 'start' to begin monitoring, 'stop' to end and receive a summary. Monitoring collects metrics every second including CPU utilization, memory usage, and scheduler statistics. Note: **You only use the tool if you find there is no other metrics you can measure. You should first check for any benchmark tools, check the output of the command, or measure the execution time, etc before use this.**")]
+    async fn system_monitor(/* ... */) -&gt; Result&lt;CallToolResult, McpError&gt; { /* ... */ }
+}</code></pre>
+    <p>Note the last description. It tells the model to prefer the workload's own metric (build time,
+    the benchmark's printed latency) over generic CPU counters. This is the paper's "adaptive context
+    provisioning" turned into a prompt: start cheap and specific, and fetch more only when needed.</p>
+
+    <h3>The policy repository is a JSON file</h3>
+    <p>What does the model know about <code>scx_rusty</code> before it runs it? This is the catalog
+    entry, trimmed to two of its tuning parameters:</p>
+    <pre data-file="schedcp/scheduler/schedulers.json"><code class="language-json">{
+  "name": "scx_rusty",
+  "production_ready": true,
+  "description": "A production-ready multi-domain scheduler with intelligent load balancing. Creates separate scheduling domains per LLC with user-space load balancing. Features configurable thresholds, greedy task stealing, and support for both FIFO and priority-based scheduling within domains. Architecture-flexible design suitable for various CPU topologies.",
+  "use_cases": [
+    "general_purpose",
+    "multi_architecture",
+    "server_workloads"
+  ],
+  "algorithm": "multi_domain_round_robin",
+  "characteristics": "multi domain support, per llc domains, user space load balancing, configurable thresholds, architecture flexibility, greedy task stealing, fifo mode support",
+  "tuning_parameters": {
+    "slice_us_underutil": {
+      "type": "integer",
+      "description": "Scheduling slice duration for under-utilized hosts, in microseconds",
+      "default": 20000,
+      "range": [1000, 100000]
+    },
+    "slice_us_overutil": {
+      "type": "integer",
+      "description": "Scheduling slice duration for over-utilized hosts, in microseconds",
+      "default": 1000,
+      "range": [100, 100000]
+    }
+    /* ... */
+  },
+  "limitations": "May not distinguish NUMA nodes well, potential infeasible weights issue",
+  "performance_profile": "balanced general-purpose performance"
+}</code></pre>
+    <p>The entry is short, typed and ranged. That is the point: the model gets a few hundred tokens
+    per scheduler instead of the scheduler's source and README. <code>scheduler_manager.rs</code> embeds
+    the file with <code>rust-embed</code> and loads the matching binaries from
+    <code>~/.schedcp/scxbin</code>, which <code>make install</code> in <code>scheduler/</code>
+    populates.</p>
+
+    <h3>Generating a scheduler: create_and_verify_scheduler</h3>
+    <p>When no existing scheduler fits, the agent writes one. The tool takes the source as a string.
+    <code>scheduler_generator.rs</code> writes it to <code>&lt;name&gt;.bpf.c</code>, compiles it with
+    fixed flags, and test-runs it. The compile step:</p>
+    <pre data-file="schedcp/mcp/src/scheduler_generator.rs"><code class="language-rust">fn compile_bpf_scheduler(&amp;self, bpf_source: impl AsRef&lt;Path&gt;) -&gt; Result&lt;PathBuf&gt; {
+    /* ... validate the file exists and ends in .bpf.c ... */
+    let output_name = file_name.replace(".bpf.c", ".bpf.o");
+    let output_path = self.work_dir.join(&amp;output_name);
+
+    // Build include paths
+    let scx_includes = self.build_scx_includes()?;
+    let sys_includes = Self::build_sys_includes();
+
+    // Build BPF compilation flags
+    let mut clang_args = vec![
+        "-g".to_string(),
+        "-O2".to_string(),
+        "-Wall".to_string(),
+        "-Wno-compare-distinct-pointer-types".to_string(),
+        "-D__TARGET_ARCH_x86".to_string(),
+        "-mcpu=v3".to_string(),
+        "-mlittle-endian".to_string(),
+        "-target".to_string(),
+        "bpf".to_string(),
+        "-c".to_string(),
+    ];
+    /* ... add includes, input, -o output ... */
+    let output = Command::new("clang")
+        .args(&amp;clang_args)
+        .current_dir(&amp;self.work_dir)
+        .output()
+        .context("Failed to execute clang")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&amp;output.stderr);
+        anyhow::bail!(
+            "BPF compilation failed:\n{}",
+            stderr
+        );
+    }
+    /* ... */</code></pre>
+    <p>Then the "execution verify" step runs a generic struct_ops loader under sudo, lets the
+    scheduler run, kills it, and inspects stderr. Loading the object is what makes the kernel verifier
+    check it:</p>
+    <pre data-file="schedcp/mcp/src/scheduler_generator.rs"><code class="language-rust">async fn execution_verify(
+    &amp;self,
+    bpf_object: impl AsRef&lt;Path&gt;,
+    duration: Option&lt;Duration&gt;,
+) -&gt; Result&lt;String&gt; {
+    let bpf_object = bpf_object.as_ref();
+    let duration = duration.unwrap_or(Duration::from_secs(10));
+    /* ... */
+    let loader_path = self.get_loader_path()?;
+    /* ... */
+    // Start the scheduler process with sudo
+    let cmd_args = vec![
+        loader_path.to_string_lossy().to_string(),
+        bpf_object.to_string_lossy().to_string(),
+    ];
+    let mut child = self.spawn_with_sudo(cmd_args).await?;
+    /* ... */
+    tokio::time::sleep(duration).await;
+
+    // Kill the child process
+    child.start_kill().context("Failed to kill scheduler process")?;
+
+    // Wait for process to finish with timeout
+    let output = timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .context("Timeout waiting for scheduler to stop")?
+        .context("Failed to get scheduler output")?;
+    /* ... */
+    // Check if execution was successful
+    // Note: Schedulers often exit with non-zero when killed, so we check stderr for errors
+    if stderr.contains("error") || stderr.contains("Error") || stderr.contains("failed") {
+        anyhow::bail!(
+            "Scheduler execution failed:\nStdout: {}\nStderr: {}",
+            stdout,
+            stderr
+        );
+    }
+    /* ... "Scheduler verification successful!" ... */
+}</code></pre>
+    <p>This is a smoke test, and it is honest about it. It shows that the program compiles, passes the
+    verifier, attaches, and survives 10 seconds of real scheduling on this machine without the loader
+    printing an error. It does not show that the scheduler is fair, avoids starvation under other
+    loads, or beats EEVDF. Those are exactly the properties the paper's second-layer static checker
+    and dynamic benchmark were meant to cover. A compile or verifier failure comes back to the agent
+    as an <code>McpError::invalid_params</code> whose message contains clang's or the loader's stderr.
+    Strictly, that is a JSON-RPC protocol error, not the <code>isError: true</code> result the spec
+    recommends for execution failures, but the text still reaches the agent, which reads it and
+    retries. The same loop is what
+    <a href="17-bpfix.html">bpfix</a> improves by replacing the raw verifier log with a better
+    diagnostic.</p>
+
+    <h3>What a generated scheduler looks like</h3>
+    <p>The paper's batch experiment ran 8 workloads, each 40 parallel tasks: 39 short ones and one long
+    one. The agent recognised the pattern and wrote a "Longest Job First" policy. The generated
+    schedulers are checked in under <code>workloads/processing/schedulers/</code>. They all follow the
+    template in <code>mcp/new_sched/example.bpf.c</code>: two custom DSQs, with the "long" queue always
+    dispatched first. Here is the one for the compression workload:</p>
+    <pre data-file="schedcp/workloads/processing/schedulers/compression.bpf.c"><code class="language-c">/* Detect if task is large compression by checking filename */
+static bool is_large_compression(struct task_struct *p)
+{
+	pid_t pid = p-&gt;pid;
+	struct filename_info *info;
+
+	/* Get filename info for this PID */
+	info = bpf_map_lookup_elem(&amp;pid_to_filename, &amp;pid);
+	if (!info)
+		return false;
+
+	/* Check for ./large_compression.py */
+	int is_large = (info-&gt;filename[0] == '.' &amp;&amp; info-&gt;filename[1] == '/' &amp;&amp;
+			info-&gt;filename[2] == 'l' &amp;&amp; info-&gt;filename[3] == 'a' &amp;&amp;
+			info-&gt;filename[4] == 'r' &amp;&amp; info-&gt;filename[5] == 'g' &amp;&amp;
+			info-&gt;filename[6] == 'e' &amp;&amp; info-&gt;filename[7] == '_' &amp;&amp;
+			info-&gt;filename[8] == 'c' &amp;&amp; info-&gt;filename[9] == 'o' &amp;&amp;
+			info-&gt;filename[10] == 'm' &amp;&amp; info-&gt;filename[11] == 'p');
+	return is_large;
+}
+/* ... is_small_compression() is the same for ./small_compression.py ... */
+
+#define LARGE_DSQ  0    /* High priority DSQ for large compression */
+#define SMALL_DSQ 1    /* Lower priority DSQ for small compression */
+
+/* Time slice configurations */
+#define SMALL_SLICE_NS  3000000ULL   /* 3ms for small compression tasks */
+#define LARGE_SLICE_NS  15000000ULL  /* 15ms for large compression task */
+#define DEFAULT_SLICE_NS 5000000ULL  /* 5ms for other tasks */
+/* ... select_cpu: scx_bpf_select_cpu_dfl(), insert into SCX_DSQ_LOCAL if idle ... */
+
+void BPF_STRUCT_OPS(compression_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	/* Enqueue based on task type */
+	if (is_large_compression(p)) {
+		scx_bpf_dsq_insert(p, LARGE_DSQ, LARGE_SLICE_NS, enq_flags);
+	} else if (is_small_compression(p)) {
+		scx_bpf_dsq_insert(p, SMALL_DSQ, SMALL_SLICE_NS, enq_flags);
+	} else {
+		/* Other tasks go to global DSQ */
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, DEFAULT_SLICE_NS, enq_flags);
+	}
+}
+
+void BPF_STRUCT_OPS(compression_dispatch, s32 cpu, struct task_struct *prev)
+{
+	/* Priority dispatch: always try large compression first */
+	if (!scx_bpf_dsq_move_to_local(LARGE_DSQ)) {
+		/* If no large tasks, dispatch small compression tasks */
+		if (!scx_bpf_dsq_move_to_local(SMALL_DSQ)) {
+			/* Finally, dispatch other tasks */
+			scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
+		}
+	}
+}
+/* ... init: scx_bpf_create_dsq(LARGE_DSQ, -1), scx_bpf_create_dsq(SMALL_DSQ, -1); SCX_OPS_DEFINE ... */</code></pre>
+    <p>How does the scheduler know a task's file name? <code>task_struct-&gt;comm</code> for a Python
+    script is just <code>python3</code>. The helper header supplied to the agent adds a tracepoint
+    program that records each process's exec file name in a hash map, which the scheduler then looks
+    up. This is a good example of a non-scheduler BPF program feeding a scheduler through a map:</p>
+    <pre data-file="schedcp/mcp/new_sched/pid_filename_header.h"><code class="language-c">/* BPF hash map: PID -&gt; filename */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PID_ENTRIES);
+	__type(key, pid_t);
+	__type(value, struct filename_info);
+} pid_to_filename SEC(".maps");
+
+/* Tracepoint: capture filename when process exec's */
+SEC("tp/sched/sched_process_exec")
+int pid_filename_handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	struct filename_info info = {};
+	unsigned fname_off;
+	pid_t pid;
+
+	/* Get PID of the process */
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	/* Extract filename offset from the tracepoint data */
+	fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+
+	/* Read the filename from the tracepoint context */
+	bpf_probe_read_str(&amp;info.filename, sizeof(info.filename), (void *)ctx + fname_off);
+
+	/* Store PID-&gt;filename mapping */
+	bpf_map_update_elem(&amp;pid_to_filename, &amp;pid, &amp;info, BPF_ANY);
+	return 0;
+}
+/* ... sched_process_exit deletes the entry ... */</code></pre>
+    <p>Look at what the model was told to do. The generation prompt in
+    <code>workloads/processing/scripts/prompt.md</code> says: "you are a experienced eBPF developer who
+    already know what application you are going to run … you just need to make exact match for the
+    processes name … For python program, you should use the filename to check the application, not
+    the comm name." So the agent's job in this experiment was <em>workload-specific</em> policy with
+    known process names, not a general-purpose scheduler. The character-by-character comparison is
+    what such code tends to look like when the author wants the verifier to accept it without loops.
+    Also notice that these schedulers have no starvation guard: a stream of "large" tasks would starve
+    the small queue and the global queue. For 40 tasks that run to completion this is fine. On a
+    general machine the sched_ext watchdog would eventually step in.</p>
+    <div class="callout tip"><span class="label">Read generated code critically</span><p>The template
+    <code>mcp/new_sched/example.bpf.c</code>, which the agent is told to imitate, defines
+    <code>SHORT_SLICE_NS 30000000ULL /* 3ms for short tasks */</code>. 30,000,000 ns is 30 ms, not
+    3 ms. Generated code inherits mistakes in its examples, and a 10-second smoke test will not catch
+    a wrong constant.</p></div>
+
+    <h3>The driver: autotune</h3>
+    <p><code>autotune</code> is the "press one button" entry point. <code>autotune cc "&lt;command&gt;"</code>
+    builds a prompt that includes a system specification, then launches the Claude Code CLI with it.
+    The Claude binary path is hard-coded to <code>/usr/local/bin/claude</code> in
+    <code>daemon.rs</code>. Claude Code then finds the schedcp server through <code>.mcp.json</code>.
+    The whole "multi-agent" plan is this one string:</p>
+    <pre data-file="schedcp/autotune/src/prompt.rs"><code class="language-rust">/// Creates a prompt specifically for the cc subcommand
+pub fn create_cc_prompt(command: &amp;str) -&gt; String {
+    let system_spec = get_system_spec_prompt();
+    format!(
+        "{}\n\n\
+        For the command '{}', optimize the scheduler with the schedcp mcp tools. When optimize, make sure run the exact command user wants, do not change or break it down. You should analyze the workload, check the detail like reading code, create a profile include the exact full command and workload user wants, and the analysis of the workload, list the schedulers, and test the default and max 3 different other schedulers (that may be best) available with best configuration, update history for all the available metrics correctly after each test, and summary for the best one. If you know the command generate too many outputs, consider using like 1&gt;/dev/null to make sure you capture the metrics. otherwise check the output of the command. The exact command is '{}'.",
+        system_spec, command, command
+    )
+}</code></pre>
+
+    <h3>Walkthrough: an agent tuning the scheduler for a kernel build</h3>
+    <p>The steps below combine the <code>autotune</code> prompt, the tool implementations, and the
+    kernel-compilation example in §5.2 of the paper. The numbers in steps 6 and 8 are the paper's
+    reported results on its 172-thread machine, not something we ran.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. The user starts autotune</h4><p><code>autotune cc "make -C workloads/linux-build-bench/linux -j"</code>.
+      autotune collects system facts (CPU model, cores and threads, memory, OS, kernel version,
+      architecture) and starts Claude Code with the
+      prompt above. Claude Code launches <code>mcp/target/release/schedcp</code> over stdio, sends
+      <code>initialize</code>, then <code>tools/list</code>, and the model now sees seven tools.</p></div>
+      <div class="step"><h4>2. Observe the workload</h4><p>The model reads the Makefile and the
+      source tree with its own file tools, and runs the build once under the default scheduler (EEVDF)
+      to get a baseline time. It concludes, in the paper's words, that this is a "CPU-intensive parallel
+      compilation task with short-lived processes, inter-process dependencies, and a goal to minimize
+      makespan".</p></div>
+      <div class="step"><h4>3. Record a profile</h4><p><code>tools/call workload {"command":"create","description":"…"}</code>
+      returns a UUID. The profile is free text, stored in <code>schedcp_workloads.json</code>, so a
+      later session can find it with <code>workload list</code>.</p></div>
+      <div class="step"><h4>4. Read the catalog</h4><p><code>list_schedulers</code> returns the 20 JSON
+      entries. The model matches its profile against descriptions and use cases ("throughput",
+      "server_workloads") and shortlists at most three, as the prompt says.</p></div>
+      <div class="step"><h4>5. Try a candidate</h4><p><code>run_scheduler {"name":"scx_rusty","args":[…]}</code>.
+      The server stops any running scheduler, waits 500 ms, starts <code>sudo scx_rusty …</code> as a
+      tracked process, and returns an <code>execution_id</code>. From now on, sched_ext tasks are
+      scheduled by BPF code, not by the model.</p></div>
+      <div class="step"><h4>6. Measure and record</h4><p>The model reruns the exact build command
+      and reads the wall-clock time. It calls <code>get_execution_status</code> to check that the
+      scheduler is still alive and <code>workload add_history</code> to store the scheduler, its args and
+      the result. In the paper, <code>scx_rusty</code> as the first attempt cut the build from 13.57 s to
+      8.31 s (1.63×).</p></div>
+      <div class="step"><h4>7. Iterate</h4><p><code>stop_scheduler</code>, then the next candidate or a
+      new flag set. Each iteration is one more tool call and one more build, which is cheap compared
+      with writing code. If nothing fits, the model writes a <code>.bpf.c</code> and calls
+      <code>create_and_verify_scheduler</code>, reading clang or verifier errors from the result until
+      it passes.</p></div>
+      <div class="step"><h4>8. Pick the winner and leave it running</h4><p>The model summarises the
+      history and chooses the best result. In the paper, after three iterations the agent moved to
+      <code>scx_layered</code>, gaining 16% more for a total of 1.79× over EEVDF (7.60 s). Stopping the
+      scheduler, or Ctrl-C, returns the machine to EEVDF.</p></div>
+    </div>
+
+    <h3>Reported results</h3>
+    <p>All numbers below are from the paper (v2 text in the repo; the v4 HTML on arXiv reports the
+    same headline figures). The agent was Claude Code with Claude Opus 4. Machine 1 has an 86-core,
+    172-thread Xeon 6787P and runs Linux 6.14. Machine 2 has an 8-core Core Ultra 7 258V and runs 6.13.
+    Each case was run 3 times and averaged.</p>
+    <table>
+      <thead><tr><th>Experiment</th><th>Baseline</th><th>First attempt</th><th>After iteration</th></tr></thead>
+      <tbody>
+        <tr><td>Linux 6.14 tinyconfig build, <code>make -j 172</code> (machine 1)</td><td>EEVDF 13.57 s</td><td><code>scx_rusty</code> 8.31 s (1.63×)</td><td><code>scx_layered</code> after 3 iterations, 7.60 s (1.79×)</td></tr>
+        <tr><td>schbench P99 latency (machine 2)</td><td>EEVDF 40.3 ms</td><td><code>scx_bpfland</code> 46.1 ms (worse)</td><td><code>scx_rusty</code> after 3 iterations, 19.1 ms (2.11×)</td></tr>
+        <tr><td>schbench throughput (machine 2)</td><td>EEVDF 910 req/s</td><td><code>scx_bpfland</code> 741 req/s (0.81×)</td><td><code>scx_rusty</code> 1452 req/s (1.60×)</td></tr>
+        <tr><td>8 batch workloads, 39 short + 1 long task (machine 2)</td><td>default scheduler</td><td colspan="2">agent-written LJF schedulers: 20% average reduction in end-to-end time</td></tr>
+      </tbody>
+    </table>
+    <p>On cost, the paper's motivation experiment ("write a FIFO scheduler in eBPF" from an empty
+    folder, all permissions) succeeded once in three tries and took 33 minutes, 221 API calls, 15+
+    iterations and about $6. With SchedCP, generation time per iteration fell to 2.5 minutes (13×).
+    Cost fell to $0.5 in v2; v4 says $0.45 synthesis cost per workload. Workload analysis cost $0.15
+    per workload at August 2025 Opus pricing. Opus classified all 8 batch workloads and Claude Sonnet
+    did not. A pre-trained RL tuner (the approach in
+    <a href="https://lwn.net/Articles/1027096/">LWN, "Improved load balancing with machine learning"</a>)
+    showed no improvement on the kernel build. The paper attributes this to a need for
+    hardware- or workload-specific retraining.</p>
+    <div class="callout warn"><span class="label">Reading the numbers</span><p>These are three runs per
+    case on two machines, from a short workshop-style paper. The first attempt on schbench was worse
+    than the default, which is a useful reminder that the loop needs measurement. The
+    <code>workloads/processing/README.md</code> claims "30-35% performance improvements" for the
+    same batch setup, while the paper reports 20%. We quote the paper. We did not reproduce either
+    number: that needs a sched_ext kernel, root and Claude API access.</p></div>
+
+    <h3>Building and using it</h3>
+    <p>Requirements from the README: Linux 6.12+ with sched_ext, a Rust toolchain, the dependencies of
+    <a href="https://github.com/sched-ext/scx">scx</a> (meson, clang, libbpf), and Claude Code for the
+    agent path. These commands are from the README and <code>document/USAGE_GUIDE.md</code>:</p>
+    <pre data-file="schedcp/README.md"><code class="language-bash"># Clone with submodules
+git clone https://github.com/eunomia-bpf/schedcp
+cd schedcp
+git submodule update --init --recursive scheduler/scx
+
+# Build schedulers
+cd scheduler &amp;&amp; make &amp;&amp; make install &amp;&amp; cd ..
+# Build autotune
+cd autotune &amp;&amp; cargo build --release &amp;&amp; cd ..
+# Build MCP server
+cd mcp &amp;&amp; cargo build --release &amp;&amp; cd ..
+
+# Without an LLM: the CLI drives the same scheduler manager
+export SCHEDCP_SUDO_PASSWORD="your_password"
+./mcp/target/release/schedcp-cli list
+./mcp/target/release/schedcp-cli run scx_rusty --sudo
+./mcp/target/release/schedcp-cli monitor
+
+# With an agent (run from the repo root so Claude Code finds .mcp.json)
+./autotune/target/release/autotune cc "&lt;your workload command&gt;"</code></pre>
+    <div class="callout warn"><span class="label">Two password variables</span><p>At
+    <code>730e2589</code>, <code>mcp/src/main.rs</code> reads <code>SUDO_PASSWORD</code> (and otherwise
+    tries passwordless sudo), but <code>cli.rs</code>, the docs, and <code>spawn_with_sudo</code> in
+    <code>scheduler_generator.rs</code> read <code>SCHEDCP_SUDO_PASSWORD</code>. If
+    <code>create_and_verify_scheduler</code> works but <code>run_scheduler</code> fails with permission
+    errors, or the other way round, this is the likely reason. Passwordless sudo for the scheduler
+    binaries avoids putting a password in the environment at all.</p></div>
+    <p>A useful sanity check before involving any model is <code>schedcp-cli run scx_simple --sudo</code>
+    in one terminal and <code>cat /sys/kernel/sched_ext/state</code> in another. It should print
+    <code>enabled</code> while the scheduler runs (see <a href="05-program-types-and-hooks.html">chapter 05</a>).</p>
+
+    <h2>MCPtrace: bpftrace as four MCP tools</h2>
+    <p>MCPtrace is the tracing counterpart to schedcp, and it is much smaller: one 552-line
+    <code>src/main.rs</code>. Its README describes it as "a minimal MCP (Model Context Protocol)
+    server that provides AI assistants with access to bpftrace kernel tracing capabilities". It is
+    published on crates.io as <code>bpftrace-mcp-server</code> (version 0.1.1, first published
+    2025-08-01). A Python version built on FastMCP (<code>server.py</code>) is still in the tree as
+    the legacy implementation.</p>
+    <p>The design choice to notice: <strong>MCPtrace does not generate bpftrace</strong>. GPTtrace
+    called a model itself. MCPtrace has no model and no API key. The host's model writes the
+    bpftrace script, and the server only gives it the context it needs (which probes exist, what
+    this kernel's bpftrace supports) and a controlled way to run the script. Generation moved from the
+    tool into the agent.</p>
+
+    <h3>The tools</h3>
+    <table>
+      <thead><tr><th>Tool</th><th>Runs</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>list_probes(filter?)</code></td><td><code>sudo -S bpftrace -l [filter]</code></td><td>e.g. <code>syscalls:*open*</code>; lets the model check that a probe exists on this kernel before using it</td></tr>
+        <tr><td><code>bpf_info()</code></td><td><code>sudo -S bpftrace --info</code></td><td>kernel helpers, map types, probe types, features</td></tr>
+        <tr><td><code>exec_program(program, timeout=10)</code></td><td><code>sudo -S bpftrace -e &lt;program&gt;</code> in the background</td><td>timeout clamped to 1–60 s; buffer of 10,000 lines; returns <code>exec_XXXXXXXX</code></td></tr>
+        <tr><td><code>get_result(execution_id, offset=0, limit=1000)</code></td><td>—</td><td>paged output, status, <code>has_more</code>, duration</td></tr>
+      </tbody>
+    </table>
+    <p>Execution is asynchronous because tracing is: a useful trace often runs for seconds, and an MCP
+    call should not block that long. <code>exec_program</code> starts a task, waits half a second to
+    catch syntax errors, and returns an ID. The model polls <code>get_result</code>, and that is how
+    it pages through a large histogram without filling its context window.</p>
+    <pre data-file="MCPtrace/src/main.rs"><code class="language-rust">#[tool(description = "Execute a bpftrace program with buffered output")]
+async fn exec_program(
+    &amp;self,
+    Parameters(ExecProgramRequest { program, timeout }): Parameters&lt;ExecProgramRequest&gt;,
+) -&gt; Result&lt;CallToolResult, McpError&gt; {
+    // Validate timeout
+    let timeout = timeout.clamp(1, 60);
+
+    // Generate execution ID
+    let execution_id = format!("exec_{}", Uuid::new_v4().to_string()[..8].to_string());
+
+    // Create buffer
+    let buffer = ExecutionBuffer::new(10000);
+    self.execution_buffers
+        .insert(execution_id.clone(), buffer.clone());
+
+    // Start execution in background
+    let password = self.sudo_password.to_string();
+    let exec_id = execution_id.clone();
+    tokio::spawn(async move {
+        BpftraceServer::run_bpftrace_program(
+            exec_id,
+            program,
+            Duration::from_secs(timeout),
+            password,
+            buffer,
+        )
+        .await;
+    });
+
+    // Give it a moment to check for syntax errors
+    sleep(Duration::from_millis(500)).await;
+
+    // Check if it failed immediately (syntax error)
+    if let Some(buffer) = self.execution_buffers.get(&amp;execution_id) {
+        let status = buffer.status.lock().await.clone();
+        if status == "failed" {
+            /* ... */
+            return Err(McpError::internal_error(
+                "Failed to start bpftrace program", 
+                Some(json!({"error": error_msg})),
+            ));
+        }
+    }
+
+    Ok(CallToolResult::success(vec![Content::text(
+        json!({
+            "execution_id": execution_id,
+            "status": "started",
+            "message": format!("Program execution started with timeout of {}s", timeout)
+        }).to_string()
+    )]))
+}</code></pre>
+    <p>The runner pipes the sudo password to <code>sudo -S</code> on stdin, then reads stdout and
+    stderr line by line in a <code>tokio::select!</code> loop that checks the deadline every 100 ms.
+    stderr lines are kept but prefixed, so the model sees bpftrace's own error messages in the
+    result:</p>
+    <pre data-file="MCPtrace/src/main.rs"><code class="language-rust">let mut cmd = Command::new("sudo");
+cmd.arg("-S")
+    .arg("bpftrace")
+    .arg("-e")
+    .arg(&amp;program)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+/* ... spawn, write password to stdin ... */
+loop {
+    tokio::select! {
+        _ = sleep(Duration::from_millis(100)) =&gt; {
+            if start_time.elapsed() &gt; timeout {
+                let _ = child.kill().await;
+                buffer.add_line("[Execution timed out]".to_string()).await;
+                buffer.mark_failed("Timeout".to_string()).await;
+                break;
+            }
+        }
+        line = stdout_reader.next_line() =&gt; {
+            /* ... push line into the buffer, or break on EOF ... */
+        }
+        line = stderr_reader.next_line() =&gt; {
+            match line {
+                Ok(Some(line)) =&gt; {
+                    if !line.starts_with("[sudo] password") {
+                        buffer.add_line(format!("[Error] {}", line)).await;
+                    }
+                }
+                Ok(None) =&gt; {}
+                Err(_) =&gt; {}
+            }
+        }
+    }
+}</code></pre>
+    <p>A background task removes buffers older than one hour, checking every five minutes. Nothing is
+    persisted.</p>
+    <p>The last commit is worth a look because it shows a real MCP pitfall. Writing a log line to
+    stdout corrupts the JSON-RPC stream, so <code>main()</code> now sets up logging only when
+    <code>RUST_LOG</code> is set, and exits silently if no password is configured:</p>
+    <pre data-file="MCPtrace/src/main.rs"><code class="language-rust">// Only initialize logging if RUST_LOG is explicitly set
+// MCP servers should not write to stdout as it interferes with protocol communication
+if std::env::var("RUST_LOG").is_ok() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+}
+
+// Get password from environment variable
+let sudo_password = match std::env::var("BPFTRACE_PASSWD") {
+    Ok(password) =&gt; {
+        verify_password(&amp;password)?;
+        password
+    },
+    Err(_) =&gt; {
+        // Exit without printing to stdio/stderr to avoid interfering with MCP
+        std::process::exit(1);
+    }
+};</code></pre>
+
+    <h3>Install and run</h3>
+    <pre data-file="MCPtrace/README.md"><code class="language-bash">sudo apt-get install bpftrace          # Ubuntu/Debian
+cargo install bpftrace-mcp-server      # or: cargo build --release from a clone
+
+# Password for sudo, read from .env (or configure NOPASSWD for /usr/bin/bpftrace)
+echo "BPFTRACE_PASSWD=your_sudo_password" &gt; .env
+
+# Register with a host
+./setup/setup_claude.sh                # Claude Desktop
+./setup/setup_claude_code.sh           # Claude Code</code></pre>
+    <p>Then ask the agent something like "show me which processes are opening files". A typical
+    sequence is <code>list_probes("syscalls:*open*")</code>, then <code>exec_program</code> with a
+    one-liner such as <code>tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm,
+    str(args-&gt;filename)); }</code>, then one or more <code>get_result</code> calls. (This sequence is an
+    illustration; the README shows the same tools called from Python.)</p>
+    <div class="callout danger"><span class="label">Security model</span><p>The README is direct:
+    "No script validation - trust the AI client to generate safe scripts". It also says "AI never gets
+    root access", which is true only in the narrow sense that the model does not hold the password.
+    The model can still run <em>any</em> bpftrace program as root for up to 60 seconds, including ones
+    that read kernel memory or, with <code>--unsafe</code> builtins such as <code>system()</code>, run
+    commands. bpftrace's own safety (the verifier) prevents crashes, not data exposure. Treat the
+    host's tool-approval prompt as the real gate, and read each script before you approve it.</p></div>
+    <p>Two details at <code>1bd88555</code>. The <code>src/tools/</code> directory ships 39 classic
+    bpftrace tools (<code>opensnoop.bt</code>, <code>biolatency.bt</code>, …) and an
+    <code>examples.json</code>, but <code>main.rs</code> does not expose them as a tool or resource.
+    The README's "curated collection of production-ready bpftrace scripts" therefore reaches the model
+    only if it reads the files some other way. And <code>doc/COMPARISON_WITH_GPTTRACE.md</code> lays out
+    the differences from GPTtrace that the next section explains.</p>
+
+    <h2>GPTtrace: the 2023 prompt pipeline</h2>
+    <p>GPTtrace is the oldest project here and the most-starred (275). It predates MCP and agentic
+    coding tools: the model is called directly through the OpenAI Python SDK, and the "tool use" is
+    OpenAI <em>function calling</em>, introduced in mid-2023 with the <code>gpt-3.5-turbo-0613</code>
+    model that GPTtrace still names in its code. It is on PyPI as <code>gpttrace</code> (latest 0.1.2).
+    The README now opens by redirecting readers to MCPtrace.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 300" role="img" aria-label="GPTtrace pipeline: user request, FAISS example search, prompt construction, GPT function call, user confirmation, sudo bpftrace, retry with error on stderr up to five times, then GPT explanation of output">
+        <style>
+          .c3-box{fill:var(--bg3);stroke:var(--border);stroke-width:1.2}
+          .c3-hl{fill:var(--bg3);stroke:var(--accent);stroke-width:1.8}
+          .c3-hl2{fill:var(--bg3);stroke:var(--accent2);stroke-width:1.8}
+          .c3-t{fill:var(--fg);font:bold 12.5px sans-serif}
+          .c3-s{fill:var(--muted);font:11px sans-serif}
+          .c3-ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah303)}
+          .c3-re{stroke:var(--accent2);stroke-width:1.5;fill:none;stroke-dasharray:5 3;marker-end:url(#ah303)}
+          .c3-lab{fill:var(--accent2);font:bold 11.5px sans-serif}
+        </style>
+        <defs><marker id="ah303" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <rect class="c3-box" x="10" y="40" width="120" height="70" rx="8"/>
+        <text class="c3-t" x="20" y="64">User request</text>
+        <text class="c3-s" x="20" y="84">"Count page faults</text>
+        <text class="c3-s" x="20" y="98">by process"</text>
+        <rect class="c3-box" x="155" y="40" width="130" height="70" rx="8"/>
+        <text class="c3-t" x="165" y="64">FAISS search</text>
+        <text class="c3-s" x="165" y="84">tools/examples.json</text>
+        <text class="c3-s" x="165" y="98">top 2 examples</text>
+        <rect class="c3-box" x="310" y="40" width="130" height="70" rx="8"/>
+        <text class="c3-t" x="320" y="64">Prompt</text>
+        <text class="c3-s" x="320" y="84">"supportive assistant</text>
+        <text class="c3-s" x="320" y="98">to a Linux sysadmin"</text>
+        <rect class="c3-hl" x="465" y="40" width="130" height="70" rx="8"/>
+        <text class="c3-t" x="475" y="64">gpt-3.5-turbo</text>
+        <text class="c3-s" x="475" y="84">functions: bpftrace,</text>
+        <text class="c3-s" x="475" y="98">SaveFile</text>
+        <rect class="c3-box" x="620" y="40" width="120" height="70" rx="8"/>
+        <text class="c3-t" x="630" y="64">Confirm</text>
+        <text class="c3-s" x="630" y="84">"Enter 'y' to</text>
+        <text class="c3-s" x="630" y="98">proceed"</text>
+        <rect class="c3-hl2" x="765" y="40" width="125" height="70" rx="8"/>
+        <text class="c3-t" x="775" y="64">sudo bpftrace</text>
+        <text class="c3-s" x="775" y="84">-e … with timer</text>
+        <text class="c3-s" x="775" y="98">(default 300 s)</text>
+        <path class="c3-ar" d="M130,75 L153,75"/>
+        <path class="c3-ar" d="M285,75 L308,75"/>
+        <path class="c3-ar" d="M440,75 L463,75"/>
+        <path class="c3-ar" d="M595,75 L618,75"/>
+        <path class="c3-ar" d="M740,75 L763,75"/>
+        <path class="c3-re" d="M827,112 C827,190 375,190 375,114"/>
+        <text class="c3-lab" x="470" y="182">stderr not empty → construct_prompt_on_error → retry (5 times max)</text>
+        <path class="c3-ar" d="M860,112 L860,225 L700,225"/>
+        <rect class="c3-hl" x="520" y="205" width="178" height="70" rx="8"/>
+        <text class="c3-t" x="530" y="229">Explain</text>
+        <text class="c3-s" x="530" y="249">first 2048 chars of output</text>
+        <text class="c3-s" x="530" y="263">→ gpt-3.5-turbo-0613</text>
+        <text class="c3-s" x="712" y="243">success</text>
+      </svg>
+      <figcaption>Figure 30.3 — GPTtrace's default path (<code>gpttrace/execute.py</code>). Retrieval,
+      generation, execution and explanation all happen inside one Python process that holds both the
+      OpenAI key and the user's sudo session.</figcaption>
+    </figure>
+
+    <h3>Step by step through the code</h3>
+    <p><strong>Retrieve examples.</strong> <code>examples.py</code> loads the bpftrace example corpus
+    from <code>tools/examples.json</code>, embeds it with OpenAI embeddings into a FAISS index cached in
+    <code>data_save/</code>, and returns the two most similar entries for the user's request:</p>
+    <pre data-file="GPTtrace/gpttrace/examples.py"><code class="language-python">def get_bpftrace_basic_examples(query: str) -&gt; str:
+    """Get basic bpftrace examples from vector database."""
+    loader = JSONLoader(
+        file_path='./tools/examples.json',
+        jq_schema='.data[].content',
+        json_lines=True
+    )
+    documents = loader.load()
+    embeddings = OpenAIEmbeddings()
+
+    # Check if the vector database files exist
+    if not (os.path.exists("./data_save/vector_db.faiss") and
+            os.path.exists("./data_save/vector_db.pkl")):
+        db = FAISS.from_documents(documents, embeddings)
+        db.save_local("./data_save", index_name="vector_db")
+    else:
+        # Load an existing FAISS vector store
+        db = FAISS.load_local(
+            "./data_save",
+            index_name="vector_db",
+            embeddings=embeddings,
+            allow_dangerous_deserialization=True,
+        )
+
+    results = db.search(query, search_type='similarity')
+    results = [result.page_content for result in results]
+    return "\n".join(results[:2])</code></pre>
+    <p><strong>Build the prompt.</strong> <code>prompt.py</code> wraps the examples and the request.
+    There are three templates: the first prompt, the prompt after an error, and the explanation
+    prompt:</p>
+    <pre data-file="GPTtrace/gpttrace/prompt.py"><code class="language-python">def construct_prompt_on_error(previous_prompt: str, _text: str, output: str) -&gt; str:
+    """
+    Construct prompts when an error occurs.
+    # ...
+    """
+    return f"""
+    {previous_prompt}
+
+    The previous command failed to execute or not finished.
+    Maybe you can try list the attach points and choose one to attach,
+    if you have not done so before.
+    The origin command and output is as follows:
+
+    {output}
+    """
+# ... construct_prompt_for_explain() truncates output to 2048 chars ...
+
+def construct_running_prompt(text: str) -&gt; str:
+    """
+    Construct prompts that translate user requests into bpf commands.
+    # ...
+    """
+    examples = construct_bpftrace_examples(text)
+    return f"""
+    As a supportive assistant to a Linux system administrator,
+    your role involves leveraging bpftrace to generate eBPF code that aids
+    in problem-solving, as well as responding to queries.
+    Note that you may not always need to call the bpftrace tool function.
+    Here are some pertinent examples that align with the user's requests:
+
+    {examples}
+
+    Now, you have received the following request from a user: {text}
+    Please utilize your capabilities to the fullest extent to accomplish this task.
+    """</code></pre>
+    <p><strong>Call the model with a function schema.</strong> <code>bpftrace.py</code> describes the
+    bpftrace CLI as an OpenAI function. Each JSON property maps to a real bpftrace flag in
+    <code>construct_command()</code> (<code>bufferingMode</code> → <code>-B</code>,
+    <code>program</code> → <code>-e</code>, <code>unsafe</code> → <code>--unsafe</code>, and so
+    on). This is the same idea as an MCP <code>inputSchema</code>, two years earlier and tied to one
+    vendor:</p>
+    <pre data-file="GPTtrace/gpttrace/bpftrace.py"><code class="language-python">functions = [
+    {
+        "name": "bpftrace",
+        "description": "A tool use to run bpftrace eBPF programs",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bufferingMode": {
+                    "type": "string",
+                    "description": "output buffering mode"
+                },
+                # ... format, outputFile, debugInfo, verboseDebugInfo ...
+                "program": {
+                    "type": "string",
+                    "description": "program to execute"
+                },
+                # ... includeDir, usdtFileActivation, unsafe, quiet, verbose, noWarnings ...
+                "timeout": {
+                    "type": "integer",
+                    "description": "seconds to run the command"
+                },
+                "continue": {
+                    "type": "boolean",
+                    "description": "finish conversation and not continue."
+                }
+            },
+            "required": ["program"]
+        }
+    },
+    {
+        "name": "SaveFile",
+        "description": "Save the eBPF program to file",
+        # ... filename, content ...
+    }
+]</code></pre>
+    <p><strong>Run, retry, explain.</strong> <code>run_bpftrace()</code> sends the prompt with
+    <code>function_call="auto"</code>, builds <code>["sudo", "bpftrace", …]</code> from the returned
+    arguments, and runs it with a timer (default 300 s) after asking the user to type <code>y</code>.
+    <code>execute()</code> is the loop. Any stderr output counts as failure and triggers a retry with
+    the error appended, up to five times:</p>
+    <pre data-file="GPTtrace/gpttrace/execute.py"><code class="language-python">def execute(user_input: str, verbose: bool = False, retry: int = 5,
+            previous_prompt: Optional[str] = None,
+            output: Optional[str] = None) -&gt; None:
+    """
+    Convert the user request into a BPF command and execute it.
+    # ...
+    """
+    if retry == 0:
+        print("Retry times exceeded...")
+        return
+    # ...
+    if previous_prompt is None:
+        prompt = construct_running_prompt(user_input)
+    else:
+        prompt = construct_prompt_on_error(
+            previous_prompt, user_input, output)
+    # ...
+    res = run_bpftrace(prompt, verbose)
+    if res["stderr"] != '':
+        print("output: " + json.dumps(res))
+        print("retry time " + str(retry) + "...")
+        # retry
+        execute(user_input, verbose, retry - 1, prompt, json.dumps(res))
+        return
+
+    # success
+    print("AI explanation:")
+    prompt = construct_prompt_for_explain(user_input, res["stdout"])
+    # ...
+    explain = call_gpt_api(prompt)
+    print(explain)</code></pre>
+    <p>Notice how the retry prompt grows: each attempt embeds the previous prompt, so five failures
+    stack five copies of the examples and errors. A "warning" on stderr also counts as failure. The
+    <code>-c CMD_NAME QUERY</code> mode does the same for bcc tools: <code>cmd.py</code> uses a predefined
+    function schema for the tool if one exists, or asks the model to write one from the tool's
+    <code>--help</code> output, then calls the model with it and runs <code>sudo &lt;tool&gt; …</code>.
+    The README also shows a run in which the tool chose <code>sudo memleak-bpfcc --trace</code> for "Trace allocations and
+    display each individual allocator function call".</p>
+    <pre data-file="GPTtrace/README.md"><code class="language-bash">pip install gpttrace
+export OPENAI_API_KEY=...            # or pass -k OPENAI_API_KEY
+python3 -m gpttrace -h               # options: -c CMD_NAME QUERY, -v, -k OPENAI_API_KEY
+python3 gpttrace "Count page faults by process"   # as written in the README, from a clone</code></pre>
+    <p>The retrieval code opens <code>./tools/examples.json</code> and <code>./data_save</code> by
+    relative path, so in practice you run it from a clone of the repository.</p>
+
+    <h2>KEN / Kgent and GPTtrace-web</h2>
+    <h3>KEN, published as Kgent</h3>
+    <p>The research version of GPTtrace's idea appeared first as <strong>KEN: Kernel Extensions using
+    Natural Language</strong> (<a href="https://arxiv.org/abs/2312.05531">arXiv:2312.05531</a>,
+    9 December 2023) and then as <strong>Kgent: Kernel Extensions Large Language Model Agent</strong>
+    in the <em>Proceedings of the ACM SIGCOMM 2024 Workshop on eBPF and Kernel Extensions</em>
+    (eBPF '24, Sydney), pages 30–36,
+    <a href="https://doi.org/10.1145/3672197.3673434">doi:10.1145/3672197.3673434</a>. Authors:
+    Yusheng Zheng, Yiwei Yang, Maolin Chen, Andrew Quinn.</p>
+    <p>Kgent asks a harder question than "does it load?": <em>is the synthesised program the program
+    the user asked for?</em> Its abstract describes a combination of "LLM-empowered program
+    comprehension, symbolic execution, and a series of feedback loops". The arXiv (KEN) version spells
+    out four components:</p>
+    <ol>
+      <li>A <strong>Prompter</strong> wraps the user's request, asks for a bpftrace program, and appends
+      every error message collected so far for this task.</li>
+      <li>A <strong>Synthesis Engine</strong> retrieves similar prompt/program pairs from a vector
+      database (few-shot in-context learning, as in GPTtrace) and asks the LLM for a candidate.</li>
+      <li>A <strong>Comprehension Engine</strong> asks an LLM to annotate the candidate with Hoare-logic
+      pre- and post-conditions (<code>assume</code>/<code>assert</code>) for every kernel function it
+      touches. It starts from an automatically generated dataset of Z3 contracts for kernel functions.</li>
+      <li>A <strong>Symbolic Verifier</strong> (SeaHorn over LLVM IR, Z3 as the solver) checks the
+      annotated program. The authors added 51 lines to the bpftrace compiler for
+      <code>assume</code>/<code>assert</code>. Only a program that passes goes on to the kernel's eBPF
+      verifier.</li>
+    </ol>
+    <p>Both a failed assertion (or a timeout) and a verifier rejection go back to the Prompter. After 3
+    failed trials (the default) KEN asks the user for more detail. The arXiv version's corpus,
+    eBPFNLDataset, has 145 prompt/program pairs (79 bpftrace, 66 libbpf). On its 40-case test set KEN
+    reached 80% accuracy against 30% for a ChatGPT-4 baseline (hence 2.67×), with a 2.5% false-positive
+    rate for both. A false positive is a program that passes KEN's checks but that manual inspection
+    shows to be wrong for the prompt. The ablation is instructive: adding feedback alone took
+    the baseline to 60%, and adding comprehension plus symbolic execution took it to 77.5%. The
+    published Kgent abstract repeats the 80% and 2.67× figures. The repository's
+    <code>dataset/spec/helper_spec.json</code> and <code>kprobe_spec.json</code> are the Z3
+    specifications.</p>
+    <p>The <a href="https://github.com/eunomia-bpf/KEN">KEN repository</a> (last commit 2024-08-07)
+    states that it is "only for evaluation scripts and code for the paper" and points users to GPTtrace.
+    It contains the libbpf and bpftrace example databases with descriptions
+    (<code>dataset/libbpf/output.json</code>, <code>dataset/bpftrace/output.json</code>), the Z3 specs,
+    and <code>evaluation/</code>. <a href="17-bpfix.html">Chapter 17</a> discusses Kgent's use of raw
+    verifier messages as feedback, the signal that bpfix tries to improve.</p>
+
+    <h3>GPTtrace-web</h3>
+    <p><a href="https://github.com/eunomia-bpf/GPTtrace-web">GPTtrace-web</a> (last commit 2024-08-07)
+    calls itself "GPT2Bpftrace". It is a small web app: type a sentence on the left, get a bpftrace
+    program on the right, copy it, and run <code>sudo bpftrace gpt-bpftrace.bt</code> yourself. Local
+    use is <code>npm install</code> and <code>npm run dev</code>. The README links a hosted demo at
+    <code>gpt-2-bpftrace.vercel.app</code> (not checked for liveness) and gives a clone URL under the
+    older name <code>eunomia-bpf/GPT2Bpftrace</code>. Its safety model is the simplest of all: the
+    human is the executor, so the human decides what runs.</p>
+
+    <h2>Comparison</h2>
+    <table>
+      <thead><tr><th></th><th>GPTtrace</th><th>GPTtrace-web</th><th>KEN / Kgent</th><th>MCPtrace</th><th>schedcp</th></tr></thead>
+      <tbody>
+        <tr><td>Kind</td><td>Python CLI</td><td>Web app</td><td>Research prototype + datasets</td><td>MCP server (Rust)</td><td>MCP server + driver (Rust)</td></tr>
+        <tr><td>Who calls the LLM</td><td>The tool (OpenAI SDK)</td><td>The app (OpenAI)</td><td>The system (any LLM)</td><td>The host's agent</td><td>The host's agent (Claude Code via <code>autotune</code>)</td></tr>
+        <tr><td>Generates</td><td>bpftrace one-liners, bcc invocations</td><td>bpftrace scripts</td><td>bpftrace (and libbpf in eval)</td><td>Nothing itself; runs agent-written bpftrace</td><td>Scheduler choice + flags, or new sched_ext <code>.bpf.c</code></td></tr>
+        <tr><td>Context given to model</td><td>Top-2 FAISS examples</td><td>Prompt only</td><td>Vector-DB examples + Z3 contracts</td><td>Probe list, <code>bpftrace --info</code></td><td>Scheduler catalog JSON, workload history, <code>/proc</code> metrics</td></tr>
+        <tr><td>Checks before / after running</td><td>User types <code>y</code>; stderr → retry</td><td>Human runs it</td><td>Symbolic execution + kernel verifier</td><td>None on the script; 60 s cap</td><td>clang, kernel verifier, 10 s smoke run</td></tr>
+        <tr><td>Privilege path</td><td><code>sudo</code> from the CLI process</td><td>User</td><td>(evaluation)</td><td><code>sudo -S</code> with <code>BPFTRACE_PASSWD</code></td><td><code>sudo -S</code> with <code>SUDO_PASSWORD</code>/<code>SCHEDCP_SUDO_PASSWORD</code></td></tr>
+        <tr><td>Feedback signal</td><td>stderr text</td><td>—</td><td>Failed assertions, verifier log</td><td>bpftrace stderr in <code>get_result</code></td><td>Measured workload metric (time, latency)</td></tr>
+        <tr><td>Paper</td><td>—</td><td>—</td><td>arXiv 2312.05531; eBPF '24</td><td>—</td><td>arXiv 2509.01245</td></tr>
+        <tr><td>Last commit</td><td>2026-03-07</td><td>2024-08-07</td><td>2024-08-07</td><td>2026-02-12</td><td>2026-02-12</td></tr>
+      </tbody>
+    </table>
+    <p>The table shows two shifts. The first is <strong>who owns the model</strong>. In 2023 each
+    tool shipped its own prompt pipeline and API key. By 2025 the agent is a general coding agent,
+    and the tool's job is to provide context and actions over a standard protocol. The second is
+    <strong>what counts as success</strong>. GPTtrace stops when stderr is empty. Kgent checks semantics.
+    schedcp checks a measured performance number. Each is a step closer to asking whether the result is
+    what the user wanted, not just whether it loaded.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefits</h4><ul>
+        <li><strong>The LLM stays out of the hot path.</strong> sched_ext and bpftrace run native BPF.
+        The model costs money and seconds only at decision time.</li>
+        <li><strong>eBPF is a forgiving target.</strong> The verifier rejects unsafe code, and sched_ext
+        reverts to the fair class on error or stall. Mistakes cost a retry, not a reboot.</li>
+        <li><strong>Narrow tools beat a root shell.</strong> Seven typed tools are easier to audit and to
+        approve than arbitrary shell access, and the descriptions steer the model.</li>
+        <li><strong>Agent-agnostic.</strong> Any MCP host can drive both servers. The interface does not
+        need to change when models improve.</li>
+        <li><strong>Reported gains are real when the loop measures.</strong> The 1.79× and 2.11× results
+        come from trying candidates and keeping the best, not from a single guess.</li>
+      </ul></div>
+      <div class="card"><h4>Limitations</h4><ul>
+        <li><strong>Prototype gap.</strong> The paper's micro-VM, scheduler-specific static analysis,
+        deployment tokens and circuit breaker are not in schedcp's code at <code>730e2589</code>.</li>
+        <li><strong>Passwords in environment variables.</strong> Both servers pipe a sudo password to
+        <code>sudo -S</code>. A scoped <code>NOPASSWD</code> rule or a capability-limited helper would be
+        safer.</li>
+        <li><strong>The verifier proves safety, not intent.</strong> A scheduler can starve tasks and a
+        trace can leak data while passing the verifier. Only Kgent checks semantics, and only for
+        tracing programs.</li>
+        <li><strong>Weak checks after load.</strong> schedcp's verify step greps stderr for "error".
+        MCPtrace does not validate scripts at all.</li>
+        <li><strong>Small evaluations.</strong> Three runs per case on two machines. A Claude Opus
+        model was needed for the batch classification. Nothing in this chapter was reproduced here.</li>
+        <li><strong>Maintenance.</strong> Low commit activity since early 2026. sched_ext kfunc names and
+        the MCP spec have both moved since these servers were written; they still negotiate
+        <code>2024-11-05</code>.</li>
+      </ul></div>
+    </div>
+
+    <h2>Related work</h2>
+    <h3>In this curriculum</h3>
+    <ul>
+      <li><a href="05-program-types-and-hooks.html">05 · program types and hooks</a>: sched_ext's DSQs,
+      callbacks and safety model, which schedcp builds on.</li>
+      <li><a href="08-ecosystem.html">08 · ecosystem</a>: bpftrace and bcc, which GPTtrace and MCPtrace
+      drive.</li>
+      <li><a href="17-bpfix.html">17 · bpfix</a>: the org's later work on the feedback signal itself.
+      bpfix turns a verifier log into a diagnostic that helps an LLM repair the program, and it measures
+      the gain. Every loop in this chapter ("compile, load, read the error, retry") would benefit.</li>
+      <li><a href="19-bpf-benchmark.html">19 · bpf-benchmark</a>: agent-driven optimisation of eBPF
+      programs themselves.</li>
+      <li><a href="09-bpf-developer-tutorial.html">09 · bpf-developer-tutorial</a>: GPTtrace's README
+      describes the tutorial as an attempt "to teach ChatGPT to write eBPF programs", and its lesson 44
+      is the <code>scx_simple</code> scheduler.</li>
+    </ul>
+    <h3>Outside the org</h3>
+    <ul>
+      <li><strong>Learned schedulers.</strong> RL-based job schedulers such as Decima (Mao et al.,
+      SIGCOMM 2019) learn policies from numeric state. The schedcp paper positions itself against this
+      line: an LLM can read code and synthesise new policy, while RL maps state to predefined actions and
+      needs retraining per workload. LWN covered a machine-learning load balancer for Linux in
+      <a href="https://lwn.net/Articles/1027096/">"Improved load balancing with machine learning"</a>
+      (2025), which is the pre-trained RL baseline the paper compared against.</li>
+      <li><strong>sched_ext schedulers.</strong> The <a href="https://github.com/sched-ext/scx">scx</a>
+      repository is both schedcp's policy repository and its competition: hand-written schedulers such
+      as <code>scx_rusty</code> and <code>scx_layered</code> produced the best results in the paper's
+      experiments. The agent chose and configured them; it did not write them.</li>
+      <li><strong>MCP servers in general.</strong> The
+      <a href="https://github.com/modelcontextprotocol/servers">modelcontextprotocol/servers</a>
+      repository collects reference servers. The kernel servers here follow the same pattern with
+      unusually dangerous tools.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> In MCP terms, what is schedcp?</p>
+        <button class="opt">A host: it runs the LLM and the conversation</button>
+        <button class="opt" data-right>A server: a subprocess that offers tools over JSON-RPC on stdio</button>
+        <button class="opt">A client: the connector inside Claude Code</button>
+        <button class="opt">A sched_ext scheduler loaded into the kernel</button>
+        <div class="why">The host (Claude Code) launches <code>mcp/target/release/schedcp</code> from
+        <code>.mcp.json</code> as a stdio subprocess. schedcp advertises only the <code>tools</code>
+        capability. The schedulers it starts are separate processes.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Why did MCPtrace's last commit disable logging unless
+      <code>RUST_LOG</code> is set?</p>
+        <button class="opt">To make the server faster</button>
+        <button class="opt">To avoid leaking the sudo password into logs</button>
+        <button class="opt" data-right>Because in the stdio transport, anything on stdout that is not an MCP message breaks the protocol</button>
+        <button class="opt">Because bpftrace refuses to run with logging enabled</button>
+        <div class="why">The spec says the server "MUST NOT write anything to its stdout that is not a
+        valid MCP message". A stray log line corrupts the newline-delimited JSON-RPC stream. Logs belong
+        on stderr, or nowhere.</div></div>
+      <div class="q"><p><strong>Q3.</strong> What does schedcp's <code>create_and_verify_scheduler</code>
+      actually check at commit <code>730e2589</code>?</p>
+        <button class="opt">Fairness and starvation-freedom via a custom static analyzer, then a micro-VM benchmark</button>
+        <button class="opt" data-right>That the code compiles with clang, passes the kernel verifier on load, and runs for 10 s without "error"/"failed" on stderr</button>
+        <button class="opt">Only that the source file ends in <code>.bpf.c</code></button>
+        <button class="opt">That it is faster than EEVDF on the current workload</button>
+        <div class="why">The first option is the paper's design. The code compiles, starts the generic
+        loader under sudo, sleeps 10 seconds, kills it, and greps stderr. Performance is measured
+        separately by the agent rerunning the workload.</div></div>
+      <div class="q"><p><strong>Q4.</strong> In the paper's schbench experiment, what happened on the
+      agent's first attempt?</p>
+        <button class="opt">It immediately reached 2.11× better P99 latency</button>
+        <button class="opt">It crashed the kernel and the watchdog rebooted it</button>
+        <button class="opt" data-right>It chose <code>scx_bpfland</code>, which was worse than EEVDF (46.1 ms vs 40.3 ms P99); iteration found <code>scx_rusty</code> at 19.1 ms</button>
+        <button class="opt">It wrote a new Longest Job First scheduler</button>
+        <div class="why">The first configuration was 13% worse on P99 latency and 19% lower in throughput.
+        After three observe-and-optimise iterations, <code>scx_rusty</code> reached 2.11× better P99 latency
+        and 1.60× throughput. This is why the measurement loop matters.</div></div>
+      <div class="q"><p><strong>Q5.</strong> What does Kgent add over GPTtrace's "retry until stderr is
+      empty" loop?</p>
+        <button class="opt">A larger language model</button>
+        <button class="opt">An MCP interface</button>
+        <button class="opt" data-right>An LLM-written Hoare-logic annotation of the candidate, checked by symbolic execution before the kernel verifier</button>
+        <button class="opt">A micro-VM in which every candidate runs</button>
+        <div class="why">The Comprehension Engine annotates kernel-function pre- and post-conditions, and
+        SeaHorn/Z3 check them. This targets semantic correctness ("does it do what was asked?"), which
+        neither the verifier nor an empty stderr can show. Accuracy rose from 30% (ChatGPT-4) to 80%.</div></div>
+      <div class="q"><p><strong>Q6.</strong> MCPtrace's README says "AI never gets root access". What is
+      the most accurate reading?</p>
+        <button class="opt">The model cannot affect the kernel at all</button>
+        <button class="opt" data-right>The model never holds the password, but it can run any bpftrace program as root for up to 60 s</button>
+        <button class="opt">bpftrace programs run unprivileged under MCPtrace</button>
+        <button class="opt">MCPtrace validates every script against an allow-list</button>
+        <div class="why">The server runs <code>sudo -S bpftrace -e &lt;program&gt;</code> with the
+        model's program and, per its README, does "No script validation". The host's per-call approval
+        is the real control.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>eunomia-bpf/schedcp, commit <code>730e2589</code> (2026-02-12). <a href="https://github.com/eunomia-bpf/schedcp">https://github.com/eunomia-bpf/schedcp</a> — <code>mcp/src/</code>, <code>autotune/src/</code>, <code>scheduler/schedulers.json</code>, <code>workloads/processing/</code>, <code>document/AI_AGENTS.md</code>.</li>
+      <li>Y. Zheng, Y. Hu, W. Zhang, A. Quinn. <em>Towards Agentic OS: An LLM Agent Framework for Linux Schedulers</em>. arXiv:2509.01245, 2025 (v1 1 Sep, v4 30 Sep 2025; journal-ref "MLforSystem 2025"). <a href="https://arxiv.org/abs/2509.01245">https://arxiv.org/abs/2509.01245</a></li>
+      <li>eunomia-bpf/MCPtrace, commit <code>1bd88555</code> (2026-02-12). <a href="https://github.com/eunomia-bpf/MCPtrace">https://github.com/eunomia-bpf/MCPtrace</a>; crate <a href="https://crates.io/crates/bpftrace-mcp-server">bpftrace-mcp-server</a>.</li>
+      <li>eunomia-bpf/GPTtrace, commit <code>a1f83c7b</code> (2026-03-07). <a href="https://github.com/eunomia-bpf/GPTtrace">https://github.com/eunomia-bpf/GPTtrace</a>; PyPI <a href="https://pypi.org/project/gpttrace/">gpttrace</a>.</li>
+      <li>eunomia-bpf/KEN, commit <code>7575d9ba</code> (2024-08-07). <a href="https://github.com/eunomia-bpf/KEN">https://github.com/eunomia-bpf/KEN</a></li>
+      <li>eunomia-bpf/GPTtrace-web, commit <code>02bc89f7</code> (2024-08-07). <a href="https://github.com/eunomia-bpf/GPTtrace-web">https://github.com/eunomia-bpf/GPTtrace-web</a></li>
+      <li>Y. Zheng, Y. Yang, M. Chen, A. Quinn. <em>Kgent: Kernel Extensions Large Language Model Agent</em>. Proc. ACM SIGCOMM 2024 Workshop on eBPF and Kernel Extensions (eBPF '24), pp. 30–36, 2024. <a href="https://doi.org/10.1145/3672197.3673434">doi:10.1145/3672197.3673434</a></li>
+      <li>Y. Zheng, Y. Yang, M. Chen, A. Quinn. <em>KEN: Kernel Extensions using Natural Language</em>. arXiv:2312.05531, 2023. <a href="https://arxiv.org/abs/2312.05531">https://arxiv.org/abs/2312.05531</a></li>
+      <li>Model Context Protocol specification, revision 2025-06-18 (overview, <a href="https://modelcontextprotocol.io/specification/2025-06-18/server/tools">Tools</a>, <a href="https://modelcontextprotocol.io/specification/2025-06-18/basic/transports">Transports</a>). <a href="https://modelcontextprotocol.io/specification/2025-06-18">https://modelcontextprotocol.io/specification/2025-06-18</a>; revision 2024-11-05 <a href="https://modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle">Lifecycle</a>; <a href="https://github.com/modelcontextprotocol/modelcontextprotocol/releases">release list</a>.</li>
+      <li>Anthropic. <em>Introducing the Model Context Protocol</em>, 25 Nov 2024. <a href="https://www.anthropic.com/news/model-context-protocol">https://www.anthropic.com/news/model-context-protocol</a></li>
+      <li>MCP Rust SDK (rmcp). <a href="https://github.com/modelcontextprotocol/rust-sdk">https://github.com/modelcontextprotocol/rust-sdk</a></li>
+      <li>Extensible Scheduler Class, Linux kernel documentation. <a href="https://docs.kernel.org/scheduler/sched-ext.html">https://docs.kernel.org/scheduler/sched-ext.html</a>; sched-ext/scx <a href="https://github.com/sched-ext/scx">https://github.com/sched-ext/scx</a></li>
+      <li>J. Corbet. <em>Improved load balancing with machine learning</em>. LWN.net, July 2025. <a href="https://lwn.net/Articles/1027096/">https://lwn.net/Articles/1027096/</a></li>
+      <li>H. Mao, M. Schwarzkopf, S. B. Venkatakrishnan, Z. Meng, M. Alizadeh. <em>Learning Scheduling Algorithms for Data Processing Clusters</em>. ACM SIGCOMM 2019. <a href="https://doi.org/10.1145/3341302.3342080">doi:10.1145/3341302.3342080</a></li>
+      <li>bpftrace. <a href="https://github.com/bpftrace/bpftrace">https://github.com/bpftrace/bpftrace</a></li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="29-qwen3-ebpf.html"><small>Previous</small>29 · qwen3-ebpf</a>
+      <a class="next" href="31-org-meta.html"><small>Next</small>31 · Org meta</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
