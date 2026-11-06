@@ -1,0 +1,1425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · BTF, CO-RE and libbpf · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="06">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="How BTF type information, compiler-emitted CO-RE relocations and the libbpf loader let one compiled eBPF object run on many kernels, and how skeletons, links and pinning manage its lifecycle.">
+<meta name="chapter-repo" content="https://github.com/libbpf/libbpf-bootstrap">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 06 · BTF, CO-RE and libbpf</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 06</div>
+      <h1>BTF, CO-RE and libbpf</h1>
+      <p class="lede">A tracing program that reads <code>task-&gt;real_parent-&gt;tgid</code> needs to know where
+        <code>real_parent</code> sits inside <code>struct task_struct</code>. That offset is different on almost
+        every kernel. How can you compile the program once, ship one binary, and have it read the right bytes on
+        all of them?</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="05-program-types-and-hooks.html">05</a></span><span>Repo: libbpf/libbpf-bootstrap @ 820a1bd</span><span>~45 min</span></div>
+    </section>
+
+    <h2>Why this matters: the portability problem</h2>
+    <p>Earlier chapters showed that an eBPF program is bytecode the kernel checks and runs
+      (<a href="02-ebpf-isa-and-vm.html">02</a>, <a href="03-verifier.html">03</a>). Bytecode does not contain field
+      names. When C code says <code>task-&gt;real_parent</code>, the compiler turns it into "add a constant to a pointer
+      and load 8 bytes". The constant is the byte offset of <code>real_parent</code> inside
+      <code>struct task_struct</code>, and the compiler takes it from whatever header it was given.</p>
+    <p>Networking programs mostly read stable, user-facing structures: packet bytes, <code>struct __sk_buff</code>,
+      <code>struct xdp_md</code>. The kernel keeps those fixed. Tracing and security programs are different: they read
+      <em>internal</em> kernel structures such as <code>task_struct</code>, <code>file</code>, <code>sock</code> or
+      <code>mm_struct</code>. These have no stability promise. Between versions, and between two builds of the same
+      version with different Kconfig options, fields get added, removed, reordered, renamed, moved into nested structs,
+      or compiled out.</p>
+    <p>Here is a concrete case measured in this curriculum's orb. The same libbpf-bootstrap program was compiled
+      against the <code>vmlinux.h</code> that libbpf-bootstrap ships for x86 (generated from a Linux 6.18 kernel), and
+      run on the orb's 6.1 kernel. The offsets the compiler baked in, and the offsets the running kernel actually uses,
+      were:</p>
+    <table>
+      <thead><tr><th>Field of <code>struct task_struct</code></th><th>Offset in the 6.18 header (compile time)</th><th>Offset in the orb's 6.1.189 kernel</th></tr></thead>
+      <tbody>
+        <tr><td><code>exit_code</code></td><td>924</td><td>1280</td></tr>
+        <tr><td><code>tgid</code></td><td>1028</td><td>1388</td></tr>
+        <tr><td><code>real_parent</code></td><td>1032</td><td>1400</td></tr>
+      </tbody>
+    </table>
+    <p>The numbers differ because of both the kernel version and the kernel configuration; <code>task_struct</code> is
+      7,616 bytes on the orb kernel and contains many <code>#ifdef CONFIG_…</code> members. If the program used the
+      compiled offsets as they are, it would read 368 bytes too early and report garbage as the parent PID, with no error
+      at all. The verifier cannot catch this: reading kernel memory through <code>bpf_probe_read_kernel()</code> at
+      a wrong offset is still a safe read, it is just the wrong one.</p>
+    <p>This chapter explains the three-part answer to this problem. <strong>BTF</strong> describes types.
+      <strong>CO-RE relocations</strong> record, at compile time, which fields the program meant. <strong>libbpf</strong>
+      rewrites the instructions at load time to match the running kernel. The chapter also covers the parts of libbpf
+      that every libbpf-based tool in this curriculum relies on: the object lifecycle, the BPF skeleton generated by
+      <code>bpftool</code>, global variables, the <code>bpf()</code> syscalls that do the real work, and BPF links and
+      pinning.</p>
+
+    <h3>The old answer: compile on the target (BCC)</h3>
+    <p>Before CO-RE, the usual answer was <a href="https://github.com/iovisor/bcc">BCC</a>, the BPF Compiler Collection
+      (covered with the rest of the ecosystem in <a href="08-ecosystem.html">08</a>). A BCC tool carries the C source of
+      its BPF program as a string. When the tool starts on the target machine, BCC runs an embedded Clang/LLVM, compiles
+      the string against that machine's kernel headers, and loads the result. The offsets are right because the
+      compilation happened against the exact kernel that will run the code.</p>
+    <p>This works, and BCC is still a good tool for quick prototypes. Andrii Nakryiko's
+      <a href="https://nakryiko.com/posts/bpf-portability-and-co-re/">"BPF Portability and CO-RE"</a> lists the costs
+      that pushed production users away from it:</p>
+    <ul>
+      <li>Clang/LLVM is a large library, so every tool ships a large binary.</li>
+      <li>Compiling at start-up uses a lot of CPU and memory. On a busy host it can disturb the workload, and it can be
+        slow.</li>
+      <li>The target needs kernel headers installed (<code>kernel-devel</code> or similar). Custom-built kernels often
+        have none.</li>
+      <li>Even trivial compile errors appear only at run time, on the target, after you have deployed.</li>
+    </ul>
+    <p>CO-RE, "Compile Once – Run Everywhere", moves compilation back to the developer's machine and replaces "compile
+      against the right headers" with "patch a few constants against the right type information".</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p>CO-RE splits the job into three parts. The <strong>kernel</strong> publishes an exact description of its own types
+        (BTF, at <code>/sys/kernel/btf/vmlinux</code>). The <strong>compiler</strong> records, next to each instruction that
+        touches a kernel structure, <em>which</em> field of <em>which</em> type it meant, by name. The <strong>loader</strong>
+        (libbpf) matches those names against the kernel's BTF and rewrites the instruction's offset before the program is
+        sent to the verifier. The kernel then sees a normal program that looks as if it had been compiled on that host.</p>
+    </div>
+
+    <h2>BTF: the BPF Type Format</h2>
+    <h3>What it encodes</h3>
+    <p>BTF is a compact binary format that describes C types, plus function and line information for BPF programs. The
+      kernel documentation (<a href="https://docs.kernel.org/bpf/btf.html">docs.kernel.org/bpf/btf.html</a>) defines it.
+      It was designed as a smaller alternative to DWARF. With the deduplication algorithm Nakryiko describes in
+      <a href="https://nakryiko.com/posts/btf-dedup/">"BTF deduplication and Linux kernel BTF"</a>, the kernel's type
+      information shrinks by up to about 100× compared to DWARF, small enough to keep inside every kernel image.</p>
+    <p>A BTF blob has a header, a type section and a string section:</p>
+    <pre data-file="linux/Documentation/bpf/btf.rst"><code class="language-c">struct btf_header {
+    __u16   magic;
+    __u8    version;
+    __u8    flags;
+    __u32   hdr_len;
+
+    /* All offsets are in bytes relative to the end of this header */
+    __u32   type_off;       /* offset of type section       */
+    __u32   type_len;       /* length of type section       */
+    __u32   str_off;        /* offset of string section     */
+    __u32   str_len;        /* length of string section     */
+};</code></pre>
+    <p>The magic is <code>0xeB9F</code>. On the orb, the first two bytes of <code>/sys/kernel/btf/vmlinux</code> are
+      <code>9f eb</code>: the little-endian form of that magic. The type section is a sequence of records. Each record
+      starts with a 12-byte <code>struct btf_type</code>: a name (an offset into the string section), an
+      <code>info</code> word that packs the <em>kind</em> (bits 24–30), a count <code>vlen</code> (bits 0–23) and a flag
+      bit, then either a size or a reference to another type. Kind-specific data follows. A <code>STRUCT</code> is followed
+      by <code>vlen</code> members, each with a name, a type ID and a bit offset. Types are numbered in order starting at 1;
+      ID 0 is <code>void</code>.</p>
+    <p>The kinds are <code>INT</code>, <code>PTR</code>, <code>ARRAY</code>, <code>STRUCT</code>, <code>UNION</code>,
+      <code>ENUM</code>, <code>FWD</code>, <code>TYPEDEF</code>, <code>VOLATILE</code>, <code>CONST</code>,
+      <code>RESTRICT</code>, <code>FUNC</code>, <code>FUNC_PROTO</code>, <code>VAR</code>, <code>DATASEC</code>,
+      <code>FLOAT</code>, <code>DECL_TAG</code>, <code>TYPE_TAG</code> and <code>ENUM64</code> (kinds 1–19). Most map
+      directly to C. Three are BPF-specific. <code>FUNC</code> describes a function (a subprogram), not a type.
+      <code>VAR</code> describes a global variable. <code>DATASEC</code> describes an ELF data section, such as
+      <code>.bss</code> or <code>.rodata</code>, and lists the variables inside it. These last two are what make the
+      global variables and skeletons later in this chapter possible.</p>
+    <p>You can read BTF as text with <code>bpftool btf dump</code>. This is real output from the orb, trimmed to the
+      lines this chapter uses:</p>
+    <pre><code class="language-plaintext">$ bpftool btf dump file /sys/kernel/btf/vmlinux format raw
+[1] INT 'long unsigned int' size=8 bits_offset=0 nr_bits=64 encoding=(none)
+[2] CONST '(anon)' type_id=1
+[3] VOLATILE '(anon)' type_id=2
+/* ... */
+[66] TYPEDEF 'pid_t' type_id=45
+/* ... */
+[187] STRUCT 'task_struct' size=7616 vlen=231
+	'exit_code' type_id=21 bits_offset=10240
+	'pid' type_id=66 bits_offset=11072
+	'tgid' type_id=66 bits_offset=11104
+	'real_parent' type_id=188 bits_offset=11200
+	'comm' type_id=228 bits_offset=15104
+/* ... 113,213 types in total on this kernel */</code></pre>
+    <p>Offsets are in bits: <code>real_parent</code> at bit 11200 is byte 1400, the number in the table above.</p>
+
+    <h3>Where BTF comes from</h3>
+    <p>There are two producers, and they serve the two sides of CO-RE:</p>
+    <ul>
+      <li><strong>Kernel BTF.</strong> When a kernel is built with <code>CONFIG_DEBUG_INFO_BTF=y</code>, the build runs
+        <code>pahole</code> (from the dwarves project), which converts the kernel's DWARF debug info into BTF, deduplicates
+        it and embeds it in the <code>.BTF</code> section of <code>vmlinux</code>. Since Linux 5.4 the kernel exposes it
+        at <code>/sys/kernel/btf/vmlinux</code>; loaded modules appear next to it as <code>/sys/kernel/btf/&lt;module&gt;</code>,
+        stored as <em>split BTF</em> that refers to the base vmlinux types. Most current distribution kernels enable this
+        option.</li>
+      <li><strong>Program BTF.</strong> When Clang compiles for <code>-target bpf</code> with <code>-g</code>, it writes
+        two ELF sections into the object file: <code>.BTF</code> with the types the program uses, and
+        <code>.BTF.ext</code> with function info, line info and the <strong>CO-RE relocation records</strong>. Pahole does
+        not produce CO-RE relocations; only the compiler knows which instruction accessed which field.</li>
+    </ul>
+    <p>The kernel also uses BTF for its own purposes, independent of CO-RE: the verifier uses it to type-check
+      <code>fentry</code>/<code>tp_btf</code> programs and kfunc calls (<a href="04-maps-helpers-kfuncs.html">04</a>,
+      <a href="05-program-types-and-hooks.html">05</a>), map BTF lets <code>bpftool map dump</code> print values as typed
+      structures, and line info lets <code>bpftool prog dump</code> show source lines.</p>
+
+    <h3>vmlinux.h: one header with every kernel type</h3>
+    <p>BTF can be turned back into C. <code>bpftool btf dump ... format c</code> writes a header that defines every type in
+      the kernel, including internal ones that no installed header exposes. By convention it is called
+      <code>vmlinux.h</code>:</p>
+    <pre><code class="language-bash">$ bpftool btf dump file /sys/kernel/btf/vmlinux format c &gt; vmlinux.h
+$ wc -l vmlinux.h
+117822 vmlinux.h
+$ head -6 vmlinux.h
+#ifndef __VMLINUX_H__
+#define __VMLINUX_H__
+
+#ifndef BPF_NO_PRESERVE_ACCESS_INDEX
+#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
+#endif</code></pre>
+    <p>libbpf-bootstrap wraps the same command in <code>tools/gen_vmlinux_h.sh</code>:</p>
+    <pre data-file="libbpf-bootstrap/tools/gen_vmlinux_h.sh"><code class="language-bash">#/bin/sh
+
+$(dirname "$0")/bpftool btf dump file ${1:-/sys/kernel/btf/vmlinux} format c</code></pre>
+    <p>Two details matter. First, the <code>#pragma</code> at the top applies <code>preserve_access_index</code> to every
+      struct and union in the file. That attribute is what makes Clang emit CO-RE relocations for every field access
+      through these types, described next. Second, the header does <em>not</em> have to match the target kernel. It is the
+      program's "local" view of the types. libbpf-bootstrap ships a pre-generated header per architecture (a git
+      submodule pointing at <a href="https://github.com/libbpf/vmlinux.h">libbpf/vmlinux.h</a>), so you can build on a
+      machine whose kernel has no BTF at all. BTF has no record of <code>#define</code> macros, so constants such as
+      <code>TASK_COMM_LEN</code> or flag bits are missing from <code>vmlinux.h</code>. Programs define them locally, as
+      <code>bootstrap.h</code> does below, or take them from libbpf's <code>bpf_helpers.h</code> and
+      <code>bpf_tracing.h</code>.</p>
+
+    <h2>CO-RE relocations: recording intent at compile time</h2>
+    <h3>The compiler built-ins</h3>
+    <p>Clang's BPF backend has built-ins that compile an expression normally and, in addition, record a relocation in
+      <code>.BTF.ext</code>:</p>
+    <ul>
+      <li><code>__builtin_preserve_access_index(expr)</code>: compute the address of a field access such as
+        <code>&amp;task-&gt;real_parent</code>, and record a <em>field byte offset</em> relocation for it. The
+        <code>preserve_access_index</code> attribute on a struct has the same effect on every access through that type.</li>
+      <li><code>__builtin_preserve_field_info(field, kind)</code>: return a property of a field (offset, size, whether it
+        exists, signedness, bit-shift amounts for bitfields), as a constant that libbpf will patch.</li>
+      <li><code>__builtin_preserve_type_info(type, kind)</code>: whether a type exists, its size, or whether it matches.</li>
+      <li><code>__builtin_preserve_enum_value(value, kind)</code>: whether an enumerator exists and its integer value.</li>
+      <li><code>__builtin_btf_type_id(x, kind)</code>: the BTF type ID of something, in the program or in the kernel.</li>
+    </ul>
+    <p>Each record is a <code>struct bpf_core_relo</code>. The kernel UAPI header that libbpf carries documents it:</p>
+    <pre data-file="libbpf/include/uapi/linux/bpf.h"><code class="language-c">enum bpf_core_relo_kind {
+	BPF_CORE_FIELD_BYTE_OFFSET = 0,      /* field byte offset */
+	BPF_CORE_FIELD_BYTE_SIZE = 1,        /* field size in bytes */
+	BPF_CORE_FIELD_EXISTS = 2,           /* field existence in target kernel */
+	BPF_CORE_FIELD_SIGNED = 3,           /* field signedness (0 - unsigned, 1 - signed) */
+	BPF_CORE_FIELD_LSHIFT_U64 = 4,       /* bitfield-specific left bitshift */
+	BPF_CORE_FIELD_RSHIFT_U64 = 5,       /* bitfield-specific right bitshift */
+	BPF_CORE_TYPE_ID_LOCAL = 6,          /* type ID in local BPF object */
+	BPF_CORE_TYPE_ID_TARGET = 7,         /* type ID in target kernel */
+	BPF_CORE_TYPE_EXISTS = 8,            /* type existence in target kernel */
+	BPF_CORE_TYPE_SIZE = 9,              /* type size in bytes */
+	BPF_CORE_ENUMVAL_EXISTS = 10,        /* enum value existence in target kernel */
+	BPF_CORE_ENUMVAL_VALUE = 11,         /* enum value integer value */
+	BPF_CORE_TYPE_MATCHES = 12,          /* type match in target kernel */
+};
+
+/*
+ * "struct bpf_core_relo" is used to pass relocation data form LLVM to libbpf
+ * and from libbpf to the kernel.
+ *
+ * CO-RE relocation captures the following data:
+ * - insn_off - instruction offset (in bytes) within a BPF program that needs
+ *   its insn-&gt;imm field to be relocated with actual field info;
+ * - type_id - BTF type ID of the "root" (containing) entity of a relocatable
+ *   type or field;
+ * - access_str_off - offset into corresponding .BTF string section. String
+ *   interpretation depends on specific relocation kind:
+ *     - for field-based relocations, string encodes an accessed field using
+ *       a sequence of field and array indices, separated by colon (:). It's
+ *       conceptually very close to LLVM's getelementptr ([0]) instruction's
+ *       arguments for identifying offset to a field.
+ /* ... */</code></pre>
+    <p>A record says, in effect: "instruction #30 contains the offset of member #66 of type [34] <code>struct
+      task_struct</code> (as this program saw it); please make it right." The access string <code>0:66</code> means
+      "element 0 of the pointer, then member index 66". Member <em>indices</em> are what the compiler wrote down; libbpf
+      resolves them back to member <em>names</em> through the program's own BTF, and then searches the kernel's BTF by
+      name. Field order in the target therefore does not matter.</p>
+
+    <h3>The libbpf macros you actually write</h3>
+    <p>You rarely call the built-ins directly. libbpf's <code>bpf_core_read.h</code> wraps them. The base macro is just
+      a probe-read whose source address goes through <code>__builtin_preserve_access_index</code>:</p>
+    <pre data-file="libbpf/src/bpf_core_read.h"><code class="language-c">#define bpf_core_read(dst, sz, src)					    \
+	bpf_probe_read_kernel(dst, sz, (const void *)__builtin_preserve_access_index(src))
+/* ... */
+#define bpf_core_field_exists(field...)					    \
+	__builtin_preserve_field_info(___bpf_field_ref(field), BPF_FIELD_EXISTS)
+/* ... */
+#define bpf_core_type_exists(type)					    \
+	__builtin_preserve_type_info(*___bpf_typeof(type), BPF_TYPE_EXISTS)
+/* ... */
+#ifdef __clang__
+#define bpf_core_enum_value(enum_type, enum_value)			    \
+	__builtin_preserve_enum_value(*(typeof(enum_type) *)enum_value, BPF_ENUMVAL_VALUE)
+/* ... */
+/*
+ *	int x = s-&gt;a.b.c-&gt;d.e-&gt;f-&gt;g;
+ * can be succinctly achieved using BPF_CORE_READ as:
+ *	int x = BPF_CORE_READ(s, a.b.c, d.e, f, g);
+ *
+ * BPF_CORE_READ will decompose above statement into 4 bpf_core_read (BPF
+ * CO-RE relocatable bpf_probe_read_kernel() wrapper) calls, logically
+ * equivalent to:
+ * 1. const void *__t = s-&gt;a.b.c;
+ * 2. __t = __t-&gt;d.e;
+ * 3. __t = __t-&gt;f;
+ * 4. return __t-&gt;g;
+ /* ... */
+ * N.B. Only up to 9 "field accessors" are supported, which should be more
+ * than enough for any practical purpose.
+ */
+#define BPF_CORE_READ(src, a, ...) ({					    \
+	___type((src), a, ##__VA_ARGS__) __r;				    \
+	BPF_CORE_READ_INTO(&amp;__r, (src), a, ##__VA_ARGS__);		    \
+	__r;								    \
+})</code></pre>
+    <p>The macros fall into three groups, following Nakryiko's
+      <a href="https://nakryiko.com/posts/bpf-core-reference-guide/">BPF CO-RE reference guide</a>:</p>
+    <div class="grid">
+      <div class="card"><h4>Reading data</h4><p><code>bpf_core_read()</code>, <code>bpf_core_read_str()</code>,
+        <code>BPF_CORE_READ(t, mm, exe_file, path.dentry, d_name.name)</code> (each comma is one pointer dereference),
+        <code>BPF_CORE_READ_INTO()</code>, <code>BPF_CORE_READ_STR_INTO()</code>, the <code>_USER</code> variants for
+        user memory, and <code>BPF_CORE_READ_BITFIELD[_PROBED]()</code>, which reads any integer or bitfield and keeps working
+        if its width changes.</p></div>
+      <div class="card"><h4>Asking questions</h4><p><code>bpf_core_field_exists()</code>,
+        <code>bpf_core_type_exists()</code>, <code>bpf_core_enum_value_exists()</code>,
+        <code>bpf_core_type_matches()</code>, and the size and offset queries <code>bpf_core_field_size()</code>,
+        <code>bpf_core_type_size()</code>, <code>bpf_core_field_offset()</code>. Each becomes a constant
+        (0/1 or a number) that libbpf patches in.</p></div>
+      <div class="card"><h4>Getting values</h4><p><code>bpf_core_enum_value(enum cgroup_subsys_id, cpu_cgrp_id)</code>
+        returns the enumerator's value <em>in the running kernel</em>. This makes internal enums whose values depend on
+        version or config safe to use: they are "CO-RE-relocatable enums".</p></div>
+    </div>
+    <p>Two limits are worth remembering. <code>BPF_CORE_READ</code> relocates the field's <em>offset</em>, not the
+      <em>size</em> of what you copy, so the guide recommends reading primitive fields rather than whole structs. And
+      <code>BPF_CORE_READ</code> returns 0 if any pointer on the chain is NULL or unreadable; use the lower-level
+      <code>bpf_core_read()</code> when you need the error code.</p>
+    <p>In BTF-aware program types (<code>fentry</code>/<code>fexit</code>, <code>tp_btf</code>, LSM), the verifier
+      tracks kernel pointer types and allows direct dereference: <code>t-&gt;real_parent-&gt;tgid</code> compiles to plain
+      loads. Because <code>vmlinux.h</code> marks every struct with <code>preserve_access_index</code>, those loads also get
+      CO-RE relocations, with no macro needed.</p>
+
+    <h3>Handling changes the layout alone cannot hide</h3>
+    <p>Offsets are the easy case. Harder cases are fields that were renamed, removed or changed type. CO-RE handles these
+      with three tools that work together.</p>
+    <p><strong>Existence checks plus dead-code elimination.</strong> <code>bpf_core_field_exists(t-&gt;__state)</code>
+      compiles to a constant that libbpf sets to 1 or 0. The verifier sees <code>if (0)</code> and does not check the
+      branch that cannot run. If that dead branch contains a relocation that could not be resolved, libbpf replaces the
+      instruction with a deliberately invalid call (it "poisons" it) instead of failing the load.</p>
+    <p><strong>Type and field "flavors".</strong> libbpf ignores everything from the last triple underscore onward when it
+      matches names. <code>struct task_struct___old</code> is matched against the kernel's <code>struct task_struct</code>.
+      You can then describe an <em>old</em> layout in the same source file as the new one. This comment in libbpf's
+      <code>relo_core.c</code> states the rule:</p>
+    <pre data-file="libbpf/src/relo_core.c"><code class="language-c">/*
+ * Calculate CO-RE relocation target result.
+ *
+ * The outline and important points of the algorithm:
+ * 1. For given local type, find corresponding candidate target types.
+ *    Candidate type is a type with the same "essential" name, ignoring
+ *    everything after last triple underscore (___). E.g., `sample`,
+ *    `sample___flavor_one`, `sample___flavor_another_one`, are all candidates
+ *    for each other. Names with triple underscore are referred to as
+ *    "flavors" and are useful, among other things, to allow to
+ *    specify/support incompatible variations of the same kernel struct, which
+ *    might differ between different kernel versions and/or build
+ *    configurations.
+ /* ... */</code></pre>
+    <p><strong>Kconfig externs.</strong> A program can declare <code>extern int LINUX_KERNEL_VERSION __kconfig;</code> or
+      <code>extern int CONFIG_HZ __kconfig;</code>, and libbpf fills in the running kernel's value at load time. Like the
+      existence checks, these become constants the verifier can use to remove dead branches.</p>
+    <p>The following program combines existence checks and flavors. It is <em>illustrative code written for this
+      chapter</em>, adapted from the <code>__state</code> example in the CO-RE reference guide. Kernel commit
+      <code>2f064a59a1</code> ("sched: Change task_struct::state", Linux 5.14) renamed the field from <code>state</code> to
+      <code>__state</code> and changed its type. BCC's <code>libbpf-tools/core_fixes.bpf.h</code> uses the same pattern in
+      production. The program was compiled and loaded on the orb:</p>
+    <pre><code class="language-c">/* Illustrative (not from a repo): state.bpf.c, built against the orb's vmlinux.h */
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+struct task_struct___old {          /* flavor: matched against struct task_struct */
+	long state;                     /* pre-rename name and type */
+} __attribute__((preserve_access_index));
+
+long last_state = -1;
+
+SEC("tp/sched/sched_process_exec")
+int read_state(void *ctx)
+{
+	struct task_struct *t = (void *)bpf_get_current_task();
+
+	if (bpf_core_field_exists(t-&gt;__state)) {
+		last_state = BPF_CORE_READ(t, __state);
+	} else {
+		struct task_struct___old *t_old = (void *)t;
+		last_state = BPF_CORE_READ(t_old, state);
+	}
+	return 0;
+}</code></pre>
+    <p>libbpf's debug log on the 6.1 kernel shows all three behaviours: the existence check is patched to 1, the
+      <code>__state</code> offset is resolved, and the <code>___old</code> relocation fails to match and is poisoned. The
+      load still succeeds, because the verifier never reaches the poisoned instruction:</p>
+    <pre><code class="language-plaintext">libbpf: sec 'tp/sched/sched_process_exec': found 3 CO-RE relocations
+libbpf: CO-RE relocating [5] struct task_struct: found target candidate [187] struct task_struct in [vmlinux]
+libbpf: prog 'read_state': relo #0: &lt;field_exists&gt; [5] struct task_struct.__state (0:1 @ offset 24)
+libbpf: prog 'read_state': relo #0: matching candidate #0 &lt;field_exists&gt; [187] struct task_struct.__state (0:1 @ offset 24)
+libbpf: prog 'read_state': relo #0: patched insn #1 (ALU/ALU64) imm 1 -&gt; 1
+libbpf: prog 'read_state': relo #1: &lt;byte_off&gt; [5] struct task_struct.__state (0:1 @ offset 24)
+libbpf: prog 'read_state': relo #1: matching candidate #0 &lt;byte_off&gt; [187] struct task_struct.__state (0:1 @ offset 24)
+libbpf: prog 'read_state': relo #1: patched insn #3 (ALU/ALU64) imm 24 -&gt; 24
+libbpf: CO-RE relocating [321] struct task_struct___old: found target candidate [187] struct task_struct in [vmlinux]
+libbpf: prog 'read_state': relo #2: &lt;byte_off&gt; [321] struct task_struct___old.state (0:0 @ offset 0)
+libbpf: prog 'read_state': relo #2: non-matching candidate #0 &lt;byte_off&gt; [187] struct task_struct (0 @ offset 0)
+libbpf: prog 'read_state': relo #2: no matching targets found
+libbpf: prog 'read_state': relo #2: substituting insn #12 w/ invalid insn</code></pre>
+    <p>The poison value is chosen to be easy to spot. If a poisoned instruction is reachable, for example because you
+      forgot the existence check, the verifier rejects the program with <code>invalid func unknown#195896080</code>:</p>
+    <pre data-file="libbpf/src/relo_core.c"><code class="language-c">		insn[i].code = BPF_JMP | BPF_CALL;
+		insn[i].dst_reg = 0;
+		insn[i].src_reg = 0;
+		insn[i].off = 0;
+		/*
+		 * If this instruction is reachable (not dead code), the verifier
+		 * will complain with "invalid func unknown#195896080".
+		 */
+		insn[i].imm = 195896080; /* =&gt; 0xbad2310 =&gt; "bad relo" */</code></pre>
+
+    <h2>How libbpf applies relocations at load time</h2>
+    <p>The relocation work happens inside libbpf's load step, before any program reaches the kernel. In libbpf v1.9
+      (commit <code>872299d</code>), <code>bpf_object_prepare()</code> runs these stages in order:</p>
+    <pre data-file="libbpf/src/libbpf.c"><code class="language-c">	err = bpf_object_check_gen_loader(obj);
+	err = err ? : bpf_object_prepare_token(obj);
+	err = err ? : bpf_object__probe_loading(obj);
+	err = err ? : bpf_object__load_vmlinux_btf(obj, false);
+	err = err ? : bpf_object__resolve_externs(obj, obj-&gt;kconfig);
+	err = err ? : bpf_object__sanitize_maps(obj);
+	err = err ? : bpf_object__init_kern_struct_ops_maps(obj);
+	err = err ? : bpf_object_adjust_struct_ops_autoload(obj);
+	err = err ? : bpf_object__relocate(obj, obj-&gt;btf_custom_path ? : target_btf_path);
+	err = err ? : bpf_object__sanitize_and_load_btf(obj);
+	err = err ? : bpf_object__create_maps(obj);
+	err = err ? : bpf_object_prepare_progs(obj);</code></pre>
+    <p>The kernel BTF comes from <code>btf__load_vmlinux_btf()</code>. It tries the sysfs file first and then falls back
+      to <code>vmlinux</code> images with DWARF/BTF on disk, which helps on kernels that have BTF in the image but predate
+      the sysfs file:</p>
+    <pre data-file="libbpf/src/btf.c"><code class="language-c">struct btf *btf__load_vmlinux_btf(void)
+{
+	const char *sysfs_btf_path = "/sys/kernel/btf/vmlinux";
+	/* fall back locations, trying to find vmlinux on disk */
+	const char *locations[] = {
+		"/boot/vmlinux-%1$s",
+		"/lib/modules/%1$s/vmlinux-%1$s",
+		"/lib/modules/%1$s/build/vmlinux",
+		"/usr/lib/modules/%1$s/kernel/vmlinux",
+		"/usr/lib/debug/boot/vmlinux-%1$s",
+		"/usr/lib/debug/boot/vmlinux-%1$s.debug",
+		"/usr/lib/debug/lib/modules/%1$s/vmlinux",
+	};
+	/* ... */
+	/* is canonical sysfs location accessible? */
+	if (faccessat(AT_FDCWD, sysfs_btf_path, F_OK, AT_EACCESS) &lt; 0) {
+		pr_warn("kernel BTF is missing at '%s', was CONFIG_DEBUG_INFO_BTF enabled?\n",
+			sysfs_btf_path);
+	} else {
+	/* ... */</code></pre>
+    <p>Step through what happens to the single instruction that loads <code>real_parent</code>'s offset in
+      libbpf-bootstrap's <code>bootstrap</code> program when it was built against the 6.18 header and loaded on the orb's
+      6.1 kernel. Every number below comes from the real run.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Compile: Clang writes a guess and a note</h4>
+        <p><code>BPF_CORE_READ(task, real_parent, tgid)</code> compiles to instruction #30, <code>r1 = 1032</code>, followed
+          by <code>r0 += r1</code> and a <code>bpf_probe_read_kernel()</code> call. 1032 is the offset in the 6.18 header.
+          Clang also writes a record into <code>.BTF.ext</code>: insn #30, local type [34] <code>struct task_struct</code>,
+          access string <code>0:66</code>, kind <code>byte_off</code>.</p></div>
+      <div class="step"><h4>2. Open: libbpf parses the ELF</h4>
+        <p><code>bootstrap_bpf__open()</code> parses the embedded ELF: program sections, <code>.maps</code>,
+          <code>.rodata</code>, <code>.BTF</code> and <code>.BTF.ext</code>. Nothing has touched the kernel yet, and the
+          instruction still says 1032.</p></div>
+      <div class="step"><h4>3. Load: find the kernel's BTF</h4>
+        <p><code>bootstrap_bpf__load()</code> reaches <code>bpf_object__load_vmlinux_btf()</code>. The log line is
+          <code>loaded kernel BTF from '/sys/kernel/btf/vmlinux'</code>. If <code>btf_custom_path</code> was set in the
+          open options, that file replaces vmlinux BTF for relocation purposes.</p></div>
+      <div class="step"><h4>4. Find candidates by essential name</h4>
+        <p>For local type <code>task_struct</code>, libbpf looks up every kernel type with the same kind and essential name
+          and caches the result: <code>found target candidate [187] struct task_struct in [vmlinux]</code>. Module BTF is
+          searched as well when the type is not in vmlinux.</p></div>
+      <div class="step"><h4>5. Match the access path</h4>
+        <p>libbpf turns <code>0:66</code> into names using the local BTF (member 66 is <code>real_parent</code>), then walks
+          the candidate by name. It finds <code>real_parent</code> as member 82, at bit offset 11200, and checks the types are
+          compatible (both pointers). Log: <code>matching candidate #0 &lt;byte_off&gt; [187] struct
+          task_struct.real_parent (0:82 @ offset 1400)</code>. If several candidates match with different results,
+          libbpf reports an ambiguity error instead of guessing.</p></div>
+      <div class="step"><h4>6. Patch the instruction</h4>
+        <p><code>bpf_core_patch_insn()</code> checks that insn #30 really holds the expected original value, then rewrites
+          its immediate: <code>patched insn #30 (ALU/ALU64) imm 1032 -&gt; 1400</code>. For a load such as
+          <code>r1 = *(u32 *)(r6 + 8)</code> it patches the <code>off</code> field instead. If no candidate matched, it
+          poisons the instruction (step shown in the previous section).</p></div>
+      <div class="step"><h4>7. Hand a normal program to the kernel</h4>
+        <p>After all relocations, libbpf calls <code>BPF_PROG_LOAD</code>. The verifier sees <code>r1 = 1400</code>, exactly
+          what a compile against the orb's own headers would have produced. The kernel never learns that a relocation
+          happened. The program then printed correct parent PIDs.</p></div>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 860 430" role="img" aria-label="Diagram of a CO-RE field relocation: the compiled instruction r1 = 1032 and its .BTF.ext record are matched by name against kernel BTF where real_parent is at offset 1400, and libbpf patches the instruction to r1 = 1400.">
+        <defs>
+          <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="arrG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <text x="20" y="26" fill="var(--muted)" font-size="13" font-family="sans-serif">BUILD HOST (vmlinux.h from Linux 6.18)</text>
+        <text x="590" y="26" fill="var(--muted)" font-size="13" font-family="sans-serif">TARGET HOST (Linux 6.1.189)</text>
+        <line x1="565" y1="10" x2="565" y2="420" stroke="var(--border)" stroke-dasharray="5 5"/>
+
+        <!-- local type -->
+        <rect x="20" y="40" width="250" height="150" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="32" y="62" fill="var(--fg)" font-size="13" font-family="monospace" font-weight="bold">local BTF [34] task_struct</text>
+        <text x="32" y="86" fill="var(--muted)" font-size="12" font-family="monospace">#48 exit_code    @ 924</text>
+        <text x="32" y="106" fill="var(--muted)" font-size="12" font-family="monospace">#65 tgid         @ 1028</text>
+        <text x="32" y="126" fill="var(--fg)" font-size="12" font-family="monospace">#66 real_parent  @ 1032</text>
+        <text x="32" y="150" fill="var(--muted)" font-size="11" font-family="sans-serif">(the program's own expectation,</text>
+        <text x="32" y="166" fill="var(--muted)" font-size="11" font-family="sans-serif">stored in the object's .BTF)</text>
+
+        <!-- insn -->
+        <rect x="300" y="40" width="240" height="70" rx="8" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="312" y="62" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">bootstrap.bpf.o, insn #30</text>
+        <text x="312" y="90" fill="var(--accent)" font-size="16" font-family="monospace">r1 = 1032</text>
+
+        <!-- relo record -->
+        <rect x="300" y="130" width="240" height="110" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="312" y="152" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">.BTF.ext CO-RE record</text>
+        <text x="312" y="174" fill="var(--muted)" font-size="12" font-family="monospace">insn_off = 30 * 8</text>
+        <text x="312" y="192" fill="var(--muted)" font-size="12" font-family="monospace">type_id  = [34] task_struct</text>
+        <text x="312" y="210" fill="var(--muted)" font-size="12" font-family="monospace">access   = "0:66"</text>
+        <text x="312" y="228" fill="var(--muted)" font-size="12" font-family="monospace">kind     = FIELD_BYTE_OFFSET</text>
+        <line x1="420" y1="110" x2="420" y2="128" stroke="var(--border)"/>
+        <line x1="298" y1="185" x2="272" y2="150" stroke="var(--border)" stroke-dasharray="3 3"/>
+        <text x="140" y="212" fill="var(--muted)" font-size="11" font-family="sans-serif">#66 → "real_parent"</text>
+
+        <!-- kernel btf -->
+        <rect x="590" y="40" width="250" height="150" rx="8" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="602" y="62" fill="var(--fg)" font-size="13" font-family="monospace" font-weight="bold">kernel BTF [187] task_struct</text>
+        <text x="602" y="86" fill="var(--muted)" font-size="12" font-family="monospace">#55 exit_code    @ 1280</text>
+        <text x="602" y="106" fill="var(--muted)" font-size="12" font-family="monospace">#80 tgid         @ 1388</text>
+        <text x="602" y="126" fill="var(--fg)" font-size="12" font-family="monospace">#82 real_parent  @ 1400</text>
+        <text x="602" y="150" fill="var(--muted)" font-size="11" font-family="sans-serif">/sys/kernel/btf/vmlinux</text>
+        <text x="602" y="166" fill="var(--muted)" font-size="11" font-family="sans-serif">size=7616 vlen=231</text>
+
+        <!-- libbpf box -->
+        <rect x="300" y="280" width="540" height="62" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="314" y="303" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">libbpf: bpf_core_resolve_relo() + bpf_core_patch_insn()</text>
+        <text x="314" y="326" fill="var(--muted)" font-size="12" font-family="sans-serif">match type by name → find field by name → 1400 → patch imm</text>
+        <path d="M420,240 L420,278" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrB)" fill="none"/>
+        <path d="M715,190 L715,278" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrG)" fill="none"/>
+
+        <!-- result -->
+        <rect x="590" y="362" width="250" height="52" rx="8" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="602" y="384" fill="var(--fg)" font-size="12" font-family="sans-serif">sent with BPF_PROG_LOAD:</text>
+        <text x="602" y="404" fill="var(--accent)" font-size="16" font-family="monospace">r1 = 1400</text>
+        <path d="M570,342 L640,360" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrB)" fill="none"/>
+        <text x="20" y="300" fill="var(--muted)" font-size="12" font-family="sans-serif">Log line:</text>
+        <text x="20" y="320" fill="var(--fg)" font-size="11" font-family="monospace">patched insn #30</text>
+        <text x="20" y="338" fill="var(--fg)" font-size="11" font-family="monospace">(ALU/ALU64) imm 1032 -&gt; 1400</text>
+      </svg>
+      <figcaption>Figure 06.1 — A CO-RE field relocation, with the real numbers from building libbpf-bootstrap's
+        <code>bootstrap.bpf.c</code> against its pinned 6.18 <code>vmlinux.h</code> and loading it on the orb's 6.1 kernel.
+        Matching is by name, so it does not matter that <code>real_parent</code> is member #66 locally and member #82 in the
+        kernel.</figcaption>
+    </figure>
+
+    <p>Here is the real log for the whole program (<code>sudo ./bootstrap -v</code>, trimmed to the CO-RE lines):</p>
+    <pre><code class="language-plaintext">libbpf: loaded kernel BTF from '/sys/kernel/btf/vmlinux'
+libbpf: sec 'tp/sched/sched_process_exec': found 3 CO-RE relocations
+libbpf: CO-RE relocating [34] struct task_struct: found target candidate [187] struct task_struct in [vmlinux]
+libbpf: prog 'handle_exec': relo #0: &lt;byte_off&gt; [34] struct task_struct.real_parent (0:66 @ offset 1032)
+libbpf: prog 'handle_exec': relo #0: matching candidate #0 &lt;byte_off&gt; [187] struct task_struct.real_parent (0:82 @ offset 1400)
+libbpf: prog 'handle_exec': relo #0: patched insn #30 (ALU/ALU64) imm 1032 -&gt; 1400
+libbpf: prog 'handle_exec': relo #1: &lt;byte_off&gt; [34] struct task_struct.tgid (0:65 @ offset 1028)
+libbpf: prog 'handle_exec': relo #1: matching candidate #0 &lt;byte_off&gt; [187] struct task_struct.tgid (0:80 @ offset 1388)
+libbpf: prog 'handle_exec': relo #1: patched insn #37 (ALU/ALU64) imm 1028 -&gt; 1388
+libbpf: CO-RE relocating [23] struct trace_event_raw_sched_process_exec: found target candidate [4786] struct trace_event_raw_sched_process_exec in [vmlinux]
+libbpf: prog 'handle_exec': relo #2: &lt;byte_off&gt; [23] struct trace_event_raw_sched_process_exec.__data_loc_filename (0:1 @ offset 8)
+libbpf: prog 'handle_exec': relo #2: matching candidate #0 &lt;byte_off&gt; [4786] struct trace_event_raw_sched_process_exec.__data_loc_filename (0:1 @ offset 8)
+libbpf: prog 'handle_exec': relo #2: patched insn #50 (LDX/ST/STX) off 8 -&gt; 8
+/* ... handle_exit: real_parent 1032 -&gt; 1400, tgid 1028 -&gt; 1388, exit_code 924 -&gt; 1280 */</code></pre>
+    <p>Relocation #2 shows the side effect of the <code>#pragma</code> in <code>vmlinux.h</code>. The program reads the
+      tracepoint context with plain C (<code>ctx-&gt;__data_loc_filename</code>), with no macro. The context struct comes
+      from <code>vmlinux.h</code>, so that load is relocated too; it happens to be at offset 8 on both kernels.</p>
+    <p>Since a 2021 patch set by Alexei Starovoitov, the kernel can also perform CO-RE relocations itself when
+      <code>BPF_PROG_LOAD</code> passes the records. The "light skeleton" loader uses this. LWN's
+      <a href="https://lwn.net/Articles/1031854/">"Possible paths for signing BPF programs"</a> explains why it matters:
+      a program that is rewritten at load time is not byte-identical to the file you signed.</p>
+
+    <h2>Kernels without BTF: BTFHub and minimized BTF</h2>
+    <p>CO-RE needs the target kernel's types. Kernels built without <code>CONFIG_DEBUG_INFO_BTF</code>, which includes
+      many older enterprise and embedded kernels, have no <code>/sys/kernel/btf/vmlinux</code>. libbpf then warns
+      <code>kernel BTF is missing ... was CONFIG_DEBUG_INFO_BTF enabled?</code> and any program with CO-RE relocations
+      fails to load. The relocation <em>mechanism</em> still works on those kernels; only the type data is missing. So the
+      fix is to supply the BTF from elsewhere:</p>
+    <ul>
+      <li><a href="https://github.com/aquasecurity/btfhub">BTFHub</a>, by Aqua Security, converts the debug-info packages
+        of published distribution kernels into BTF files. It stores them in a separate repository,
+        <a href="https://github.com/aquasecurity/btfhub-archive">btfhub-archive</a>, laid out by distribution, version,
+        architecture and kernel release.</li>
+      <li>A full kernel BTF file is several megabytes (4.8 MB on the orb), and supporting hundreds of kernels that way is
+        too much to ship. <strong>BTFgen</strong>, built by Aqua with Kinvolk and Elastic and later merged into bpftool as
+        <code>bpftool gen min_core_btf INPUT OUTPUT OBJECT...</code>, reads your compiled object, works out which types and
+        fields its relocations actually use, and writes a small BTF file with only those. The bpftool man page says the
+        result can be "distributed together with an eBPF CO-RE based application".</li>
+      <li>At run time the application chooses the file that matches <code>uname -r</code> and passes it through
+        <code>bpf_object_open_opts.btf_custom_path</code>. The libbpf header describes the limit: the custom BTF "completely
+        replaces the use of vmlinux BTF for the purpose of CO-RE relocations", but features that need the real kernel BTF,
+        such as <code>fentry</code>/<code>fexit</code> and <code>struct_ops</code>, still need it.</li>
+    </ul>
+    <p>eunomia-bpf's <a href="https://github.com/eunomia-bpf/bpf-compatible">bpf-compatible</a> packages this workflow.
+      Its <code>btfgen</code> script fetches btfhub-archive, generates minimized BTF for your object and packs the files
+      into a <code>.tar.gz</code>. That archive is linked into the executable with <code>ld -r -b binary</code>, and a small
+      runtime library picks the right entry and sets the custom BTF path. It also ships an adapted copy of libbpf-bootstrap.
+      <a href="13-bpf-compatible.html">Chapter 13</a> covers it in depth.</p>
+
+    <div class="callout warn"><span class="label">Watch out</span>
+      <p>CO-RE fixes layouts, not features. A program that uses a helper, kfunc, map type or attach point the target kernel
+        does not have will still fail in the verifier or at attach time. Feature checks such as
+        <code>bpf_core_type_exists(struct bpf_ringbuf)</code> or <code>bpf_core_enum_value_exists(enum bpf_func_id,
+        BPF_FUNC_ringbuf_output)</code>, combined with dead-code elimination, let one object pick a fallback. You can also
+        turn off whole programs from user space with <code>bpf_program__set_autoload(prog, false)</code> before loading.</p>
+    </div>
+
+    <h2>The build pipeline</h2>
+    <p>libbpf-bootstrap (<a href="https://github.com/libbpf/libbpf-bootstrap">github.com/libbpf/libbpf-bootstrap</a>,
+      commit <code>820a1bd</code>, October 2026) is the reference layout for a C libbpf application. It is maintained by
+      the libbpf authors, and most templates in this curriculum, including eunomia-bpf's starter templates
+      (<a href="11-starter-templates.html">11</a>), derive from it. The build has two compilers and one code generator:</p>
+
+    <figure>
+      <svg viewBox="0 0 880 360" role="img" aria-label="Build pipeline: minimal.bpf.c plus vmlinux.h compiled by clang -target bpf to a .tmp.bpf.o, linked by bpftool gen object into .bpf.o, turned into .skel.h by bpftool gen skeleton, included by minimal.c compiled by cc and linked with libbpf.a, libelf and zlib into the user binary, which at run time reads kernel BTF and calls bpf().">
+        <defs>
+          <marker id="arrP" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="arrQ" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <text x="16" y="22" fill="var(--muted)" font-size="12" font-family="sans-serif">KERNEL SIDE (BPF target)</text>
+        <rect x="16" y="34" width="130" height="44" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="81" y="61" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">minimal.bpf.c</text>
+        <rect x="16" y="90" width="130" height="44" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="81" y="112" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">vmlinux.h</text>
+        <text x="81" y="127" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">bpf_helpers.h …</text>
+
+        <rect x="186" y="56" width="150" height="56" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="261" y="80" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">clang -g -O2</text>
+        <text x="261" y="98" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">-target bpf</text>
+        <path d="M146,56 L184,74" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+        <path d="M146,112 L184,96" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <rect x="370" y="56" width="150" height="56" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="445" y="80" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">minimal.tmp.bpf.o</text>
+        <text x="445" y="98" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">ELF: code, .BTF, .BTF.ext</text>
+        <path d="M336,84 L368,84" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <rect x="554" y="56" width="140" height="56" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="624" y="80" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">bpftool gen</text>
+        <text x="624" y="98" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">object</text>
+        <path d="M520,84 L552,84" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <rect x="728" y="56" width="136" height="56" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="796" y="80" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">minimal.bpf.o</text>
+        <text x="796" y="98" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">linked BPF object</text>
+        <path d="M694,84 L726,84" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <rect x="728" y="146" width="136" height="56" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="796" y="170" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">bpftool gen</text>
+        <text x="796" y="188" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">skeleton</text>
+        <path d="M796,112 L796,144" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <rect x="554" y="146" width="140" height="56" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="624" y="170" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">minimal.skel.h</text>
+        <text x="624" y="188" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">struct + ELF bytes</text>
+        <path d="M728,174 L696,174" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <text x="16" y="236" fill="var(--muted)" font-size="12" font-family="sans-serif">USER SIDE (host target)</text>
+        <rect x="16" y="248" width="130" height="44" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="81" y="275" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">minimal.c</text>
+        <rect x="186" y="240" width="150" height="60" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="261" y="266" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">cc -c</text>
+        <text x="261" y="284" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">#include "minimal.skel.h"</text>
+        <path d="M146,270 L184,270" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrQ)" fill="none"/>
+        <path d="M554,186 L338,256" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrP)" fill="none"/>
+
+        <rect x="370" y="240" width="150" height="60" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="445" y="262" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">cc minimal.o</text>
+        <text x="445" y="280" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">libbpf.a -lelf -lz</text>
+        <path d="M336,270 L368,270" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrQ)" fill="none"/>
+
+        <rect x="554" y="240" width="140" height="60" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="624" y="266" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">./minimal</text>
+        <text x="624" y="284" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">one self-contained binary</text>
+        <path d="M520,270 L552,270" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrQ)" fill="none"/>
+
+        <rect x="728" y="240" width="136" height="60" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="796" y="262" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="sans-serif">target kernel</text>
+        <text x="796" y="280" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="monospace">kernel BTF</text>
+        <text x="796" y="294" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="monospace">bpf() syscall</text>
+        <path d="M694,270 L726,270" stroke="var(--accent2)" stroke-width="2" marker-end="url(#arrQ)" fill="none" stroke-dasharray="4 3"/>
+        <text x="710" y="320" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">run time: libbpf relocates, then loads</text>
+        <text x="16" y="345" fill="var(--muted)" font-size="11" font-family="sans-serif">Build once, on any machine with clang. Nothing on the target needs a compiler or kernel headers.</text>
+      </svg>
+      <figcaption>Figure 06.2 — The libbpf-bootstrap build pipeline, as encoded in <code>examples/c/Makefile</code>. The
+        BPF object is compiled for the BPF target, statically linked by bpftool, and embedded as bytes inside a generated
+        header. The user program includes that header and links libbpf statically.</figcaption>
+    </figure>
+
+    <h3>Directory map</h3>
+    <pre><code class="language-plaintext">libbpf-bootstrap/
+├── libbpf/        git submodule → libbpf/libbpf      (built as .output/libbpf.a)
+├── bpftool/       git submodule → libbpf/bpftool     (built with the "bootstrap" target)
+├── vmlinux.h/     git submodule → libbpf/vmlinux.h   (include/&lt;arch&gt;/vmlinux.h, pre-generated)
+├── blazesym/      git submodule → libbpf/blazesym    (symbolizer, only for the "profile" example)
+├── tools/         gen_vmlinux_h.sh, cmake helpers
+└── examples/
+    ├── c/         Makefile, CMakeLists.txt, xmake.lua and one pair per app:
+    │              minimal.{bpf.c,c}  bootstrap.{bpf.c,c,h}  kprobe  fentry  uprobe
+    │              usdt  ksyscall  tc  sockfilter  task_iter  lsm  profile  *_legacy
+    └── rust/      the same idea with libbpf-rs (see chapter 08)</code></pre>
+    <p>The pattern is one app per file pair: <code>NAME.bpf.c</code> is the kernel side and <code>NAME.c</code> the user
+      side. A shared <code>NAME.h</code> holds structures that cross the boundary, such as ring-buffer events. The
+      <code>*_legacy</code> examples avoid newer features so they run on older kernels.</p>
+
+    <h3>The Makefile, step by step</h3>
+    <p>The C examples' Makefile is short. These are the parts that implement Figure 06.2:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/Makefile"><code class="language-makefile">OUTPUT := .output
+CLANG ?= clang
+LIBBPF_SRC := $(abspath ../../libbpf/src)
+BPFTOOL_SRC := $(abspath ../../bpftool/src)
+LIBBPF_OBJ := $(abspath $(OUTPUT)/libbpf.a)
+BPFTOOL_OUTPUT ?= $(abspath $(OUTPUT)/bpftool)
+BPFTOOL ?= $(BPFTOOL_OUTPUT)/bootstrap/bpftool
+# ...
+VMLINUX := ../../vmlinux.h/include/$(ARCH)/vmlinux.h
+# Use our own libbpf API headers and Linux UAPI headers distributed with
+# libbpf to avoid dependency on system-wide headers, which could be missing or
+# outdated
+INCLUDES := -I$(OUTPUT) -I../../libbpf/include/uapi -I$(dir $(VMLINUX)) -I$(LIBBLAZESYM_INC)
+CFLAGS := -g -Wall
+# ...
+CLANG_BPF_SYS_INCLUDES ?= $(shell $(CLANG) -v -E - &lt;/dev/null 2&gt;&amp;1 \
+	| sed -n '/&lt;...&gt; search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
+# ...
+# Build libbpf
+$(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPUT)/libbpf
+	$(call msg,LIB,$@)
+	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1		      \
+		    OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
+		    INCLUDEDIR= LIBDIR= UAPIDIR=			      \
+		    install
+
+# Build bpftool
+$(BPFTOOL): | $(BPFTOOL_OUTPUT)
+	$(call msg,BPFTOOL,$@)
+	$(Q)$(MAKE) ARCH= CROSS_COMPILE= OUTPUT=$(BPFTOOL_OUTPUT)/ -C $(BPFTOOL_SRC) bootstrap
+# ...
+# Build BPF code
+$(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
+	$(call msg,BPF,$@)
+	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)		      \
+		     $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES)		      \
+		     -MT $@ -MMD -MP -MF $(patsubst %.bpf.o,%.bpf.d,$@)		      \
+		     -c $(filter %.c,$^) -o $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
+	$(Q)$(BPFTOOL) gen object $@ $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
+
+# Generate BPF skeletons
+$(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
+	$(call msg,GEN-SKEL,$@)
+	$(Q)$(BPFTOOL) gen skeleton $&lt; &gt; $@
+
+# Build user-space code
+$(patsubst %,$(OUTPUT)/%.o,$(APPS)): %.o: %.skel.h
+
+$(OUTPUT)/%.o: %.c | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -MMD -MP -c $(filter %.c,$^) -o $@
+# ...
+# Build application binary
+$(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@</code></pre>
+    <p>Things to notice:</p>
+    <ul>
+      <li><code>-g</code> is required on the BPF compile. Without debug info Clang emits no <code>.BTF</code> or
+        <code>.BTF.ext</code>, which means no CO-RE records and no skeleton. <code>-O2</code> is required in practice too;
+        unoptimized BPF code usually fails verification.</li>
+      <li><code>-D__TARGET_ARCH_$(ARCH)</code> tells <code>bpf_tracing.h</code> which register layout to use for
+        <code>PT_REGS_PARM1()</code> and similar macros in kprobes.</li>
+      <li><code>CLANG_BPF_SYS_INCLUDES</code> adds the host compiler's include directories with <code>-idirafter</code>.
+        Without it, examples that include <code>&lt;linux/bpf.h&gt;</code> fail on Debian-style systems. This was
+        reproduced on the orb: compiling <code>minimal.bpf.c</code> without it stops with <code>'asm/types.h' file not
+        found</code>.</li>
+      <li><code>bpftool gen object</code> is BPF's static linker. Here it links a single file. It exists so that several
+        <code>.bpf.o</code> files, including BPF "libraries", can be combined into one object before skeleton generation.</li>
+      <li>The final binary links libbpf statically and needs only <code>libelf</code> and <code>zlib</code> at run time.</li>
+    </ul>
+
+    <h3>Building and running</h3>
+    <p>The commands from the README:</p>
+    <pre data-file="libbpf-bootstrap/README.md"><code class="language-bash">$ apt install clang libelf1 libelf-dev zlib1g-dev
+$ git clone --recurse-submodules https://github.com/libbpf/libbpf-bootstrap
+$ git submodule update --init --recursive       # check out libbpf
+$ cd examples/c
+$ make
+$ sudo ./bootstrap</code></pre>
+    <p>On the orb, <code>bootstrap</code> built and ran. Its output (trimmed) traced the orb's own tooling:</p>
+    <pre><code class="language-plaintext">TIME     EVENT COMM             PID     PPID    FILENAME/EXIT CODE
+23:43:14 EXEC  bash             12092   1977    /usr/bin/bash
+23:43:14 EXEC  id               12094   12093   /usr/bin/id
+23:43:14 EXIT  id               12094   12093   [0] (2ms)
+23:43:14 EXEC  clang            12096   12095   /usr/bin/clang
+23:43:14 EXIT  clang            12096   12095   [0] (43ms)</code></pre>
+    <p><code>minimal</code> also loaded, but failed to attach, because this particular kernel is built without syscall
+      tracepoints: <code>failed to open '/sys/kernel/debug/tracing/events/syscalls/sys_enter_write/id': -ENOENT</code>.
+      CO-RE cannot help here; the attach point simply does not exist on this kernel.</p>
+
+    <h2>A complete minimal project</h2>
+    <p>The smallest libbpf-bootstrap application has two files. The kernel side:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/minimal.bpf.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Copyright (c) 2020 Facebook */
+#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+int my_pid = 0;
+
+SEC("tp/syscalls/sys_enter_write")
+int handle_tp(void *ctx)
+{
+	int pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	if (pid != my_pid)
+		return 0;
+
+	bpf_printk("BPF triggered from PID %d.\n", pid);
+
+	return 0;
+}</code></pre>
+    <p><code>SEC("tp/syscalls/sys_enter_write")</code> puts the function in an ELF section whose name tells libbpf both
+      the program type (tracepoint) and where to attach it. That is what lets <code>__attach()</code> work with no
+      arguments. <code>my_pid</code> is a plain global variable; the compiler places it in <code>.bss</code>. This program
+      reads no kernel structures, so it does not even need <code>vmlinux.h</code>.</p>
+    <p>The user side:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/minimal.c"><code class="language-c">// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+/* Copyright (c) 2020 Facebook */
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/resource.h&gt;
+#include &lt;bpf/libbpf.h&gt;
+#include "minimal.skel.h"
+
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
+{
+	return vfprintf(stderr, format, args);
+}
+
+int main(int argc, char **argv)
+{
+	struct minimal_bpf *skel;
+	int err;
+
+	/* Set up libbpf errors and debug info callback */
+	libbpf_set_print(libbpf_print_fn);
+
+	/* Open BPF application */
+	skel = minimal_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open BPF skeleton\n");
+		return 1;
+	}
+
+	/* ensure BPF program only handles write() syscalls from our process */
+	skel-&gt;bss-&gt;my_pid = getpid();
+
+	/* Load &amp; verify BPF programs */
+	err = minimal_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		goto cleanup;
+	}
+
+	/* Attach tracepoint handler */
+	err = minimal_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF skeleton\n");
+		goto cleanup;
+	}
+
+	printf("Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
+	       "to see output of the BPF programs.\n");
+
+	for (;;) {
+		/* trigger our BPF program */
+		fprintf(stderr, ".");
+		sleep(1);
+	}
+
+cleanup:
+	minimal_bpf__destroy(skel);
+	return -err;
+}</code></pre>
+    <p>The user program never names a file path, a section or a map. Everything goes through the generated
+      <code>struct minimal_bpf</code>. <code>skel-&gt;bss-&gt;my_pid = getpid()</code> writes to the BPF program's global
+      variable before load. Whatever value is there when <code>__load()</code> runs becomes the variable's initial value
+      in the kernel.</p>
+    <p>For a program that does read kernel structures, look at <code>bootstrap</code>. Its kernel side includes
+      <code>vmlinux.h</code> and uses <code>BPF_CORE_READ</code>, a hash map, a ring buffer (<a
+      href="04-maps-helpers-kfuncs.html">04</a>) and a read-only configuration variable:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/bootstrap.bpf.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Copyright (c) 2020 Facebook */
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include "bootstrap.h"
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, pid_t);
+	__type(value, u64);
+} exec_start SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+
+const volatile unsigned long long min_duration_ns = 0;
+
+SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	struct task_struct *task;
+	unsigned fname_off;
+	struct event *e;
+	pid_t pid;
+	u64 ts;
+
+	/* remember time exec() was executed for this PID */
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&amp;exec_start, &amp;pid, &amp;ts, BPF_ANY);
+
+	/* don't emit exec events when minimum duration is specified */
+	if (min_duration_ns)
+		return 0;
+
+	/* reserve sample from BPF ringbuf */
+	e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	/* fill out the sample with data */
+	task = (struct task_struct *)bpf_get_current_task();
+
+	e-&gt;exit_event = false;
+	e-&gt;pid = pid;
+	e-&gt;ppid = BPF_CORE_READ(task, real_parent, tgid);
+	bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+
+	fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+	bpf_probe_read_str(&amp;e-&gt;filename, sizeof(e-&gt;filename), (void *)ctx + fname_off);
+
+	/* successfully submit it to user-space for post-processing */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+/* ... handle_exit() for SEC("tp/sched/sched_process_exit") ... */</code></pre>
+    <p>And the part of its user side that sets the configuration and consumes events:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/bootstrap.c"><code class="language-c">	/* Load and verify BPF application */
+	skel = bootstrap_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+		return 1;
+	}
+
+	/* Parameterize BPF code with minimum duration parameter */
+	skel-&gt;rodata-&gt;min_duration_ns = env.min_duration_ms * 1000000ULL;
+
+	/* Load &amp; verify BPF programs */
+	err = bootstrap_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		goto cleanup;
+	}
+
+	/* Attach tracepoints */
+	err = bootstrap_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF skeleton\n");
+		goto cleanup;
+	}
+
+	/* Set up ring buffer polling */
+	rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.rb), handle_event, NULL, NULL);
+	/* ... poll loop: ring_buffer__poll(rb, 100) until Ctrl-C ... */
+
+cleanup:
+	/* Clean up */
+	ring_buffer__free(rb);
+	bootstrap_bpf__destroy(skel);</code></pre>
+
+    <h2>The libbpf object lifecycle</h2>
+    <p>The libbpf documentation (<a href="https://docs.kernel.org/bpf/libbpf/libbpf_overview.html">libbpf Overview</a>)
+      describes four phases. Every libbpf program, with or without a skeleton, goes through them:</p>
+    <ol>
+      <li><strong>Open.</strong> libbpf parses the ELF and finds programs, maps and global variables. Nothing has been
+        created in the kernel yet. This is the time to make changes: set global variable values, resize maps
+        (<code>bpf_map__set_max_entries</code>), change a program's type or turn off autoload, set pin paths.</li>
+      <li><strong>Load.</strong> libbpf probes kernel features, loads kernel BTF, resolves externs, applies CO-RE and
+        map relocations, loads the program's BTF, creates maps, and loads and verifies programs. After this step, programs
+        are in the kernel but not running. You can fill maps without racing against running BPF code.</li>
+      <li><strong>Attach.</strong> libbpf attaches programs to their hooks and returns <code>struct bpf_link</code>
+        objects. Programs start running.</li>
+      <li><strong>Tear down.</strong> Links are destroyed (programs detach), and the program, map and BTF file descriptors
+        are closed, which frees the kernel objects unless something else holds a reference.</li>
+    </ol>
+    <p>libbpf v1.9 also has <code>bpf_object__prepare()</code>, which does everything in the load phase except loading the
+      programs. You can inspect or change the final instructions before the verifier sees them.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="With a skeleton (libbpf-bootstrap)">
+        <p>The skeleton wraps each phase in one generated function. This sequence is from <code>minimal.c</code>
+          above:</p>
+        <pre data-file="libbpf-bootstrap/examples/c/minimal.c"><code class="language-c">	skel = minimal_bpf__open();
+	/* ... */
+	skel-&gt;bss-&gt;my_pid = getpid();
+	/* ... */
+	err = minimal_bpf__load(skel);
+	/* ... */
+	err = minimal_bpf__attach(skel);
+	/* ... */
+cleanup:
+	minimal_bpf__destroy(skel);</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Generic libbpf API (illustrative)">
+        <p><em>Illustrative code written for this chapter</em> (not from a repository): the same phases without a
+          skeleton, loading the object file from disk and looking things up by name. Every function is a public libbpf
+          API declared in <code>libbpf.h</code>.</p>
+        <pre><code class="language-c">/* Illustrative: generic libbpf API, no skeleton */
+struct bpf_object *obj;
+struct bpf_program *prog;
+struct bpf_link *link = NULL;
+int err;
+
+obj = bpf_object__open_file("minimal.bpf.o", NULL);       /* open   */
+if (!obj)
+	return 1;
+
+err = bpf_object__load(obj);                               /* load   */
+if (err)
+	goto out;
+
+prog = bpf_object__find_program_by_name(obj, "handle_tp");
+link = bpf_program__attach(prog);                          /* attach */
+if (!link) {
+	err = -errno;
+	goto out;
+}
+/* ... run ... */
+out:
+bpf_link__destroy(link);                                   /* detach */
+bpf_object__close(obj);                                    /* free   */</code></pre>
+        <p>Setting a global variable without a skeleton is more awkward: you find the <code>.bss</code> map with
+          <code>bpf_object__find_map_by_name()</code>, get its initial-value buffer with
+          <code>bpf_map__initial_value()</code>, and write at the right offset. The skeleton generates exactly this code
+          for you, with types.</p>
+      </div>
+      <div class="tab-panel" data-label="Generated skeleton (excerpt)">
+        <p>Real output of <code>bpftool gen skeleton</code> (bpftool v7.9.0) for <code>minimal.bpf.o</code>, built on the
+          orb and trimmed. It is generated code, so it is not in the repository.</p>
+        <pre><code class="language-c">/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+/* THIS FILE IS AUTOGENERATED BY BPFTOOL! */
+#ifndef __MINIMAL_BPF_SKEL_H__
+#define __MINIMAL_BPF_SKEL_H__
+
+#include &lt;errno.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;bpf/libbpf.h&gt;
+
+#define BPF_SKEL_SUPPORTS_MAP_AUTO_ATTACH 1
+
+struct minimal_bpf {
+	struct bpf_object_skeleton *skeleton;
+	struct bpf_object *obj;
+	struct {
+		struct bpf_map *bss;
+		struct bpf_map *rodata;
+	} maps;
+	struct {
+		struct bpf_program *handle_tp;
+	} progs;
+	struct {
+		struct bpf_link *handle_tp;
+	} links;
+	struct minimal_bpf__bss {
+		int my_pid;
+	} *bss;
+	/* ... C++ member declarations ... */
+};
+/* ... */
+static inline struct minimal_bpf *
+minimal_bpf__open_opts(const struct bpf_object_open_opts *opts)
+{
+	struct minimal_bpf *obj;
+	int err;
+
+	obj = (struct minimal_bpf *)calloc(1, sizeof(*obj));
+	if (!obj) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	err = minimal_bpf__create_skeleton(obj);
+	if (err)
+		goto err_out;
+
+	err = bpf_object__open_skeleton(obj-&gt;skeleton, opts);
+	if (err)
+		goto err_out;
+
+	return obj;
+err_out:
+	minimal_bpf__destroy(obj);
+	errno = -err;
+	return NULL;
+}
+/* ... */
+static inline int
+minimal_bpf__load(struct minimal_bpf *obj)
+{
+	return bpf_object__load_skeleton(obj-&gt;skeleton);
+}
+/* ... */
+static inline int
+minimal_bpf__attach(struct minimal_bpf *obj)
+{
+	return bpf_object__attach_skeleton(obj-&gt;skeleton);
+}
+/* ... minimal_bpf__create_skeleton() fills in names and pointers, and
+ *     minimal_bpf__elf_bytes() returns the embedded copy of minimal.bpf.o ... */
+	_Static_assert(sizeof(s-&gt;bss-&gt;my_pid) == 4, "unexpected size of 'my_pid'");</code></pre>
+      </div>
+    </div>
+
+    <h2>BPF skeletons and global variables</h2>
+    <p>A skeleton is a header that <code>bpftool gen skeleton</code> generates from a compiled object. The libbpf
+      documentation lists what it gives you:</p>
+    <ul>
+      <li><strong>The object is embedded.</strong> <code>NAME__elf_bytes()</code> returns the whole <code>.bpf.o</code>
+        as a byte array compiled into your binary, so there is no separate file to install or find at run time.</li>
+      <li><strong>Typed access instead of string lookups.</strong> <code>skel-&gt;progs.handle_tp</code>,
+        <code>skel-&gt;maps.rb</code> and <code>skel-&gt;links.handle_tp</code> are struct fields. If you rename a map in
+        the BPF code and forget the user side, the build fails, instead of a lookup returning NULL at run time.</li>
+      <li><strong>Global variables as C structs.</strong> For each data section, the skeleton declares a struct whose
+        layout comes from the <code>DATASEC</code> BTF of the object. After load, libbpf memory-maps the section's
+        backing map, so <code>skel-&gt;bss-&gt;counter++</code> in user space and <code>counter++</code> in BPF touch the
+        same memory. The <code>_Static_assert</code> lines check that the user-side compiler lays the struct out the way
+        BTF says.</li>
+      <li><strong>Lifecycle functions.</strong> <code>__open</code>, <code>__open_opts</code>, <code>__load</code>,
+        <code>__open_and_load</code>, <code>__attach</code>, <code>__detach</code> and <code>__destroy</code>. These are
+        thin wrappers. The skeleton always exposes <code>skel-&gt;obj</code>, so anything the generic API can do is still
+        available.</li>
+    </ul>
+    <p>How do global variables work, when BPF programs have no <code>.data</code> segment of their own? libbpf turns each
+      of <code>.data</code>, <code>.rodata</code>, <code>.bss</code> (and custom <code>.data.*</code>/<code>.rodata.*</code>
+      sections) into a single-element <code>BPF_MAP_TYPE_ARRAY</code> whose value is the whole section. Instructions that
+      reference a variable are relocated to "address of map value plus offset", which the verifier understands. The BTF
+      dump of <code>bootstrap.bpf.o</code> shows the sections libbpf works from:</p>
+    <pre><code class="language-plaintext">$ bpftool btf dump file bootstrap.bpf.o | grep -A2 DATASEC
+[328] DATASEC 'license' size=13 vlen=1
+	type_id=278 offset=0 size=13 (VAR 'LICENSE')
+[329] DATASEC '.rodata' size=8 vlen=1
+	type_id=281 offset=0 size=8 (VAR 'min_duration_ns')
+[330] DATASEC '.maps' size=48 vlen=2
+	type_id=15 offset=0 size=32 (VAR 'exec_start')
+	type_id=21 offset=32 size=16 (VAR 'rb')</code></pre>
+    <p>The three sections behave differently:</p>
+    <div class="grid">
+      <div class="card"><h4><code>.bss</code> / <code>.data</code></h4><p>Mutable from both sides. Used for counters,
+        PIDs to filter on, and small amounts of state. Set the value before load to choose the initial value; read or
+        write it after load through the mmap.</p></div>
+      <div class="card"><h4><code>.rodata</code></h4><p><code>const volatile</code> variables. You can write them only
+        before load (<code>skel-&gt;rodata-&gt;min_duration_ns = …</code>). libbpf then <em>freezes</em> the map, so the
+        verifier knows the exact value and can remove branches that cannot run. The <code>volatile</code> stops Clang from
+        folding the default value at compile time.</p></div>
+      <div class="card"><h4><code>.maps</code></h4><p>Not data. This section holds the BTF-defined map declarations
+        (<code>__uint(type, …)</code>, <code>__type(key, …)</code>) that libbpf reads to create real maps.</p></div>
+    </div>
+    <p>The <code>.rodata</code> behaviour is the user-space counterpart of CO-RE's dead-code elimination. Nakryiko's CO-RE
+      post explains why it beats a configuration map: a value in a map is unknown to the verifier, so it must check every
+      branch, including branches that use features the running kernel lacks. A frozen read-only value lets the verifier
+      remove those branches. Read-write global variables accessible from user space need Linux 5.5 or later; for older
+      kernels libbpf-bootstrap keeps <code>minimal_legacy.bpf.c</code>, which <code>#define</code>s
+      <code>BPF_NO_GLOBAL_DATA</code> and uses a one-element array map "instead of a global variable which does not work
+      with older kernels".</p>
+    <p>bpftool can generate two variants. A <strong>light skeleton</strong> (<code>bpftool gen skeleton -L</code>) contains
+      a small BPF "loader program" that does the map creation and relocation in the kernel. The bpftool man page says it
+      "does not use the majority of the libbpf infrastructure, and does not need libelf", which suits programs loaded
+      from inside the kernel or from minimal environments, and it is the basis of <code>--sign</code> for signed
+      skeletons. A <strong>subskeleton</strong> (<code>bpftool gen subskeleton</code>) gives a BPF library's own code typed
+      access to its part of an object that the application opened.</p>
+
+    <h2>Underneath: the bpf() syscall</h2>
+    <p>libbpf is a user-space library. Everything it does in the kernel goes through one multiplexed system call,
+      <code>bpf(int cmd, union bpf_attr *attr, unsigned int size)</code>, plus a few helpers such as
+      <code>perf_event_open</code>. Tracing <code>bootstrap</code> with <code>strace -e trace=bpf,perf_event_open,ioctl</code>
+      on the orb shows each phase. This is real output, with the long attribute structs shortened:</p>
+    <pre><code class="language-plaintext">bpf(0x24 /* BPF_??? */, ..., 8) = -1 EINVAL           # BPF_TOKEN_CREATE probe (strace 6.1 has no name for it)
+bpf(BPF_PROG_LOAD, {...}, 148) = 5                    # feature probes: tiny programs, closed immediately
+bpf(BPF_BTF_LOAD, {btf="\237\353\1\0...", ...}) = 5   # more probes: which BTF kinds does this kernel accept?
+/* ... */
+bpf(BPF_BTF_LOAD, {btf="\237\353\1\0...", btf_size=21661, ...}, 40) = 6  # the object's own BTF (magic 0xeB9F)
+bpf(BPF_MAP_CREATE, {map_type=BPF_MAP_TYPE_HASH, key_size=4, value_size=8, max_entries=8192,
+    map_name="exec_start", btf_fd=6, btf_key_type_id=8, btf_value_type_id=11, ...}) = ...
+bpf(BPF_MAP_CREATE, {map_type=BPF_MAP_TYPE_RINGBUF, max_entries=262144, map_name="rb", ...}) = ...
+bpf(BPF_MAP_CREATE, {map_type=BPF_MAP_TYPE_ARRAY, key_size=4, value_size=8, max_entries=1,
+    map_flags=BPF_F_RDONLY_PROG|BPF_F_MMAPABLE, map_name="bootstra.rodata", btf_fd=6,
+    btf_value_type_id=329, ...}) = 7                  # value type = DATASEC '.rodata' [329]
+bpf(BPF_MAP_UPDATE_ELEM, {map_fd=5, key=..., value=..., flags=BPF_ANY}, 32) = 0   # initial value set before load
+bpf(BPF_MAP_FREEZE, {map_fd=5}, 4) = 0                                          # now read-only from user space too
+bpf(BPF_PROG_LOAD, {prog_type=BPF_PROG_TYPE_TRACEPOINT, insn_cnt=63, license="Dual BSD/GPL",
+    kern_version=KERNEL_VERSION(6, 1, 189), prog_name="handle_exec", ...}) = 7
+bpf(BPF_PROG_LOAD, {prog_type=BPF_PROG_TYPE_TRACEPOINT, insn_cnt=85, prog_name="handle_exit", ...}) = 8
+perf_event_open({type=PERF_TYPE_TRACEPOINT, config=97, ...}, -1, 0, -1, PERF_FLAG_FD_CLOEXEC) = 9
+bpf(BPF_LINK_CREATE, {link_create={prog_fd=10, target_fd=-1, attach_type=BPF_PERF_EVENT, ...}}) = -1 EBADF  # probe
+bpf(BPF_LINK_CREATE, {link_create={prog_fd=7, target_fd=9, attach_type=BPF_PERF_EVENT, ...}}, 64) = 10
+ioctl(9, PERF_EVENT_IOC_ENABLE, 0) = 0</code></pre>
+    <p>The <code>BPF_MAP_UPDATE_ELEM</code> plus <code>BPF_MAP_FREEZE</code> pair is the <code>.rodata</code> freezing
+      described above: the value written is whatever <code>skel-&gt;rodata</code> held when <code>__load()</code> ran.
+      (The fd numbers do not line up because libbpf reserves a placeholder fd for each map at open time and moves the
+      real fd onto it with <code>dup3()</code>, which this strace filter does not show.)</p>
+    <p>The commands that matter most:</p>
+    <ul>
+      <li><code>BPF_BTF_LOAD</code> uploads the program's BTF, after libbpf has removed parts the kernel would not
+        understand ("sanitizing"). Maps and programs then refer to its fd so the kernel knows their key, value and function
+        types.</li>
+      <li><code>BPF_MAP_CREATE</code> creates each map. It returns a file descriptor. libbpf then rewrites every
+        <code>ld_imm64</code> instruction that referenced the map to carry that fd.</li>
+      <li><code>BPF_PROG_LOAD</code> passes the fully relocated instructions, the program type, license, BTF fd, func and
+        line info, and an optional log buffer. The verifier runs inside this call; if it fails, libbpf prints the verifier
+        log.</li>
+      <li><code>BPF_LINK_CREATE</code> (Linux 5.7 and later) attaches a program and returns a <em>link</em> fd. For a
+        tracepoint, libbpf first opens a perf event for it and then links the program to that event. On kernels without
+        perf-event links libbpf falls back to the older <code>PERF_EVENT_IOC_SET_BPF</code> ioctl.</li>
+    </ul>
+    <p>Every <code>EINVAL</code> or <code>EBADF</code> in the trace is deliberate. libbpf tests what the running kernel
+      supports by trying small operations, then adjusts: it drops BTF kinds the kernel does not know, picks an attach method
+      that exists, and so on. This feature probing complements CO-RE. CO-RE adapts the <em>program</em> to the kernel's
+      types; probing adapts the <em>loader's</em> behaviour to the kernel's features.</p>
+
+    <h2>BPF links and pinning</h2>
+    <p>Each kernel BPF object (program, map, BTF, link) is reference-counted and reached through a file descriptor. When the
+      last reference goes away, the object is freed. That is why <code>minimal</code> loops forever: once it exits, its
+      fds close, the link is released, and the program detaches.</p>
+    <p>A <strong>BPF link</strong> is a kernel object that represents one attachment of one program to one hook. Before
+      links, many attachments were global state. A <code>tc</code> filter or an XDP program set with netlink stayed attached
+      after the loading process died, and any other process could replace it by mistake. Links give attachments owner
+      semantics:</p>
+    <ul>
+      <li>Closing the last fd to a link detaches the program, so a crashed tool cleans up after itself.</li>
+      <li>A link can be <em>updated</em> atomically to a new program (<code>bpf_link__update_program()</code>), so a new
+        version can replace the old with no window where nothing is attached.</li>
+      <li>A link can be listed and queried (<code>bpftool link show</code>), and anyone holding its fd can detach it
+        explicitly with <code>BPF_LINK_DETACH</code> (libbpf: <code>bpf_link_detach()</code>).</li>
+    </ul>
+    <p>To make an object outlive its process, you <strong>pin</strong> it: give it a name in the BPF filesystem, normally
+      mounted at <code>/sys/fs/bpf</code>. Pinning uses the <code>BPF_OBJ_PIN</code> command and the pinned file holds a
+      reference. Another process can later open it with <code>BPF_OBJ_GET</code>, and removing the file with
+      <code>rm</code> drops the reference. libbpf provides <code>bpf_link__pin()</code>, <code>bpf_program__pin()</code>,
+      <code>bpf_map__pin()</code>, <code>bpf_object__pin_maps()</code> and <code>bpf_map__set_pin_path()</code>. For maps it
+      can also be declared in BPF code:</p>
+    <pre data-file="libbpf/src/bpf_helpers.h"><code class="language-c">enum libbpf_pin_type {
+	LIBBPF_PIN_NONE,
+	/* PIN_BY_NAME: pin maps by name (in /sys/fs/bpf by default) */
+	LIBBPF_PIN_BY_NAME,
+};</code></pre>
+    <p>A map declared with <code>__uint(pinning, LIBBPF_PIN_BY_NAME)</code> is pinned at <code>/sys/fs/bpf/&lt;name&gt;</code>
+      when first created. When another object with the same declaration loads later, libbpf reuses the existing map instead
+      of creating a new one, after checking that the type, key size, value size, max entries and flags match. This is how separate tools, or a new
+      version of the same daemon, share state.</p>
+    <pre><code class="language-c">/* Illustrative (not from a repo): keep a program attached after the loader exits */
+struct bpf_link *link = bpf_program__attach(skel-&gt;progs.handle_exec);
+if (!link)
+	return -errno;
+err = bpf_link__pin(link, "/sys/fs/bpf/bootstrap_exec");   /* BPF_OBJ_PIN */
+if (err)
+	return err;
+bpf_link__disconnect(link);   /* destroying the bpf_link struct will not detach */
+bpf_link__destroy(link);      /* the pin keeps the attachment alive; rm the file to detach */</code></pre>
+    <p>Pinning is how long-running systems such as Cilium (<a href="08-ecosystem.html">08</a>) keep data-plane programs and
+      maps in place across agent restarts and upgrades.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefits</h4><p>One small binary per architecture, with no Clang, LLVM or kernel headers on the
+        target. Start-up costs a few BTF lookups instead of a compilation. Compile errors appear at build time. Programs can
+        adapt to kernel versions and configurations with ordinary <code>if</code> statements, and the verifier removes the
+        branches that do not apply. The same <code>.bpf.o</code> can be loaded by libbpf, libbpf-rs, cilium/ebpf and aya,
+        which all implement CO-RE.</p></div>
+      <div class="card"><h4>Limitations</h4><p>The target needs BTF (built in, or supplied via BTFHub/<code>min_core_btf</code>).
+        CO-RE fixes layouts, not missing features. Semantic changes, where a field keeps its name but changes meaning (for
+        example a unit change), still need explicit code. Copying whole structs or arrays does not relocate sizes. Matching
+        by name can be ambiguous or wrong when the kernel has several different types with the same name; bpftool emits
+        <code>___2</code>-style suffixes for those. And rewriting at load time makes it harder to sign programs.</p></div>
+    </div>
+    <div class="callout tip"><span class="label">Debugging tip</span>
+      <p>When a CO-RE program fails to load, install a print callback that shows <code>LIBBPF_DEBUG</code> messages, as
+        <code>bootstrap -v</code> does. Look at the <code>relo #N</code> lines just before the failure. A verifier error
+        mentioning <code>unknown#195896080</code> points to a relocation that could not be resolved and was not
+        guarded by an existence check.</p>
+    </div>
+
+    <h2>Related work and where to go next</h2>
+    <ul>
+      <li><strong>Other loaders.</strong> libbpf-rs, cilium/ebpf (Go) and aya (Rust) implement the same object format and
+        CO-RE algorithm in their own languages: <a href="08-ecosystem.html">08 · Ecosystem</a>. BCC's
+        <code>libbpf-tools/</code> directory holds CO-RE ports of many classic BCC tools; Nakryiko's 2021 update counted
+        more than 25.</li>
+      <li><strong>Old kernels.</strong> <a href="13-bpf-compatible.html">13 · bpf-compatible</a> packages BTFHub plus
+        <code>min_core_btf</code> into a build step and a small runtime.</li>
+      <li><strong>Packaging.</strong> <a href="10-eunomia-bpf-ecc-ecli.html">10 · eunomia-bpf</a> compiles CO-RE objects
+        and ships them as JSON or WebAssembly packages that a generic runner loads.
+        <a href="12-wasm-bpf.html">12 · wasm-bpf</a> moves the user-space half into WebAssembly.</li>
+      <li><strong>Templates.</strong> <a href="11-starter-templates.html">11 · Starter templates</a> are ready-made
+        libbpf-bootstrap-style repositories for C and Rust. <a href="09-bpf-developer-tutorial.html">09 ·
+        bpf-developer-tutorial</a> walks through many more programs built on this toolchain.</li>
+      <li><strong>Userspace runtimes.</strong> <a href="14-bpftime-architecture.html">14 · bpftime</a> loads the same
+        libbpf objects into a user-space runtime and has to answer the same "which BTF?" question there.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Which component <em>emits</em> the CO-RE relocation records saying which
+        field an instruction accesses?</p>
+        <button class="opt">pahole, when it converts kernel DWARF to BTF</button>
+        <button class="opt" data-right>Clang, into the <code>.BTF.ext</code> section of the BPF object</button>
+        <button class="opt">The kernel verifier, during <code>BPF_PROG_LOAD</code></button>
+        <button class="opt">bpftool, when generating the skeleton</button>
+        <div class="why">Only the compiler knows which instruction came from which field access. It writes a
+          <code>bpf_core_relo</code> record (instruction offset, local type ID, access string, kind) into
+          <code>.BTF.ext</code>. pahole produces the kernel's BTF, the other half of the match.</div></div>
+      <div class="q"><p><strong>Q2.</strong> A program built against a 6.18 <code>vmlinux.h</code> reads
+        <code>task-&gt;real_parent</code> with <code>BPF_CORE_READ</code> and is loaded on a 6.1 kernel where the field is at
+        a different offset. What happens?</p>
+        <button class="opt">The verifier rejects it because the offset is out of bounds</button>
+        <button class="opt">It loads and silently reads the wrong bytes</button>
+        <button class="opt" data-right>libbpf finds <code>real_parent</code> by name in the kernel's BTF and patches the
+          instruction's offset (on the orb: 1032 → 1400) before loading</button>
+        <button class="opt">libbpf recompiles the C source on the target</button>
+        <div class="why">That is the whole point of a field byte-offset relocation. Without CO-RE (a plain
+          <code>bpf_probe_read_kernel</code> with a hard-coded offset), the second option is what would happen.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does <code>bootstrap.bpf.c</code> declare
+        <code>const volatile unsigned long long min_duration_ns</code> instead of storing the setting in a map?</p>
+        <button class="opt">Maps cannot hold 64-bit values</button>
+        <button class="opt" data-right>It lives in <code>.rodata</code>. User space sets it before load, libbpf freezes the
+          map, and the verifier knows its value and can remove branches that cannot run</button>
+        <button class="opt">Global variables are faster because they are stored in registers</button>
+        <button class="opt">The skeleton cannot access maps</button>
+        <div class="why">A map value is unknown to the verifier, so every branch is checked. A frozen read-only global is
+          a known constant. <code>volatile</code> stops Clang from folding the default 0 at compile time.</div></div>
+      <div class="q"><p><strong>Q4.</strong> A target kernel was built without <code>CONFIG_DEBUG_INFO_BTF</code>. What
+        is the standard way to still run a CO-RE program there?</p>
+        <button class="opt">Rebuild the BPF object with <code>-g0</code></button>
+        <button class="opt">Disable the verifier</button>
+        <button class="opt" data-right>Ship BTF for that kernel (from BTFHub, minimized with <code>bpftool gen
+          min_core_btf</code>) and pass it via <code>btf_custom_path</code></button>
+        <button class="opt">Use <code>BPF_CORE_READ_BITFIELD</code> for every field</button>
+        <div class="why">The relocation mechanism works on such kernels; only the type data is missing. bpf-compatible
+          (chapter 13) automates this. Features that need real kernel BTF, such as fentry, still will not work.</div></div>
+      <div class="q"><p><strong>Q5.</strong> A tool attaches with <code>bpf_program__attach()</code> and exits without
+        pinning anything. What happens to the program?</p>
+        <button class="opt">It stays attached until reboot</button>
+        <button class="opt" data-right>The link fd closes, the link is released, and the program detaches and is
+          freed</button>
+        <button class="opt">It is moved to <code>/sys/fs/bpf</code> automatically</button>
+        <button class="opt">It keeps running but its maps are freed</button>
+        <div class="why">BPF links have owner semantics: the attachment lives as long as something holds a reference.
+          Pin the link (<code>bpf_link__pin</code>) to keep it beyond the process.</div></div>
+      <div class="q"><p><strong>Q6.</strong> In a BPF program, <code>struct task_struct___old</code> is declared with
+        one field, <code>long state</code>. What does libbpf match it against?</p>
+        <button class="opt">A kernel type literally named <code>task_struct___old</code></button>
+        <button class="opt" data-right>The kernel's <code>struct task_struct</code>; everything after the last
+          <code>___</code> is a "flavor" and is ignored</button>
+        <button class="opt">Nothing; local-only types are never relocated</button>
+        <button class="opt">The first struct in the kernel with a field named <code>state</code></button>
+        <div class="why">Flavors let one source file describe several historical layouts of the same type. Combined with
+          <code>bpf_core_field_exists()</code>, the branch that does not apply is poisoned and removed as dead
+          code.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-portability-and-co-re/">"BPF CO-RE (Compile Once – Run
+        Everywhere)"</a> (BPF Portability and CO-RE), 19 Feb 2020, with 2021 update.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-core-reference-guide/">"BPF CO-RE reference
+        guide"</a>, 2021.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/libbpf-bootstrap/">"Building BPF applications with
+        libbpf-bootstrap"</a>.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/btf-dedup/">"BTF deduplication and Linux kernel
+        BTF"</a>.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/btf.html">"BPF Type Format (BTF)"</a>.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/llvm_reloc.html">"BPF LLVM Relocations"</a>.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/libbpf/libbpf_overview.html">"libbpf
+        Overview"</a>, and the <a href="https://libbpf.readthedocs.io/">libbpf API documentation</a>.</li>
+      <li><a href="https://github.com/libbpf/libbpf-bootstrap">libbpf/libbpf-bootstrap</a>, commit
+        <code>820a1bd8b4f4cb4b78b442ae4eb3994738651f12</code> (files quoted: <code>examples/c/Makefile</code>,
+        <code>minimal.bpf.c</code>, <code>minimal.c</code>, <code>bootstrap.bpf.c</code>, <code>bootstrap.c</code>,
+        <code>tools/gen_vmlinux_h.sh</code>, <code>README.md</code>).</li>
+      <li><a href="https://github.com/libbpf/libbpf">libbpf/libbpf</a>, commit
+        <code>872299d94e27d2fa9f119667c7e52268698dc760</code> (v1.9; <code>src/libbpf.c</code>, <code>src/btf.c</code>,
+        <code>src/relo_core.c</code>, <code>src/bpf_core_read.h</code>, <code>src/bpf_helpers.h</code>,
+        <code>include/uapi/linux/bpf.h</code>).</li>
+      <li><a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a>, commit <code>1f6bbb7</code>, and its
+        <a href="https://github.com/libbpf/bpftool/blob/main/docs/bpftool-gen.rst">bpftool-gen man page</a>.</li>
+      <li><a href="https://github.com/libbpf/vmlinux.h">libbpf/vmlinux.h</a>, pre-generated headers (pinned commit
+        <code>991dd4b</code>, x86 header from Linux 6.18).</li>
+      <li>Aqua Security, <a href="https://github.com/aquasecurity/btfhub">BTFHub</a> and
+        <a href="https://github.com/aquasecurity/btfhub-archive">btfhub-archive</a>; <a
+        href="https://github.com/aquasecurity/btfhub/blob/main/docs/generating-tailored-btfs.md">"Generating tailored
+        BTFs"</a>.</li>
+      <li>eunomia-bpf, <a href="https://github.com/eunomia-bpf/bpf-compatible">bpf-compatible</a>.</li>
+      <li>KernelNewbies, <a href="https://kernelnewbies.org/Linux_5.4">Linux 5.4 release notes</a> (exposure of
+        <code>/sys/kernel/btf/vmlinux</code>; CO-RE core support).</li>
+      <li>eBPF Docs, <a href="https://docs.ebpf.io/linux/syscall/BPF_LINK_CREATE/">"Syscall command BPF_LINK_CREATE"</a>
+        (available since v5.7).</li>
+      <li>Daroc Alden, <a href="https://lwn.net/Articles/1031854/">"Possible paths for signing BPF programs"</a>, LWN.net,
+        12 Aug 2025.</li>
+      <li>BCC, <a href="https://github.com/iovisor/bcc/blob/master/libbpf-tools/core_fixes.bpf.h">libbpf-tools/core_fixes.bpf.h</a>
+        (flavor-based fixes for kernel struct changes); Linux commit
+        <a href="https://github.com/torvalds/linux/commit/2f064a59a1">2f064a59a1 "sched: Change task_struct::state"</a>.</li>
+      <li>Brendan Gregg, <a href="https://www.brendangregg.com/blog/2020-11-04/bpf-co-re-btf-libbpf.html">"BPF binaries:
+        BTF, CO-RE, and the future of BPF perf tools"</a>, 4 Nov 2020.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="05-program-types-and-hooks.html"><small>Previous</small>05 · Program types and hooks</a>
+      <a class="next" href="07-networking-xdp-tc.html"><small>Next</small>07 · Networking: XDP, tc and sockets</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

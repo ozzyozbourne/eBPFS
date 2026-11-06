@@ -1,0 +1,1033 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="07">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="Where eBPF hooks into the Linux packet path, from XDP in the NIC driver through AF_XDP, tc/TCX and socket-level programs, with real drop, redirect and tc programs and the commands to load them.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpf-developer-tutorial">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 07 · eBPF in the networking stack</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 07</div>
+      <h1>eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs</h1>
+      <p class="lede">A packet passes many points between the wire and <code>recv()</code>. Where can an eBPF program run along that path? What can it see and decide at each point? And why do the busiest load balancers and DDoS filters run their code in the NIC driver, before the kernel has even allocated an <code>sk_buff</code>?</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04 (maps, helpers)</a>, <a href="05-program-types-and-hooks.html">05 (program types)</a>, <a href="06-btf-core-libbpf.html">06 (libbpf, bpftool)</a></span><span>Repos: xdp-project/xdp-tutorial, eunomia-bpf/bpf-developer-tutorial</span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>On a 10 Gbit/s link, minimum-size Ethernet frames can arrive at about 14.88 million packets per second. That leaves a CPU core roughly 67 nanoseconds per packet if it handles them alone. The normal Linux receive path allocates and fills a <code>struct sk_buff</code> (the kernel's packet object, around 200+ bytes of metadata), runs GRO, packet taps, traffic control, netfilter, routing and the socket layer. It is very flexible and much too slow for that budget. If the job is "drop this flood" or "send this packet on to backend #7", most of that work is wasted.</p>
+    <p>Before eBPF there were two answers, and both were poor. You could write a <strong>kernel module</strong>, which is fast but can crash the machine, is hard to upgrade, and is tied to kernel internals. Or you could do <strong>kernel bypass</strong> (DPDK, netmap, vendor libraries): a userspace driver takes the NIC away from the kernel and busy-polls it. Bypass is very fast, but the kernel's routing table, firewall, <code>tcpdump</code>, <code>ip</code> and the rest of the tooling no longer see the traffic. The cores spin at 100% even when idle, and any packet meant for the host has to be put back into the kernel by hand.</p>
+    <p>eBPF in the networking stack offers a third option: <strong>safe, verified programs at well-defined hooks inside the kernel's own data path</strong>. The earliest hook, XDP, runs inside the driver's receive loop, and the CoNEXT 2018 paper that describes it reports up to 24 million packets per second on a single core for a drop program [1]. Later hooks (tc, socket hooks) run less often per byte of decision but see more context, such as the full <code>sk_buff</code>, the owning socket and the cgroup. This chapter walks the packet path from the NIC to the application and stops at every eBPF hook on the way.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Each networking hook makes a different trade between <em>how early</em> it runs and <em>how much the kernel already knows</em>. XDP is earliest and cheapest, but sees only raw bytes. tc sees an <code>sk_buff</code> with metadata and can also act on egress. Socket-level hooks see connections and messages. Pick the earliest hook that has the information your decision needs.</p></div>
+
+    <h2>The packet path and its eBPF hooks</h2>
+    <p>Figure 07.1 shows the receive path of a Linux host, simplified. Read it top to bottom. On the left are the kernel stages and on the right the eBPF program types that can attach there.</p>
+
+    <figure>
+      <svg viewBox="0 0 800 560" role="img" aria-label="Linux receive path: NIC, native XDP in driver, sk_buff allocation, generic XDP, tc ingress, netfilter, routing, socket lookup, socket, application, with XDP side exits for drop, tx and redirect">
+        <style>
+          .x7b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .x7h{fill:var(--bg3);stroke:var(--accent);stroke-width:2.5}
+          .x7t{fill:var(--fg);font:14px sans-serif}
+          .x7s{fill:var(--muted);font:12px sans-serif}
+          .x7a{stroke:var(--fg);stroke-width:1.6;fill:none;marker-end:url(#x7arr)}
+          .x7d{stroke:var(--accent2);stroke-width:1.6;fill:none;stroke-dasharray:5 4;marker-end:url(#x7arr2)}
+          .x7k{fill:var(--accent);font:bold 13px sans-serif}
+          .x7k2{fill:var(--accent2);font:bold 12px sans-serif}
+        </style>
+        <defs>
+          <marker id="x7arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker>
+          <marker id="x7arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--accent2)"/></marker>
+        </defs>
+        <!-- main column -->
+        <rect class="x7b" x="40" y="10" width="300" height="40" rx="6"/><text class="x7t" x="55" y="35">NIC hardware (DMA into RX ring)</text>
+        <rect class="x7h" x="40" y="70" width="300" height="40" rx="6"/><text class="x7t" x="55" y="95">Driver NAPI poll: native XDP</text>
+        <rect class="x7b" x="40" y="130" width="300" height="40" rx="6"/><text class="x7t" x="55" y="155">sk_buff allocation, GRO</text>
+        <rect class="x7b" x="40" y="190" width="300" height="40" rx="6"/><text class="x7t" x="55" y="215">__netif_receive_skb_core</text>
+        <rect class="x7h" x="40" y="250" width="300" height="40" rx="6"/><text class="x7t" x="55" y="275">tc ingress (clsact / TCX)</text>
+        <rect class="x7b" x="40" y="310" width="300" height="40" rx="6"/><text class="x7t" x="55" y="335">netfilter PREROUTING, routing</text>
+        <rect class="x7b" x="40" y="370" width="300" height="40" rx="6"/><text class="x7t" x="55" y="395">LOCAL_IN, TCP/UDP socket lookup</text>
+        <rect class="x7b" x="40" y="430" width="300" height="40" rx="6"/><text class="x7t" x="55" y="455">Socket receive queue</text>
+        <rect class="x7b" x="40" y="490" width="300" height="40" rx="6"/><text class="x7t" x="55" y="515">Application: recv() / read()</text>
+        <path class="x7a" d="M190,50 L190,68"/><path class="x7a" d="M190,110 L190,128"/><path class="x7a" d="M190,170 L190,188"/>
+        <path class="x7a" d="M190,230 L190,248"/><path class="x7a" d="M190,290 L190,308"/><path class="x7a" d="M190,350 L190,368"/>
+        <path class="x7a" d="M190,410 L190,428"/><path class="x7a" d="M190,470 L190,488"/>
+        <!-- hook labels -->
+        <text class="x7k" x="360" y="35">XDP offload (BPF on the NIC, e.g. nfp)</text>
+        <text class="x7k" x="360" y="95">BPF_PROG_TYPE_XDP (xdp_md)</text>
+        <text class="x7k" x="360" y="215">generic XDP (skb mode) runs here</text>
+        <text class="x7k" x="360" y="275">BPF_PROG_TYPE_SCHED_CLS (__sk_buff)</text>
+        <text class="x7k" x="360" y="335">BPF_PROG_TYPE_NETFILTER (6.4+)</text>
+        <text class="x7k" x="360" y="395">BPF_PROG_TYPE_SK_LOOKUP</text>
+        <text class="x7k" x="360" y="455">socket filter, cgroup_skb, sk_skb, sockops</text>
+        <text class="x7k" x="360" y="515">sk_msg (on sendmsg), cgroup sock hooks</text>
+        <!-- XDP exits -->
+        <path class="x7d" d="M340,102 C 380,135 420,150 470,155"/>
+        <text class="x7k2" x="478" y="145">XDP_DROP: buffer recycled</text>
+        <text class="x7k2" x="478" y="162">XDP_TX: back out same NIC</text>
+        <text class="x7k2" x="478" y="179">XDP_REDIRECT: devmap / cpumap / AF_XDP</text>
+        <text class="x7s" x="55" y="550">Egress mirrors this: socket → routing → netfilter → tc egress (clsact / TCX) → driver → NIC. XDP has no egress hook.</text>
+      </svg>
+      <figcaption>Figure 07.1 — The Linux receive path (simplified) and the eBPF hook at each stage. Native XDP runs before any <code>sk_buff</code> exists; everything from tc onward works on an <code>sk_buff</code>.</figcaption>
+    </figure>
+
+    <h3>XDP: in the driver, before the sk_buff</h3>
+    <p>When the NIC raises an interrupt, the driver schedules its NAPI poll routine. That routine runs in softirq context and pulls descriptors off the RX ring. A driver with <strong>native XDP</strong> support runs the attached XDP program on each received buffer <em>right there</em>, while the frame is still a page of DMA'd bytes. The program gets a tiny context (<code>struct xdp_md</code>) holding pointers to the packet start and end, and it returns a verdict. Only if the verdict is <code>XDP_PASS</code> does the driver go on to build an <code>sk_buff</code> and hand the packet to the stack. A dropped packet costs one program run and one page recycle, with no allocation, no GRO and no taps. One consequence is that <code>tcpdump</code> does <em>not</em> see packets that native XDP dropped.</p>
+    <h3>tc: the first hook with an sk_buff</h3>
+    <p>After skb allocation, <code>__netif_receive_skb_core()</code> delivers the packet to taps (packet sockets, which is how <code>tcpdump</code> sees it) and then to the <strong>tc ingress</strong> hook. Programs here are of type <code>BPF_PROG_TYPE_SCHED_CLS</code> and see a <code>struct __sk_buff</code>: the packet bytes plus metadata such as mark, priority, the VLAN tag, the hash and the ingress ifindex. tc also has an <strong>egress</strong> hook, run just before the packet goes to the driver's transmit queue. That makes tc the usual place for egress policy, NAT, encapsulation and container networking.</p>
+    <h3>Netfilter, routing and the socket layer</h3>
+    <p>Past tc, the packet enters IP: netfilter PREROUTING (iptables/nftables, and since 6.4 BPF programs of type <code>BPF_PROG_TYPE_NETFILTER</code>, covered in <a href="05-program-types-and-hooks.html">chapter 05</a>), the routing decision, then LOCAL_IN. For TCP/UDP, the transport layer then looks up the socket, and an <strong>sk_lookup</strong> program can pick the socket itself. On the socket, a <strong>socket filter</strong> can trim or reject the packet before it is queued, and sockmap's <strong>sk_skb</strong> verdict programs can splice it to another socket. On the send side, <strong>sk_msg</strong> programs see each <code>sendmsg()</code>. <strong>sockops</strong> programs, attached to a cgroup, are called on TCP events such as connection establishment, RTO and retransmit.</p>
+
+    <h2>XDP in depth</h2>
+    <h3>The context: struct xdp_md</h3>
+    <p>An XDP program is a function <code>int prog(struct xdp_md *ctx)</code>. The context the program sees is a small "mirror" structure. The verifier rewrites each access to it into loads from the kernel's real <code>struct xdp_buff</code> (see <a href="03-verifier.html">chapter 03</a> for how context rewriting works).</p>
+    <pre data-file="linux/include/uapi/linux/bpf.h"><code class="language-c">enum xdp_action {
+	XDP_ABORTED = 0,
+	XDP_DROP,
+	XDP_PASS,
+	XDP_TX,
+	XDP_REDIRECT,
+};
+
+/* user accessible metadata for XDP packet hook
+ * new fields must be added to the end of this structure
+ */
+struct xdp_md {
+	__u32 data;
+	__u32 data_end;
+	__u32 data_meta;
+	/* Below access go through struct xdp_rxq_info */
+	__u32 ingress_ifindex; /* rxq-&gt;dev-&gt;ifindex */
+	__u32 rx_queue_index;  /* rxq-&gt;queue_index  */
+
+	__u32 egress_ifindex;  /* txq-&gt;dev-&gt;ifindex */
+};</code></pre>
+    <p><code>data</code> and <code>data_end</code> are declared as <code>__u32</code> for ABI reasons, but at runtime they are pointers. Every XDP program begins with the same two casts: <code>void *data = (void *)(long)ctx-&gt;data;</code>. <code>data_meta</code> points to a scratch area <em>before</em> <code>data</code>. A program can grow it with <code>bpf_xdp_adjust_meta()</code> to pass information along, and a later tc program reads it through <code>__sk_buff-&gt;data_meta</code>. The kernel reserves <code>XDP_PACKET_HEADROOM</code> (256 bytes) in front of the packet so that <code>bpf_xdp_adjust_head()</code> can push encapsulation headers without copying.</p>
+
+    <h3>The five actions</h3>
+    <div class="grid">
+      <div class="card"><h4>XDP_PASS</h4><p>Continue normally. The driver builds an <code>sk_buff</code> and the packet goes up the stack. The program may have rewritten bytes first.</p></div>
+      <div class="card"><h4>XDP_DROP</h4><p>Discard silently. The page goes straight back to the driver's RX ring. This is the cheapest possible drop, and the basis of XDP DDoS filters.</p></div>
+      <div class="card"><h4>XDP_TX</h4><p>Transmit the (usually rewritten) frame back out of the <em>same</em> interface it arrived on. Used for "hairpin" load balancers and ICMP echo responders.</p></div>
+      <div class="card"><h4>XDP_REDIRECT</h4><p>Send the frame somewhere else: another NIC, another CPU, or an AF_XDP socket. The target is chosen beforehand by <code>bpf_redirect()</code> or <code>bpf_redirect_map()</code>, whose return value the program then returns.</p></div>
+      <div class="card"><h4>XDP_ABORTED</h4><p>Value 0: "the program hit an error". The packet is dropped <em>and</em> the <code>xdp:xdp_exception</code> tracepoint fires, so failures are visible. Unknown return codes are treated the same way.</p></div>
+    </div>
+    <p>The values are worth knowing because tools print them as numbers: <code>XDP_ABORTED = 0, XDP_DROP = 1, XDP_PASS = 2, XDP_TX = 3, XDP_REDIRECT = 4</code>. The xdp-tutorial's stats examples index a per-action counter array by exactly these values.</p>
+
+    <h3>Native, generic and offloaded modes</h3>
+    <p>The same XDP object file can run in three places. You choose one with a flag at attach time (<code>XDP_FLAGS_DRV_MODE</code>, <code>XDP_FLAGS_SKB_MODE</code>, <code>XDP_FLAGS_HW_MODE</code> in <code>include/uapi/linux/if_link.h</code>):</p>
+    <ul>
+      <li><strong>Native (driver) mode</strong>, <code>xdpdrv</code>. The driver calls the program in its NAPI poll loop. This is the fast path, and it needs driver support. Most 10G+ server NIC drivers (mlx5, i40e/ice, ixgbe, bnxt, ...) and virtual devices such as <code>veth</code>, <code>virtio_net</code> and <code>tun</code> support it.</li>
+      <li><strong>Generic (skb) mode</strong>, <code>xdpgeneric</code>. Added in Linux 4.12, this runs the program from the core receive path <em>after</em> the <code>sk_buff</code> has been allocated. It works on every device, <code>lo</code> included, so it is ideal for learning and testing. It removes most of XDP's performance advantage, though, because the expensive allocation has already happened.</li>
+      <li><strong>Offloaded (hardware) mode</strong>, <code>xdpoffload</code>. The NIC's own processors JIT and run the BPF program, and the host CPU never sees dropped packets. Support is rare. The xdp-tutorial documents Netronome Agilio SmartNICs (the <code>nfp</code> driver), which need a special BPF firmware (<code>basic02-prog-by-name/xdp_offload_nfp.org</code>). Offload supports only a subset of helpers and map types.</li>
+    </ul>
+    <p>If you ask for plain <code>xdp</code> without a mode, <code>ip</code> and <code>bpftool</code> try native first and fall back to generic. Programs written for one mode run unchanged in the others; only speed and the set of supported helpers differ.</p>
+
+    <div class="callout warn"><span class="label">veth gotcha</span><p>Native XDP on <code>veth</code> works, but frames that are <code>XDP_TX</code>'d or redirected <em>into</em> a veth are only delivered if the <em>peer</em> end also has an XDP program attached. That is why the eunomia tutorial's load balancer README loads a stub: <code>sudo ip l set dev veth7 xdp obj ./stub.bpf.o sec .xdp</code> (<code>bpf-developer-tutorial/src/42-xdp-loadbalancer/README.md</code>).</p></div>
+
+    <h2>Parsing packets safely: data, data_end and the verifier</h2>
+    <p>An XDP or tc program reads the packet through ordinary pointer dereferences ("direct packet access", Linux 4.7). The verifier must prove that every load stays within <code>[data, data_end)</code>. It tracks each pointer derived from <code>data</code> as type <code>PTR_TO_PACKET</code> with a known offset range. When you compare <code>ptr + N &gt; data_end</code> and branch away, the verifier records on the fall-through path that <code>N</code> bytes past <code>ptr</code> are safe to read. Access a byte beyond what you have checked and the program is rejected at load time with <em>"invalid access to packet"</em>. The rejection happens at load time, never at run time.</p>
+
+    <figure>
+      <svg viewBox="0 0 800 260" role="img" aria-label="XDP buffer layout: headroom, data_meta, data, Ethernet, IP, TCP headers, payload, data_end, tailroom, with bounds checks">
+        <rect class="x7b" x="20" y="60" width="110" height="60"/><text class="x7s" x="35" y="95">headroom</text>
+        <rect class="x7b" x="130" y="60" width="70" height="60"/><text class="x7s" x="138" y="95">metadata</text>
+        <rect class="x7h" x="200" y="60" width="110" height="60"/><text class="x7t" x="215" y="88">ethhdr</text><text class="x7s" x="215" y="106">14 bytes</text>
+        <rect class="x7h" x="310" y="60" width="130" height="60"/><text class="x7t" x="325" y="88">iphdr</text><text class="x7s" x="325" y="106">ihl × 4 bytes</text>
+        <rect class="x7h" x="440" y="60" width="130" height="60"/><text class="x7t" x="455" y="88">tcphdr</text><text class="x7s" x="455" y="106">doff × 4 bytes</text>
+        <rect class="x7b" x="570" y="60" width="120" height="60"/><text class="x7s" x="590" y="95">payload</text>
+        <rect class="x7b" x="690" y="60" width="90" height="60"/><text class="x7s" x="700" y="95">tailroom</text>
+        <path class="x7a" d="M130,30 L130,58"/><text class="x7k" x="95" y="24">data_meta</text>
+        <path class="x7a" d="M200,30 L200,58"/><text class="x7k" x="185" y="24">data</text>
+        <path class="x7a" d="M690,30 L690,58"/><text class="x7k" x="660" y="24">data_end</text>
+        <text class="x7s" x="20" y="160">Check before each read. Each passed check widens the verifier's "known safe" range:</text>
+        <text class="x7t" x="20" y="185">1. if (eth + 1 &gt; data_end) return XDP_PASS;    → bytes [data, data+14) readable</text>
+        <text class="x7t" x="20" y="207">2. if (iph + 1 &gt; data_end) ...; hdrsize = iph-&gt;ihl*4; if (pos + hdrsize &gt; data_end) ...</text>
+        <text class="x7t" x="20" y="229">3. if (tcph + 1 &gt; data_end) ...; len = tcph-&gt;doff*4; if (pos + len &gt; data_end) ...</text>
+        <text class="x7s" x="20" y="252">Variable-length headers need a second, byte-based check after the fixed-size one.</text>
+      </svg>
+      <figcaption>Figure 07.2 — An XDP buffer. The program may read only between <code>data</code> and <code>data_end</code>, and only after a comparison has proved the range. Headroom lets <code>bpf_xdp_adjust_head()</code> add encapsulation headers in place.</figcaption>
+    </figure>
+
+    <p>The xdp-tutorial collects its bounds-checked parsers in one header that every <code>packetXX</code> lesson includes. They use a small cursor struct that walks forward through the headers. Here are the IPv4 and TCP parsers. Note the two-step check for variable-length headers: first <code>iph + 1</code> (the fixed 20 bytes, so that <code>ihl</code> can be read at all), then <code>nh-&gt;pos + hdrsize</code> for the real length. The sanity check that <code>ihl*4</code> is at least <code>sizeof(*iph)</code> also matters. Without it, a malicious <code>ihl = 0</code> would make the cursor stand still, and the next "header" would overlap this one.</p>
+    <pre data-file="xdp-tutorial/common/parsing_helpers.h"><code class="language-c">/* Header cursor to keep track of current parsing position */
+struct hdr_cursor {
+	void *pos;
+};
+/* ... */
+static __always_inline int parse_iphdr(struct hdr_cursor *nh,
+				       void *data_end,
+				       struct iphdr **iphdr)
+{
+	struct iphdr *iph = nh-&gt;pos;
+	int hdrsize;
+
+	if (iph + 1 &gt; data_end)
+		return -1;
+
+	hdrsize = iph-&gt;ihl * 4;
+	/* Sanity check packet field is valid */
+	if(hdrsize &lt; sizeof(*iph))
+		return -1;
+
+	/* Variable-length IPv4 header, need to use byte-based arithmetic */
+	if (nh-&gt;pos + hdrsize &gt; data_end)
+		return -1;
+
+	nh-&gt;pos += hdrsize;
+	*iphdr = iph;
+
+	return iph-&gt;protocol;
+}
+/* ... */
+/*
+ * parse_tcphdr: parse and return the length of the tcp header
+ */
+static __always_inline int parse_tcphdr(struct hdr_cursor *nh,
+					void *data_end,
+					struct tcphdr **tcphdr)
+{
+	int len;
+	struct tcphdr *h = nh-&gt;pos;
+
+	if (h + 1 &gt; data_end)
+		return -1;
+
+	len = h-&gt;doff * 4;
+	/* Sanity check packet field is valid */
+	if(len &lt; sizeof(*h))
+		return -1;
+
+	/* Variable-length TCP header, need to use byte-based arithmetic */
+	if (nh-&gt;pos + len &gt; data_end)
+		return -1;
+
+	nh-&gt;pos += len;
+	*tcphdr = h;
+
+	return len;
+}</code></pre>
+    <p>The Ethernet parser in the same file also skips up to <code>VLAN_MAX_DEPTH</code> (default 2) 802.1Q/802.1ad tags. It does this in a loop marked <code>#pragma unroll</code>, which predates the verifier's support for bounded loops. The loop checks <code>vlh + 1 &gt; data_end</code> on every iteration.</p>
+
+    <div class="callout tip"><span class="label">Learn from the deliberate bug</span><p>Lesson <code>packet01-parsing/xdp_prog_kern.c</code> ships with a bug planted on purpose as Assignment 1: <code>if (nh-&gt;pos + 1 &gt; data_end)</code>, where <code>pos</code> is a <code>void *</code>. That checks one byte, not 14, so the verifier rejects the later read of <code>eth-&gt;h_proto</code>. Pointer arithmetic on a typed pointer (<code>eth + 1</code>) advances by <code>sizeof(*eth)</code>. On a <code>void *</code> it advances by bytes. Mixing the two up is the most common XDP verifier error.</p></div>
+
+    <p>A few further rules for parsing safely. Fields are in network byte order, so compare against <code>bpf_htons(ETH_P_IP)</code> rather than converting every packet. Do not trust length fields (<code>tot_len</code>, UDP <code>len</code>) as bounds; check against <code>data_end</code>. In tc programs, the linear area may not hold the whole packet, so use <code>bpf_skb_pull_data()</code> or <code>bpf_skb_load_bytes()</code> for bytes past <code>data_end</code>.</p>
+
+    <h2>A real XDP drop program, built and loaded</h2>
+    <p>The smallest useful XDP program drops everything. The xdp-tutorial's <code>basic02</code> lesson puts a pass and a drop program in one object, so that you can see how a loader selects a program by name:</p>
+    <pre data-file="xdp-tutorial/basic02-prog-by-name/xdp_prog_kern.c"><code class="language-c">/* SPDX-License-Identifier: GPL-2.0 */
+#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+/* Notice how this XDP/BPF-program contains several programs in the same source
+ * file. These will each get their own section in the ELF file, and via libbpf
+ * they can be selected individually, and via their file-descriptor attached to
+ * a given kernel BPF-hook.
+ * ...
+ */
+
+SEC("xdp")
+int  xdp_pass_func(struct xdp_md *ctx)
+{
+	return XDP_PASS;
+}
+
+SEC("xdp")
+int  xdp_drop_func(struct xdp_md *ctx)
+{
+	return XDP_DROP;
+}
+
+/* Assignment#2: Add new XDP program section that use XDP_ABORTED */
+
+char _license[] SEC("license") = "GPL";</code></pre>
+    <p>A more realistic firewall parses headers and drops selectively. This is the reference solution of the parsing lesson, which lives in <code>packet02-rewriting</code>. It drops ICMP and ICMPv6 echo requests with an even sequence number, so <code>ping</code> shows exactly every other reply missing. Every decision is recorded in a per-action stats map by <code>xdp_stats_record_action()</code>:</p>
+    <pre data-file="xdp-tutorial/packet02-rewriting/xdp_prog_kern.c"><code class="language-c">/* Solution to the parsing exercise in lesson packet01. Handles VLANs and legacy
+ * IP (via the helpers in parsing_helpers.h).
+ */
+SEC("xdp")
+int  xdp_parser_func(struct xdp_md *ctx)
+{
+	void *data_end = (void *)(long)ctx-&gt;data_end;
+	void *data = (void *)(long)ctx-&gt;data;
+
+	/* Default action XDP_PASS, imply everything we couldn't parse, or that
+	 * we don't want to deal with, we just pass up the stack and let the
+	 * kernel deal with it.
+	 */
+	__u32 action = XDP_PASS; /* Default action */
+
+	/* These keep track of the next header type and iterator pointer */
+	struct hdr_cursor nh;
+	int nh_type;
+	nh.pos = data;
+
+	struct ethhdr *eth;
+
+	/* Packet parsing in steps: Get each header one at a time, aborting if
+	 * parsing fails. Each helper function does sanity checking (is the
+	 * header type in the packet correct?), and bounds checking.
+	 */
+	nh_type = parse_ethhdr(&amp;nh, data_end, &amp;eth);
+
+	if (nh_type == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6h;
+		struct icmp6hdr *icmp6h;
+
+		nh_type = parse_ip6hdr(&amp;nh, data_end, &amp;ip6h);
+		if (nh_type != IPPROTO_ICMPV6)
+			goto out;
+
+		nh_type = parse_icmp6hdr(&amp;nh, data_end, &amp;icmp6h);
+		if (nh_type != ICMPV6_ECHO_REQUEST)
+			goto out;
+
+		if (bpf_ntohs(icmp6h-&gt;icmp6_sequence) % 2 == 0)
+			action = XDP_DROP;
+
+	} else if (nh_type == bpf_htons(ETH_P_IP)) {
+		struct iphdr *iph;
+		struct icmphdr *icmph;
+
+		nh_type = parse_iphdr(&amp;nh, data_end, &amp;iph);
+		if (nh_type != IPPROTO_ICMP)
+			goto out;
+
+		nh_type = parse_icmphdr(&amp;nh, data_end, &amp;icmph);
+		if (nh_type != ICMP_ECHO)
+			goto out;
+
+		if (bpf_ntohs(icmph-&gt;un.echo.sequence) % 2 == 0)
+			action = XDP_DROP;
+	}
+ out:
+	return xdp_stats_record_action(ctx, action);
+}</code></pre>
+    <p>Note the "default to <code>XDP_PASS</code>" stance. Anything the program cannot parse goes to the normal stack, which knows how to handle it. A firewall that defaults to drop must also handle fragments, IP options, unknown EtherTypes and tunnels, or it will black-hole legitimate traffic.</p>
+
+    <h3>Building and loading</h3>
+    <p>The tutorial's Makefiles compile each <code>*_kern.c</code> with <code>clang -target bpf -O2 -g</code> into an ELF object. Run <code>./configure &amp;&amp; make</code> at the top of the repo. It needs clang, llvm, libelf, libpcap, and kernel headers; <code>setup_dependencies.org</code> lists them. The <code>testenv/testenv.sh</code> script builds a veth pair in a network namespace, so you can experiment without touching a real NIC. There are several ways to attach the object, shown in the tabs below.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="ip (iproute2)"><pre data-file="xdp-tutorial/basic01-xdp-pass/README.org"><code class="language-bash">$ sudo ip link set dev lo xdpgeneric obj xdp_pass_kern.o sec xdp
+$ sudo ip link show dev lo
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 xdpgeneric qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+...
+$ sudo ip link set dev lo xdpgeneric off</code></pre>
+      <p>Replace <code>xdpgeneric</code> with <code>xdpdrv</code> to require native mode (fail instead of falling back), with <code>xdpoffload</code> for hardware, or with plain <code>xdp</code> for "native if possible". Cloudflare's "How to drop 10 million packets per second" post loads its drop program with exactly <code>ip link set dev ext0 xdp obj xdp-drop-ebpf.o</code> [8]. <code>ip</code> attaches the program directly and does not speak libxdp's multi-program dispatcher protocol.</p></div>
+      <div class="tab-panel" data-label="xdp-loader (xdp-tools)"><pre data-file="xdp-tutorial/basic01-xdp-pass/README.org"><code class="language-bash">$ sudo xdp-loader load -m skb lo xdp_pass_kern.o
+$ sudo xdp-loader status lo
+CURRENT XDP PROGRAM STATUS:
+
+Interface        Prio  Program name      Mode     ID   Tag               Chain actions
+--------------------------------------------------------------------------------------
+lo                     xdp_dispatcher    skb      486  94d5f00c20184d17
+ =&gt;              50     xdp_prog_simple           493  3b185187f1855c4c  XDP_PASS
+sudo xdp-loader unload -i 493 lo 
+sudo xdp-loader unload -a lo</code></pre>
+      <p><code>xdp-loader</code> (from <a href="https://github.com/xdp-project/xdp-tools">xdp-tools</a>) installs an <code>xdp_dispatcher</code> and chains your program into it with a priority. That lets several XDP programs share one interface. The kernel itself allows only one XDP program per interface.</p></div>
+      <div class="tab-panel" data-label="tutorial loader"><pre data-file="xdp-tutorial/basic02-prog-by-name/README.org"><code class="language-bash">$ sudo ../testenv/testenv.sh setup --name veth-basic02
+sudo ./xdp_loader --dev veth-basic02
+sudo ./xdp_loader --dev veth-basic02 --unload-all
+sudo ./xdp_loader --dev veth-basic02 --progname xdp_drop_func
+sudo ./xdp_loader --dev veth-basic02 --progname xdp_pass_func
+$ sudo ../testenv/testenv.sh ping --name veth-basic02</code></pre>
+      <p>With <code>xdp_drop_func</code> attached, the ping from inside the namespace stops getting replies. Switch to <code>xdp_pass_func</code> and the replies come back.</p></div>
+      <div class="tab-panel" data-label="bpftool"><pre><code class="language-bash"># Illustrative: syntax from bpftool-net(8) and bpftool-prog(8), not from the tutorial repos
+$ sudo bpftool prog load xdp_prog_kern.o /sys/fs/bpf/xdp_drop     # pins the first program in the object
+$ sudo bpftool net attach xdpdrv pinned /sys/fs/bpf/xdp_drop dev eth0
+$ sudo bpftool net list dev eth0
+$ sudo bpftool net detach xdpdrv dev eth0</code></pre>
+      <p><code>bpftool net attach</code> accepts <code>xdp</code>, <code>xdpgeneric</code>, <code>xdpdrv</code>, <code>xdpoffload</code>, <code>tcx_ingress</code> and <code>tcx_egress</code>. For XDP the <code>overwrite</code> keyword replaces an existing program. <code>bpftool net list</code> is the quickest way to see what is attached to which interface.</p></div>
+    </div>
+    <p>In your own libbpf code you would call <code>bpf_program__attach_xdp(prog, ifindex)</code>, which creates a <strong>BPF link</strong> (XDP links exist since Linux 5.9). The link detaches when its file descriptor is closed and cannot be replaced by accident by another tool. The eunomia tutorial's <code>21-xdp</code> example takes the declarative route: comments such as <code>/// @ifindex 1</code> above <code>SEC("xdp")</code> tell <code>ecli</code> where to attach (<a href="10-eunomia-bpf-ecc-ecli.html">chapter 10</a>).</p>
+
+    <h3>Walkthrough: a packet meets the XDP firewall</h3>
+    <p>Step through what happens to one ICMP echo request arriving at an interface running <code>xdp_parser_func</code> in native mode.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. DMA into the RX ring</h4><p>The NIC writes the frame (Ethernet + IPv4 + ICMP, 98 bytes for a default <code>ping</code>) into a page the driver posted on RX queue 3. It writes a completion descriptor and raises an interrupt. The driver masks the interrupt and schedules NAPI on that queue's CPU.</p></div>
+      <div class="step"><h4>2. Driver builds an xdp_buff</h4><p>In its NAPI poll loop the driver reads the descriptor and fills a stack-allocated <code>struct xdp_buff</code>: <code>data</code> points 256 bytes into the page (after <code>XDP_PACKET_HEADROOM</code>), <code>data_end = data + 98</code>, and <code>rxq</code> records ifindex and queue 3. No <code>sk_buff</code> exists yet. The driver then calls the JIT-compiled program.</p></div>
+      <div class="step"><h4>3. Parse Ethernet</h4><p><code>parse_ethhdr()</code> checks <code>nh-&gt;pos + 14 &gt; data_end</code> (false, since 98 bytes are present), advances the cursor and returns <code>h_proto = htons(0x0800)</code>. No VLAN tag, so the unrolled VLAN loop exits at once. The verifier proved at load time that this read is safe; at run time the check is a single compare.</p></div>
+      <div class="step"><h4>4. Parse IPv4</h4><p><code>parse_iphdr()</code> checks the fixed 20 bytes and reads <code>ihl = 5</code> (20 bytes). It confirms <code>20 ≥ sizeof(struct iphdr)</code>, checks <code>pos + 20 &gt; data_end</code>, advances, and returns <code>protocol = IPPROTO_ICMP</code>.</p></div>
+      <div class="step"><h4>5. Parse ICMP and decide</h4><p><code>parse_icmphdr()</code> checks <code>icmph + 1 &gt; data_end</code> and returns <code>type = ICMP_ECHO</code>. The program reads <code>un.echo.sequence</code>, converts it with <code>bpf_ntohs()</code> and finds 42, an even number. <code>action = XDP_DROP</code>.</p></div>
+      <div class="step"><h4>6. Record and return</h4><p><code>xdp_stats_record_action()</code> looks up the per-CPU stats entry for key <code>XDP_DROP</code> and adds 1 to packets and 98 to bytes. It then returns the action. Userspace (<code>xdp_stats</code>) reads this map to print per-action rates.</p></div>
+      <div class="step"><h4>7. Driver acts on XDP_DROP</h4><p>The driver puts the page back on its RX recycle path; with page_pool drivers it never even reaches the page allocator. Total cost: one program run of a few dozen instructions. There is no skb, no taps (tcpdump never sees it), no netfilter, no socket. The next echo request (sequence 43, odd) instead returns <code>XDP_PASS</code>.</p></div>
+      <div class="step"><h4>8. The XDP_PASS path for comparison</h4><p>For sequence 43, the driver now allocates an <code>sk_buff</code> around the page (<code>build_skb</code>-style, no copy), runs GRO and calls <code>netif_receive_skb</code>. The packet then visits taps, tc ingress, netfilter PREROUTING, routing, LOCAL_IN and the ICMP handler, which generates the reply. Every one of those stages is work that step 7 skipped.</p></div>
+    </div>
+
+    <h2>XDP_TX and XDP_REDIRECT: forwarding without the stack</h2>
+    <p><code>XDP_TX</code> sends a frame back out of the interface it came in on. The program must first rewrite it into something worth sending. The tutorial's <code>packet03</code> lesson turns ICMP echo requests into replies by swapping MACs and IPs, changing the type and fixing the checksum, and then returns <code>XDP_TX</code>. Katran-style "load balancer on a stick" designs also use <code>XDP_TX</code>: they encapsulate the packet towards a backend and bounce it out of the same NIC.</p>
+    <p><code>XDP_REDIRECT</code> is more general. The program calls a helper that records a target and returns <code>XDP_REDIRECT</code> (or a fallback action on failure), and the driver queues the frame to that target. Redirects are <em>bulked</em>: the driver flushes queued frames at the end of the NAPI poll, so the cost of a TX doorbell or a cross-CPU wakeup is shared across many packets. According to the kernel documentation, <code>XDP_REDIRECT</code> works with four map types [3]:</p>
+
+    <figure>
+      <svg viewBox="0 0 800 300" role="img" aria-label="XDP_REDIRECT targets: devmap to another NIC, cpumap to another CPU kthread building an skb, xskmap to an AF_XDP socket in userspace">
+        <rect class="x7h" x="10" y="120" width="215" height="60" rx="6"/><text class="x7t" x="22" y="145">XDP program on eth0</text><text class="x7s" x="22" y="165">bpf_redirect_map(&amp;map, key, 0)</text>
+        <rect class="x7b" x="300" y="20" width="225" height="60" rx="6"/><text class="x7t" x="315" y="45">DEVMAP / DEVMAP_HASH</text><text class="x7s" x="315" y="65">key → ifindex (+ optional prog)</text>
+        <rect class="x7b" x="300" y="120" width="225" height="60" rx="6"/><text class="x7t" x="315" y="145">CPUMAP</text><text class="x7s" x="315" y="165">key → CPU (+ queue size, prog)</text>
+        <rect class="x7b" x="300" y="220" width="225" height="60" rx="6"/><text class="x7t" x="315" y="245">XSKMAP</text><text class="x7s" x="315" y="265">key (rx queue) → AF_XDP socket</text>
+        <rect class="x7b" x="590" y="20" width="200" height="60" rx="6"/><text class="x7t" x="605" y="45">eth1 TX ring</text><text class="x7s" x="605" y="65">ndo_xdp_xmit, bulk flush</text>
+        <rect class="x7b" x="590" y="120" width="200" height="60" rx="6"/><text class="x7t" x="605" y="145">kthread on CPU n</text><text class="x7s" x="605" y="165">builds skb → normal stack</text>
+        <rect class="x7b" x="590" y="220" width="200" height="60" rx="6"/><text class="x7t" x="605" y="245">UMEM in userspace</text><text class="x7s" x="605" y="265">RX ring of the socket</text>
+        <path class="x7a" d="M225,140 L298,55"/><path class="x7a" d="M225,150 L298,150"/><path class="x7a" d="M225,160 L298,245"/>
+        <path class="x7a" d="M525,50 L588,50"/><path class="x7a" d="M525,150 L588,150"/><path class="x7a" d="M525,250 L588,250"/>
+      </svg>
+      <figcaption>Figure 07.3 — The three families of redirect target. A map indirection lets userspace change destinations without reloading the program, and lets the kernel bulk and pre-validate targets.</figcaption>
+    </figure>
+
+    <ul>
+      <li><strong>DEVMAP</strong> (4.14) and <strong>DEVMAP_HASH</strong> (5.4) hold net devices. Redirecting into one sends the frame out of another NIC through the driver's <code>ndo_xdp_xmit</code>, which is how an XDP router or bridge works. Entries can carry a second XDP program that runs just before transmit. The flags <code>BPF_F_BROADCAST</code> and <code>BPF_F_EXCLUDE_INGRESS</code> allow multicast to every entry.</li>
+      <li><strong>CPUMAP</strong> (4.15) holds CPUs. Each entry has a kernel thread bound to that CPU. Frames redirected there are turned into <code>sk_buff</code>s <em>on the remote CPU</em>, which is a software RSS: one CPU does the cheap classification at line rate and spreads the expensive stack work. Since 5.9 an entry may run a second XDP program on the remote CPU [4].</li>
+      <li><strong>XSKMAP</strong> (4.18) holds AF_XDP sockets, covered in the next section.</li>
+    </ul>
+    <p>Here is the devmap variant from the tutorial. The program is short because userspace does the real configuration: it fills <code>tx_port</code> with the egress ifindex and <code>redirect_params</code> with a source-MAC → destination-MAC mapping.</p>
+    <pre data-file="xdp-tutorial/packet03-redirecting/xdp_prog_kern.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_DEVMAP);
+	__type(key, int);
+	__type(value, int);
+	__uint(max_entries, 256);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} tx_port SEC(".maps");
+
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key,  unsigned char[ETH_ALEN]);
+	__type(value, unsigned char[ETH_ALEN]);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} redirect_params SEC(".maps");
+/* ... */
+/* Assignment 3: nothing to do here, patch the xdp_prog_user.c program */
+SEC("xdp")
+int xdp_redirect_map_func(struct xdp_md *ctx)
+{
+	void *data_end = (void *)(long)ctx-&gt;data_end;
+	void *data = (void *)(long)ctx-&gt;data;
+	struct hdr_cursor nh;
+	struct ethhdr *eth;
+	int eth_type;
+	int action = XDP_PASS;
+	unsigned char *dst;
+
+	/* These keep track of the next header type and iterator pointer */
+	nh.pos = data;
+
+	/* Parse Ethernet and IP/IPv6 headers */
+	eth_type = parse_ethhdr(&amp;nh, data_end, &amp;eth);
+	if (eth_type == -1)
+		goto out;
+
+	/* Do we know where to redirect this packet? */
+	dst = bpf_map_lookup_elem(&amp;redirect_params, eth-&gt;h_source);
+	if (!dst)
+		goto out;
+
+	/* Set a proper destination address */
+	memcpy(eth-&gt;h_dest, dst, ETH_ALEN);
+	action = bpf_redirect_map(&amp;tx_port, 0, 0);
+
+out:
+	return xdp_stats_record_action(ctx, action);
+}</code></pre>
+    <p>The final assignment of that lesson (solution in <code>packet-solutions/xdp_prog_kern_03.c</code>, <code>xdp_router_func</code>) turns this into a real IPv4/IPv6 router. It calls <code>bpf_fib_lookup()</code> to query the <em>kernel's own</em> routing table and neighbour cache, decrements the TTL, rewrites both MACs and returns <code>bpf_redirect(fib_params.ifindex, 0)</code>. Destinations that are blackholed or unreachable become <code>XDP_DROP</code>, and "no neighbour yet" falls back to <code>XDP_PASS</code>, so the stack resolves ARP. Here XDP's kernel integration pays off: routes added with <code>ip route</code> take effect in the fast path at once.</p>
+    <div class="callout tip"><span class="label">Debugging silent redirect drops</span><p>A failed redirect (target down, driver without <code>ndo_xdp_xmit</code>, frame too big) drops silently. The kernel's redirect documentation recommends counting the XDP tracepoints: <code>sudo bpftrace -e 'tracepoint:xdp:* { @cnt[probe] = count(); }'</code>, or extracting errno from <code>xdp:xdp_redirect*_err</code> and <code>xdp:xdp_devmap_xmit</code> [3]. The xdp-tutorial's <code>tracing02-xdp-monitor</code> lesson builds a monitor on the same tracepoints.</p></div>
+
+    <h2>AF_XDP: packets to userspace, zero-copy</h2>
+    <p>Sometimes the processing really belongs in userspace: a DPDK-style packet pipeline, an IDS, a userspace TCP stack. <strong>AF_XDP</strong> (Linux 4.18) gives userspace a socket whose packets come straight from an XDP redirect. They skip the whole stack and, in zero-copy mode, are never copied [2]. Unlike full kernel bypass, the NIC stays under the kernel's control. You choose per packet which traffic goes to userspace (<code>XDP_REDIRECT</code> into an XSKMAP) and which goes to the kernel (<code>XDP_PASS</code>).</p>
+
+    <figure>
+      <svg viewBox="0 0 800 310" role="img" aria-label="AF_XDP: UMEM shared memory region with FILL, COMPLETION, RX and TX rings between user space and kernel driver">
+        <line x1="20" y1="160" x2="780" y2="160" style="stroke:var(--border);stroke-width:2;stroke-dasharray:6 4"/>
+        <text class="x7s" x="20" y="152">user space</text><text class="x7s" x="20" y="178">kernel / driver</text>
+        <rect class="x7h" x="220" y="15" width="365" height="60" rx="6"/><text class="x7t" x="245" y="40">UMEM: frames 0 … N-1 (e.g. 4096 × 4 KiB)</text><text class="x7s" x="245" y="60">allocated by the app, registered with XDP_UMEM_REG</text>
+        <rect class="x7b" x="40" y="95" width="150" height="40" rx="6"/><text class="x7t" x="55" y="120">FILL ring</text>
+        <rect class="x7b" x="210" y="95" width="150" height="40" rx="6"/><text class="x7t" x="225" y="120">RX ring</text>
+        <rect class="x7b" x="440" y="95" width="150" height="40" rx="6"/><text class="x7t" x="455" y="120">TX ring</text>
+        <rect class="x7b" x="610" y="95" width="160" height="40" rx="6"/><text class="x7t" x="625" y="120">COMPLETION ring</text>
+        <rect class="x7b" x="200" y="235" width="400" height="60" rx="6"/><text class="x7t" x="215" y="260">NIC queue q (bound socket) + XDP program</text><text class="x7s" x="215" y="280">bpf_redirect_map(&amp;xsks_map, rx_queue_index, 0)</text>
+        <path class="x7a" d="M115,135 L240,233"/><text class="x7s" x="20" y="215">app gives empty frames</text>
+        <path class="x7a" d="M330,233 L290,137"/><text class="x7s" x="318" y="200">filled frames</text>
+        <path class="x7a" d="M515,137 L475,233"/><text class="x7s" x="503" y="200">frames to send</text>
+        <path class="x7a" d="M560,233 L690,137"/><text class="x7s" x="640" y="225">sent, reusable</text>
+      </svg>
+      <figcaption>Figure 07.4 — AF_XDP's four single-producer/single-consumer rings carry only frame <em>addresses</em> (offsets into UMEM). Packet bytes stay in UMEM; with zero-copy, the NIC DMAs directly into it.</figcaption>
+    </figure>
+
+    <p>The mechanics, from the kernel's AF_XDP documentation [2]:</p>
+    <ul>
+      <li>The application allocates a <strong>UMEM</strong>, a contiguous region of equal-size frames (malloc, mmap, huge pages), and registers it with <code>setsockopt(XDP_UMEM_REG)</code>.</li>
+      <li>A UMEM has two rings. The <strong>FILL</strong> ring carries frame addresses from userspace to the kernel ("you may write a received packet here"). The <strong>COMPLETION</strong> ring carries addresses back once the kernel has finished transmitting them.</li>
+      <li>Each socket has an <strong>RX</strong> and/or <strong>TX</strong> ring of descriptors (address + length). Rings are mmap'd and work as lock-free producer/consumer queues.</li>
+      <li>The socket is <code>bind()</code>-ed to one <em>(netdev, queue id)</em> pair. An XDP program then redirects into an XSKMAP whose key is normally the RX queue index. A frame from queue 3 can only be delivered to a socket bound to queue 3.</li>
+      <li>On bind, the kernel first tries <strong>zero-copy</strong> mode (the driver DMAs into UMEM pages) and falls back to <strong>copy</strong> mode (one copy into UMEM). <code>XDP_ZEROCOPY</code> or <code>XDP_COPY</code> force one mode or fail. <code>XDP_SHARED_UMEM</code> lets several sockets share a UMEM, and <code>XDP_USE_NEED_WAKEUP</code> lets the kernel tell the app when a syscall is needed, which avoids busy-polling.</li>
+    </ul>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Kernel side (XDP)"><pre data-file="xdp-tutorial/advanced03-AF_XDP/af_xdp_kern.c"><code class="language-c">/* SPDX-License-Identifier: GPL-2.0 */
+
+#include &lt;linux/bpf.h&gt;
+
+#include &lt;bpf/bpf_helpers.h&gt;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_XSKMAP);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 64);
+} xsks_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, 64);
+} xdp_stats_map SEC(".maps");
+
+SEC("xdp")
+int xdp_sock_prog(struct xdp_md *ctx)
+{
+	int index = ctx-&gt;rx_queue_index;
+	__u32 *pkt_count;
+
+	pkt_count = bpf_map_lookup_elem(&amp;xdp_stats_map, &amp;index);
+	if (pkt_count) {
+
+		/* We pass every other packet */
+		if ((*pkt_count)++ &amp; 1)
+		return XDP_PASS;
+	}
+
+	/* A set entry here means that the corresponding queue_id
+	 * has an active AF_XDP socket bound to it. */
+	if (bpf_map_lookup_elem(&amp;xsks_map, &amp;index))
+		return bpf_redirect_map(&amp;xsks_map, index, 0);
+
+	return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="User side (libxdp xsk API)"><pre data-file="xdp-tutorial/advanced03-AF_XDP/af_xdp_user.c"><code class="language-c">#include &lt;bpf/bpf.h&gt;
+#include &lt;xdp/xsk.h&gt;
+#include &lt;xdp/libxdp.h&gt;
+/* ... */
+	ret = xsk_umem__create(&amp;umem-&gt;umem, buffer, size, &amp;umem-&gt;fq, &amp;umem-&gt;cq,
+			       NULL);
+/* ... */
+	xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	xsk_cfg.xdp_flags = cfg-&gt;xdp_flags;
+	xsk_cfg.bind_flags = cfg-&gt;xsk_bind_flags;
+	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
+	ret = xsk_socket__create(&amp;xsk_info-&gt;xsk, cfg-&gt;ifname,
+				 cfg-&gt;xsk_if_queue, umem-&gt;umem, &amp;xsk_info-&gt;rx,
+				 &amp;xsk_info-&gt;tx, &amp;xsk_cfg);
+/* ... */
+	/* Stuff the receive path with buffers, we assume we have enough */
+	ret = xsk_ring_prod__reserve(&amp;xsk_info-&gt;umem-&gt;fq,
+				     XSK_RING_PROD__DEFAULT_NUM_DESCS,
+				     &amp;idx);
+/* ... */
+	for (i = 0; i &lt; XSK_RING_PROD__DEFAULT_NUM_DESCS; i ++)
+		*xsk_ring_prod__fill_addr(&amp;xsk_info-&gt;umem-&gt;fq, idx++) =
+			xsk_alloc_umem_frame(xsk_info);
+
+	xsk_ring_prod__submit(&amp;xsk_info-&gt;umem-&gt;fq,
+			      XSK_RING_PROD__DEFAULT_NUM_DESCS);
+/* ... in handle_receive_packets(): */
+	rcvd = xsk_ring_cons__peek(&amp;xsk-&gt;rx, RX_BATCH_SIZE, &amp;idx_rx);
+	if (!rcvd)
+		return;
+/* ... */
+	/* Process received packets */
+	for (i = 0; i &lt; rcvd; i++) {
+		uint64_t addr = xsk_ring_cons__rx_desc(&amp;xsk-&gt;rx, idx_rx)-&gt;addr;
+		uint32_t len = xsk_ring_cons__rx_desc(&amp;xsk-&gt;rx, idx_rx++)-&gt;len;
+
+		if (!process_packet(xsk, addr, len))
+			xsk_free_umem_frame(xsk, addr);
+
+		xsk-&gt;stats.rx_bytes += len;
+	}
+
+	xsk_ring_cons__release(&amp;xsk-&gt;rx, rcvd);</code></pre></div>
+      <div class="tab-panel" data-label="Run it"><pre data-file="xdp-tutorial/advanced03-AF_XDP/README.org"><code class="language-bash">$ sudo ./af_xdp_user -d veth-adv03
+$ sudo ./af_xdp_user -d veth-adv03 --filename af_xdp_kern.o</code></pre>
+      <p>The option table in <code>af_xdp_user.c</code> also defines <code>--skb-mode</code>/<code>--native-mode</code>/<code>--auto-mode</code> (XDP attach mode), <code>--copy</code>/<code>--zero-copy</code> (force the AF_XDP bind mode) and <code>--queue</code> (RX queue to bind, default 0).</p>
+      <p>Without <code>--filename</code>, libxdp installs its default program, which redirects every packet on a queue that has a bound socket. With <code>af_xdp_kern.o</code>, every other packet is passed to the kernel instead. The README suggests <code>ethtool -L &lt;interface&gt; combined 1</code> on a real NIC, so all traffic lands on the one queue you bound.</p></div>
+    </div>
+    <p>The tutorial's README warns about one trade-off. Zero-copy needs explicit driver support for placing UMEM pages in the RX ring. In zero-copy mode, <code>XDP_PASS</code> is <em>expensive</em>, because the kernel must allocate an skb and copy out of UMEM. If an RX queue mixes AF_XDP and stack traffic, copy mode on a zero-copy-capable driver can be the better choice. Note also that the xsk ring helpers moved from libbpf to <strong>libxdp</strong> (<code>&lt;xdp/xsk.h&gt;</code>) when libbpf 1.0 removed them.</p>
+
+    <h2>tc: cls_bpf and direct-action</h2>
+    <p>Linux traffic control (tc) is the kernel's packet scheduling and classification framework. Its BPF classifier, <strong>cls_bpf</strong> (Linux 4.1), runs programs of type <code>BPF_PROG_TYPE_SCHED_CLS</code>. Two later additions made it the main programmable hook for skb-level work:</p>
+    <ul>
+      <li><strong>direct-action</strong> ("da", 4.4). Classically, a classifier returns a <em>class id</em> and separate tc actions decide what to do. In da mode, the program's return value <em>is</em> the action (<code>TC_ACT_OK</code>, <code>TC_ACT_SHOT</code>, <code>TC_ACT_REDIRECT</code>, ...), so one program both classifies and acts. Practically every modern tc BPF program uses da.</li>
+      <li>The <strong>clsact</strong> qdisc (4.5). It is a pseudo-qdisc that does no queueing and only provides an ingress and an egress attach point. <code>tc qdisc add dev X clsact</code> is the standard first step.</li>
+    </ul>
+    <p>The context is <code>struct __sk_buff</code>, a mirror of a subset of <code>struct sk_buff</code>. Compared with <code>xdp_md</code> it is rich:</p>
+    <pre data-file="linux/include/uapi/linux/bpf.h"><code class="language-c">struct __sk_buff {
+	__u32 len;
+	__u32 pkt_type;
+	__u32 mark;
+	__u32 queue_mapping;
+	__u32 protocol;
+	__u32 vlan_present;
+	__u32 vlan_tci;
+	__u32 vlan_proto;
+	__u32 priority;
+	__u32 ingress_ifindex;
+	__u32 ifindex;
+	__u32 tc_index;
+	__u32 cb[5];
+	__u32 hash;
+	__u32 tc_classid;
+	__u32 data;
+	__u32 data_end;
+	__u32 napi_id;
+	/* ... family, remote_ip4, local_ip4, remote_ip6[4], local_ip6[4],
+	 *     remote_port, local_port (sk_skb programs only) ... */
+	__u32 data_meta;
+	__bpf_md_ptr(struct bpf_flow_keys *, flow_keys);
+	__u64 tstamp;
+	__u32 wire_len;
+	__u32 gso_segs;
+	__bpf_md_ptr(struct bpf_sock *, sk);
+	__u32 gso_size;
+	/* ... */
+};</code></pre>
+    <p>tc programs also get skb helpers that XDP lacks: <code>bpf_skb_store_bytes()</code>, <code>bpf_l3_csum_replace()</code>/<code>bpf_l4_csum_replace()</code> (incremental checksum fixes), <code>bpf_skb_vlan_push/pop()</code>, <code>bpf_skb_adjust_room()</code> and <code>bpf_skb_change_head/tail()</code> (grow or shrink for encapsulation), <code>bpf_skb_set_tunnel_key()</code>, <code>bpf_redirect_neigh()</code> and <code>bpf_redirect_peer()</code> (5.10, fast paths into containers). Because tc runs on egress too, it can rewrite locally generated traffic, which XDP cannot.</p>
+    <p>The eunomia tutorial's tc example is a good first program. It checks <code>ctx-&gt;protocol</code> (filled by the stack, so no Ethernet parsing is needed to learn the EtherType), bounds-checks the headers and logs the IPv4 length and TTL:</p>
+    <pre data-file="bpf-developer-tutorial/src/20-tc/tc.bpf.c"><code class="language-c">// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+/* Copyright (c) 2022 Hengqi Chen */
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+
+#define TC_ACT_OK 0
+#define ETH_P_IP 0x0800 /* Internet Protocol packet	*/
+
+/// @tchook {"ifindex":1, "attach_point":"BPF_TC_INGRESS"}
+/// @tcopts {"handle":1, "priority":1}
+SEC("tc")
+int tc_ingress(struct __sk_buff *ctx)
+{
+    void *data_end = (void *)(__u64)ctx-&gt;data_end;
+    void *data = (void *)(__u64)ctx-&gt;data;
+    struct ethhdr *l2;
+    struct iphdr *l3;
+
+    if (ctx-&gt;protocol != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;
+
+    l2 = data;
+    if ((void *)(l2 + 1) &gt; data_end)
+        return TC_ACT_OK;
+
+    l3 = (struct iphdr *)(l2 + 1);
+    if ((void *)(l3 + 1) &gt; data_end)
+        return TC_ACT_OK;
+
+    bpf_printk("Got IP packet: tot_len: %d, ttl: %d", bpf_ntohs(l3-&gt;tot_len), l3-&gt;ttl);
+    return TC_ACT_OK;
+}
+
+char __license[] SEC("license") = "GPL";</code></pre>
+    <p>The <code>/// @tchook</code> comments are for eunomia's <code>ecli</code>, which reads them and attaches to ifindex 1 (<code>lo</code>) at ingress through libbpf's <code>bpf_tc_hook_create()</code> + <code>bpf_tc_attach()</code>. The tutorial builds and runs it with <code>ecc tc.bpf.c</code> and <code>sudo ecli run ./package.json</code>, then reads <code>/sys/kernel/debug/tracing/trace_pipe</code>.</p>
+    <p>A program that <em>modifies</em> traffic, with the classic <code>tc</code> command-line workflow, comes from xdp-tutorial's packet02 solutions. It runs on <strong>egress</strong> and increments the source port of TCP/UDP replies. The xdp-tutorial uses it together with an XDP program that decrements the destination port on ingress, so the pair is transparent end to end:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="tc program (egress)"><pre data-file="xdp-tutorial/packet-solutions/tc_reply_kern_02.c"><code class="language-c">/* SPDX-License-Identifier: GPL-2.0 */
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/in.h&gt;
+
+#include &lt;linux/if_ether.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+#include &lt;linux/pkt_cls.h&gt;
+
+// The parsing helper functions from the packet01 lesson have moved here
+#include "../common/parsing_helpers.h"
+
+SEC("tc")
+int _fix_port_egress(struct __sk_buff *skb)
+{
+	void *data_end = (void *)(long)skb-&gt;data_end;
+	void *data = (void *)(long)skb-&gt;data;
+	struct hdr_cursor nh = { .pos = data };
+	int eth_type, ip_type, ret = TC_ACT_OK;
+	struct ipv6hdr *ipv6hdr;
+	struct iphdr *iphdr;
+	struct udphdr *udphdr;
+	struct tcphdr *tcphdr;
+	struct ethhdr *eth;
+
+	if (data + sizeof(*eth) &gt; data_end)
+		goto out;
+
+	eth_type = parse_ethhdr(&amp;nh, data_end, &amp;eth);
+	if (eth_type &lt; 0)
+		goto out;
+
+
+	if (eth_type == bpf_htons(ETH_P_IP)) {
+		ip_type = parse_iphdr(&amp;nh, data_end, &amp;iphdr);
+	} else if (eth_type == bpf_htons(ETH_P_IPV6)) {
+		ip_type = parse_ip6hdr(&amp;nh, data_end, &amp;ipv6hdr);
+	} else {
+		goto out;
+	}
+
+	if (ip_type == IPPROTO_UDP) {
+		if (parse_udphdr(&amp;nh, data_end, &amp;udphdr) &lt; 0)
+			goto out;
+
+		udphdr-&gt;source = bpf_htons(bpf_ntohs(udphdr-&gt;source) + 1);
+		udphdr-&gt;check += bpf_htons(-1);
+		if (!udphdr-&gt;check)
+			udphdr-&gt;check += bpf_htons(-1);
+	} else if (ip_type == IPPROTO_TCP) {
+		if (parse_tcphdr(&amp;nh, data_end, &amp;tcphdr) &lt; 0)
+			goto out;
+
+		tcphdr-&gt;source = bpf_htons(bpf_ntohs(tcphdr-&gt;source) + 1);
+		tcphdr-&gt;check += bpf_htons(-1);
+		if (!tcphdr-&gt;check)
+			tcphdr-&gt;check += bpf_htons(-1);
+	}
+
+out:
+	return ret;
+}
+char _license[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="tc commands"><pre data-file="xdp-tutorial/packet-solutions/README.org"><code class="language-bash">tc qdisc add dev eth0 clsact
+tc filter add dev eth0 egress bpf da obj tc_reply_kern_02.o sec tc
+tc filter show dev eth0 egress
+
+# Clean qdisc clsact:
+tc qdisc del dev eth0 clsact</code></pre>
+      <p><code>bpf da obj FILE sec SECTION</code> makes tc load the ELF section itself and attach it in direct-action mode. Use <code>ingress</code> instead of <code>egress</code> for the receive side. Deleting the clsact qdisc removes every filter on it.</p></div>
+    </div>
+    <p>The checksum trick deserves a note. Adding 1 to a 16-bit field in network order lowers the ones'-complement checksum by 1, which the code does with <code>check += htons(-1)</code>. A UDP checksum of 0 means "no checksum", hence the extra fix-up. A general program would use <code>bpf_l4_csum_replace()</code> instead.</p>
+
+    <h3>tc return codes</h3>
+    <p>In direct-action mode the common verdicts, from <code>include/uapi/linux/pkt_cls.h</code>, are: <code>TC_ACT_UNSPEC (-1)</code> use the default/next filter; <code>TC_ACT_OK (0)</code> accept; <code>TC_ACT_SHOT (2)</code> drop; <code>TC_ACT_PIPE (3)</code> continue to the next action; <code>TC_ACT_REDIRECT (7)</code> deliver to the device chosen by <code>bpf_redirect()</code>.</p>
+
+    <h2>TCX: link-based tc attachment (Linux 6.6)</h2>
+    <p>cls_bpf works, but it was designed for an era of one admin and one <code>tc</code> command. Several BPF-based agents on one host (a CNI, an observability tool, a security agent) run into the same problems. Filters are identified by handle and priority, so one agent can replace or delete another's by accident. Nothing ties a filter's lifetime to the process that installed it. And there is no clean ordering ("run me before Cilium") or atomic replace.</p>
+    <p><strong>TCX</strong>, written by Daniel Borkmann and merged in Linux 6.6 [9], fixes this with a qdisc-less, fd-based attach point for the same ingress and egress hooks. It is built on the generic <code>bpf_mprog</code> multi-program infrastructure:</p>
+    <ul>
+      <li>Programs attach as <strong>BPF links</strong> (<code>BPF_TCX_INGRESS</code>/<code>BPF_TCX_EGRESS</code>). A link is owned by a file descriptor or a bpffs pin and disappears when its owner does; other users cannot silently detach it.</li>
+      <li>Ordering is explicit: <code>BPF_F_BEFORE</code>/<code>BPF_F_AFTER</code> relative to another program or link, or first/last. Each change bumps a <strong>revision</strong> counter, so updates can be made conditional (compare-and-swap).</li>
+      <li>New return codes make chaining explicit: <code>TCX_NEXT (-1)</code> runs the next program, <code>TCX_PASS (0)</code>, <code>TCX_DROP (2)</code> and <code>TCX_REDIRECT (7)</code> are terminal. They match the numeric values of the <code>TC_ACT_*</code> equivalents, so existing programs keep working.</li>
+      <li>TCX programs run first, then any classic cls_bpf filters still present, so a gradual migration is possible.</li>
+    </ul>
+    <p>The eunomia tutorial's chapter 50 demonstrates this with two ingress programs on <code>lo</code>, one counting and continuing, one terminating:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Kernel side"><pre data-file="bpf-developer-tutorial/src/50-tcx/tcx_demo.bpf.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0
+#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+#ifndef TCX_NEXT
+#define TCX_NEXT -1
+#endif
+
+#ifndef TCX_PASS
+#define TCX_PASS 0
+#endif
+
+char LICENSE[] SEC("license") = "GPL";
+
+__u64 stats_hits;
+__u64 classifier_hits;
+__u32 last_len;
+__u16 last_protocol;
+__u32 last_ifindex;
+
+SEC("tcx/ingress")
+int tcx_stats(struct __sk_buff *skb)
+{
+	__sync_fetch_and_add(&amp;stats_hits, 1);
+	last_len = skb-&gt;len;
+	last_protocol = bpf_ntohs(skb-&gt;protocol);
+	last_ifindex = skb-&gt;ifindex;
+	return TCX_NEXT;
+}
+
+SEC("tcx/ingress")
+int tcx_classifier(struct __sk_buff *skb)
+{
+	__sync_fetch_and_add(&amp;classifier_hits, 1);
+	return TCX_PASS;
+}</code></pre></div>
+      <div class="tab-panel" data-label="User side"><pre data-file="bpf-developer-tutorial/src/50-tcx/tcx_demo.c"><code class="language-c">	classifier_link = bpf_program__attach_tcx(skel-&gt;progs.tcx_classifier,
+						 ifindex, NULL);
+	/* ... error handling ... */
+	{
+		LIBBPF_OPTS(bpf_tcx_opts, before_opts,
+			.flags = BPF_F_BEFORE,
+			.relative_fd = bpf_program__fd(skel-&gt;progs.tcx_classifier));
+
+		stats_link = bpf_program__attach_tcx(skel-&gt;progs.tcx_stats,
+						    ifindex, &amp;before_opts);
+		/* ... */
+	}
+/* ... print_tcx_chain(): */
+	err = bpf_prog_query_opts(ifindex, BPF_TCX_INGRESS, &amp;query);
+	/* ... */
+	printf("TCX ingress chain revision: %llu\n",
+	       (unsigned long long)query.revision);
+	for (i = 0; i &lt; query.count; i++) {
+		printf("  slot %u: prog_id=%u link_id=%u\n",
+		       i, prog_ids[i], link_ids[i]);
+	}</code></pre></div>
+      <div class="tab-panel" data-label="Run it"><pre data-file="bpf-developer-tutorial/src/50-tcx/README.md"><code class="language-bash">cd bpf-developer-tutorial/src/50-tcx
+make
+sudo ./tcx_demo</code></pre>
+      <p>It needs Linux 6.6+. By default it monitors <code>lo</code> (<code>-i IFACE</code> picks another interface, per <code>usage()</code> in <code>tcx_demo.c</code>). Generate traffic with <code>ping -c 1 127.0.0.1</code> in another terminal. Ctrl-C prints the counters and destroys the links, which detaches both programs.</p>
+      <pre><code class="language-bash"># Illustrative, syntax from bpftool-net(8): attach a pinned program as a TCX link
+$ sudo bpftool net attach tcx_ingress pinned /sys/fs/bpf/myprog dev eth0 [prepend]
+$ sudo bpftool net list dev eth0
+$ sudo bpftool link show</code></pre></div>
+    </div>
+    <p>Even though <code>tcx_classifier</code> was attached first, <code>tcx_stats</code> was inserted <code>BPF_F_BEFORE</code> it. So every packet is counted, then passed on with <code>TCX_NEXT</code>, then accepted with <code>TCX_PASS</code>. libbpf maps the <code>SEC("tcx/ingress")</code> and <code>SEC("tcx/egress")</code> section names (with <code>tc/ingress</code> and <code>tc/egress</code> as aliases) to <code>BPF_PROG_TYPE_SCHED_CLS</code> with the TCX attach type. The same <code>bpf_mprog</code> machinery backs <strong>netkit</strong> (Linux 6.7), a BPF-programmable veth replacement designed for container networking. Cilium uses it on 6.8+ kernels, together with TCX for every other device [11].</p>
+
+    <h2>Socket-level programs</h2>
+    <p>The last group of hooks works on sockets rather than devices. They are covered more briefly here; <a href="05-program-types-and-hooks.html">chapter 05</a> places them among the other program types.</p>
+    <h3>Socket filters</h3>
+    <p><code>BPF_PROG_TYPE_SOCKET_FILTER</code> (3.19) is the direct descendant of classic BPF (<a href="01-what-is-bpf.html">chapter 01</a>). A program attached with <code>setsockopt(fd, SOL_SOCKET, SO_ATTACH_BPF, &amp;prog_fd, ...)</code> runs on each packet queued to that socket. It receives an <code>__sk_buff</code> and returns how many bytes to keep, where 0 means drop. Most often it filters raw <code>AF_PACKET</code> sockets, as <code>tcpdump</code> does with classic BPF. It is observation-only: it cannot change the packet or affect other sockets. bcc's early networking tools used it to tap traffic.</p>
+    <h3>sockops, sk_msg and sockmap</h3>
+    <p><strong>sockops</strong> (<code>BPF_PROG_TYPE_SOCK_OPS</code>, 4.13) programs attach to a cgroup. They are called at TCP events (<code>BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB</code>, <code>PASSIVE_ESTABLISHED_CB</code>, <code>RTO_CB</code>, <code>STATE_CB</code>, header-option callbacks, ...). They can tune the connection with <code>bpf_setsockopt()</code>, for example to pick a congestion control or set initial windows, and they can insert the socket into a <strong>SOCKMAP</strong>/<strong>SOCKHASH</strong> (4.14/4.18). Programs attached to such a map then act on its sockets. <strong>sk_msg</strong> (4.17) runs on every <code>sendmsg()</code> and can redirect the data <em>directly into another socket's receive queue</em> with <code>bpf_msg_redirect_hash()</code>. <strong>sk_skb</strong> stream parser/verdict programs do the same on the receive side. For two processes talking over loopback, such as a service and its sidecar proxy, this skips the whole TCP/IP stack in both directions.</p>
+    <p>The eunomia tutorial's chapter 29 is a compact, complete example:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="sockops: record sockets"><pre data-file="bpf-developer-tutorial/src/29-sockops/bpf_contrack.bpf.c"><code class="language-c">#include "bpf_sockmap.h"
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+SEC("sockops")
+int bpf_sockops_handler(struct bpf_sock_ops *skops){
+    u32 family, op;
+
+	family = skops-&gt;family;
+	op = skops-&gt;op;
+	if (op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB
+        &amp;&amp; op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
+        return BPF_OK;
+    }
+
+    if(skops-&gt;remote_ip4 != LOCALHOST_IPV4 || skops-&gt;local_ip4!= LOCALHOST_IPV4) {
+        return BPF_OK;
+    }
+
+	struct sock_key key = {
+        .dip = skops-&gt;remote_ip4,
+        .sip = skops-&gt;local_ip4,
+        .sport = bpf_htonl(skops-&gt;local_port),  /* convert to network byte order */
+        .dport = skops-&gt;remote_port,
+        .family = skops-&gt;family,
+    };
+
+	bpf_printk("&gt;&gt;&gt; new connection: OP:%d, PORT:%d --&gt; %d\n", op, bpf_ntohl(key.sport), bpf_ntohl(key.dport));
+
+	bpf_sock_hash_update(skops, &amp;sock_ops_map, &amp;key, BPF_NOEXIST);
+    return BPF_OK;
+}</code></pre></div>
+      <div class="tab-panel" data-label="sk_msg: redirect"><pre data-file="bpf-developer-tutorial/src/29-sockops/bpf_redirect.bpf.c"><code class="language-c">#include "bpf_sockmap.h"
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+SEC("sk_msg")
+int bpf_redir(struct sk_msg_md *msg)
+{
+    if(msg-&gt;remote_ip4 != LOCALHOST_IPV4 || msg-&gt;local_ip4!= LOCALHOST_IPV4) 
+        return SK_PASS;
+    
+    struct sock_key key = {
+        .sip = msg-&gt;remote_ip4,
+        .dip = msg-&gt;local_ip4,
+        .dport = bpf_htonl(msg-&gt;local_port), /* convert to network byte order */
+        .sport = msg-&gt;remote_port,
+        .family = msg-&gt;family,
+    };
+    return bpf_msg_redirect_hash(msg, &amp;sock_ops_map, &amp;key, BPF_F_INGRESS);
+}</code></pre></div>
+      <div class="tab-panel" data-label="The map"><pre data-file="bpf-developer-tutorial/src/29-sockops/bpf_sockmap.h"><code class="language-c">#define LOCALHOST_IPV4 16777343
+
+struct sock_key {
+    __u32 sip;
+    __u32 dip;
+    __u32 sport;
+    __u32 dport;
+    __u32 family;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SOCKHASH);
+	__uint(max_entries, 65535);
+	__type(key, struct sock_key);
+	__type(value, int);
+} sock_ops_map SEC(".maps");</code></pre></div>
+      <div class="tab-panel" data-label="load.sh"><pre data-file="bpf-developer-tutorial/src/29-sockops/load.sh"><code class="language-bash"># load and attach sock_ops program
+sudo bpftool prog load bpf_contrack.bpf.o /sys/fs/bpf/bpf_sockops type sockops pinmaps /sys/fs/bpf/
+sudo bpftool cgroup attach "/sys/fs/cgroup/" sock_ops pinned "/sys/fs/bpf/bpf_sockops"
+
+# load and attach sk_msg program 
+sudo bpftool prog load bpf_redirect.bpf.o "/sys/fs/bpf/bpf_redir" map name sock_ops_map pinned "/sys/fs/bpf/sock_ops_map"
+sudo bpftool prog attach pinned /sys/fs/bpf/bpf_redir msg_verdict pinned /sys/fs/bpf/sock_ops_map</code></pre></div>
+    </div>
+    <p>Note the key symmetry. The sockops program stores each socket under <em>(its local, its remote)</em>, and the sk_msg program looks up <em>(remote, local)</em> of the sending socket. That finds the <em>peer</em> socket, whose ingress queue receives the bytes (<code>BPF_F_INGRESS</code>). <code>LOCALHOST_IPV4</code> is 127.0.0.1 read as a little-endian 32-bit integer. The sk_msg program attaches to the <em>map</em> (<code>msg_verdict</code>), not to a cgroup or device: every socket in the map inherits it. Projects such as Cilium and Merbridge have used this sockmap pattern to accelerate local, sidecar-style traffic.</p>
+    <h3>sk_lookup: choosing the listening socket</h3>
+    <p><code>BPF_PROG_TYPE_SK_LOOKUP</code> (5.9) runs when TCP needs a <em>listening</em> socket, or UDP an <em>unconnected</em> one, for an incoming packet. Established connections do not trigger it. The program can pick any socket, normally from a SOCKMAP, with <code>bpf_sk_assign()</code>, and return <code>SK_PASS</code> or <code>SK_DROP</code> [6]. It attaches to a <strong>network namespace</strong> via a BPF link, and several programs run in attach order. The kernel documentation's motivating cases are serving a whole IP range (e.g. 192.0.2.0/24) on one socket when binding to <code>INADDR_ANY</code> is impossible because of a port conflict, and an L7 proxy accepting connections on all or many ports, which would otherwise need one <code>bind()</code> per address/port pair. Cloudflare, which needed exactly this for its edge, contributed the feature upstream.</p>
+
+    <h2>Who runs this in production</h2>
+    <div class="grid">
+      <div class="card"><h4>Katran (Meta)</h4><p>An open-source C++ library plus BPF program forming the forwarding plane of Meta's L4 load balancer, released in 2018 [7]. It runs in XDP (driver mode for speed; generic mode works at a cost). It checks whether the destination is a VIP and looks up existing flows in a connection table. For new flows it hashes the 5-tuple to pick a backend consistently, so different Katran instances agree without sharing state. It then IP-in-IP encapsulates the packet and sends it back out with <code>XDP_TX</code>. Backends reply directly (DSR). Its README documents the limits that come with the speed: no IP fragments, no IP options, and a bounded maximum packet size.</p></div>
+      <div class="card"><h4>Cilium</h4><p>The Kubernetes CNI whose datapath is built entirely from the hooks in this chapter [11]. tc (and, since Cilium 1.16 on 6.6+ kernels, TCX) programs sit on host devices and on the host side of each Pod's veth for policy, load balancing and encapsulation (<code>bpf_lxc.c</code>, <code>bpf_host.c</code>, <code>bpf_overlay.c</code> in <code>cilium/bpf/</code>). Optional XDP acceleration (<code>bpf_xdp.c</code>, <code>loadBalancer.acceleration=native</code>) handles NodePort/LoadBalancer traffic in the driver. Socket hooks (<code>bpf_sock.c</code>) do service translation at <code>connect()</code> time, and sockmap-based redirection is available as well. Its <a href="https://docs.cilium.io/en/stable/reference-guides/bpf/index.html">BPF and XDP Reference Guide</a> is one of the best long-form references.</p></div>
+      <div class="card"><h4>Cloudflare</h4><p>Cloudflare's DDoS mitigation sends every packet arriving at a server first through a group of XDP programs. The first, <strong>L4Drop</strong>, applies mitigation rules from earlier detected attacks and samples packets for the detection daemon <code>dosd</code>. Packets that survive go to <strong>Unimog</strong>, Cloudflare's XDP-based L4 load balancer, and then to iptables [8]. The 2018 L4Drop post describes compiling rules into eBPF and keeping XDP "always on". Their sk_lookup and socket work fed the upstream kernel features described above.</p></div>
+    </div>
+    <p>The XDP paper itself evaluates three such use cases (layer-3 routing, inline DDoS protection and layer-4 load balancing) next to a DPDK baseline. In the paper's packet-drop test, XDP reached 24 Mpps on one core against 43.5 Mpps for DPDK on the same hardware. The authors argue that XDP's integration with the kernel, its lack of dedicated busy-polling cores and its safety make up for the gap [1]. Treat those numbers as the 2018 paper's measurements on its test hardware, not as a property of every NIC.</p>
+
+    <h2>Beyond the kernel: eunomia-bpf's userspace XDP work</h2>
+    <p>XDP programs are just eBPF bytecode with a known context and return contract, so nothing ties them to the kernel. Two eunomia-bpf research projects build on that idea:</p>
+    <ul>
+      <li><strong><a href="https://github.com/userspace-xdp/userspace-xdp">userspace-xdp</a></strong> (moved from <code>eunomia-bpf/XDP-eBPF-in-DPDK</code>) runs <em>unmodified</em> XDP network functions in userspace. It uses <a href="14-bpftime-architecture.html">bpftime</a> as the loader and runtime for maps and helpers, <a href="16-llvmbpf.html">llvmbpf</a> or uBPF as the JIT/AOT back-end, and DPDK or AF_XDP as packet I/O. The existing control plane keeps working, and XDP can run where kernel eBPF is unavailable. Its README calls it a research prototype that currently supports an <code>l2fwd</code> setup (mainly <code>XDP_DROP</code>/<code>XDP_TX</code>), and says the component will move into the bpftime repository.</li>
+      <li><strong><a href="https://github.com/eunomia-bpf/XDP-on-GPU">XDP-on-GPU</a></strong> explores batching packets from a DPDK poll-mode driver and running XDP-style programs over them on a GPU (CUDA/OpenCL back-ends), while keeping the DROP/PASS/TX/REDIRECT semantics. The README labels it work in progress that "does not work now". Read it as a design direction, not a usable tool. GPU-side eBPF is the subject of <a href="20-gpu-ext.html">Part V</a>.</li>
+    </ul>
+
+    <h2>How the example code is organized</h2>
+    <p>Both tutorial repositories are worth cloning (<code>git clone --depth 1</code>). The directories this chapter quoted:</p>
+    <pre><code class="language-text">xdp-tutorial/                         (xdp-project, commit 4e2bf56)
+├── basic01-xdp-pass/      first program; ip link / xdp-loader loading
+├── basic02-prog-by-name/  pass + drop in one object; testenv; nfp offload notes
+├── basic03-map-counter/   per-action stats map; XDP_ABORTED on lookup failure
+├── basic04-pinning-maps/  bpffs pinning shared between loader and stats tool
+├── packet01-parsing/      parsing exercise (with the deliberate bounds bug)
+├── packet02-rewriting/    solution parser that drops even ICMP echo; rewriting
+├── packet03-redirecting/  XDP_TX echo, bpf_redirect, devmap, fib_lookup router
+├── packet-solutions/      solutions incl. tc_reply_kern_02.c (tc egress)
+├── advanced01-xdp-tc-interact/  XDP + tc cooperation via metadata
+├── advanced03-AF_XDP/     XSKMAP program + libxdp xsk userspace
+├── tracing01..04-*/       xdp tracepoints, monitor, debug print, tcpdump
+├── common/                parsing_helpers.h, rewrite_helpers.h, loaders
+└── testenv/               testenv.sh: veth + netns lab
+
+bpf-developer-tutorial/src/          (eunomia-bpf, commit 110b91f)
+├── 20-tc/                 SEC("tc") ingress logger, ecc/ecli
+├── 21-xdp/                SEC("xdp") packet-size logger
+├── 29-sockops/            sockops + sk_msg + SOCKHASH local redirect
+├── 41-xdp-tcpdump/        capturing packets from XDP
+├── 42-xdp-loadbalancer/   XDP L4 load balancer on veth namespaces
+├── 46-xdp-test/           testing XDP programs
+└── 50-tcx/                TCX links, ordering, chain query</code></pre>
+    <p>The repositories are complementary. xdp-tutorial uses libbpf + libxdp with plain kernel headers and is organized as graded assignments with solutions. bpf-developer-tutorial uses <code>vmlinux.h</code>/CO-RE (<a href="06-btf-core-libbpf.html">chapter 06</a>), and its examples can be run either with plain libbpf skeletons or with eunomia's <code>ecc</code>/<code>ecli</code>. <a href="09-bpf-developer-tutorial.html">Chapter 09</a> tours the latter in full.</p>
+
+    <h2>Benefits and limitations</h2>
+    <h3>Benefits</h3>
+    <ul>
+      <li><strong>Speed where it matters</strong>: XDP drops and forwards before any allocation, and redirects are bulked.</li>
+      <li><strong>Kernel integration</strong>: <code>XDP_PASS</code> hands packets back to the normal stack. Helpers such as <code>bpf_fib_lookup()</code> reuse the kernel's routing and neighbour tables. The usual tools keep working for everything the program passes.</li>
+      <li><strong>Safety and live updates</strong>: the verifier rejects out-of-bounds packet access, and programs can be replaced atomically (<code>XDP_FLAGS_REPLACE</code>, link updates) without dropping the interface.</li>
+      <li><strong>No dedicated cores</strong>: XDP runs on interrupt/NAPI processing, so idle systems really are idle. The XDP paper stresses this against DPDK's busy polling.</li>
+      <li><strong>Choice of layer</strong>: the same language and maps work from the driver up to the socket, so a system can split work across hooks (Cilium's XDP + tc + socket design).</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>Ingress only</strong> for XDP. There is no XDP egress hook, so outgoing policy needs tc/TCX.</li>
+      <li><strong>Raw bytes only</strong> in XDP: no socket, no cgroup, and no conntrack unless you build it yourself or use the conntrack kfuncs. Checksums, fragments, tunnels and IP options are your problem.</li>
+      <li><strong>Driver dependence</strong>: native mode, redirect targets, zero-copy AF_XDP and multi-buffer support vary by driver. Generic mode works everywhere but is slow.</li>
+      <li><strong>Large frames</strong>: classic XDP assumes the packet fits in one buffer. Jumbo frames need the multi-buffer ("frags") API of Linux 5.18, with programs declared <code>SEC("xdp.frags")</code> and helpers such as <code>bpf_xdp_get_buff_len()</code>.</li>
+      <li><strong>One XDP program per interface</strong> in the kernel. Sharing needs libxdp's dispatcher or cooperation between tools. For tc, TCX solves the equivalent problem.</li>
+      <li><strong>Verifier constraints</strong>: complex parsers (IPv6 extension headers, TLVs) need careful bounded loops and can hit complexity limits (<a href="03-verifier.html">chapter 03</a>).</li>
+      <li><strong>Raw throughput ceiling</strong>: kernel-bypass frameworks still report more per-core packets in microbenchmarks, as the XDP paper's own DPDK comparison shows.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>Kernel bypass</strong>: DPDK and netmap take the NIC away from the kernel. AF_XDP is the in-kernel answer, and DPDK has an AF_XDP poll-mode driver, so the two now meet. Karlsson and Töpel's LPC 2018 paper "The Path to DPDK Speeds for AF_XDP" describes the AF_XDP design and its performance work [10].</li>
+      <li><strong>Classic BPF</strong> socket filters and <code>tcpdump</code>'s compiler are the ancestors of everything here (<a href="01-what-is-bpf.html">chapter 01</a>).</li>
+      <li><strong>Netfilter</strong> (iptables/nftables) remains the general firewall. BPF can now also attach there (<code>BPF_PROG_TYPE_NETFILTER</code>), and Cloudflare pushes some mitigations into iptables-hosted BPF.</li>
+      <li><strong>Other hooks</strong> not covered in depth: flow dissector programs, lightweight tunnel (LWT) programs, <code>cgroup_skb</code> and cgroup socket-address hooks (<code>connect4</code>, <code>bind4</code> …), and SO_REUSEPORT selection programs. See <a href="05-program-types-and-hooks.html">chapter 05</a>.</li>
+      <li><strong>Tooling and libraries</strong>: xdp-tools (libxdp, xdp-loader, xdp-filter, xdpdump), and the Go, Rust and C libraries of <a href="08-ecosystem.html">chapter 08</a>.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> An XDP program in native mode returns <code>XDP_DROP</code>. Which of these happened to the packet?</p>
+        <button class="opt">An sk_buff was allocated and then freed</button>
+        <button class="opt">tcpdump on the interface captured it before the drop</button>
+        <button class="opt" data-right>The driver recycled the RX buffer; no sk_buff was ever allocated</button>
+        <button class="opt">netfilter logged it in the INPUT chain</button>
+        <div class="why">Native XDP runs in the driver's NAPI poll before skb allocation. Taps (tcpdump), tc and netfilter all run later on an sk_buff, so they never see a packet dropped by XDP.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Why does the verifier reject <code>struct ethhdr *eth = data; if (data + 1 &gt; data_end) return XDP_PASS; return eth-&gt;h_proto == 0 ? XDP_DROP : XDP_PASS;</code>?</p>
+        <button class="opt">h_proto must be read with bpf_probe_read</button>
+        <button class="opt" data-right><code>data</code> is a void pointer, so the check proves only 1 byte; <code>h_proto</code> is at offset 12</button>
+        <button class="opt">XDP programs may not return XDP_DROP from a conditional</button>
+        <button class="opt">data_end must be checked before data</button>
+        <div class="why">This is the planted bug from packet01. Arithmetic on <code>void *</code> advances bytes; use <code>eth + 1 &gt; data_end</code> (or <code>data + sizeof(*eth)</code>) to prove all 14 bytes.</div></div>
+      <div class="q"><p><strong>Q3.</strong> You need to rewrite the source port of packets your host <em>sends</em>. Which hook do you use?</p>
+        <button class="opt">XDP in native mode</button>
+        <button class="opt">XDP in generic mode</button>
+        <button class="opt" data-right>tc (clsact) or TCX egress</button>
+        <button class="opt">sk_lookup</button>
+        <div class="why">XDP is receive-only, in every mode. tc/TCX has an egress hook with an <code>__sk_buff</code> and checksum helpers. The xdp-tutorial's <code>tc_reply_kern_02.c</code> does exactly this.</div></div>
+      <div class="q"><p><strong>Q4.</strong> Which map lets an XDP program hand frames to another CPU, where they become sk_buffs and enter the normal stack?</p>
+        <button class="opt">DEVMAP</button>
+        <button class="opt" data-right>CPUMAP</button>
+        <button class="opt">XSKMAP</button>
+        <button class="opt">SOCKMAP</button>
+        <div class="why">Each CPUMAP entry has a kernel thread bound to that CPU, which builds skbs for redirected frames: a software RSS. DEVMAP targets other NICs, XSKMAP targets AF_XDP sockets, and SOCKMAP is for socket-level redirection.</div></div>
+      <div class="q"><p><strong>Q5.</strong> What problem does TCX (Linux 6.6) solve compared with <code>tc filter add ... bpf da</code>?</p>
+        <button class="opt">It lets tc programs run before XDP</button>
+        <button class="opt">It introduces direct-action mode</button>
+        <button class="opt" data-right>It gives fd-owned links with explicit ordering and revisions, so multiple agents can safely share the hook</button>
+        <button class="opt">It enables zero-copy delivery to userspace</button>
+        <div class="why">Direct-action is from 4.4. TCX adds link-based ownership, BPF_F_BEFORE/AFTER ordering, revision checks and TCX_NEXT chaining, all without a qdisc.</div></div>
+      <div class="q"><p><strong>Q6.</strong> An AF_XDP socket is bound to queue 0 of eth0, but no packets arrive even though the XDP program calls <code>bpf_redirect_map(&amp;xsks_map, ctx-&gt;rx_queue_index, 0)</code>. What is the most likely cause?</p>
+        <button class="opt">AF_XDP requires generic mode</button>
+        <button class="opt" data-right>The traffic is arriving on other RX queues; a socket only receives frames from the queue it is bound to</button>
+        <button class="opt">The FILL ring must be empty for RX to work</button>
+        <button class="opt">XSKMAP keys must be ifindexes</button>
+        <div class="why">An XSK is bound to one (netdev, queue). RSS spreads flows across queues, so either bind a socket per queue or reduce queues (<code>ethtool -L eth0 combined 1</code>, as the tutorial suggests). The FILL ring must have frames for RX, not be empty.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>T. Høiland-Jørgensen, J. D. Brouer, D. Borkmann, J. Fastabend, T. Herbert, D. Ahern, D. Miller. "The eXpress Data Path: Fast Programmable Packet Processing in the Operating System Kernel." <em>ACM CoNEXT 2018</em>, pp. 54–66. <a href="https://dl.acm.org/doi/10.1145/3281411.3281443">doi:10.1145/3281411.3281443</a> (open access); source: <a href="https://github.com/tohojo/xdp-paper">github.com/tohojo/xdp-paper</a>.</li>
+      <li>Linux kernel documentation, "AF_XDP". <a href="https://docs.kernel.org/networking/af_xdp.html">docs.kernel.org/networking/af_xdp.html</a>. See also "Accelerating networking with AF_XDP", LWN.net, 2018: <a href="https://lwn.net/Articles/750845/">lwn.net/Articles/750845</a>.</li>
+      <li>Linux kernel documentation, "Redirect" (XDP_REDIRECT, supported maps, debugging). <a href="https://docs.kernel.org/bpf/redirect.html">docs.kernel.org/bpf/redirect.html</a>.</li>
+      <li>Linux kernel documentation, map types: <a href="https://docs.kernel.org/bpf/map_devmap.html">DEVMAP/DEVMAP_HASH</a>, <a href="https://docs.kernel.org/bpf/map_cpumap.html">CPUMAP</a>, <a href="https://docs.kernel.org/bpf/map_xskmap.html">XSKMAP</a>, <a href="https://docs.kernel.org/bpf/map_sockmap.html">SOCKMAP/SOCKHASH</a>.</li>
+      <li>Linux UAPI headers: <a href="https://github.com/torvalds/linux/blob/master/include/uapi/linux/bpf.h">include/uapi/linux/bpf.h</a> (xdp_md, xdp_action, __sk_buff, tcx_action_base), <a href="https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_link.h">if_link.h</a> (XDP_FLAGS_*), <a href="https://github.com/torvalds/linux/blob/master/include/uapi/linux/pkt_cls.h">pkt_cls.h</a> (TC_ACT_*); <a href="https://github.com/torvalds/linux/blob/master/tools/bpf/bpftool/Documentation/bpftool-net.rst">bpftool-net(8)</a>.</li>
+      <li>Linux kernel documentation, "BPF sk_lookup program". <a href="https://docs.kernel.org/bpf/prog_sk_lookup.html">docs.kernel.org/bpf/prog_sk_lookup.html</a>.</li>
+      <li>N. Shirokov, R. Dasineni. "Open-sourcing Katran, a scalable network load balancer." Engineering at Meta, 2018-05-22. <a href="https://engineering.fb.com/2018/05/22/open-source/open-sourcing-katran-a-scalable-network-load-balancer/">engineering.fb.com</a>; code: <a href="https://github.com/facebookincubator/katran">github.com/facebookincubator/katran</a>.</li>
+      <li>Cloudflare blog: A. Fabre, "<a href="https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/">L4Drop: XDP DDoS Mitigations</a>" (2018); M. Majkowski, "<a href="https://blog.cloudflare.com/how-to-drop-10-million-packets/">How to drop 10 million packets per second</a>" (2018); "<a href="https://blog.cloudflare.com/deep-dive-cloudflare-autonomous-edge-ddos-protection">A deep-dive into Cloudflare's autonomous edge DDoS protection</a>".</li>
+      <li>KernelNewbies, "Linux 6.6" (TCX: fd-based tc BPF attach API and BPF link support). <a href="https://kernelnewbies.org/Linux_6.6">kernelnewbies.org/Linux_6.6</a>; D. Borkmann, "Update on Cilium with tcx &amp; netkit", LSF/MM/BPF 2024: <a href="http://oldvger.kernel.org/bpfconf2024_material/tcx_netkit_update_and_global_sk_iter.pdf">slides</a>.</li>
+      <li>M. Karlsson, B. Töpel. "The Path to DPDK Speeds for AF_XDP." Linux Plumbers Conference 2018, Networking Track. <a href="http://oldvger.kernel.org/lpc_net2018_talks/lpc18_paper_af_xdp_perf-v2.pdf">paper (PDF)</a>.</li>
+      <li>Cilium documentation: <a href="https://docs.cilium.io/en/stable/network/ebpf/intro/">eBPF Datapath — Introduction</a>; <a href="https://docs.cilium.io/en/stable/operations/performance/tuning/">Tuning Guide</a> (XDP acceleration, netkit, tcx); <a href="https://docs.cilium.io/en/stable/reference-guides/bpf/index.html">BPF and XDP Reference Guide</a>.</li>
+      <li>xdp-project, <a href="https://github.com/xdp-project/xdp-tutorial">xdp-tutorial</a> (commit 4e2bf5658434) and <a href="https://github.com/xdp-project/xdp-tools">xdp-tools</a> (libxdp, xdp-loader).</li>
+      <li>eunomia-bpf, <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial">bpf-developer-tutorial</a> (commit 110b91f87320): <code>src/20-tc</code>, <code>src/21-xdp</code>, <code>src/29-sockops</code>, <code>src/42-xdp-loadbalancer</code>, <code>src/50-tcx</code>.</li>
+      <li>eunomia-bpf userspace XDP: <a href="https://github.com/userspace-xdp/userspace-xdp">userspace-xdp/userspace-xdp</a>; <a href="https://github.com/eunomia-bpf/XDP-on-GPU">eunomia-bpf/XDP-on-GPU</a> (WIP).</li>
+      <li>BPF features by kernel version (bcc): <a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">iovisor/bcc docs/kernel-versions.md</a> — source for the version numbers used in this chapter.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="06-btf-core-libbpf.html"><small>Previous</small>06 · BTF, CO-RE and libbpf</a>
+      <a class="next" href="08-ecosystem.html"><small>Next</small>08 · The eBPF ecosystem</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

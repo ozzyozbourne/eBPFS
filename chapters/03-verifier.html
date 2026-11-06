@@ -1,0 +1,1490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · The eBPF verifier · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="03">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="How the in-kernel verifier proves an eBPF program safe: the CFG pass, path-by-path abstract interpretation, register types, tnum and range tracking, pruning, precision, loops, limits, Spectre hardening, reading error messages, and the research that checks the verifier itself.">
+<meta name="chapter-repo" content="https://github.com/torvalds/linux/tree/master/kernel/bpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+<style>
+  /* Chapter-local classes for the inline SVG diagrams and the two small widgets. */
+  .d-box { fill: var(--bg3); stroke: var(--border); stroke-width: 1.5; }
+  .d-acc { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .d-acc2 { fill: none; stroke: var(--accent2); stroke-width: 2; }
+  .d-fillacc { fill: var(--accent); }
+  .d-fillacc2 { fill: var(--accent2); }
+  .d-line { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  .d-dash { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+  .d-t { fill: var(--fg); font: 14px var(--font); }
+  .d-s { fill: var(--muted); font: 12px var(--font); }
+  .d-m { fill: var(--fg); font: 12px var(--mono); }
+  .d-h { fill: var(--accent); font: 600 14px var(--font); }
+  .d-h2 { fill: var(--accent2); font: 600 14px var(--font); }
+  .reg-table td, .reg-table th { font-family: var(--mono); font-size: .82rem; }
+  .reg-table td.chg { color: var(--accent); font-weight: 600; }
+  .insn-now { font-family: var(--mono); background: var(--code-bg); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 6px; padding: .4rem .7rem; display: block; margin: .4rem 0; white-space: pre-wrap; }
+  #tnum-lab { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; margin: 1.5rem 0; }
+  #tnum-lab input, #tnum-lab select { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: .25rem .5rem; font-family: var(--mono); }
+  #tnum-lab .row { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; margin: .4rem 0; }
+  #tnum-lab output { font-family: var(--mono); white-space: pre-wrap; display: block; margin-top: .6rem; }
+</style>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 03 · The eBPF verifier</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 03</div>
+      <h1>The eBPF verifier</h1>
+      <p class="lede">The kernel runs your eBPF program only after the verifier has proved it safe. How
+        does a static analyzer inside the kernel prove that arbitrary bytecode will not crash the
+        machine, read memory it should not, or run forever? And why does it sometimes reject code
+        that looks fine to you?</p>
+      <div class="meta"><span>Prerequisites: <a href="01-what-is-bpf.html">01</a>, <a href="02-ebpf-isa-and-vm.html">02</a></span><span>Source: kernel/bpf/ at Linux master d68ce4e7 (2026-11-05)</span><span>~60 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>An eBPF program is code that someone outside the kernel hands to the kernel, and the kernel
+      then runs with full kernel privilege: in the network receive path, on every system call, inside
+      the scheduler. A kernel module can do the same, but a module is trusted. If it dereferences a bad
+      pointer the machine panics, and if it leaks a kernel address that is a security bug. eBPF's
+      promise is that you can load new code into a running production kernel without making the kernel
+      any less safe. The <strong>verifier</strong> is what keeps that promise. It is a static analyzer in
+      <code>kernel/bpf/</code> that runs on every <code>BPF_PROG_LOAD</code> and either accepts the
+      program or refuses it with an error log.</p>
+    <p>A kernel could protect itself in three ways. It could trust the author, as with modules.
+      It could check every memory access at run time, as a software sandbox or a WebAssembly runtime
+      does. Or it could prove before the first run that no bad access can ever happen, then run the
+      code at native speed with no checks. eBPF mostly takes the third option. That choice explains
+      almost everything that makes eBPF programming feel strange: you write
+      <code>if (!val) return 0;</code> after every map lookup, and you compare packet pointers
+      against <code>data_end</code> before every header access. These checks are how you hand the
+      verifier the facts it needs for its proof.</p>
+    <p>The verifier does not have to be perfect, but it has to be <em>sound</em>. A program can be
+      safe in fact and still be rejected; that is a <em>false positive</em>, and it is annoying. If
+      an unsafe program is accepted, that is a soundness bug, and in practice a kernel vulnerability.
+      Rice's theorem tells us that no analyzer can decide every safety property exactly, so the
+      verifier errs on the side of rejection. This chapter shows where those approximations are and
+      how to write code that survives them.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p>The verifier is an <strong>abstract interpreter</strong>. It runs the program on abstract
+      values instead of real ones. Each register holds a <em>type</em> (pointer to context, pointer
+      to map value, pointer into the packet, plain number, and so on) and, for numbers, a set of
+      possible values described by known bits (a <em>tnum</em>) and by signed and unsigned ranges.
+      It walks every path through the program, and on each path it checks that every memory access,
+      helper call and return is safe for <em>all</em> concrete values that the abstract state
+      allows.</p></div>
+
+    <p>What the verifier guarantees, in the words of the kernel's own documentation and code
+      comments, comes down to a list of properties:</p>
+    <ul>
+      <li><strong>Termination.</strong> The program reaches <code>exit</code> on every path within a
+        bounded number of steps. Since Linux 5.3 loops are allowed when the verifier can prove they
+        end.</li>
+      <li><strong>Memory safety.</strong> Every load and store goes through a pointer of a known
+        type, inside the bounds of the object it points to, and with acceptable alignment.</li>
+      <li><strong>No uninitialised reads.</strong> A register that was never written is
+        <code>NOT_INIT</code> and cannot be read. Stack bytes cannot be read before they are written,
+        unless the loader has <code>CAP_PERFMON</code>.</li>
+      <li><strong>Type-correct calls.</strong> Every helper and kfunc is called with arguments
+        whose types match its prototype. For example, <code>bpf_map_lookup_elem()</code> needs a map
+        pointer and a pointer to initialised stack memory of at least <code>key_size</code> bytes.</li>
+      <li><strong>Resource safety.</strong> References acquired from the kernel, such as sockets,
+        ring buffer reservations or task references, are released on every path, and locks are
+        unlocked.</li>
+      <li><strong>No pointer leaks for unprivileged users.</strong> A program loaded without
+        <code>CAP_PERFMON</code> cannot store a kernel pointer into a map, compare pointers in ways
+        that reveal addresses, or return one.</li>
+    </ul>
+
+    <h2>Where the verifier sits</h2>
+    <p>The entry point is <code>bpf_check()</code> in <code>kernel/bpf/verifier.c</code>, called from
+      <code>bpf_prog_load()</code> in <code>kernel/bpf/syscall.c</code>. It receives the program's
+      instructions, the attach type, the BTF information that libbpf passed along (see
+      <a href="06-btf-core-libbpf.html">Chapter 06</a>), and an optional user buffer for the
+      verifier log. When it returns 0, the program is rewritten (context accesses converted, helper
+      calls patched, Spectre masks inserted) and handed to the JIT described in
+      <a href="02-ebpf-isa-and-vm.html">Chapter 02</a>.</p>
+
+    <figure>
+      <svg viewBox="0 0 860 300" role="img" aria-label="Load pipeline: bpf syscall, bpf_check with CFG pass and symbolic execution, rewrites, JIT">
+        <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-fillacc2"/></marker></defs>
+        <rect x="10" y="110" width="120" height="70" rx="8" class="d-box"/>
+        <text x="70" y="140" text-anchor="middle" class="d-t">bpf(BPF_PROG_LOAD)</text>
+        <text x="70" y="160" text-anchor="middle" class="d-s">insns, type, BTF, log</text>
+        <rect x="160" y="20" width="520" height="260" rx="12" class="d-acc"/>
+        <text x="175" y="42" class="d-h">bpf_check()  (kernel/bpf/verifier.c)</text>
+        <rect x="180" y="60" width="150" height="90" rx="8" class="d-box"/>
+        <text x="255" y="85" text-anchor="middle" class="d-h2">Pass 1</text>
+        <text x="255" y="105" text-anchor="middle" class="d-t">bpf_check_cfg()</text>
+        <text x="255" y="123" text-anchor="middle" class="d-s">DFS over the CFG (cfg.c)</text>
+        <text x="255" y="139" text-anchor="middle" class="d-s">back-edges, unreachable</text>
+        <rect x="180" y="170" width="150" height="90" rx="8" class="d-box"/>
+        <text x="255" y="195" text-anchor="middle" class="d-s">analyses in between:</text>
+        <text x="255" y="213" text-anchor="middle" class="d-s">postorder, SCCs, live regs,</text>
+        <text x="255" y="231" text-anchor="middle" class="d-s">const fold, dominators,</text>
+        <text x="255" y="249" text-anchor="middle" class="d-s">loops, SCEV (2026)</text>
+        <rect x="360" y="60" width="300" height="200" rx="8" class="d-box"/>
+        <text x="510" y="85" text-anchor="middle" class="d-h2">Pass 2: do_check_main()</text>
+        <text x="510" y="106" text-anchor="middle" class="d-t">abstract interpretation, path by path</text>
+        <text x="375" y="134" class="d-s">• registers: type + tnum + ranges</text>
+        <text x="375" y="154" class="d-s">• stack slots, call frames, references</text>
+        <text x="375" y="174" class="d-s">• branch: push other side on a stack</text>
+        <text x="375" y="194" class="d-s">• prune: compare with explored states</text>
+        <text x="375" y="214" class="d-s">• precision backtracking (backtrack.c)</text>
+        <text x="375" y="234" class="d-s">• limit: 1,000,000 processed insns</text>
+        <rect x="710" y="60" width="140" height="90" rx="8" class="d-box"/>
+        <text x="780" y="88" text-anchor="middle" class="d-t">rewrites</text>
+        <text x="780" y="108" text-anchor="middle" class="d-s">ctx access, helpers,</text>
+        <text x="780" y="126" text-anchor="middle" class="d-s">Spectre masks,</text>
+        <text x="780" y="142" text-anchor="middle" class="d-s">dead code, bpf_loop</text>
+        <rect x="710" y="180" width="140" height="70" rx="8" class="d-box"/>
+        <text x="780" y="210" text-anchor="middle" class="d-t">JIT / interpreter</text>
+        <text x="780" y="230" text-anchor="middle" class="d-s">Chapter 02</text>
+        <path d="M130,145 L178,105" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M255,150 L255,168" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M330,215 L358,190" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M660,105 L708,105" class="d-acc2" marker-end="url(#ar1)"/>
+        <path d="M780,150 L780,178" class="d-acc2" marker-end="url(#ar1)"/>
+        <text x="690" y="290" text-anchor="end" class="d-s">any error → -EINVAL / -EACCES / -E2BIG and a text log</text>
+      </svg>
+      <figcaption>Figure 03.1 — The load pipeline. The verifier is one function with two main passes.
+        Between them, recent kernels run several cheap whole-program analyses that make the second
+        pass faster and more precise.</figcaption>
+    </figure>
+
+    <p>Here is the heart of <code>bpf_check()</code> at the commit studied, trimmed. The order of
+      the calls is the architecture of the verifier:</p>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">	ret = bpf_check_cfg(env);
+	if (ret &lt; 0)
+		goto skip_full_check;
+/* ... */
+	ret = bpf_compute_const_regs(env);
+	if (ret &lt; 0)
+		goto skip_full_check;
+
+	ret = bpf_prune_dead_branches(env);
+	if (ret &lt; 0)
+		goto skip_full_check;
+/* ... */
+	ret = bpf_compute_loops(env);
+	if (ret &lt; 0)
+		goto skip_full_check;
+
+	ret = bpf_compute_live_registers(env);
+	if (ret &lt; 0)
+		goto skip_full_check;
+/* ... */
+	ret = bpf_compute_scev(env);
+	if (ret &lt; 0)
+		goto skip_full_check;
+/* ... */
+	ret = do_check_main(env);
+	ret = ret ?: do_check_subprogs(env);
+/* ... */
+skip_full_check:
+	kvfree(env-&gt;explored_states);
+/* ... */
+	if (ret == 0)
+		ret = check_max_stack_depth(env);
+
+	/* instruction rewrites happen after this point */
+	if (ret == 0)
+		ret = bpf_optimize_bpf_loop(env);
+/* ... */
+	if (ret == 0)
+		/* program is valid, convert *(u32*)(ctx + off) accesses */
+		ret = bpf_convert_ctx_accesses(env);
+
+	if (ret == 0)
+		ret = bpf_do_misc_fixups(env);</code></pre>
+
+    <h3>How the code is organised</h3>
+    <p>For most of its life the verifier was one file. By 2025 <code>verifier.c</code> had grown
+      past 25,000 lines. In 2026 the maintainers began splitting it up: <code>check_cfg()</code> moved
+      to <code>cfg.c</code> (commit <code>f8a8faceab99</code>, first released in v7.1), and state
+      comparison moved to <code>states.c</code> (<code>c82834a5a11f</code>). If you read an older
+      article that links to <code>verifier.c</code> for a function you cannot find, look in these
+      files:</p>
+    <table>
+      <tr><th>File (kernel/bpf/ unless noted)</th><th>What lives there</th></tr>
+      <tr><td><code>verifier.c</code> (24,331 lines)</td><td><code>bpf_check()</code>, <code>do_check()</code>, instruction checks (<code>check_mem_access</code>, <code>check_alu_op</code>, <code>check_cond_jmp_op</code>, helper and kfunc argument checks), bounds propagation, Spectre sanitation</td></tr>
+      <tr><td><code>cfg.c</code></td><td>Pass 1: <code>bpf_check_cfg()</code>, iterative DFS, back-edge and unreachable-code detection, postorder</td></tr>
+      <tr><td><code>states.c</code></td><td><code>bpf_is_state_visited()</code>, <code>states_equal()</code>, <code>regsafe()</code>, <code>range_within()</code>, infinite-loop detection</td></tr>
+      <tr><td><code>backtrack.c</code></td><td>Jump history and precision backtracking (<code>bpf_mark_chain_precision()</code>)</td></tr>
+      <tr><td><code>liveness.c</code></td><td>Register and stack-slot liveness used to make states equal more often</td></tr>
+      <tr><td><code>loops.c</code>, <code>scev.c</code></td><td>Dominators, loop nests, and scalar-evolution loop widening (new in 2026)</td></tr>
+      <tr><td><code>const_fold.c</code></td><td>Forward constant propagation before the main pass</td></tr>
+      <tr><td><code>tnum.c</code>, <code>cnum.c</code>, <code>cnum_defs.h</code></td><td>The numeric abstract domains: tristate numbers and circular ranges</td></tr>
+      <tr><td><code>fixups.c</code></td><td>Post-verification rewrites, including <code>inline_bpf_loop()</code></td></tr>
+      <tr><td><code>log.c</code>, <code>diagnostics.c</code></td><td>The text log you read, and (since v7.3) structured diagnostic reports</td></tr>
+      <tr><td><code>include/linux/bpf_verifier.h</code></td><td><code>struct bpf_reg_state</code>, <code>struct bpf_verifier_state</code>, <code>struct bpf_verifier_env</code></td></tr>
+      <tr><td><code>include/linux/bpf.h</code></td><td><code>enum bpf_reg_type</code>, helper prototypes (<code>struct bpf_func_proto</code>), <code>BPF_COMPLEXITY_LIMIT_INSNS</code></td></tr>
+      <tr><td><code>Documentation/bpf/verifier.rst</code></td><td>The official prose description, published at docs.kernel.org/bpf/verifier.html</td></tr>
+    </table>
+
+    <h2>Pass 1: the control-flow graph check</h2>
+    <p>The first pass never looks at values. It treats the program as a directed graph: each
+      instruction is a node, and edges go to the next instruction and to jump targets. A
+      non-recursive depth-first search (<code>bpf_check_cfg()</code>) labels each node
+      <em>discovered</em> when it is pushed and <em>explored</em> when all its successors are done.
+      During the walk it rejects:</p>
+    <ul>
+      <li>jumps outside the program (<code>jump out of range from insn 3 to 99</code>);</li>
+      <li>jumps into the second half of a 16-byte <code>ld_imm64</code> instruction;</li>
+      <li>instructions that no path reaches (<code>unreachable insn 7</code>). Classic BPF allowed
+        dead code, but eBPF does not, because an unverified island of code is a gadget waiting to be
+        reached by a bug elsewhere;</li>
+      <li>a <strong>back-edge</strong>, which is an edge to a node that is still <em>discovered</em>
+        (on the DFS stack). A back-edge means a loop. Since 5.3, back-edges are allowed for
+        privileged loaders (<code>CAP_BPF</code>), and the second pass then has to prove the loop
+        terminates. Unprivileged programs must still be loop-free.</li>
+    </ul>
+    <pre data-file="linux/kernel/bpf/cfg.c"><code class="language-c">	if (insn_state[w] == 0) {
+		/* tree-edge */
+		insn_state[t] = DISCOVERED | e;
+		insn_state[w] = DISCOVERED;
+		if (env-&gt;cfg.cur_stack &gt;= env-&gt;prog-&gt;len)
+			return -E2BIG;
+		insn_stack[env-&gt;cfg.cur_stack++] = w;
+		return KEEP_EXPLORING;
+	} else if ((insn_state[w] &amp; 0xF0) == DISCOVERED) {
+		if (env-&gt;bpf_capable)
+			return DONE_EXPLORING;
+		verbose_linfo(env, t, "%d: ", t);
+		verbose_linfo(env, w, "%d: ", w);
+		verbose(env, "back-edge from insn %d to %d\n", t, w);
+/* ... */
+		return -EINVAL;
+	} else if (insn_state[w] == EXPLORED) {
+		/* forward- or cross-edge */
+		insn_state[t] = DISCOVERED | e;
+	}</code></pre>
+    <p>The same walk also records <em>prune points</em> and <em>jump points</em>: jump targets and
+      the instructions after calls are marked with <code>mark_prune_point()</code>. Pass 2 saves
+      states for pruning only at these points, so this cheap graph pass decides where the expensive
+      pass may stop early.</p>
+
+    <h2>Pass 2: path-by-path symbolic execution</h2>
+    <p>The second pass, <code>do_check()</code>, is where the real work happens. It starts at
+      instruction 0 with an initial state: <code>R1</code> holds a pointer to the program's context
+      (type <code>PTR_TO_CTX</code>), <code>R10</code> is the read-only frame pointer, and every other
+      register is <code>NOT_INIT</code>. Then it steps through instructions one at a time. For each one
+      it checks that the operation is legal on the current abstract state and computes the next
+      state:</p>
+    <ul>
+      <li>An <strong>ALU</strong> instruction updates the destination's type and value bounds.
+        Pointer plus constant stays a pointer with a larger offset. Pointer plus pointer becomes a
+        plain scalar, which is forbidden for unprivileged loaders.</li>
+      <li>A <strong>load or store</strong> is checked against the base register's type. A context
+        access is checked by the program type's <code>is_valid_access()</code> callback, a stack access
+        against the 512-byte frame and the slot's initialisation state, a map-value access against
+        <code>value_size</code>, a packet access against the proven range.</li>
+      <li>A <strong>call</strong> checks every argument register against the helper's prototype,
+        then marks <code>R1</code>–<code>R5</code> <code>NOT_INIT</code> (caller-saved) and sets
+        <code>R0</code> to the helper's return type.</li>
+      <li>A <strong>conditional jump</strong> is the interesting case. If the verifier can decide the
+        outcome from the abstract values, for example <code>if r0 &gt; 10</code> when
+        <code>r0</code> is known to be at most 5, it follows only that branch
+        (<code>is_branch_taken()</code>). Otherwise it copies the whole state, refines each copy with
+        what the branch condition implies, follows the fall-through side, and pushes the other side on
+        a stack (<code>push_stack()</code>) to explore later.</li>
+      <li><strong><code>exit</code></strong> checks that <code>R0</code> holds a legal return value
+        for the program type and that no references are leaked. Then the verifier pops the next
+        pending branch and continues from there.</li>
+    </ul>
+    <p>When the stack is empty, every path has been checked and the program is accepted. This is
+      <em>path-sensitive</em> analysis: unlike a classic compiler data-flow analysis, it does not merge
+      states at join points by default. That makes it very precise; it knows that on <em>this</em>
+      path <code>r0</code> was NULL-checked. The price is a number of paths that is exponential in the
+      number of branches. Pruning, covered below, is what makes this affordable.</p>
+
+    <figure>
+      <svg viewBox="0 0 860 280" role="img" aria-label="Exploration tree: branches push states, pruning cuts paths that reach a known-safe state">
+        <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-fillacc2"/></marker></defs>
+        <circle cx="90" cy="140" r="22" class="d-box"/><text x="90" y="145" text-anchor="middle" class="d-m">0</text>
+        <circle cx="230" cy="140" r="22" class="d-box"/><text x="230" y="145" text-anchor="middle" class="d-m">br A</text>
+        <circle cx="380" cy="70" r="22" class="d-box"/><text x="380" y="75" text-anchor="middle" class="d-m">br B</text>
+        <circle cx="380" cy="210" r="22" class="d-box"/><text x="380" y="215" text-anchor="middle" class="d-m">…</text>
+        <circle cx="560" cy="40" r="22" class="d-box"/><text x="560" y="45" text-anchor="middle" class="d-m">P</text>
+        <circle cx="560" cy="120" r="22" class="d-box"/><text x="560" y="125" text-anchor="middle" class="d-m">P</text>
+        <circle cx="560" cy="210" r="22" class="d-box"/><text x="560" y="215" text-anchor="middle" class="d-m">P</text>
+        <rect x="660" y="20" width="180" height="40" rx="8" class="d-box"/><text x="750" y="45" text-anchor="middle" class="d-t">… → exit ✓</text>
+        <path d="M112,140 L206,140" class="d-acc2" marker-end="url(#ar2)"/>
+        <path d="M250,128 L358,80" class="d-acc2" marker-end="url(#ar2)"/>
+        <path d="M250,152 L358,200" class="d-dash" marker-end="url(#ar2)"/>
+        <path d="M400,60 L536,45" class="d-acc2" marker-end="url(#ar2)"/>
+        <path d="M400,80 L536,115" class="d-dash" marker-end="url(#ar2)"/>
+        <path d="M402,210 L536,210" class="d-dash" marker-end="url(#ar2)"/>
+        <path d="M582,40 L658,40" class="d-acc2" marker-end="url(#ar2)"/>
+        <text x="600" y="125" class="d-h">pruned: state ⊑ saved state at P</text>
+        <text x="600" y="215" class="d-h">pruned</text>
+        <rect x="40" y="235" width="300" height="34" rx="6" class="d-box"/>
+        <text x="190" y="257" text-anchor="middle" class="d-s">solid: explored first · dashed: pushed on the stack</text>
+        <text x="460" y="268" class="d-s">P = prune point (a jump target). The first visit saves its state there.</text>
+      </svg>
+      <figcaption>Figure 03.2 — Pass 2 explores one path to <code>exit</code>, then pops pending branches
+        from its stack. When a popped path reaches a prune point in a state that is covered by a state
+        already proven safe there, it stops at once.</figcaption>
+    </figure>
+
+    <h3>Register state types</h3>
+    <p>Every register in the abstract state carries an <code>enum bpf_reg_type</code>. This is the
+      first and coarsest abstract domain: it says what <em>kind</em> of value the register holds. Here
+      is the list at the commit studied, trimmed:</p>
+    <pre data-file="linux/include/linux/bpf.h"><code class="language-c">enum bpf_reg_type {
+	NOT_INIT = 0,		 /* nothing was written into register */
+	SCALAR_VALUE,		 /* reg doesn't contain a valid pointer */
+	PTR_TO_CTX,		 /* reg points to bpf_context */
+	CONST_PTR_TO_MAP,	 /* reg points to struct bpf_map */
+	PTR_TO_MAP_VALUE,	 /* reg points to map element value */
+	PTR_TO_MAP_KEY,		 /* reg points to a map element key */
+	PTR_TO_STACK,		 /* reg == frame_pointer + offset */
+	PTR_TO_PACKET_META,	 /* skb-&gt;data - meta_len */
+	PTR_TO_PACKET,		 /* reg points to skb-&gt;data */
+	PTR_TO_PACKET_END,	 /* skb-&gt;data + headlen */
+	PTR_TO_FLOW_KEYS,	 /* reg points to bpf_flow_keys */
+	PTR_TO_SOCKET,		 /* reg points to struct bpf_sock */
+/* ... */
+	PTR_TO_BTF_ID,
+	PTR_TO_MEM,		 /* reg points to valid memory region */
+	PTR_TO_ARENA,
+	PTR_TO_BUF,		 /* reg points to a read/write buffer */
+	PTR_TO_FUNC,		 /* reg points to a bpf program function */
+/* ... */
+	__BPF_REG_TYPE_MAX,
+
+	/* Extended reg_types. */
+	PTR_TO_MAP_VALUE_OR_NULL	= PTR_MAYBE_NULL | PTR_TO_MAP_VALUE,
+	PTR_TO_SOCKET_OR_NULL		= PTR_MAYBE_NULL | PTR_TO_SOCKET,
+/* ... */
+};</code></pre>
+    <p>The types fall into a few families:</p>
+    <table>
+      <tr><th>Type</th><th>Log spelling</th><th>Typical origin</th><th>What you may do with it</th></tr>
+      <tr><td><code>NOT_INIT</code></td><td>(not printed)</td><td>start of program; R1–R5 after a call</td><td>nothing; reading it gives <code>R2 !read_ok</code></td></tr>
+      <tr><td><code>SCALAR_VALUE</code></td><td><code>scalar(...)</code> or a constant like <code>0</code></td><td>immediates, arithmetic, loaded data</td><td>arithmetic, comparisons, use as an offset if bounded; never dereference</td></tr>
+      <tr><td><code>PTR_TO_CTX</code></td><td><code>ctx()</code></td><td><code>R1</code> at entry</td><td>loads/stores at offsets allowed by the program type</td></tr>
+      <tr><td><code>CONST_PTR_TO_MAP</code></td><td><code>map_ptr(ks=..,vs=..)</code></td><td><code>ld_imm64</code> with a map fd</td><td>pass to map helpers</td></tr>
+      <tr><td><code>PTR_TO_MAP_VALUE</code> (+ <code>PTR_MAYBE_NULL</code>)</td><td><code>map_value</code> / <code>map_value_or_null</code></td><td><code>bpf_map_lookup_elem()</code></td><td>access inside <code>[0, value_size)</code>, only after a NULL check</td></tr>
+      <tr><td><code>PTR_TO_STACK</code></td><td><code>fp-8</code></td><td><code>R10</code> plus a constant</td><td>access inside the 512-byte frame; reads only of written slots</td></tr>
+      <tr><td><code>PTR_TO_PACKET</code>, <code>PTR_TO_PACKET_END</code></td><td><code>pkt(off=..,r=..)</code>, <code>pkt_end</code></td><td>loading <code>ctx-&gt;data</code> / <code>ctx-&gt;data_end</code></td><td>access within the range <code>r</code> proven by comparing against <code>pkt_end</code></td></tr>
+      <tr><td><code>PTR_TO_BTF_ID</code></td><td><code>ptr_task_struct(...)</code></td><td>tracing arguments, kfunc returns</td><td>typed reads checked against BTF; faults are handled at run time</td></tr>
+      <tr><td><code>PTR_TO_MEM</code>, <code>PTR_TO_BUF</code></td><td><code>mem(sz=..)</code></td><td>ring buffer reserve, dynptr slices</td><td>access within the known size</td></tr>
+    </table>
+    <p>Since late 2021 (<code>c25b2ae13603</code>), "or NULL" is not a separate type but a flag,
+      <code>PTR_MAYBE_NULL</code>, combined with a base type. Other flags such as
+      <code>MEM_RDONLY</code> follow the same pattern. That is why the log prints
+      <code>map_value_or_null</code>: the base type is <code>map_value</code>, plus the maybe-NULL
+      flag.</p>
+
+    <h3>Reading the state in a log line</h3>
+    <p>With <code>log_level</code> 1 or 2, the verifier prints the state after each instruction.
+      The notation is compact:</p>
+    <pre><code class="nohighlight">6: (85) call bpf_map_lookup_elem#1    ; R0_w=map_value_or_null(id=1,off=0,ks=4,vs=8,imm=0)
+1: (63) *(u32 *)(r10 -4) = r1         ; R1_w=0 R10=fp0 fp-8=0000????
+12: (25) if r0 &gt; 0xf goto pc+5        ; R0_w=scalar(umax=15,var_off=(0x0; 0xf))</code></pre>
+    <ul>
+      <li><code>6:</code> is the instruction index, <code>(85)</code> the opcode byte, then the
+        disassembly.</li>
+      <li><code>R0_w</code>: the <code>_w</code> suffix means "written in the current state". Older
+        logs also print <code>_r</code> and <code>_rw</code>; these are liveness marks.</li>
+      <li><code>id=1</code> ties together registers that hold copies of the same pointer or
+        scalar, so that a check on one also refines the others.</li>
+      <li><code>ks</code>/<code>vs</code> are the map's key and value sizes.</li>
+      <li><code>fp-8=0000????</code> describes the 8-byte stack slot at <code>fp-8</code> byte by
+        byte, highest address first: <code>0</code> is a known zero, <code>?</code> is
+        uninitialised, <code>m</code> is "misc" (written with unknown data), <code>r</code> would be
+        a spilled register.</li>
+      <li><code>scalar(umax=15,var_off=(0x0; 0xf))</code> is a number with unsigned maximum 15 and
+        known bits given as a tnum <code>(value; mask)</code>. Bounds that are not interesting
+        (for example <code>umin=0</code>) are left out.</li>
+      <li><code>P</code> before a type (<code>Pscalar()</code>) marks a register as
+        <em>precise</em>; see <a href="#precision-tracking">precision tracking</a>.</li>
+    </ul>
+
+    <h2>Tracking numbers: tnums and ranges</h2>
+    <p>Types alone cannot prove that <code>array[i]</code> is safe. For that the verifier must know
+      something about the value of <code>i</code>. Every register of type <code>SCALAR_VALUE</code>,
+      and the variable part of every pointer's offset, is described by <strong>two kinds of
+      abstraction at once</strong>, kept in sync after every operation:</p>
+    <ol>
+      <li>a <strong>tnum</strong> ("tracked" or "tristate" number), which records which
+        <em>bits</em> are known to be 0, known to be 1, or unknown;</li>
+      <li><strong>ranges</strong>: signed and unsigned minimum and maximum, each in a 64-bit and a
+        32-bit version. That is eight numbers: <code>smin/smax</code>, <code>umin/umax</code>,
+        <code>s32_min/s32_max</code>, <code>u32_min/u32_max</code>.</li>
+    </ol>
+    <p>Edward Cree introduced the current design in Linux 4.14 (2017, commits
+      <code>f1174f77b50c</code> "bpf/verifier: rework value tracking" and <code>b03c9f9fdc37</code>
+      "bpf/verifier: track signed and unsigned min/max values"). John Fastabend added explicit
+      32-bit bounds in 2020 (<code>3f50f132d840</code>), because BPF has 32-bit ALU instructions
+      (<code>w0 += 1</code>) whose results wrap at 2<sup>32</sup> and are then zero-extended.</p>
+
+    <h3>Tristate numbers</h3>
+    <p>A tnum is two 64-bit words. A bit set in <code>mask</code> is unknown; where
+      <code>mask</code> is 0, the bit's value is given by <code>value</code>. The invariant is
+      <code>value &amp; mask == 0</code>.</p>
+    <pre data-file="linux/include/linux/tnum.h"><code class="language-c">/* tnum: tracked (or tristate) numbers
+ *
+ * A tnum tracks knowledge about the bits of a value.  Each bit can be either
+ * known (0 or 1), or unknown (x).  Arithmetic operations on tnums will
+ * propagate the unknown bits such that the tnum result represents all the
+ * possible results for possible values of the operands.
+ */
+/* ... */
+struct tnum {
+	u64 value;
+	u64 mask;
+};</code></pre>
+    <p>Bitwise operations are easy to define on tnums. AND, for instance, gives a known 0 wherever
+      either input has a known 0. Shifts by a constant move both words. Addition is the clever one,
+      because carries can turn known bits into unknown bits. The kernel's version runs in constant
+      time with no loop over bits:</p>
+    <pre data-file="linux/kernel/bpf/tnum.c"><code class="language-c">struct tnum tnum_add(struct tnum a, struct tnum b)
+{
+	u64 sm, sv, sigma, chi, mu;
+
+	sm = a.mask + b.mask;
+	sv = a.value + b.value;
+	sigma = sm + sv;
+	chi = sigma ^ sv;
+	mu = chi | a.mask | b.mask;
+	return TNUM(sv &amp; ~mu, mu);
+}</code></pre>
+    <p><code>sv</code> is the sum with every unknown bit taken as 0; <code>sigma</code> is the sum
+      with every unknown bit taken as 1. Any bit where those two extremes differ (<code>chi</code>)
+      might have been reached by a carry, so it becomes unknown. Bits unknown in either input stay
+      unknown.</p>
+    <p><strong>A worked tnum example.</strong> Let <code>a = 0b1xx</code>, so the value is
+      one of 4, 5, 6 or 7 (<code>value=0b100, mask=0b011</code>), and add the constant
+      <code>b = 1</code>:</p>
+    <pre><code class="nohighlight">sm    = 0b011 + 0b000          = 0b0011
+sv    = 0b100 + 0b001          = 0b0101
+sigma = sm + sv                = 0b1000
+chi   = sigma ^ sv             = 0b1101
+mu    = chi | 0b011 | 0b000    = 0b1111
+result: value = sv &amp; ~mu = 0,  mask = 0b1111   →  "xxxx" (any of 0..15)</code></pre>
+    <p>The true results are {5, 6, 7, 8}. The tnum <code>xxxx</code> is the smallest tnum that
+      contains all four (the CGO 2022 paper below proves that <code>tnum_add</code> is optimal in
+      this sense), yet it also contains 0 and 15. That is why the verifier does not rely on tnums
+      alone. The interval domain computes <code>umin = 4+1 = 5</code>, <code>umax = 7+1 = 8</code>
+      for the same addition, and the two domains then tighten each other. In the other direction,
+      tnums are better at bit-level facts that intervals cannot express. After
+      <code>x &amp;= 0xf0</code>, an interval says "0 to 240", while the tnum says "a multiple of 16
+      that is at most 240", and the alignment check needs exactly that.</p>
+
+    <div id="tnum-lab">
+      <strong>Try it: an 8-bit tnum calculator</strong>
+      <p style="margin:.3rem 0;color:var(--muted);font-size:.9rem">Type each operand as 8 characters
+        of <code>0</code>, <code>1</code> or <code>x</code> (most significant bit first). The widget
+        applies the kernel's formulas for add, sub, and, or and xor, reduced to 8 bits, and compares
+        the result with the exact set of results computed by brute force.</p>
+      <div class="row">
+        <label>a <input id="tl-a" value="000001xx" size="10" maxlength="8"></label>
+        <select id="tl-op"><option>add</option><option>sub</option><option>and</option><option>or</option><option>xor</option></select>
+        <label>b <input id="tl-b" value="00000001" size="10" maxlength="8"></label>
+      </div>
+      <output id="tl-out"></output>
+    </div>
+
+    <h3>Signed and unsigned, 64-bit and 32-bit ranges</h3>
+    <p>Why keep both signed and unsigned bounds? Because BPF has both signed and unsigned
+      comparisons (<code>JSGT</code> and <code>JGT</code>), and the same 64 bits mean very different
+      things under each. The value <code>0xffff_ffff_ffff_fff0</code> is a huge unsigned number and
+      the signed number −16. A bounds check written with a signed comparison,
+      <code>if ((s64)i &lt; 64)</code>, teaches the verifier nothing about the unsigned range,
+      because −16 passes it. This is the source of the error
+      <code>min value is negative, either use unsigned index or do a if (index &gt;=0) check</code>.</p>
+    <p>After every ALU operation and every branch, <code>reg_bounds_sync()</code> runs a small
+      fixed sequence of reductions: derive bounds from the tnum, derive signed from unsigned and
+      back, 32-bit from 64-bit and back, then tighten the tnum from the bounds. The CAV 2023 paper
+      discussed below found that this reduction is what keeps the verifier sound even where single
+      operators, taken alone, are not.</p>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">static void reg_bounds_sync(struct bpf_reg_state *reg)
+{
+	/* If the input reg_state is invalid, we can exit early */
+	if (range_bounds_violation(reg))
+		return;
+	/* We might have learned new bounds from the var_off. */
+	__update_reg_bounds(reg);
+	/* We might have learned something about the sign bit. */
+	__reg_deduce_bounds(reg);
+	__reg_deduce_bounds(reg);
+	/* We might have learned some bits from the bounds. */
+	__reg_bound_offset(reg);
+	/* Intersecting with the old var_off might have improved our bounds
+	 * slightly, e.g. if umax was 0x7f...f and var_off was (0; 0xf...fc),
+	 * then new var_off is (0; 0x7f...fc) which improves our umax.
+	 */
+	__update_reg_bounds(reg);
+/* ... */
+	__update_bounds_from_step(reg);
+}</code></pre>
+
+    <div class="callout warn"><span class="label">2026: circular numbers</span>
+      <p>If you read <code>struct bpf_reg_state</code> on current master you will not find the
+      eight fields <code>smin_value</code> … <code>u32_max_value</code>. Since Linux v7.2
+      (commit <code>256f0071f9b6</code>, Eduard Zingerman, April 2026) the ranges are stored as
+      two <strong>circular numbers</strong>, <code>struct cnum64 r64</code> and
+      <code>struct cnum32 r32</code>. Each is a <code>base</code> and a <code>size</code> describing
+      an arc on the wrap-around number circle, so a single value captures both the signed and the
+      unsigned view. The commit message says the idea came from a post by Shung-Hsi Yu and the
+      wrapped-intervals work of Navas et al., and that the operations were checked with the CBMC
+      model checker. Code now reads bounds through accessors such as <code>reg_umax(reg)</code>,
+      the log still prints <code>umax=</code> and friends, and the model in this section still
+      holds. Recent master also adds a <code>base</code>/<code>step</code> pair to describe values
+      of the form <em>base + k·step</em>.</p></div>
+    <pre data-file="linux/include/linux/bpf_verifier.h"><code class="language-c">	/* For scalar types (SCALAR_VALUE), this represents our knowledge of
+	 * the actual value.
+	 * For pointer types, this represents the variable part of the offset
+	 * from the pointed-to object, and is shared with all bpf_reg_states
+	 * with the same id as us.
+	 */
+	struct tnum var_off;
+	/* Used to determine if any memory access using this register will
+	 * result in a bad access.
+	 * These refer to the same value as var_off, not necessarily the actual
+	 * contents of the register.
+	 */
+	struct cnum64 r64; /* 64-bit range as circular number */
+	struct cnum32 r32; /* 32-bit range as circular number */
+/* ... */
+	/* if (!precise &amp;&amp; SCALAR_VALUE) min/max/tnum don't affect safety */
+	u32 precise:1;</code></pre>
+
+    <h3>Branches refine bounds</h3>
+    <p>A conditional jump is where most bounds come from. On the fall-through side of
+      <code>if r0 &gt; 15 goto L</code>, the verifier sets <code>umax = min(umax, 15)</code>; on
+      the taken side it sets <code>umin = max(umin, 16)</code>. <code>reg_bounds_sync()</code> then
+      converts the new <code>umax=15</code> into the tnum <code>(0x0; 0xf)</code>. If both operands
+      are registers that share an <code>id</code> with other registers (because one was copied from
+      another), the refinement is applied to all of them. For pointer comparisons against
+      <code>pkt_end</code> the verifier records a packet range instead; more on that below.</p>
+
+    <h3>A worked example, from a real log</h3>
+    <p>This program keeps a 16-slot histogram in a map value and bumps a random slot. It was
+      compiled with clang 14 and loaded on Linux 6.1 in this orb with <code>log_level=2</code>. The
+      program is illustrative, written for this chapter:</p>
+    <pre><code class="language-c">/* Illustrative program written for this chapter (idx_good.bpf.c). */
+struct slot { __u64 hist[16]; };
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct slot);
+} table SEC(".maps");
+
+SEC("xdp")
+int bump(struct xdp_md *ctx)
+{
+	__u32 key = 0;
+	struct slot *s = bpf_map_lookup_elem(&amp;table, &amp;key);
+	if (!s)
+		return XDP_PASS;
+	__u32 i = bpf_get_prandom_u32();
+	if (i &gt;= 16)			/* FIX: bound the index */
+		return XDP_PASS;
+	s-&gt;hist[i] += 1;
+	return XDP_PASS;
+}</code></pre>
+    <p>The interesting part of the verifier log (map address replaced by <code>…</code>):</p>
+    <pre><code class="nohighlight">9: (85) call bpf_get_prandom_u32#7    ; R0=scalar()
+10: (67) r0 &lt;&lt;= 32                    ; R0_w=scalar(smax=9223372032559808512,umax=18446744069414584320,var_off=(0x0; 0xffffffff00000000),s32_min=0,s32_max=0,u32_max=0)
+11: (77) r0 &gt;&gt;= 32                    ; R0_w=scalar(umax=4294967295,var_off=(0x0; 0xffffffff))
+; if (i &gt;= 16)			/* FIX: bound the index */
+12: (25) if r0 &gt; 0xf goto pc+5        ; R0_w=scalar(umax=15,var_off=(0x0; 0xf))
+; s-&gt;hist[i] += 1;
+13: (67) r0 &lt;&lt;= 3                     ; R0_w=scalar(umax=120,var_off=(0x0; 0x78))
+14: (0f) r6 += r0
+...
+15: R0_w=scalar(umax=120,var_off=(0x0; 0x78)) R6_w=map_value(off=0,ks=4,vs=128,umax=120,var_off=(0x0; 0x78))
+15: (79) r1 = *(u64 *)(r6 +0)         ; R1_w=scalar() R6_w=map_value(off=0,ks=4,vs=128,umax=120,var_off=(0x0; 0x78))</code></pre>
+    <p>Read it line by line:</p>
+    <ul>
+      <li><strong>9.</strong> The helper returns a 64-bit scalar about which nothing is known:
+        tnum <code>(0; 0xffff…ffff)</code>, full ranges.</li>
+      <li><strong>10–11.</strong> Clang zero-extends the <code>__u32</code> by shifting left and then
+        right by 32. After the left shift the low 32 bits are known zeros, which you can see in the
+        tnum mask <code>0xffffffff00000000</code> and in <code>u32_max=0</code>. After the logical
+        right shift the high 32 bits are known zeros: <code>umax=4294967295</code>, tnum mask
+        <code>0xffffffff</code>.</li>
+      <li><strong>12.</strong> On the fall-through path of <code>if r0 &gt; 0xf</code>, the verifier
+        learns <code>umax=15</code>, and the reduction turns that into the tnum
+        <code>(0x0; 0xf)</code>: only the low four bits are unknown.</li>
+      <li><strong>13.</strong> <code>r0 &lt;&lt;= 3</code> (×8, the element size) shifts the tnum to
+        <code>(0x0; 0x78)</code>, so the value is a multiple of 8 between 0 and 120.</li>
+      <li><strong>14–15.</strong> Adding the scalar to the map-value pointer moves the bounds into
+        the pointer's variable offset. At the 8-byte load the verifier checks the worst case:
+        <code>off + umax + size = 0 + 120 + 8 = 128 ≤ vs = 128</code>. The access is safe, and the
+        tnum also shows it is 8-byte aligned.</li>
+    </ul>
+    <p>The stepper below walks the whole program with the register state after each
+      instruction.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Entry state</h4>
+        <p>Before instruction 0. Only two registers are initialised.</p>
+        <table class="reg-table"><tr><th>Reg</th><th>State</th></tr>
+          <tr><td>R1</td><td class="chg">ctx(off=0)</td></tr>
+          <tr><td>R10</td><td class="chg">fp0 (frame pointer, read-only)</td></tr>
+          <tr><td>R0, R2–R9</td><td>NOT_INIT</td></tr></table>
+        <p>Reading any <code>NOT_INIT</code> register would fail with <code>R2 !read_ok</code>.</p></div>
+      <div class="step"><h4>2. Insns 0–1: build the key on the stack</h4>
+        <span class="insn-now">0: (b7) r1 = 0
+1: (63) *(u32 *)(r10 -4) = r1</span>
+        <table class="reg-table"><tr><th>Reg / slot</th><th>State</th></tr>
+          <tr><td>R1</td><td class="chg">0 (known constant)</td></tr>
+          <tr><td>fp-8</td><td class="chg">0000???? (bytes fp-4..fp-1 known zero; fp-8..fp-5 uninitialised)</td></tr></table>
+        <p>The store overwrites R1's old <code>ctx</code> type, which is fine because the program
+        no longer needs it. The stack slot now records which bytes have been written.</p></div>
+      <div class="step"><h4>3. Insns 2–3: pointer to the key</h4>
+        <span class="insn-now">2: (bf) r2 = r10
+3: (07) r2 += -4</span>
+        <table class="reg-table"><tr><th>Reg</th><th>State</th></tr>
+          <tr><td>R2</td><td class="chg">fp-4 (PTR_TO_STACK, constant offset −4)</td></tr></table>
+        <p>Frame pointer plus a constant stays a stack pointer with a known offset.</p></div>
+      <div class="step"><h4>4. Insn 4: load the map</h4>
+        <span class="insn-now">4: (18) r1 = 0xffff… (ld_imm64 with map fd, rewritten to the map address)</span>
+        <table class="reg-table"><tr><th>Reg</th><th>State</th></tr>
+          <tr><td>R1</td><td class="chg">map_ptr(ks=4, vs=128)</td></tr></table>
+        <p>The 16-byte <code>ld_imm64</code> occupies indices 4 and 5, which is why the next
+        instruction is 6.</p></div>
+      <div class="step"><h4>5. Insn 6: call bpf_map_lookup_elem</h4>
+        <span class="insn-now">6: (85) call bpf_map_lookup_elem#1</span>
+        <table class="reg-table"><tr><th>Reg</th><th>State</th></tr>
+          <tr><td>R0</td><td class="chg">map_value_or_null(id=1, ks=4, vs=128)</td></tr>
+          <tr><td>R1–R5</td><td class="chg">NOT_INIT (clobbered by the call)</td></tr></table>
+        <p>Argument checks: R1 must be <code>CONST_PTR_TO_MAP</code>; R2 must point to
+        <code>key_size</code> = 4 initialised stack bytes (fp-4..fp-1 are known zero, so it passes).
+        The return type from the helper's prototype is "map value or NULL". The fresh
+        <code>id=1</code> identifies this particular lookup result.</p></div>
+      <div class="step"><h4>6. Insns 7–8: copy and NULL check</h4>
+        <span class="insn-now">7: (bf) r6 = r0
+8: (15) if r6 == 0x0 goto pc+9</span>
+        <table class="reg-table"><tr><th>Reg</th><th>Fall-through (≠ 0)</th><th>Taken (== 0), pushed</th></tr>
+          <tr><td>R6</td><td class="chg">map_value(vs=128)</td><td class="chg">scalar 0</td></tr>
+          <tr><td>R0</td><td class="chg">map_value(vs=128)</td><td class="chg">scalar 0</td></tr></table>
+        <p>R0 and R6 share <code>id=1</code>, so the check on R6 converts both. The taken side is
+        pushed on the stack for later.</p></div>
+      <div class="step"><h4>7. Insns 9–11: a random u32</h4>
+        <span class="insn-now">9: (85) call bpf_get_prandom_u32#7
+10: (67) r0 &lt;&lt;= 32
+11: (77) r0 &gt;&gt;= 32</span>
+        <table class="reg-table"><tr><th>Reg</th><th>State after 11</th></tr>
+          <tr><td>R0</td><td class="chg">scalar(umax=4294967295, var_off=(0x0; 0xffffffff))</td></tr>
+          <tr><td>R6</td><td>map_value(vs=128) — callee-saved, survives the call</td></tr></table>
+        <p>R6–R9 keep their state across calls, which is why the compiler put the map pointer in
+        R6.</p></div>
+      <div class="step"><h4>8. Insn 12: the bounds check</h4>
+        <span class="insn-now">12: (25) if r0 &gt; 0xf goto pc+5</span>
+        <table class="reg-table"><tr><th>Reg</th><th>Fall-through (≤ 15)</th><th>Taken (&gt; 15), pushed</th></tr>
+          <tr><td>R0</td><td class="chg">scalar(umax=15, var_off=(0x0; 0xf))</td><td class="chg">scalar(umin=16, umax=4294967295)</td></tr></table>
+        <p>Both outcomes are possible, so the state forks again. Each copy is refined by the
+        condition and then reduced.</p></div>
+      <div class="step"><h4>9. Insn 13: scale by 8</h4>
+        <span class="insn-now">13: (67) r0 &lt;&lt;= 3</span>
+        <table class="reg-table"><tr><th>Reg</th><th>State</th></tr>
+          <tr><td>R0</td><td class="chg">scalar(umax=120, var_off=(0x0; 0x78))</td></tr></table>
+        <p>tnum <code>0000xxxx</code> shifted left by 3 becomes <code>0xxxx000</code>, which is
+        mask 0x78. The upper bound becomes 15 × 8 = 120.</p></div>
+      <div class="step"><h4>10. Insn 14: pointer + scalar, and precision</h4>
+        <span class="insn-now">14: (0f) r6 += r0</span>
+        <table class="reg-table"><tr><th>Reg</th><th>State</th></tr>
+          <tr><td>R6</td><td class="chg">map_value(off=0, vs=128, umax=120, var_off=(0x0; 0x78))</td></tr>
+          <tr><td>R0</td><td class="chg">Pscalar(umax=120, …) — marked precise</td></tr></table>
+        <p>The scalar's range now decides the safety of a pointer, so the verifier marks R0
+        <em>precise</em> and walks back through instructions 13, 12, 11, 10, 9 to mark the registers
+        it came from. That is the <code>regs=1 stack=0 before 13: …</code> section of the log.</p></div>
+      <div class="step"><h4>11. Insns 15–17: the access</h4>
+        <span class="insn-now">15: (79) r1 = *(u64 *)(r6 +0)
+16: (07) r1 += 1
+17: (7b) *(u64 *)(r6 +0) = r1</span>
+        <table class="reg-table"><tr><th>Check</th><th>Result</th></tr>
+          <tr><td>max offset + size ≤ value_size</td><td class="chg">0 + 120 + 8 = 128 ≤ 128 ✓</td></tr>
+          <tr><td>min offset ≥ 0</td><td class="chg">umin = 0 ✓</td></tr>
+          <tr><td>R1 after load</td><td>scalar() — map contents are unknown</td></tr></table></div>
+      <div class="step"><h4>12. Insns 18–19 and the pending branches</h4>
+        <span class="insn-now">18: (b7) r0 = 2
+19: (95) exit</span>
+        <p>R0 = 2 (<code>XDP_PASS</code>) is a valid XDP return code. Then the verifier pops the
+        branch from 12 (R0 ≥ 16): it goes straight to 18, sets R0 = 2 and exits safely. Finally it pops
+        the branch from 8 (NULL). At instruction 18 it finds a saved state that covers the current
+        one and prints <code>from 8 to 18: safe</code>; that path is pruned. Totals:
+        <code>processed 22 insns (limit 1000000) … total_states 2 peak_states 2</code>.</p></div>
+    </div>
+
+    <h2>NULL checks after a map lookup</h2>
+    <p><code>bpf_map_lookup_elem()</code> returns NULL when the key is absent. The verifier marks
+      the result <code>PTR_TO_MAP_VALUE | PTR_MAYBE_NULL</code> and gives it a fresh
+      <code>id</code>. The type forbids both dereference and pointer arithmetic, so the only useful
+      things you can do with it are compare it with 0, copy it, or pass it to a helper that accepts
+      NULL. When a comparison against 0 is seen, <code>mark_ptr_or_null_regs()</code> visits
+      <em>every</em> register and spilled stack slot in all frames that carries the same
+      <code>id</code>, and converts it either to a plain pointer (non-NULL branch) or to the scalar
+      0 (NULL branch):</p>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">static void mark_ptr_or_null_reg(struct bpf_func_state *state,
+				 struct bpf_reg_state *reg, u32 id,
+				 bool is_null)
+{
+	if (type_may_be_null(reg-&gt;type) &amp;&amp; reg-&gt;id == id &amp;&amp;
+	    (is_rcu_reg(reg) || !WARN_ON_ONCE(!reg-&gt;id))) {
+/* ... */
+		if (is_null) {
+			/* We don't need id from this point
+			 * onwards anymore, thus we should better reset it,
+			 * so that state pruning has chances to take effect.
+			 */
+			__mark_reg_known_zero(reg);
+			reg-&gt;type = SCALAR_VALUE;
+
+			return;
+		}
+
+		mark_ptr_not_null_reg(reg);
+/* ... */
+	}
+}</code></pre>
+
+    <figure>
+      <svg viewBox="0 0 860 220" role="img" aria-label="Type transitions on a NULL check">
+        <defs><marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-fillacc2"/></marker></defs>
+        <rect x="20" y="80" width="200" height="60" rx="8" class="d-box"/>
+        <text x="120" y="105" text-anchor="middle" class="d-m">call map_lookup_elem</text>
+        <text x="120" y="125" text-anchor="middle" class="d-s">args: map_ptr, fp-4</text>
+        <rect x="270" y="80" width="230" height="60" rx="8" class="d-acc"/>
+        <text x="385" y="105" text-anchor="middle" class="d-m">R0 = map_value_or_null</text>
+        <text x="385" y="125" text-anchor="middle" class="d-s">id=1 · deref ✗ · arithmetic ✗</text>
+        <rect x="580" y="20" width="260" height="60" rx="8" class="d-box"/>
+        <text x="710" y="45" text-anchor="middle" class="d-m">R0 = map_value</text>
+        <text x="710" y="65" text-anchor="middle" class="d-s">access [0, value_size) ✓</text>
+        <rect x="580" y="140" width="260" height="60" rx="8" class="d-box"/>
+        <text x="710" y="165" text-anchor="middle" class="d-m">R0 = scalar 0</text>
+        <text x="710" y="185" text-anchor="middle" class="d-s">deref → invalid mem access 'scalar'</text>
+        <path d="M220,110 L268,110" class="d-acc2" marker-end="url(#ar3)"/>
+        <path d="M500,100 L578,55" class="d-acc2" marker-end="url(#ar3)"/>
+        <path d="M500,120 L578,165" class="d-acc2" marker-end="url(#ar3)"/>
+        <text x="520" y="70" class="d-s">r0 != 0</text>
+        <text x="520" y="160" class="d-s">r0 == 0</text>
+        <text x="385" y="175" text-anchor="middle" class="d-s">also applied to every copy with id=1</text>
+        <text x="385" y="195" text-anchor="middle" class="d-s">(registers and stack spills, all frames)</text>
+      </svg>
+      <figcaption>Figure 03.3 — A NULL check splits one maybe-NULL state into two precise states. The
+        shared <code>id</code> is what lets a check on a copy (<code>r6 = r0; if r6 == 0</code>)
+        also refine the original.</figcaption>
+    </figure>
+    <p>Two practical consequences follow. First, you cannot do pointer arithmetic before the
+      check: <code>p = lookup(...) + 8; if (!p) ...</code> is rejected. CVE-2022-23222 was a bug in
+      exactly this area: some <code>*_OR_NULL</code> types allowed arithmetic, and an attacker could
+      turn a NULL into a non-NULL "valid" pointer. Second, compilers sometimes move the check
+      somewhere the verifier cannot connect to the pointer, for example by testing a value derived
+      from it. Keeping the check directly on the returned pointer avoids that.</p>
+
+    <h2>Packet bounds: data and data_end</h2>
+    <p>Networking programs (XDP, tc; see <a href="07-networking-xdp-tc.html">Chapter 07</a>) read
+      packet bytes directly through two pointers in the context: <code>data</code> (first byte) and
+      <code>data_end</code> (one past the last). The packet length is only known at run time, so the
+      verifier cannot check a packet access against a constant size as it does for map values.
+      Instead it gives every <code>PTR_TO_PACKET</code> register a <strong>range</strong>
+      <code>r</code>: the number of bytes after the packet start that this path has proven to
+      exist. It starts at 0. The only way to grow it is to compare a packet pointer against
+      <code>pkt_end</code>.</p>
+
+    <figure>
+      <svg viewBox="0 0 860 200" role="img" aria-label="Packet pointers and the proven range">
+        <rect x="60" y="70" width="740" height="50" rx="4" class="d-box"/>
+        <rect x="60" y="70" width="210" height="50" rx="4" class="d-acc"/>
+        <text x="165" y="100" text-anchor="middle" class="d-t">Ethernet header (14 B)</text>
+        <text x="520" y="100" text-anchor="middle" class="d-s">rest of the packet (length unknown to the verifier)</text>
+        <line x1="60" y1="40" x2="60" y2="70" class="d-line"/><text x="60" y="32" text-anchor="middle" class="d-m">data</text>
+        <line x1="270" y1="40" x2="270" y2="70" class="d-line"/><text x="270" y="32" text-anchor="middle" class="d-m">data + 14</text>
+        <line x1="800" y1="40" x2="800" y2="70" class="d-line"/><text x="800" y="32" text-anchor="middle" class="d-m">data_end</text>
+        <path d="M60,140 L270,140" class="d-acc2"/>
+        <line x1="60" y1="133" x2="60" y2="147" class="d-acc2"/><line x1="270" y1="133" x2="270" y2="147" class="d-acc2"/>
+        <text x="165" y="165" text-anchor="middle" class="d-h2">r = 14 after: if (data + 14 &gt; data_end) drop;</text>
+        <text x="540" y="165" text-anchor="middle" class="d-s">any access beyond r → "invalid access to packet"</text>
+      </svg>
+      <figcaption>Figure 03.4 — On the path where <code>data + 14 &lt;= data_end</code> holds, the
+        verifier records <code>r=14</code> on every packet pointer with the same <code>id</code>. An
+        access at offset <code>off</code> of <code>size</code> bytes is allowed when
+        <code>off + size ≤ r</code>.</figcaption>
+    </figure>
+    <p>The function that applies a successful comparison is <code>find_good_pkt_pointers()</code>.
+      Its comment lists the four comparison shapes the verifier recognises:</p>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">	/* Examples for register markings:
+	 *
+	 * pkt_data in dst register:
+	 *
+	 *   r2 = r3;
+	 *   r2 += 8;
+	 *   if (r2 &gt; pkt_end) goto &lt;handle exception&gt;
+	 *   &lt;access okay&gt;
+	 *
+	 *   r2 = r3;
+	 *   r2 += 8;
+	 *   if (r2 &lt; pkt_end) goto &lt;access okay&gt;
+	 *   &lt;handle exception&gt;
+	 *
+	 *   Where:
+	 *     r2 == dst_reg, pkt_end == src_reg
+	 *     r2=pkt(id=n,off=8,r=0)
+	 *     r3=pkt(id=n,off=0,r=0)
+/* ... */
+	 * Find register r3 and mark its range as r3=pkt(id=n,off=0,r=8)
+	 * or r3=pkt(id=n,off=0,r=8-1), so that range of bytes [r3, r3 + 8)
+	 * and [r3, r3 + 8-1) respectively is safe to access depending on
+	 * the check.
+	 */
+/* ... */
+	bpf_for_each_reg_in_vstate(vstate, state, reg, ({
+		if (reg-&gt;type == type &amp;&amp; reg-&gt;id == dst_reg-&gt;id)
+			/* keep the maximum range already checked */
+			reg-&gt;range = max(reg-&gt;range, new_range);
+	}));</code></pre>
+    <p>The function also refuses to record a range when the pointer's variable offset might exceed
+      <code>MAX_PACKET_OFF</code>, because a huge offset could wrap around and make
+      <code>ptr &lt; pkt_end</code> true for the wrong reason. In practice: add a variable offset,
+      such as a header length read from the packet, only after you have bounded it, for example
+      with <code>ihl &amp; 0xf</code> or an explicit comparison. Then compare the
+      <em>resulting</em> pointer against <code>data_end</code> again before using it.</p>
+
+    <h2>State pruning</h2>
+    <p>Without pruning, a program with 30 independent <code>if</code>s would need 2<sup>30</sup>
+      paths. Pruning rests on one observation. If the verifier has already proven that, starting
+      from instruction <em>i</em> in abstract state <em>S<sub>old</sub></em>, every continuation is
+      safe, then any new state <em>S<sub>cur</sub></em> at <em>i</em> that is <em>contained in</em>
+      <em>S<sub>old</sub></em> (every concrete state it describes is also described by
+      <em>S<sub>old</sub></em>) is safe too, and needs no further exploration.</p>
+    <p><code>bpf_is_state_visited()</code> runs at every prune point. It looks up the states saved
+      at that instruction, compares each with the current one via <code>states_equal()</code>,
+      which calls <code>regsafe()</code> per register and <code>stacksafe()</code> per stack slot,
+      and either prunes or saves the current state as a new checkpoint. The scalar case in
+      <code>regsafe()</code> shows the containment test directly:</p>
+    <pre data-file="linux/kernel/bpf/states.c"><code class="language-c">	if (rold-&gt;type != rcur-&gt;type)
+		return false;
+
+	switch (base_type(rold-&gt;type)) {
+	case SCALAR_VALUE:
+/* ... */
+		if (!rold-&gt;precise &amp;&amp; exact == NOT_EXACT)
+			return true;
+/* ... */
+		return range_within(rold, rcur) &amp;&amp; tnum_in(rold-&gt;var_off, rcur-&gt;var_off);
+/* ... */
+	case PTR_TO_PACKET_META:
+	case PTR_TO_PACKET:
+		/* We must have at least as much range as the old ptr
+		 * did, so that any accesses which were safe before are
+		 * still safe.  This is true even if old range &lt; old off,
+		 * since someone could have accessed through (ptr - k), or
+		 * even done ptr -= k in a register, to get a safe access.
+		 */</code></pre>
+    <p>A scalar is safe if its range and known bits fit inside the old ones. A packet pointer is
+      safe if it has <em>at least</em> as much proven range as before. A register that the old state
+      never read (<code>NOT_INIT</code> in the old state, or found dead by liveness analysis) matches
+      anything. The documentation gives a small example of why liveness matters: two paths reach
+      instruction 4 with <code>r0=1</code> and <code>r0=0</code>, but instruction 4 overwrites
+      <code>r0</code> before reading it, so the two states are equivalent. In real logs a pruned
+      path shows up as <code>from 7 to 11: safe</code>.</p>
+    <p>Saved states cost memory and comparison time, and the 2019 bounded-loops work reported that
+      most saved states never prune anything (LWN, "Bounded loops in BPF for the 5.3 kernel").
+      The verifier therefore saves states only at prune points, drops states that never matched,
+      and when it is inside a loop it adds new checkpoints only now and then.</p>
+
+    <h2>Precision tracking</h2>
+    <p>Pruning has a tension built in. To prune often, the comparison should ignore differences
+      that do not matter: whether <code>r7</code> was 3 or 4 is irrelevant if <code>r7</code> is
+      only ever stored into a map. If <code>r7</code> is later used as an array index, the
+      difference matters a lot. Since Linux 5.3 (<code>b5dc0163d8fd</code>, "bpf: precise
+      scalar_value tracking") the verifier tracks which scalars actually influence a safety
+      decision.</p>
+    <p>All scalars start <em>imprecise</em>. When a scalar's value is used in a way that affects
+      safety (as a pointer offset, a memory access size, a helper argument that must be a constant,
+      a return value with a required range, or a branch that is pruned because its outcome was
+      known), the verifier calls <code>bpf_mark_chain_precision()</code>. That function walks
+      <em>backward</em> through the recorded jump history and instructions, marking the register
+      and every register or stack slot it was computed from as precise, across parent states. In
+      the log this is the block of lines like:</p>
+    <pre><code class="nohighlight">14: (0f) r6 += r0
+last_idx 14 first_idx 10
+regs=1 stack=0 before 13: (67) r0 &lt;&lt;= 3
+regs=1 stack=0 before 12: (25) if r0 &gt; 0xf goto pc+5
+regs=1 stack=0 before 11: (77) r0 &gt;&gt;= 32
+regs=1 stack=0 before 10: (67) r0 &lt;&lt;= 32
+parent didn't have regs=1 stack=0 marks: R0_rw=Pscalar() R6_rw=map_value(off=0,ks=4,vs=128,imm=0) R10=fp0 fp-8=mmmm????
+last_idx 9 first_idx 0
+regs=1 stack=0 before 9: (85) call bpf_get_prandom_u32#7</code></pre>
+    <p><code>regs=1</code> is a bitmask: bit 0, which is R0. The walk stops at the call that
+      produced the value. <code>regsafe()</code> then compares ranges only for precise scalars (the
+      <code>if (!rold-&gt;precise …) return true;</code> line above). The kernel comment in
+      <code>backtrack.c</code> explains why it is enough to set precision on checkpointed parent
+      states:</p>
+    <pre data-file="linux/kernel/bpf/backtrack.c"><code class="language-c"> * One important and subtle aspect is that precise marks *do not matter* in
+ * the currently verified state (current state). It is important to understand
+ * why this is the case.
+ *
+ * First, note that current state is the state that is not yet "checkpointed",
+ * i.e., it is not yet put into env-&gt;explored_states, and it has no children
+ * states as well. It's ephemeral, and can end up either a) being discarded if
+ * compatible explored state is found at some point or BPF_EXIT instruction is
+ * reached or b) checkpointed and put into env-&gt;explored_states, branching out
+ * into one or more children states.</code></pre>
+    <p>Precision tracking is subtle and has had its share of fixes. A GitHub commit search for
+      "precision" in the kernel's BPF history turns up fixes in 2019, 2023 and 2026. Bugs here are
+      dangerous because a missing precision mark means a state is pruned when it should not be,
+      which makes the verifier unsound.</p>
+
+    <h2>Loops</h2>
+    <p>Termination is the hardest property, and the verifier's answer has changed several
+      times:</p>
+    <table>
+      <tr><th>Kernel</th><th>Mechanism</th><th>How termination is proven</th></tr>
+      <tr><td>before 5.3</td><td>no loops; developers used <code>#pragma unroll</code></td><td>the CFG is a DAG, so every path is finite</td></tr>
+      <tr><td>5.3 (2019)</td><td><strong>bounded loops</strong> (<code>2589726d12a1</code>)</td><td>the verifier simulates iterations as ordinary paths; each iteration must change the state, and the total must fit in the 1M-instruction budget</td></tr>
+      <tr><td>5.17 (2022)</td><td><code>bpf_loop(nr, callback, ctx, flags)</code> helper (<code>e6f2dd0f8067</code>)</td><td>the kernel runs the loop; the verifier checks the callback body once, with the index as an unknown scalar</td></tr>
+      <tr><td>6.4 (2023)</td><td>open-coded iterators, e.g. <code>bpf_for(i, 0, n)</code> (<code>06accc8779c1</code>)</td><td>iterator kfuncs whose <code>next()</code> eventually returns NULL; the verifier checks that the loop state converges</td></tr>
+      <tr><td>6.9 (2024)</td><td><code>may_goto</code> instruction, the <code>can_loop</code> macro (<code>011832b97b31</code>)</td><td>a hidden run-time counter bounds the iterations; the verifier may treat the loop like an iterator loop</td></tr>
+      <tr><td>7.4-rc1 (2026)</td><td>SCEV widening (<code>1501b536818b</code>, <code>6ccf49f79327</code>)</td><td>scalar-evolution expressions compute an iteration bound and widen induction variables, so the verifier need not walk every iteration</td></tr>
+    </table>
+    <p>The 5.3 design is a brute-force idea that fits the existing machinery. Back-edges are
+      allowed; the verifier follows them and keeps going, and each iteration is just more path.
+      To catch real infinite loops early, <code>bpf_is_state_visited()</code> checks whether the
+      current state at a loop header is <em>exactly</em> equal to an ancestor on the same path. If
+      the state did not change in a full iteration, the loop will never exit:</p>
+    <pre data-file="linux/kernel/bpf/states.c"><code class="language-c">			/* attempt to detect infinite loop to avoid unnecessary doomed work */
+			if (states_maybe_looping(&amp;sl-&gt;state, cur) &amp;&amp;
+			    states_equal(env, &amp;sl-&gt;state, cur, EXACT) &amp;&amp;
+			    !iter_active_depths_differ(&amp;sl-&gt;state, cur) &amp;&amp;
+			    sl-&gt;state.may_goto_depth == cur-&gt;may_goto_depth &amp;&amp;
+			    sl-&gt;state.callback_unroll_depth == cur-&gt;callback_unroll_depth) {
+				verbose_linfo(env, insn_idx, "; ");
+				verbose(env, "infinite loop detected at insn %d\n", insn_idx);</code></pre>
+    <p>Most loops do change the state: the counter grows. The verifier then keeps unrolling until
+      the exit condition becomes decidable, until the path stack of pending branches overflows
+      (<code>The sequence of 8193 jumps is too complex.</code>), or until it has processed a
+      million instructions (<code>BPF program is too large. Processed 1000001 insn</code>). A
+      loop up to a small constant is cheap; a loop up to an unknown <code>n</code> is not. That is
+      exactly the case <code>bpf_loop()</code> and iterators exist for. LWN's 2026 coverage of
+      Eduard Zingerman's scalar-evolution work describes the goal as letting the verifier handle
+      typical <code>for</code> and <code>while</code> loops without walking every iteration.</p>
+
+    <h2>The complexity limits</h2>
+    <p>The verifier runs in the kernel, in the context of the process that called
+      <code>bpf()</code>, so its own run time and memory must be bounded. The limits at the commit
+      studied:</p>
+    <table>
+      <tr><th>Limit</th><th>Value</th><th>Where</th><th>Error</th></tr>
+      <tr><td>Instructions <em>processed</em> during pass 2</td><td>1,000,000</td><td><code>BPF_COMPLEXITY_LIMIT_INSNS</code> in <code>include/linux/bpf.h</code> ("yes. 1M insns")</td><td><code>BPF program is too large. Processed 1000001 insn</code></td></tr>
+      <tr><td>Program size, privileged</td><td>1,000,000 insns</td><td><code>syscall.c</code>, same constant</td><td><code>-E2BIG</code></td></tr>
+      <tr><td>Program size, unprivileged</td><td>4,096 insns</td><td><code>BPF_MAXINSNS</code></td><td><code>-E2BIG</code></td></tr>
+      <tr><td>Pending branches on the stack</td><td>8,192</td><td><code>BPF_COMPLEXITY_LIMIT_JMP_SEQ</code></td><td><code>The sequence of 8193 jumps is too complex.</code></td></tr>
+      <tr><td>Stack per frame</td><td>512 bytes</td><td><code>MAX_BPF_STACK</code> (include/linux/filter.h; master adds <code>MAX_BPF_STACK_JIT</code> 2048 for JITs that support it)</td><td><code>combined stack size of N calls is M. Too large</code></td></tr>
+      <tr><td>Call frames</td><td>16 on master (8 in older kernels)</td><td><code>MAX_CALL_FRAMES</code></td><td>call stack too deep</td></tr>
+    </table>
+    <p>Note the difference between the first two rows. The 1M figure (raised to 1M in Linux 5.2 by commit <code>c04c0d2b968a</code>,
+      which also lifted the privileged program-size limit from 4k instructions) limits <em>work</em>, not size. A 200-instruction
+      program with a loop over an unknown bound can exceed it; a 50,000-instruction straight-line
+      program uses 50,000. The final line of every log reports the count:
+      <code>processed 22 insns (limit 1000000) max_states_per_insn 0 total_states 2 peak_states 2 mark_read 1</code>.
+      The kernel header comment at the top of <code>verifier.c</code> still says the analysis "is
+      limited to 64k insn"; that line is out of date.</p>
+
+    <h2>Privileged and unprivileged loading</h2>
+    <p>The verifier does not apply the same rules to everyone. At load time
+      <code>bpf_check()</code> samples the caller's capabilities (or a BPF token's delegated
+      capabilities) into flags on the verifier environment:</p>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">	env-&gt;allow_ptr_leaks = bpf_allow_ptr_leaks(env-&gt;prog-&gt;aux-&gt;token);
+	env-&gt;allow_uninit_stack = bpf_allow_uninit_stack(env-&gt;prog-&gt;aux-&gt;token);
+	env-&gt;bypass_spec_v1 = bpf_bypass_spec_v1(env-&gt;prog-&gt;aux-&gt;token);
+	env-&gt;bypass_spec_v4 = bpf_bypass_spec_v4(env-&gt;prog-&gt;aux-&gt;token);
+	env-&gt;bpf_capable = is_priv = bpf_token_capable(env-&gt;prog-&gt;aux-&gt;token, CAP_BPF);</code></pre>
+    <pre data-file="linux/include/linux/bpf.h"><code class="language-c">static inline bool bpf_allow_ptr_leaks(const struct bpf_token *token)
+{
+	return bpf_token_capable(token, CAP_PERFMON);
+}
+/* ... */
+static inline bool bpf_bypass_spec_v1(const struct bpf_token *token)
+{
+	return bpf_jit_bypass_spec_v1() ||
+		cpu_mitigations_off() ||
+		bpf_token_capable(token, CAP_PERFMON);
+}</code></pre>
+    <table>
+      <tr><th></th><th>Unprivileged</th><th><code>CAP_BPF</code></th><th><code>CAP_BPF</code> + <code>CAP_PERFMON</code></th></tr>
+      <tr><td>May load at all</td><td>only if <code>kernel.unprivileged_bpf_disabled = 0</code></td><td>yes</td><td>yes</td></tr>
+      <tr><td>Program types</td><td><code>SOCKET_FILTER</code>, <code>CGROUP_SKB</code> only</td><td>most; networking types also need <code>CAP_NET_ADMIN</code></td><td>plus tracing types</td></tr>
+      <tr><td>Program size</td><td>4,096</td><td>1M</td><td>1M</td></tr>
+      <tr><td>Back-edges / bounded loops</td><td>no</td><td>yes</td><td>yes</td></tr>
+      <tr><td>Pointer leaks, pointer comparisons, uninit stack reads</td><td>rejected</td><td>rejected</td><td>allowed</td></tr>
+      <tr><td>Spectre sanitation</td><td>applied</td><td>applied</td><td>skipped</td></tr>
+    </table>
+    <p>Unprivileged BPF has a long record of being a privilege-escalation route: most verifier
+      CVEs need it. Linux 5.13 added <code>CONFIG_BPF_UNPRIV_DEFAULT_OFF</code>
+      (<code>08389d888287</code>). With it, the sysctl <code>kernel.unprivileged_bpf_disabled</code>
+      defaults to 2, which means "disabled, but an administrator may re-enable it". The value 1
+      means "disabled until reboot". The orb used for this chapter reports 2.</p>
+
+    <h2>Spectre mitigations</h2>
+    <p>The verifier proves that an access is in bounds on every <em>architectural</em> path. A CPU
+      that speculates past a bounds check can still execute the access transiently and leak data
+      through the cache (Spectre variant 1), and a CPU can speculatively load stale data before a
+      preceding store resolves (variant 4, speculative store bypass). Because unprivileged users
+      could load programs, the verifier gained mitigations starting in January 2018:</p>
+    <ul>
+      <li><strong>Array index masking</strong> (<code>b2157399cc98</code>, v4.15): map lookups in
+        array maps are rewritten to AND the index with a mask, so a speculated out-of-range index
+        still lands inside the array.</li>
+      <li><strong>Pointer arithmetic sanitation</strong> (<code>979d63d50c0c</code>, 2019, and
+        later rework): for pointer ± unknown scalar, the verifier computes an
+        <code>alu_limit</code>, the largest offset that stays inside the object, and emits extra
+        instructions that clamp the offset to that limit without a branch. It also simulates the
+        <em>speculative</em> path where a branch goes the "wrong" way, as a special state with
+        <code>speculative = true</code>, to make sure even that path cannot reach out of
+        bounds.</li>
+      <li><strong>Speculative store bypass</strong> (<code>af86ca4e3088</code>, v4.17): the verifier
+        inserts a speculation barrier (<code>nospec</code>) after certain stack stores, so that a
+        later load cannot speculatively read the stale value that was there before.</li>
+    </ul>
+    <pre data-file="linux/kernel/bpf/verifier.c"><code class="language-c">static int sanitize_ptr_alu(struct bpf_verifier_env *env,
+			    struct bpf_insn *insn,
+			    const struct bpf_reg_state *ptr_reg,
+			    const struct bpf_reg_state *off_reg,
+			    struct bpf_reg_state *dst_reg,
+			    struct bpf_sanitize_info *info,
+			    const bool commit_window)
+{
+/* ... */
+	if (can_skip_alu_sanitation(env, insn))
+		return 0;
+/* ... */
+	if (!commit_window) {
+		if (!tnum_is_const(off_reg-&gt;var_off) &amp;&amp;
+		    (reg_smin(off_reg) &lt; 0) != (reg_smax(off_reg) &lt; 0))
+			return REASON_BOUNDS;
+/* ... */
+	}
+
+	err = retrieve_ptr_limit(env, ptr_reg, &amp;alu_limit, info-&gt;mask_to_left);
+/* ... */
+	/* Simulate and find potential out-of-bounds access under
+	 * speculative execution from truncation as a result of
+	 * masking when off was not within expected range. If off
+	 * sits in dst, then we temporarily need to move ptr there
+	 * to simulate dst (== 0) +/-= ptr. Needed, for example,
+	 * for cases where we use K-based arithmetic in one direction
+	 * and truncated reg-based in the other in order to explore
+	 * bad access.
+	 */</code></pre>
+    <p>The first check explains a message unprivileged users sometimes see: <code>R1 has unknown
+      scalar with mixed signed bounds</code>. The masking scheme cannot handle an offset that might
+      be either negative or positive. The cure is to make the sign known, for example by using an
+      unsigned type or by checking <code>&gt;= 0</code>. Privileged loaders with
+      <code>CAP_PERFMON</code>, and systems booted with <code>mitigations=off</code>, skip all of
+      this (<code>bypass_spec_v1/v4</code>).</p>
+
+    <h2>Reading common verifier errors</h2>
+    <p>Every rejection comes with the log of the path that failed. The last line is the error; the
+      lines above it show the state that led there. All the logs below were produced by real
+      loads on Linux 6.1 in the orb (programs written for this chapter, compiled with
+      <code>clang -O2 -g -target bpf</code>); each panel shows the failing program, its log, and the
+      fix.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="map_value_or_null">
+        <p><strong>Before</strong> (illustrative):</p>
+        <pre><code class="language-c">SEC("xdp")
+int count_packets(struct xdp_md *ctx)
+{
+	__u32 key = 0;
+	__u64 *val = bpf_map_lookup_elem(&amp;counters, &amp;key);
+	*val += 1;			/* BUG: val may be NULL */
+	return XDP_PASS;
+}</code></pre>
+        <pre><code class="nohighlight">6: (85) call bpf_map_lookup_elem#1    ; R0_w=map_value_or_null(id=1,off=0,ks=4,vs=8,imm=0)
+; *val += 1;			/* BUG: val may be NULL */
+7: (79) r1 = *(u64 *)(r0 +0)
+R0 invalid mem access 'map_value_or_null'
+processed 7 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0</code></pre>
+        <p><strong>After:</strong> test the returned pointer itself.</p>
+        <pre><code class="language-c">	__u64 *val = bpf_map_lookup_elem(&amp;counters, &amp;key);
+	if (!val)			/* FIX: NULL check */
+		return XDP_PASS;
+	*val += 1;</code></pre>
+        <pre><code class="nohighlight">7: (15) if r0 == 0x0 goto pc+3        ; R0_w=map_value(off=0,ks=4,vs=8,imm=0)
+8: (79) r1 = *(u64 *)(r0 +0)          ; R0_w=map_value(off=0,ks=4,vs=8,imm=0) R1_w=scalar()
+...
+from 7 to 11: safe
+processed 13 insns (limit 1000000) max_states_per_insn 0 total_states 1 peak_states 1 mark_read 0</code></pre>
+        <p>Related: <code>R0 invalid mem access 'scalar'</code> means you dereferenced a number,
+          often the NULL branch of a check that jumped to the wrong place. <code>'inv'</code> is the
+          spelling of the same thing in old logs.</p>
+      </div>
+      <div class="tab-panel" data-label="invalid access to packet">
+        <p><strong>Before</strong> (illustrative):</p>
+        <pre><code class="language-c">SEC("xdp")
+int parse_eth(struct xdp_md *ctx)
+{
+	void *data = (void *)(long)ctx-&gt;data;
+	void *data_end = (void *)(long)ctx-&gt;data_end;
+	struct ethhdr *eth = data;
+
+	/* BUG: no check that the 14-byte header fits before data_end */
+	if (eth-&gt;h_proto == bpf_htons(ETH_P_IP))
+		return XDP_PASS;
+	return XDP_DROP;
+}</code></pre>
+        <pre><code class="nohighlight">0: (61) r1 = *(u32 *)(r1 +0)          ; R1_w=pkt(off=0,r=0,imm=0)
+; if (eth-&gt;h_proto == bpf_htons(ETH_P_IP))
+1: (71) r2 = *(u8 *)(r1 +12)
+invalid access to packet, off=12 size=1, R1(id=0,off=12,r=0)
+R1 offset is outside of the packet</code></pre>
+        <p><code>r=0</code>: nothing has been proven about the packet length. (Clang even dropped
+          the unused <code>data_end</code> load.)</p>
+        <p><strong>After:</strong></p>
+        <pre><code class="language-c">	if ((void *)(eth + 1) &gt; data_end)	/* FIX: prove 14 bytes exist */
+		return XDP_DROP;
+	if (eth-&gt;h_proto == bpf_htons(ETH_P_IP))
+		return XDP_PASS;</code></pre>
+        <pre><code class="nohighlight">4: (07) r3 += 14                      ; R3_w=pkt(off=14,r=0,imm=0)
+5: (2d) if r3 &gt; r2 goto pc+7          ; R2_w=pkt_end(off=0,imm=0) R3_w=pkt(off=14,r=14,imm=0)
+6: (71) r2 = *(u8 *)(r1 +12)          ; R1_w=pkt(off=0,r=14,imm=0) R2_w=scalar(umax=255,var_off=(0x0; 0xff))</code></pre>
+      </div>
+      <div class="tab-panel" data-label="unbounded memory access">
+        <p><strong>Before</strong>: the histogram example from the stepper, without the bounds
+          check.</p>
+        <pre><code class="language-c">	__u32 i = bpf_get_prandom_u32();
+	s-&gt;hist[i] += 1;		/* BUG: i can be anything in [0, 2^32) */</code></pre>
+        <pre><code class="nohighlight">11: (77) r0 &gt;&gt;= 32                    ; R0_w=scalar(umax=4294967295,var_off=(0x0; 0xffffffff))
+12: (67) r0 &lt;&lt;= 3                     ; R0_w=scalar(umax=34359738360,var_off=(0x0; 0x7fffffff8),s32_max=2147483640,u32_max=-8)
+13: (0f) r6 += r0
+...
+14: (79) r1 = *(u64 *)(r6 +0)
+R6 unbounded memory access, make sure to bounds check any such access</code></pre>
+        <p><strong>After:</strong> <code>if (i &gt;= 16) return XDP_PASS;</code> as in the stepper,
+          or <code>i &amp;= 15;</code>. The mask version needs no branch, and the verifier learns
+          the tnum <code>(0x0; 0xf)</code> directly.</p>
+        <p>Variants of the same problem: <code>min value is negative, either use unsigned index or
+          do a if (index &gt;=0) check.</code> (a signed index), and <code>invalid access to map
+          value, value_size=128 off=128 size=8</code> (bounded, but off by one).</p>
+      </div>
+      <div class="tab-panel" data-label="loops">
+        <p><strong>Before</strong> (illustrative): a loop whose trip count is unknown.</p>
+        <pre><code class="language-c">	__u32 n = bpf_get_prandom_u32();	/* unknown trip count */
+	__u64 sum = 0;
+
+	for (__u32 i = 0; i &lt; n; i++) {	/* BUG: no constant upper bound */
+		__u8 *p = data + (i &amp; 0xff);
+		if ((void *)(p + 1) &gt; data_end)
+			break;
+		sum += *p;
+	}</code></pre>
+        <pre><code class="nohighlight">The sequence of 8193 jumps is too complex.
+verification time 25480 usec
+processed 122878 insns (limit 1000000) max_states_per_insn 4 total_states 1173 peak_states 1173 mark_read 2</code></pre>
+        <p>A variant with no branch in the body instead ran into the budget:
+          <code>BPF program is too large. Processed 1000001 insn</code>. A loop whose state never
+          changes, <code>r1 = 0; 1: if r1 == 0 goto 1b</code>, gave <code>infinite loop detected at
+          insn 1</code>. Unprivileged programs get <code>back-edge from insn X to Y</code> for any
+          loop.</p>
+        <p><strong>After, option 1:</strong> a constant bound. The log shows it accepted after 661
+          processed instructions.</p>
+        <pre><code class="language-c">	for (int i = 0; i &lt; 64; i++) {	/* FIX: constant bound */
+		__u8 *p = data + i;
+		if ((void *)(p + 1) &gt; data_end)
+			break;
+		sum += *p;
+	}</code></pre>
+        <p><strong>After, option 2:</strong> <code>bpf_loop()</code> (5.17+). The callback is
+          verified once. In this orb's kernel the load failed for an unrelated reason: the kernel has
+          no JIT, and the verifier says <code>callbacks are not allowed in non-JITed programs</code>.
+          So this version compiles, but its successful load was not observed here.</p>
+        <pre><code class="language-c">struct loop_ctx { void *data, *data_end; __u64 sum; };
+
+static long add_byte(__u64 i, void *arg)
+{
+	struct loop_ctx *lc = arg;
+	__u8 *p = lc-&gt;data + (i &amp; 0xff);
+
+	if ((void *)(p + 1) &gt; lc-&gt;data_end)
+		return 1;		/* 1 = stop iterating */
+	lc-&gt;sum += *p;
+	return 0;			/* 0 = continue */
+}
+/* ... in the program: */
+	bpf_loop(n, add_byte, &amp;lc, 0);</code></pre>
+      </div>
+    </div>
+
+    <p>A few more messages you will meet, all present as format strings in the current source:</p>
+    <table>
+      <tr><th>Message</th><th>Meaning</th><th>Usual fix</th></tr>
+      <tr><td><code>R2 !read_ok</code></td><td>Read of a <code>NOT_INIT</code> register, often R1–R5 after a call</td><td>Keep values you need across calls in R6–R9 (in C: use the variable after the call, and the compiler will)</td></tr>
+      <tr><td><code>invalid indirect read from stack off -8+0 size 8</code></td><td>A helper was given a pointer to uninitialised stack bytes, for example a struct key with padding</td><td><code>__builtin_memset(&amp;key, 0, sizeof(key))</code> before filling it</td></tr>
+      <tr><td><code>invalid stack off=8 size=8</code></td><td>Access above the frame pointer or below −512</td><td>Smaller stack objects, or a per-CPU array map as scratch space</td></tr>
+      <tr><td><code>math between map_value pointer and register with unbounded min value is not allowed</code></td><td>Pointer + scalar whose lower bound is unknown</td><td>Bound or mask the scalar first</td></tr>
+      <tr><td><code>Unreleased reference id=1 alloc_insn=7</code></td><td>A path reaches <code>exit</code> while still holding a reference (socket, ringbuf reservation, …)</td><td>Release (or submit/discard) on every path, including error paths</td></tr>
+      <tr><td><code>misaligned access off 4 size 8</code></td><td>Alignment violation under strict alignment</td><td>Align fields; use smaller loads</td></tr>
+      <tr><td><code>unreachable insn 7</code></td><td>Dead code, usually hand-written assembly</td><td>Remove it</td></tr>
+    </table>
+    <p>When the message alone does not tell you what went wrong, read the log upwards from the
+      error to the instruction where the offending register got its state. Usually that is a call,
+      a load, or a branch where a bound was not learned. <a href="17-bpfix.html">Chapter 17
+      (bpfix)</a> shows tooling that automates this diagnosis and proposes fixes with LLMs.</p>
+
+    <h2>Using the verifier: real commands</h2>
+    <p>You never call the verifier directly. It runs when the program is loaded. These are the
+      practical ways to see its output.</p>
+    <p><strong>Compile with debug info</strong> so the log interleaves C source lines
+      (<code>; *val += 1;</code>), which needs BTF line info:</p>
+    <pre><code class="language-bash">clang -O2 -g -target bpf -c prog.bpf.c -o prog.bpf.o</code></pre>
+    <p><strong>bpftool</strong> loads and pins an object. Its <code>-d</code>/<code>--debug</code>
+      option prints "logs from libbpf as well as from the verifier, when attempting to load
+      programs":</p>
+    <pre><code class="language-bash">sudo bpftool -d prog load prog.bpf.o /sys/fs/bpf/prog</code></pre>
+    <p><strong>libbpf</strong> prints the verifier log on failure by default. To get the full log
+      on success too, set a log level when opening the object, or per program with
+      <code>bpf_program__set_log_level()</code> and <code>bpf_program__set_log_buf()</code>. This
+      is the core of the loader used for this chapter's logs:</p>
+    <pre><code class="language-c">/* Illustrative loader (written for this chapter). Build: gcc loader.c -lbpf -lelf -lz */
+LIBBPF_OPTS(bpf_object_open_opts, o, .kernel_log_level = 1);
+struct bpf_object *obj = bpf_object__open_file(argv[1], &amp;o);
+static char buf[1 &lt;&lt; 22];
+struct bpf_program *p;
+
+bpf_object__for_each_program(p, obj) {
+	bpf_program__set_log_buf(p, buf, sizeof(buf));
+	bpf_program__set_log_level(p, 2);	/* 1 = log, 2 = full log of every path */
+}
+int err = bpf_object__load(obj);
+fputs(buf, stdout);</code></pre>
+    <p>Log level 1 (<code>BPF_LOG_LEVEL1</code>) prints the failing path, level 2 prints every
+      instruction of every path, and the flag 4 (<code>BPF_LOG_STATS</code>) prints only the summary
+      statistics. Level 4 is what you want for a loop that burns through a million instructions; at
+      level 1 the 4 MB buffer in the loader above overflowed (<code>-ENOSPC</code>).</p>
+    <p><strong>veristat</strong> lives in <code>tools/testing/selftests/bpf/</code> and is mirrored
+      as a standalone project at <a href="https://github.com/libbpf/veristat">libbpf/veristat</a>.
+      It loads every program in one or more object files and reports verdicts and complexity in a
+      table, which makes it the standard tool for "did my change make verification harder?".
+      Options at the studied commit include <code>-v</code> (verbose), <code>-l LEVEL</code>
+      (verifier log level), <code>-e SPEC</code> (columns to emit), <code>-C</code> (compare two
+      CSV runs) and <code>-f</code> (filter):</p>
+    <pre><code class="language-bash">sudo veristat prog.bpf.o                      # verdict, insns, states per program
+sudo veristat -e file,prog,verdict,insns,states -o csv old.bpf.o &gt; old.csv
+sudo veristat -e file,prog,verdict,insns,states -o csv new.bpf.o &gt; new.csv
+veristat -C old.csv new.csv                   # side-by-side diff
+sudo veristat -v -l 2 -f count_packets prog.bpf.o   # full log of one program</code></pre>
+    <p><strong>System settings:</strong></p>
+    <pre><code class="language-bash">cat /proc/sys/kernel/unprivileged_bpf_disabled   # 0 = allowed, 1 = off until reboot, 2 = off (admin may change)
+sudo sysctl kernel.unprivileged_bpf_disabled=1</code></pre>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefit: zero run-time cost</h4><p>Once accepted, the program runs as native JIT code with no bounds checks beyond the ones you wrote, plus the few Spectre masks. That is why XDP can run at line rate.</p></div>
+      <div class="card"><h4>Benefit: precise</h4><p>Path sensitivity and the combined tnum + range domains accept a lot of real-world C, including pointer arithmetic, variable-length parsing and loops.</p></div>
+      <div class="card"><h4>Benefit: one gatekeeper</h4><p>Every program type, from socket filters to sched_ext schedulers, goes through the same checker, parameterised by per-type callbacks and helper prototypes.</p></div>
+      <div class="card"><h4>Limit: false positives</h4><p>Safe programs get rejected, often after compiler optimisations reorder or spill values in ways the verifier cannot follow. Programs end up shaped to please the verifier.</p></div>
+      <div class="card"><h4>Limit: complexity cliffs</h4><p>Small changes can multiply the number of states, and a program that verified yesterday can hit the 1M limit after a new <code>if</code>. Verification time is not linear in program size.</p></div>
+      <div class="card"><h4>Limit: a large trusted base</h4><p>Tens of thousands of lines of intricate C run in the kernel. Bugs in it are kernel vulnerabilities, and the history of CVEs below shows they happen.</p></div>
+    </div>
+    <p>What the verifier does <em>not</em> check is just as important. It does not check that your
+      program is <em>correct</em>, that it does what you meant. It does not prevent a tracing program
+      from reading any kernel memory through <code>bpf_probe_read_kernel()</code> when the loader has
+      the right capabilities; that is a policy question. And it treats helpers and kfuncs as trusted
+      code: a bug inside a helper is not the verifier's to find.</p>
+
+    <h2>Research: checking and replacing the verifier</h2>
+    <p>Because the verifier is both security-critical and hard to get right, it has drawn steady
+      attention from the programming-languages and verification communities. Four lines of work
+      stand out.</p>
+
+    <h3>PREVAIL: abstract interpretation done "properly" (PLDI 2019)</h3>
+    <p>Gershuni, Amit, Gurfinkel, Narodytska, Navas, Rinetzky, Ryzhyk and Sagiv, <em>Simple and
+      Precise Static Analysis of Untrusted Linux Kernel Extensions</em>, PLDI 2019. The paper
+      argues that the Linux verifier's design, which enumerates paths with pruning, is fragile and
+      scales badly. It describes it as relying on "syntactic pattern matching and ad hoc case
+      analysis". PREVAIL instead uses classic abstract interpretation: states are
+      <em>joined</em> where paths merge and <em>widened</em> at loop heads, so the analysis runs
+      in polynomial time and handles loops naturally. For numeric facts the authors evaluated
+      several relational domains and chose the <em>zone</em> domain, which tracks constraints of
+      the form <code>x − y ≤ c</code>, such as "packet pointer + 14 ≤ data_end". On their 192
+      benchmark programs (from the Linux samples, Open vSwitch, Suricata and Cilium) plain
+      intervals failed 64 programs, while zones verified all but one. PREVAIL proves safety of
+      programs with loops but, in the paper's version, not termination. The authors report that
+      Linux's verifier was faster on those mostly-Linux-tuned benchmarks, while PREVAIL scaled
+      linearly on a synthetic loop where Linux's time grew until it hit its limit. PREVAIL lives on
+      as <a href="https://github.com/vbpf/prevail">vbpf/prevail</a> and is the verifier used by
+      <a href="https://github.com/microsoft/ebpf-for-windows">eBPF for Windows</a> (see
+      <a href="08-ecosystem.html">Chapter 08</a>). Its command-line tool runs on ELF objects, for
+      example <code>bin/prevail ebpf-samples/cilium/bpf_lxc.o 2/1</code> from its README.
+      <a href="18-ebpf-correctness-verifier.html">Chapter 18</a> uses PREVAIL together with Z3 to
+      validate program transformations.</p>
+
+    <h3>Tristate numbers made rigorous (CGO 2022)</h3>
+    <p>Vishwanathan, Shachnai, Narayana and Nagarakatte, <em>Sound, Precise, and Fast Abstract
+      Interpretation with Tristate Numbers</em>, CGO 2022. The paper formalises the tnum domain and
+      gives the first proofs that the kernel's <code>tnum_add</code> and <code>tnum_sub</code> are
+      sound and optimal: no smaller tnum contains all possible results. It also presents a new
+      tnum multiplication that is more precise and, by the paper's measurement, 33% faster on
+      average than the kernel's previous algorithm. That algorithm was merged into Linux as commit
+      <code>05924717ac70</code> ("bpf, tnums: Provably sound, faster, and more precise algorithm for
+      tnum_mul", v5.14). It is the loop you can see in <code>tnum_mul()</code> today.</p>
+
+    <h3>Agni: verifying the range analysis (CAV 2023)</h3>
+    <p>Vishwanathan, Shachnai, Narayana and Nagarakatte, <em>Verifying the Verifier: eBPF Range
+      Analysis Verification</em>, CAV 2023. The same group built
+      <a href="https://github.com/bpfverif/agni">Agni</a>, which extracts the semantics of the
+      verifier's value-tracking code <em>directly from the kernel's C source</em> (through LLVM IR)
+      into SMT formulas and asks Z3 whether each abstract operator is sound for every input. A key
+      finding: many operators, taken alone, are <em>not</em> sound. The verifier stays sound only
+      because the shared reduction (<code>reg_bounds_sync()</code> above) preconditions their
+      inputs. With that refinement, Agni checked 16 kernel versions from 4.14 to 5.19, proved the
+      range analysis sound for versions newer than 5.13, and found 27 previously unknown bugs in
+      older versions. When a check fails, Agni synthesises a short eBPF program that shows the
+      mismatch between abstract and concrete execution; it managed this for about 97% of the
+      violations.</p>
+
+    <h3>Testing the verifier: state embedding (OSDI 2024)</h3>
+    <p>Hao Sun and Zhendong Su, <em>Validating the eBPF Verifier via State Embedding</em>, OSDI
+      2024. Instead of proving operators sound, this work tests the whole verifier. It takes a
+      program the verifier accepted, records concrete states, and embeds checks into the program
+      that the verifier itself must prove. If the verifier then "proves" something that a concrete
+      run contradicts, it has a logic bug. The authors report 15 previously unknown bugs found in
+      one month, 10 already fixed, two of them exploitable for local privilege escalation.</p>
+
+    <h3>Verifier bugs in the wild</h3>
+    <p>The kernel's CVE history shows why this research matters. A few well-documented
+      examples:</p>
+    <table>
+      <tr><th>CVE</th><th>Bug</th><th>Fix commit</th></tr>
+      <tr><td>CVE-2017-16995</td><td>Incorrect sign extension in <code>check_alu_op()</code></td><td><code>95a762e2c8c9</code> (Jann Horn)</td></tr>
+      <tr><td>CVE-2020-8835</td><td>32-bit bounds were not restricted correctly (5.5+, backported to 5.4.7+); a Pwn2Own 2020 exploit, written up by Manfred Paul for ZDI</td><td><code>f2d67fec0b43</code> "Undo incorrect __reg_bound_offset32 handling"</td></tr>
+      <tr><td>CVE-2021-3490</td><td>ALU32 bounds tracking for AND/OR/XOR did not update 32-bit bounds</td><td><code>049c4e13714e</code></td></tr>
+      <tr><td>CVE-2021-31440</td><td>Incorrect propagation of 32-bit unsigned bounds from 64-bit bounds (ZDI), Linux 5.11</td><td><code>10bf4e83167c</code></td></tr>
+      <tr><td>CVE-2022-23222</td><td>Pointer arithmetic allowed on some <code>*_OR_NULL</code> types</td><td><code>64620e0a1e71</code> (as referenced by NVD)</td></tr>
+    </table>
+    <p>Nearly all of these sit in exactly the part of the verifier this chapter spent the most time
+      on: numeric bounds, especially the interaction between 32-bit and 64-bit views. That is also
+      the motivation behind the 2026 move to circular numbers checked with a model checker.</p>
+    <div class="callout tip"><span class="label">Where this continues</span>
+      <p><a href="17-bpfix.html">Chapter 17 · bpfix</a> starts from the error messages in this
+      chapter and uses LLMs to explain and repair verifier rejections.
+      <a href="18-ebpf-correctness-verifier.html">Chapter 18 · ebpf-correctness-verifier</a>
+      combines PREVAIL with Z3 to check that a program transformation preserves behaviour, a
+      correctness question the kernel verifier does not ask. <a href="14-bpftime-architecture.html">Chapter 14</a>
+      shows bpftime, a userspace runtime that reuses verifiers outside the kernel.</p></div>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> What does pass 1 (<code>bpf_check_cfg()</code>) look at?</p>
+        <button class="opt">Register types and value ranges along each path</button>
+        <button class="opt" data-right>Only the control-flow graph: jump targets, reachability and back-edges</button>
+        <button class="opt">Helper argument types</button>
+        <div class="why">Pass 1 is a depth-first search over the instruction graph. It never computes values; it rejects out-of-range jumps, unreachable instructions and (for unprivileged loaders) back-edges, and marks prune points for pass 2.</div></div>
+      <div class="q"><p><strong>Q2.</strong> After <code>if r0 &gt; 0xf goto L</code> on the fall-through path, and then <code>r0 &lt;&lt;= 3</code>, what is r0's tnum, assuming r0 started as an unknown u32?</p>
+        <button class="opt">(0x0; 0xf)</button>
+        <button class="opt" data-right>(0x0; 0x78)</button>
+        <button class="opt">(0x8; 0x70)</button>
+        <button class="opt">(0x0; 0xffffffff)</button>
+        <div class="why">The branch gives umax=15, which becomes tnum (0x0; 0xf). Shifting left by 3 moves the four unknown bits to positions 3–6: mask 0x78, so the value is a multiple of 8 in [0, 120]. The real log above shows exactly this.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does the verifier keep both signed and unsigned bounds?</p>
+        <button class="opt">For faster pruning only</button>
+        <button class="opt" data-right>BPF has signed and unsigned comparisons; a check in one interpretation says little about the other (−16 is a huge unsigned number)</button>
+        <button class="opt">Because the JIT needs them to pick instructions</button>
+        <div class="why">A signed check like <code>if ((s64)i &lt; 64)</code> leaves negative values, which are huge as unsigned offsets. Tracking both views, and deducing one from the other, lets each kind of comparison contribute what it actually proves.</div></div>
+      <div class="q"><p><strong>Q4.</strong> When may the verifier stop exploring a path at a prune point?</p>
+        <button class="opt">When the current state is exactly equal to a saved one, bit for bit</button>
+        <button class="opt">After 64 visits to the same instruction</button>
+        <button class="opt" data-right>When the current state is contained in a saved state already proven safe there, comparing ranges only for precise scalars</button>
+        <div class="why"><code>regsafe()</code> tests containment: ranges and tnums inside the old ones, packet range at least as large, same pointer types. Imprecise scalars match anything, which is why precision tracking exists. Exact equality is used only to detect infinite loops.</div></div>
+      <div class="q"><p><strong>Q5.</strong> A privileged XDP program loops <code>for (i = 0; i &lt; n; i++)</code> with <code>n</code> from <code>bpf_get_prandom_u32()</code>, and the body is branch-free. What is the most likely result?</p>
+        <button class="opt">back-edge from insn X to Y</button>
+        <button class="opt" data-right>BPF program is too large. Processed 1000001 insn</button>
+        <button class="opt">Accepted; bounded loops can use any u32 bound</button>
+        <div class="why">Privileged loaders may use back-edges, so pass 1 passes. Pass 2 simulates iterations; with an unknown bound the exit never becomes certain, and the 1M processed-instruction budget runs out. The fix is a constant bound, <code>bpf_loop()</code>, an iterator, or <code>can_loop</code>.</div></div>
+      <div class="q"><p><strong>Q6.</strong> What did the CAV 2023 Agni paper find about the kernel's abstract operators?</p>
+        <button class="opt">They were all sound in every version from 4.14</button>
+        <button class="opt" data-right>Many are unsound taken alone; the shared reduction step makes recent kernels sound, while older versions had 27 previously unknown bugs</button>
+        <button class="opt">The tnum domain should be replaced by zones</button>
+        <div class="why">Agni extracted the operators from kernel C code and checked them with Z3. With a specification that accounts for <code>reg_bounds_sync()</code>-style preconditioning, kernels newer than 5.13 were proven sound; older ones had 27 new bugs, mostly demonstrated with synthesised programs.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>Linux kernel source at commit <code>d68ce4e71248</code>: <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/verifier.c">kernel/bpf/verifier.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/cfg.c">cfg.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/states.c">states.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/backtrack.c">backtrack.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/tnum.c">tnum.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/include/linux/bpf_verifier.h">include/linux/bpf_verifier.h</a>.</li>
+      <li>Kernel documentation, <a href="https://docs.kernel.org/bpf/verifier.html">eBPF verifier</a> (Documentation/bpf/verifier.rst).</li>
+      <li>E. Gershuni, N. Amit, A. Gurfinkel, N. Narodytska, J. A. Navas, N. Rinetzky, L. Ryzhyk, M. Sagiv. <a href="https://dl.acm.org/doi/10.1145/3314221.3314590">Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions</a>. PLDI 2019, pp. 1069–1084. (<a href="https://vbpf.github.io/assets/prevail-paper.pdf">PDF</a>, <a href="https://github.com/vbpf/prevail">code</a>)</li>
+      <li>H. Vishwanathan, M. Shachnai, S. Narayana, S. Nagarakatte. <a href="https://doi.org/10.1109/CGO53902.2022.9741267">Sound, Precise, and Fast Abstract Interpretation with Tristate Numbers</a>. CGO 2022, pp. 254–265. (<a href="https://arxiv.org/abs/2105.05398">arXiv:2105.05398</a>)</li>
+      <li>H. Vishwanathan, M. Shachnai, S. Narayana, S. Nagarakatte. <a href="https://link.springer.com/chapter/10.1007/978-3-031-37709-9_12">Verifying the Verifier: eBPF Range Analysis Verification</a>. CAV 2023, LNCS 13966, pp. 226–251. (<a href="https://github.com/bpfverif/agni">Agni</a>)</li>
+      <li>H. Sun, Z. Su. <a href="https://www.usenix.org/conference/osdi24/presentation/sun-hao">Validating the eBPF Verifier via State Embedding</a>. OSDI 2024.</li>
+      <li>LWN: <a href="https://lwn.net/Articles/740157/">A thorough introduction to eBPF</a> (2017); <a href="https://lwn.net/Articles/794934/">Bounded loops in BPF for the 5.3 kernel</a> (2019); <a href="https://lwn.net/Articles/877062/">A different approach to BPF loops</a> (2021); <a href="https://lwn.net/Articles/982077/">A look inside the BPF verifier</a> (2024); <a href="https://lwn.net/Articles/1017116/">Taking BPF programs beyond one-million instructions</a> (2025); <a href="https://lwn.net/Articles/1050779/">Verifier-state pruning in BPF</a> (2026); <a href="https://lwn.net/Articles/1076121/">BPF loop verification with scalar evolution</a> (2026).</li>
+      <li>Kernel commits (GitHub): <a href="https://github.com/torvalds/linux/commit/17a5267067f3">17a5267067f3</a> verifier core (2014); <a href="https://github.com/torvalds/linux/commit/f1174f77b50c">f1174f77b50c</a> and <a href="https://github.com/torvalds/linux/commit/b03c9f9fdc37">b03c9f9fdc37</a> value tracking (4.14); <a href="https://github.com/torvalds/linux/commit/3f50f132d840">3f50f132d840</a> ALU32 bounds; <a href="https://github.com/torvalds/linux/commit/c04c0d2b968a">c04c0d2b968a</a> 1M limit (5.2); <a href="https://github.com/torvalds/linux/commit/2589726d12a1">2589726d12a1</a> bounded loops (5.3); <a href="https://github.com/torvalds/linux/commit/b5dc0163d8fd">b5dc0163d8fd</a> precision tracking (5.3); <a href="https://github.com/torvalds/linux/commit/e6f2dd0f8067">e6f2dd0f8067</a> bpf_loop (5.17); <a href="https://github.com/torvalds/linux/commit/06accc8779c1">06accc8779c1</a> open-coded iterators (6.4); <a href="https://github.com/torvalds/linux/commit/011832b97b31">011832b97b31</a> may_goto (6.9); <a href="https://github.com/torvalds/linux/commit/05924717ac70">05924717ac70</a> tnum_mul (5.14); <a href="https://github.com/torvalds/linux/commit/256f0071f9b6">256f0071f9b6</a> circular numbers (7.2); <a href="https://github.com/torvalds/linux/commit/6ccf49f79327">6ccf49f79327</a> SCEV widening (7.4-rc1); <a href="https://github.com/torvalds/linux/commit/b2157399cc98">b2157399cc98</a>, <a href="https://github.com/torvalds/linux/commit/979d63d50c0c">979d63d50c0c</a>, <a href="https://github.com/torvalds/linux/commit/af86ca4e3088">af86ca4e3088</a> Spectre mitigations; <a href="https://github.com/torvalds/linux/commit/08389d888287">08389d888287</a> unprivileged-off Kconfig (5.13).</li>
+      <li>NVD entries: <a href="https://nvd.nist.gov/vuln/detail/CVE-2017-16995">CVE-2017-16995</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2020-8835">CVE-2020-8835</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-3490">CVE-2021-3490</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2021-31440">CVE-2021-31440</a>, <a href="https://nvd.nist.gov/vuln/detail/CVE-2022-23222">CVE-2022-23222</a>; Manfred Paul, <a href="https://www.zerodayinitiative.com/blog/2020/4/8/cve-2020-8835-linux-kernel-privilege-escalation-via-improper-ebpf-program-verification">CVE-2020-8835: Linux kernel privilege escalation via improper eBPF program verification</a> (ZDI blog, 2020).</li>
+      <li>Tools: <a href="https://github.com/libbpf/veristat">veristat</a>; <a href="https://github.com/libbpf/bpftool">bpftool</a>; <a href="https://github.com/microsoft/ebpf-for-windows">eBPF for Windows</a> (uses PREVAIL).</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="02-ebpf-isa-and-vm.html"><small>Previous</small>02 · ISA and VM</a>
+      <a class="next" href="04-maps-helpers-kfuncs.html"><small>Next</small>04 · Maps, helpers and kfuncs</a>
+    </div>
+  </main>
+</div>
+<script>
+// 8-bit tnum calculator for this chapter. Mirrors kernel/bpf/tnum.c formulas, reduced to 8 bits.
+(function () {
+  const M = 0xff;
+  const a = document.getElementById("tl-a"), b = document.getElementById("tl-b");
+  const op = document.getElementById("tl-op"), out = document.getElementById("tl-out");
+  if (!a || !b || !op || !out) return;
+  const parse = (s) => {
+    s = s.trim().toLowerCase();
+    if (!/^[01x]{8}$/.test(s)) return null;
+    let v = 0, m = 0;
+    for (const c of s) { v <<= 1; m <<= 1; if (c === "1") v |= 1; else if (c === "x") m |= 1; }
+    return { v, m };
+  };
+  const fmt = (t) => { let s = ""; for (let i = 7; i >= 0; i--) s += (t.m >> i) & 1 ? "x" : ((t.v >> i) & 1 ? "1" : "0"); return s; };
+  const T = (v, m) => ({ v: v & ~m & M, m: m & M });
+  const ops = {
+    add: (x, y) => { const sm = (x.m + y.m) & M, sv = (x.v + y.v) & M, sigma = (sm + sv) & M, chi = sigma ^ sv, mu = chi | x.m | y.m; return T(sv, mu); },
+    sub: (x, y) => { const dv = (x.v - y.v) & M, al = (dv + x.m) & M, be = (dv - y.m) & M, chi = al ^ be, mu = chi | x.m | y.m; return T(dv, mu); },
+    and: (x, y) => { const al = x.v | x.m, be = y.v | y.m, v = x.v & y.v; return T(v, al & be & ~v); },
+    or: (x, y) => T(x.v | y.v, (x.m | y.m) & ~(x.v | y.v)),
+    xor: (x, y) => T(x.v ^ y.v, x.m | y.m),
+  };
+  const concrete = { add: (p, q) => (p + q) & M, sub: (p, q) => (p - q) & M, and: (p, q) => p & q, or: (p, q) => p | q, xor: (p, q) => p ^ q };
+  const members = (t) => { const r = []; for (let n = 0; n <= M; n++) if ((n & ~t.m) === t.v) r.push(n); return r; };
+  const run = () => {
+    const x = parse(a.value), y = parse(b.value);
+    if (!x || !y) { out.textContent = "Each operand must be exactly 8 characters of 0, 1 or x."; return; }
+    const r = ops[op.value](x, y);
+    const exact = new Set();
+    for (const p of members(x)) for (const q of members(y)) exact.add(concrete[op.value](p, q));
+    const ex = [...exact].sort((u, v) => u - v), rs = members(r);
+    const list = (arr) => arr.length > 16 ? arr.slice(0, 16).join(", ") + ", … (" + arr.length + " values)" : arr.join(", ");
+    out.textContent =
+      "a      = " + fmt(x) + "   (value=0x" + x.v.toString(16) + ", mask=0x" + x.m.toString(16) + ")\n" +
+      "b      = " + fmt(y) + "   (value=0x" + y.v.toString(16) + ", mask=0x" + y.m.toString(16) + ")\n" +
+      "a " + op.value.padEnd(3) + " b = " + fmt(r) + "   (value=0x" + r.v.toString(16) + ", mask=0x" + r.m.toString(16) + ")\n\n" +
+      "tnum result contains " + rs.length + " value(s): " + list(rs) + "\n" +
+      "exact results (" + ex.length + "): " + list(ex) + "\n" +
+      "exact range: [" + ex[0] + ", " + ex[ex.length - 1] + "]   — the interval domain would keep this range alongside the tnum";
+  };
+  [a, b, op].forEach((e) => e.addEventListener("input", run));
+  run();
+})();
+</script>
+</body>
+</html>

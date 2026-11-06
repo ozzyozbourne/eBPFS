@@ -1,0 +1,851 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · The eBPF ecosystem map · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="08">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="One exec tracer written in bpftrace, BCC, libbpf, cilium/ebpf, aya, libbpf-rs and eunomia-bpf; the major eBPF projects and runtimes; and a map of the eunomia-bpf organization that the rest of the curriculum follows.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 08 · The eBPF ecosystem map</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 08</div>
+      <h1>The eBPF ecosystem map, and where eunomia-bpf fits</h1>
+      <p class="lede">Chapters 01–07 covered what the kernel provides. This chapter covers the software around it: which framework to write a program in, which large projects already use eBPF in production, which runtimes run eBPF outside the Linux kernel, and how the eunomia-bpf organization's projects fit into that picture.</p>
+      <div class="meta"><span>Prerequisites: <a href="05-program-types-and-hooks.html">05</a>, <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: <a href="https://github.com/eunomia-bpf">github.com/eunomia-bpf</a></span><span>~45 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>The kernel exposes eBPF through a single system call, <code>bpf(2)</code>, plus a few attach interfaces (perf events, netlink, cgroup files, BPF links). Nobody writes raw <code>bpf()</code> calls by hand. Between your idea and the kernel sit a compiler (almost always Clang/LLVM, sometimes rustc), an object format (ELF with BTF), a <em>loader library</em> that relocates and loads the object, and a user-space program that reads the results from maps or ring buffers. Each framework puts these pieces together differently. Those differences decide whether your tool ships as one static binary or needs a 100&nbsp;MB compiler on every host, whether it runs unchanged on a different kernel, and which language your team writes.</p>
+    <p>The second reason to study the ecosystem is to avoid duplicating work. Container networking, runtime security, continuous profiling and L4 load balancing each already have mature eBPF projects. Knowing what Cilium, Tetragon, Falco or Katran do, and roughly how, tells you when to build on them and when to write your own program.</p>
+    <p>The third reason is specific to this curriculum. Chapters 09–31 cover the eunomia-bpf organization, whose projects sit at almost every layer of this map: a compiler and loader (ecc/ecli), a Wasm runtime for eBPF, a userspace eBPF runtime (bpftime), verifier tooling, GPU extensions and agent observability. This chapter places each of them on the map before later chapters cover them in detail.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Every eBPF framework answers the same four questions: <strong>where does compilation happen</strong> (on the build machine or on the target), <strong>who relocates the object for the running kernel</strong> (CO-RE via BTF, or recompiling against local headers), <strong>which library issues the <code>bpf()</code> syscalls</strong> (libbpf, a pure-Go or pure-Rust reimplementation, or libbcc), and <strong>which language the user-space half is written in</strong>. Once you know a framework's answers, you can predict most of its strengths and limitations.</p></div>
+
+    <h2>The map at a glance</h2>
+    <p>Figure 08.1 arranges the ecosystem in layers. At the bottom is the kernel machinery from earlier chapters: the verifier (<a href="03-verifier.html">03</a>), JIT (<a href="02-ebpf-isa-and-vm.html">02</a>), maps and helpers (<a href="04-maps-helpers-kfuncs.html">04</a>), and hooks (<a href="05-program-types-and-hooks.html">05</a>, <a href="07-networking-xdp-tc.html">07</a>). Above it are the loader libraries that speak <code>bpf(2)</code>. Above those are front-ends that hide the loader entirely (bpftrace, BCC's Python API, eunomia-bpf's ecli). At the top are complete products. On the side are runtimes that run eBPF bytecode without the Linux kernel at all.</p>
+
+    <figure>
+      <svg viewBox="0 0 820 470" role="img" aria-label="Layered map of the eBPF ecosystem: kernel at the bottom, loader libraries, front-ends, applications on top, alternative runtimes and tooling on the sides">
+        <style>
+          .l-box { fill: var(--bg3); stroke: var(--border); }
+          .l-acc { fill: none; stroke: var(--accent); stroke-width: 2; }
+          .l-acc2 { fill: none; stroke: var(--accent2); stroke-width: 2; }
+          .l-t { fill: var(--fg); font: 13px sans-serif; }
+          .l-s { fill: var(--muted); font: 11px sans-serif; }
+          .l-h { fill: var(--accent); font: bold 12px sans-serif; letter-spacing: .05em; }
+        </style>
+        <!-- Applications -->
+        <text x="20" y="22" class="l-h">APPLICATIONS</text>
+        <rect x="20" y="30" width="560" height="70" rx="8" class="l-box"/>
+        <text x="34" y="54" class="l-t">Cilium · Hubble · Tetragon</text>
+        <text x="34" y="72" class="l-s">networking, flow visibility, enforcement</text>
+        <text x="320" y="54" class="l-t">Falco · Tracee · Pixie · Parca · Katran</text>
+        <text x="320" y="72" class="l-s">security, k8s telemetry, profiling, L4 LB</text>
+        <text x="34" y="92" class="l-s">eunomia-bpf: agentsight, ActPlane, agentcgroup, gpu_ext, xpu-perf …</text>
+        <!-- Front-ends -->
+        <text x="20" y="122" class="l-h">FRONT-ENDS (hide the loader)</text>
+        <rect x="20" y="130" width="560" height="60" rx="8" class="l-box"/>
+        <text x="34" y="154" class="l-t">bpftrace</text>
+        <text x="34" y="172" class="l-s">awk-like scripts</text>
+        <text x="150" y="154" class="l-t">BCC Python / Lua</text>
+        <text x="150" y="172" class="l-s">C string compiled at runtime</text>
+        <text x="330" y="154" class="l-t">eunomia-bpf ecc / ecli · wasm-bpf</text>
+        <text x="330" y="172" class="l-s">kernel code only → JSON / Wasm / OCI</text>
+        <!-- Loaders -->
+        <text x="20" y="212" class="l-h">LOADER LIBRARIES (speak bpf(2))</text>
+        <rect x="20" y="220" width="560" height="70" rx="8" class="l-box"/>
+        <rect x="32" y="232" width="120" height="46" rx="6" class="l-acc"/>
+        <text x="44" y="252" class="l-t">libbpf (C)</text>
+        <text x="44" y="268" class="l-s">reference CO-RE</text>
+        <rect x="162" y="232" width="120" height="46" rx="6" class="l-acc"/>
+        <text x="172" y="252" class="l-t">libbpf-rs</text>
+        <text x="172" y="268" class="l-s">wraps libbpf</text>
+        <rect x="292" y="232" width="130" height="46" rx="6" class="l-acc2"/>
+        <text x="302" y="252" class="l-t">cilium/ebpf (Go)</text>
+        <text x="302" y="268" class="l-s">pure Go, own CO-RE</text>
+        <rect x="432" y="232" width="136" height="46" rx="6" class="l-acc2"/>
+        <text x="442" y="252" class="l-t">aya (Rust)</text>
+        <text x="442" y="268" class="l-s">pure Rust, libc only</text>
+        <text x="34" y="306" class="l-s">orange: uses libbpf · blue: own loader</text>
+        <!-- Kernel -->
+        <text x="20" y="330" class="l-h">LINUX KERNEL</text>
+        <rect x="20" y="338" width="560" height="70" rx="8" class="l-box"/>
+        <text x="34" y="362" class="l-t">bpf(2) · verifier · JIT · maps · helpers/kfuncs · BTF</text>
+        <text x="34" y="382" class="l-s">hooks: kprobe/fentry, tracepoints, uprobes, LSM, cgroup, XDP, tc, struct_ops, sched_ext</text>
+        <text x="34" y="398" class="l-s">tested by tools/testing/selftests/bpf · inspected with bpftool</text>
+        <!-- Side: other runtimes -->
+        <text x="600" y="22" class="l-h">OTHER RUNTIMES</text>
+        <rect x="600" y="30" width="200" height="200" rx="8" class="l-box"/>
+        <text x="614" y="56" class="l-t">eBPF for Windows</text>
+        <text x="614" y="72" class="l-s">PREVAIL + bpf2c / uBPF</text>
+        <text x="614" y="100" class="l-t">uBPF (C) · rbpf (Rust)</text>
+        <text x="614" y="116" class="l-s">userspace VMs</text>
+        <text x="614" y="144" class="l-t">bpftime + llvmbpf</text>
+        <text x="614" y="160" class="l-s">userspace runtime, uprobes,</text>
+        <text x="614" y="174" class="l-s">syscalls, GPU (eunomia-bpf)</text>
+        <text x="614" y="202" class="l-t">PREVAIL</text>
+        <text x="614" y="218" class="l-s">abstract-interpretation verifier</text>
+        <!-- Side: tooling -->
+        <text x="600" y="252" class="l-h">VERIFY / TUNE</text>
+        <rect x="600" y="260" width="200" height="148" rx="8" class="l-box"/>
+        <text x="614" y="286" class="l-t">bpftool · veristat</text>
+        <text x="614" y="314" class="l-t">bpfix</text>
+        <text x="614" y="330" class="l-s">readable verifier errors</text>
+        <text x="614" y="356" class="l-t">ebpf-correctness-verifier</text>
+        <text x="614" y="372" class="l-s">transformation equivalence</text>
+        <text x="614" y="396" class="l-t">bpf-benchmark</text>
+        <!-- arrows -->
+        <line x1="300" y1="100" x2="300" y2="130" stroke="var(--muted)" marker-end="url(#ar1)"/>
+        <line x1="300" y1="190" x2="300" y2="220" stroke="var(--muted)" marker-end="url(#ar1)"/>
+        <line x1="300" y1="290" x2="300" y2="338" stroke="var(--muted)" marker-end="url(#ar1)"/>
+        <text x="20" y="440" class="l-s">The Foundation layer: the eBPF Foundation (Linux Foundation, 2021) hosts eBPF governance; the ISA is standardised as RFC 9669.</text>
+        <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+      </svg>
+      <figcaption>Figure 08.1 — The eBPF ecosystem in layers. Applications are built on loader libraries, or on front-ends that hide them; everything ends in the same <code>bpf(2)</code> interface. On the right are runtimes that run eBPF bytecode without the Linux kernel, and tools for checking and tuning programs.</figcaption>
+    </figure>
+
+    <h2>One program, seven frameworks</h2>
+    <p>The clearest way to compare frameworks is to look at the same program written in each. We use an <strong>exec tracer</strong>: a program that fires every time a process calls <code>execve()</code> and either prints the new command line or counts the calls. It is the classic first eBPF program, and every framework below has an official example close to it. Wherever possible the code is copied from the framework's own repository, trimmed with <code>/* ... */</code> or <code># ...</code>. libbpf-rs has no official execve example, so its tab shows its port of BCC's <code>runqslower</code>, which has the same structure: a tracepoint program, global configuration, and a ring buffer consumer.</p>
+
+    <div class="callout tip"><span class="label">How to read the tabs</span><p>In each tab, look at three things: <strong>(1)</strong> the attach point (kprobe on <code>sys_execve</code>, the <code>syscalls:sys_enter_execve</code> tracepoint, or <code>sched:sched_process_exec</code>; see <a href="05-program-types-and-hooks.html">05</a> for why they differ); <strong>(2)</strong> how data reaches user space (map polling, perf buffer, ring buffer, or log macros); <strong>(3)</strong> how much code exists only to compile and load the program.</p></div>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="bpftrace">
+        <p>bpftrace is the awk of eBPF. A probe description, an optional filter and an action block are compiled with LLVM on the target machine when you press Enter. This is the full official tool, minus its header comment:</p>
+        <pre data-file="bpftrace/bpftrace/tools/execsnoop.bt"><code class="language-c">#ifndef BPFTRACE_HAVE_BTF
+#include &lt;linux/sched.h&gt;
+#endif
+
+BEGIN
+{
+  printf("%-15s %-7s %-7s %s\n", "TIME", "PID", "PPID", "ARGS");
+}
+
+tracepoint:syscalls:sys_enter_exec*
+{
+  printf("%15s %-7d %-7d ", strftime("%H:%M:%S.%f", nsecs), pid, ppid);
+  join(args.argv);
+}</code></pre>
+        <p>The official one-liner tutorial (<a href="https://github.com/bpftrace/bpftrace/blob/master/docs/tutorial_one_liners.md">docs/tutorial_one_liners.md</a>, Lesson 4) counts all syscalls per process with <code>bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'</code>. Swapping in the execve tracepoint gives an "execs per process" counter. <em>This line is our own adaptation, not copied from the repo:</em></p>
+        <pre><code class="language-bash"># illustrative: Lesson 4 of the bpftrace tutorial with the probe changed
+sudo bpftrace -e 'tracepoint:syscalls:sys_enter_execve { @[comm] = count(); }'</code></pre>
+        <p>There is no user-space code to write. <code>@</code> is a BPF hash map that bpftrace prints when you press Ctrl-C, and <code>args.argv</code> is typed from the tracepoint's format description (or BTF).</p>
+      </div>
+
+      <div class="tab-panel" data-label="BCC (Python)">
+        <p>BCC (BPF Compiler Collection) was the first widely used framework. The kernel half is a C string inside a Python program. At run time, libbcc compiles it with an embedded Clang/LLVM against the running kernel's headers, so the struct offsets in <code>task-&gt;real_parent-&gt;tgid</code> are correct for that kernel without any relocation. Below is BCC's <code>execsnoop</code>, trimmed:</p>
+        <pre data-file="iovisor/bcc/tools/execsnoop.py"><code class="language-python">from bcc import BPF
+from bcc.containers import filter_by_containers
+from bcc.utils import ArgString, printb
+# ... argparse setup ...
+
+# define BPF program
+bpf_text = """
+#include &lt;uapi/linux/ptrace.h&gt;
+#include &lt;linux/sched.h&gt;
+#include &lt;linux/fs.h&gt;
+
+#define ARGSIZE  128
+/* ... enum event_type, struct data_t ... */
+
+BPF_PERF_OUTPUT(events);
+/* ... __submit_arg(), submit_arg() ... */
+
+int syscall__execve(struct pt_regs *ctx,
+    const char __user *filename,
+    const char __user *const __user *__argv,
+    const char __user *const __user *__envp)
+{
+    u32 uid = bpf_get_current_uid_gid() &amp; 0xffffffff;
+
+    UID_FILTER
+    /* ... */
+    struct data_t data = {};
+    struct task_struct *task;
+
+    data.pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+    task = (struct task_struct *)bpf_get_current_task();
+    /* ... */
+    data.ppid = task-&gt;real_parent-&gt;tgid;
+    /* ... */
+    bpf_get_current_comm(&amp;data.comm, sizeof(data.comm));
+    data.type = EVENT_ARG;
+
+    __submit_arg(ctx, (void *)filename, &amp;data);
+    /* ... loop over argv, then return ... */
+}
+/* ... do_ret_sys_execve() for the return value ... */
+"""
+
+bpf_text = bpf_text.replace("MAXARG", args.max_args)
+# ... more text substitution for UID_FILTER / PPID_FILTER ...
+
+# initialize BPF
+b = BPF(text=bpf_text)
+execve_fnname = b.get_syscall_fnname("execve")
+b.attach_kprobe(event=execve_fnname, fn_name="syscall__execve")
+b.attach_kretprobe(event=execve_fnname, fn_name="do_ret_sys_execve")
+# ... print_event() callback ...
+
+# loop with callback to print_event
+b["events"].open_perf_buffer(print_event)
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()</code></pre>
+        <p>Two BCC idioms appear here. Options are applied by <strong>string substitution</strong> (<code>UID_FILTER</code> is replaced with an <code>if</code> statement before compiling), and the C is not quite standard C: <code>task-&gt;real_parent-&gt;tgid</code> is a plain kernel memory dereference that BCC rewrites into <code>bpf_probe_read_kernel()</code> calls.</p>
+      </div>
+
+      <div class="tab-panel" data-label="libbpf (C)">
+        <p>The same tool, ported to libbpf and CO-RE in BCC's own <code>libbpf-tools/</code> directory. The kernel half is ordinary C compiled ahead of time with <code>clang -target bpf -g</code>. <code>BPF_CORE_READ</code> records a relocation that libbpf fixes up at load time using the running kernel's BTF (<a href="06-btf-core-libbpf.html">06</a>).</p>
+        <pre data-file="iovisor/bcc/libbpf-tools/execsnoop.bpf.c"><code class="language-c">#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include "execsnoop.h"
+
+const volatile bool filter_cg = false;
+const volatile bool ignore_failed = true;
+const volatile uid_t targ_uid = INVALID_UID;
+const volatile int max_args = DEFAULT_MAXARGS;
+/* ... cgroup_map ... */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, pid_t);
+	__type(value, struct event);
+} execs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u32));
+} events SEC(".maps");
+
+static __always_inline int enter_exec(const char *filename, const char **args)
+{
+	/* ... uid / cgroup filters ... */
+	id = bpf_get_current_pid_tgid();
+	pid = (pid_t)id;
+	tgid = id &gt;&gt; 32;
+	if (bpf_map_update_elem(&amp;execs, &amp;pid, &amp;empty_event, BPF_NOEXIST))
+		return 0;
+
+	event = bpf_map_lookup_elem(&amp;execs, &amp;pid);
+	if (!event)
+		return 0;
+
+	event-&gt;pid = tgid;
+	event-&gt;uid = uid;
+	task = (struct task_struct*)bpf_get_current_task();
+	event-&gt;ppid = (pid_t)BPF_CORE_READ(task, real_parent, tgid);
+	/* ... copy filename and up to max_args arguments ... */
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int tracepoint__syscalls__sys_enter_execve(struct syscall_trace_enter* ctx)
+{
+	return enter_exec((const char*)ctx-&gt;args[0], (const char **)(ctx-&gt;args[1]));
+}
+/* ... sys_enter_execveat, and sys_exit_* handlers that emit the event ... */
+
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+        <p>The user half uses the <strong>skeleton</strong> that <code>bpftool gen skeleton</code> generates from the object file. Options are written into <code>.rodata</code> <em>before</em> load, so the verifier sees them as constants and can prune dead branches. Compare this with BCC's string substitution:</p>
+        <pre data-file="iovisor/bcc/libbpf-tools/execsnoop.c"><code class="language-c">	obj = execsnoop_bpf__open_opts(&amp;open_opts);
+	if (!obj) {
+		fprintf(stderr, "failed to open BPF object\n");
+		return 1;
+	}
+
+	/* initialize global data (filtering options) */
+	obj-&gt;rodata-&gt;ignore_failed = !env.fails;
+	obj-&gt;rodata-&gt;targ_uid = env.uid;
+	obj-&gt;rodata-&gt;max_args = env.max_args;
+	obj-&gt;rodata-&gt;filter_cg = env.cg;
+
+	err = execsnoop_bpf__load(obj);
+	/* ... */
+	err = execsnoop_bpf__attach(obj);
+	/* ... print headers ... */
+
+	/* setup event callbacks */
+	pb = perf_buffer__new(bpf_map__fd(obj-&gt;maps.events), PERF_BUFFER_PAGES,
+			      handle_event, handle_lost_events, NULL, NULL);
+	/* ... */
+	/* main: poll */
+	while (!exiting) {
+		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
+		/* ... */
+	}</code></pre>
+      </div>
+
+      <div class="tab-panel" data-label="cilium/ebpf (Go)">
+        <p>cilium/ebpf ("ebpf-go") is a pure-Go loader. The kernel half is still C compiled with Clang, but compilation happens at <code>go generate</code> time through <code>bpf2go</code>. bpf2go embeds the resulting <code>.o</code> into the Go binary and generates typed Go accessors (<code>bpfObjects</code>, <code>objs.KprobeMap</code>). The official <code>kprobe</code> example counts <code>sys_execve</code> calls in a one-element array:</p>
+        <pre data-file="cilium/ebpf/examples/kprobe/kprobe.c"><code class="language-c">//go:build ignore
+
+#include "common.h"
+
+char __license[] SEC("license") = "Dual MIT/GPL";
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, 1);
+} kprobe_map SEC(".maps");
+
+SEC("kprobe/sys_execve")
+int kprobe_execve() {
+	u32 key     = 0;
+	u64 initval = 1, *valp;
+
+	valp = bpf_map_lookup_elem(&amp;kprobe_map, &amp;key);
+	if (!valp) {
+		bpf_map_update_elem(&amp;kprobe_map, &amp;key, &amp;initval, BPF_ANY);
+		return 0;
+	}
+	__sync_fetch_and_add(valp, 1);
+
+	return 0;
+}</code></pre>
+        <pre data-file="cilium/ebpf/examples/kprobe/main.go"><code class="language-go">//go:generate go tool bpf2go -tags linux bpf kprobe.c -- -I../headers
+
+const mapKey uint32 = 0
+
+func main() {
+
+	// Name of the kernel function to trace.
+	fn := "sys_execve"
+
+	// Allow the current process to lock memory for eBPF resources.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Load pre-compiled programs and maps into the kernel.
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&amp;objs, nil); err != nil {
+		log.Fatalf("loading objects: %v", err)
+	}
+	defer objs.Close()
+
+	kp, err := link.Kprobe(fn, objs.KprobeExecve, nil)
+	if err != nil {
+		log.Fatalf("opening kprobe: %s", err)
+	}
+	defer kp.Close()
+	/* ... */
+	for range ticker.C {
+		var value uint64
+		if err := objs.KprobeMap.Lookup(mapKey, &amp;value); err != nil {
+			log.Fatalf("reading map: %v", err)
+		}
+		log.Printf("%s called %d times\n", fn, value)
+	}
+}</code></pre>
+        <p><code>link.Kprobe("sys_execve", …)</code> resolves the architecture-specific symbol name (for example <code>__x64_sys_execve</code>), much as BCC's <code>get_syscall_fnname</code> does. Run it with <code>go run -exec sudo ./kprobe</code> from <code>examples/</code>, as the examples README says.</p>
+      </div>
+
+      <div class="tab-panel" data-label="aya (Rust)">
+        <p>aya writes <em>both</em> halves in Rust. The kernel half is a <code>#![no_std]</code> crate compiled by rustc's BPF target and linked by <code>bpf-linker</code>. The user half uses the aya crate, which issues syscalls through <code>libc</code> alone, with no libbpf and no BCC. This is the tracepoint example from the Aya book:</p>
+        <pre data-file="aya-rs/book/examples/tracepoint/tracepoint-ebpf/src/main.rs"><code class="language-rust">#![no_std]
+#![no_main]
+
+use aya_ebpf::{
+    EbpfContext,
+    helpers::bpf_probe_read_user_str_bytes,
+    macros::{map, tracepoint},
+    maps::PerCpuArray,
+    programs::TracePointContext,
+};
+use aya_log_ebpf::info;
+
+#[repr(C)]
+pub struct Buf {
+    pub buf: [u8; 4096],
+}
+
+#[map]
+pub static FILENAME_BUF: PerCpuArray&lt;Buf&gt; = PerCpuArray::with_max_entries(1, 0);
+
+#[tracepoint]
+pub fn tracepoint_execve(ctx: TracePointContext) -&gt; u32 {
+    match try_tracepoint_execve(ctx) {
+        Ok(ret) =&gt; ret,
+        Err(ret) =&gt; ret as u32,
+    }
+}
+
+fn try_tracepoint_execve(ctx: TracePointContext) -&gt; Result&lt;u32, i32&gt; {
+    // To get the offset, see
+    // /sys/kernel/debug/tracing/events/syscalls/sys_enter_execve/format
+    const FILENAME_OFFSET: usize = 16;
+    let filename: *const u8 = unsafe { ctx.read_at(FILENAME_OFFSET)? };
+    let Buf { buf } = unsafe {
+        let ptr = FILENAME_BUF.get_ptr_mut(0).ok_or(0)?;
+        &amp;mut *ptr
+    };
+    let filename = unsafe {
+        core::str::from_utf8_unchecked(bpf_probe_read_user_str_bytes(
+            filename, buf,
+        )?)
+    };
+    /* ... read ctx.command() into `command` ... */
+    info!(
+        &amp;ctx,
+        "Tracepoint sys_enter_execve called by: {}, filename: {}",
+        command,
+        filename
+    );
+
+    Ok(0)
+}
+/* ... #[panic_handler], LICENSE section ... */</code></pre>
+        <pre data-file="aya-rs/book/examples/tracepoint/tracepoint/src/main.rs"><code class="language-rust">    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/tracepoint"
+    )))?;
+    /* ... aya_log::EbpfLogger::init(&amp;mut ebpf) and a tokio task that flushes it ... */
+    let program: &amp;mut TracePoint =
+        ebpf.program_mut("tracepoint_execve").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_execve")?;
+
+    let ctrl_c = signal::ctrl_c();
+    info!("Waiting for Ctrl-C...");
+    ctrl_c.await?;</code></pre>
+        <p>Note the hard-coded <code>FILENAME_OFFSET</code> taken from the tracepoint's <code>format</code> file, and the per-CPU array used as a 4&nbsp;KiB scratch buffer because the BPF stack is only 512 bytes. Both reflect how close to the bare ABI Rust eBPF code still is. The example's README asks for stable and nightly Rust toolchains plus <code>cargo install bpf-linker</code>, then <code>cargo run --release</code>.</p>
+      </div>
+
+      <div class="tab-panel" data-label="libbpf-rs (Rust)">
+        <p>libbpf-rs is the opposite trade-off to aya: the kernel half stays in C, and the user half is idiomatic Rust over the real libbpf (linked in through <code>libbpf-sys</code>). <code>libbpf-cargo</code> runs Clang from <code>build.rs</code> and generates a Rust skeleton with typed <code>maps</code> and <code>rodata</code> fields. The repository has no execve example; its <code>runqslower</code> example, a port of the BCC tool, shows the same structure:</p>
+        <pre data-file="libbpf/libbpf-rs/examples/runqslower/build.rs"><code class="language-rust">const SRC: &amp;str = "src/bpf/runqslower.bpf.c";
+const HEADER: &amp;str = "src/bpf/runqslower.h";
+
+fn main() {
+    let out = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set in build script"),
+    )
+    .join("src")
+    .join("bpf")
+    .join("runqslower.skel.rs");
+    /* ... arch ... */
+    SkeletonBuilder::new()
+        .source(SRC)
+        .clang_args([
+            OsStr::new("-I"),
+            vmlinux::include_path_root().join(arch).as_os_str(),
+        ])
+        .build_and_generate(&amp;out)
+        .unwrap();
+    /* ... rerun-if-changed ... */
+}</code></pre>
+        <pre data-file="libbpf/libbpf-rs/examples/runqslower/src/main.rs"><code class="language-rust">mod runqslower {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bpf/runqslower.skel.rs"
+    ));
+}
+/* ... Command (clap), handle_event() ... */
+fn main() -&gt; Result&lt;()&gt; {
+    let opts = Command::parse();
+
+    let mut skel_builder = RunqslowerSkelBuilder::default();
+    /* ... */
+    let mut open_object = MaybeUninit::uninit();
+    let mut open_skel = skel_builder.open(&amp;mut open_object)?;
+    let rodata = open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .expect("`rodata` is not memory mapped");
+
+    // Write arguments into prog
+    rodata.min_us = opts.latency;
+    rodata.targ_pid = opts.pid;
+    rodata.targ_tgid = opts.tid;
+
+    // Begin tracing
+    let mut skel = open_skel.load()?;
+    skel.attach()?;
+    /* ... */
+    let mut builder = RingBufferBuilder::new();
+    builder.add(&amp;skel.maps.events, handle_event)?;
+    let ringbuf = builder.build()?;
+
+    loop {
+        ringbuf.poll(Duration::from_millis(100))?;
+    }
+}</code></pre>
+        <p>Compare it line by line with the libbpf C tab: <code>open</code> → write <code>rodata</code> → <code>load</code> → <code>attach</code> → poll. It is the same lifecycle with Rust ownership around it. The kernel side (<code>src/bpf/runqslower.bpf.c</code>) uses <code>tp_btf/sched_switch</code> and <code>bpf_core_field_exists(t-&gt;__state)</code> to handle the kernel 5.14 rename of <code>task_struct::state</code>, which is CO-RE at work.</p>
+      </div>
+
+      <div class="tab-panel" data-label="eunomia-bpf (ecc/ecli)">
+        <p>eunomia-bpf (<a href="10-eunomia-bpf-ecc-ecli.html">chapter 10</a>) asks: what if you wrote <em>only</em> the kernel half? You write a libbpf-style <code>.bpf.c</code> plus a header that declares the event struct. <code>ecc</code> compiles it and records the BTF of the maps, event struct and globals in a <code>package.json</code>. <code>ecli</code> then loads the program, generates command-line flags from the <code>const volatile</code> globals, and prints ring-buffer events as a table. This is the repo's <code>bootstrap</code> example, which tracks <code>exec()</code> and exit:</p>
+        <pre data-file="eunomia-bpf/eunomia-bpf/examples/bpftools/bootstrap/bootstrap.bpf.c"><code class="language-c">struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+
+const volatile unsigned long long min_duration_ns = 0;
+
+SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec* ctx) {
+    struct task_struct* task;
+    unsigned fname_off;
+    struct event* e;
+    pid_t pid;
+    u64 ts;
+
+    /* remember time exec() was executed for this PID */
+    pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&amp;exec_start, &amp;pid, &amp;ts, BPF_ANY);
+
+    /* don't emit exec events when minimum duration is specified */
+    if (min_duration_ns)
+        return 0;
+
+    /* reserve sample from BPF ringbuf */
+    e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    /* fill out the sample with data */
+    task = (struct task_struct*)bpf_get_current_task();
+
+    e-&gt;exit_event = false;
+    e-&gt;pid = pid;
+    e-&gt;ppid = BPF_CORE_READ(task, real_parent, tgid);
+    bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+
+    fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+    bpf_probe_read_str(&amp;e-&gt;filename, sizeof(e-&gt;filename),
+                       (void*)ctx + fname_off);
+
+    /* successfully submit it to user-space for post-processing */
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+/* ... handle_exit() on tp/sched/sched_process_exit ... */</code></pre>
+        <pre data-file="eunomia-bpf/eunomia-bpf/examples/bpftools/bootstrap/README.md"><code class="language-bash">ecc bootstrap.bpf.c bootstrap.h
+sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
+# Usage: bootstrap_bpf [--help] [--version] [--verbose] [--min_duration_ns VAR]</code></pre>
+        <p>There is no user-space source file at all. The top-level README also shows the distribution model: <code>sudo ./ecli run ghcr.io/eunomia-bpf/execve:latest</code> pulls a precompiled exec tracer from an OCI registry and runs it.</p>
+      </div>
+    </div>
+
+    <h3>What the tabs show</h3>
+    <p>Read side by side, the tabs show a spectrum. bpftrace and ecli hide user space completely, but you can only do what their output model allows. BCC hides the build but carries a compiler to every host. libbpf, libbpf-rs and cilium/ebpf all follow the same <em>open → configure → load → attach → consume</em> lifecycle from <a href="06-btf-core-libbpf.html">chapter 06</a>, in three host languages. aya applies the same lifecycle in Rust on both sides. The kernel halves differ less than the user halves: libbpf, cilium/ebpf, libbpf-rs and eunomia-bpf all accept the same libbpf-style C (<code>SEC()</code>, BTF-defined maps, <code>BPF_CORE_READ</code>), so kernel code moves between them with little change.</p>
+
+    <h2>How each framework builds and loads</h2>
+    <p>The biggest difference between frameworks is <em>when</em> the compiler runs and <em>who</em> adapts the program to the running kernel. Figure 08.2 puts the build machine on the left and the target host on the right.</p>
+
+    <figure>
+      <svg viewBox="0 0 820 400" role="img" aria-label="Timeline per framework showing whether compilation happens on the build machine or on the target host">
+        <style>
+          .b-t { fill: var(--fg); font: 12px sans-serif; }
+          .b-s { fill: var(--muted); font: 11px sans-serif; }
+          .b-c { fill: var(--accent); }
+          .b-l { fill: var(--accent2); }
+          .b-r { fill: var(--bg3); stroke: var(--border); }
+        </style>
+        <rect x="140" y="10" width="300" height="370" rx="8" class="b-r"/>
+        <rect x="460" y="10" width="345" height="370" rx="8" class="b-r"/>
+        <text x="150" y="30" class="b-s">BUILD MACHINE (once)</text>
+        <text x="470" y="30" class="b-s">TARGET HOST (every run)</text>
+        <!-- rows -->
+        <g>
+          <text x="10" y="64" class="b-t">bpftrace</text>
+          <rect x="470" y="52" width="150" height="18" rx="4" class="b-c"/><text x="476" y="65" class="b-t" style="fill:#111">LLVM compiles script</text>
+          <rect x="630" y="52" width="160" height="18" rx="4" class="b-l"/><text x="636" y="65" class="b-t" style="fill:#111">load (libbpf)</text>
+        </g>
+        <g>
+          <text x="10" y="108" class="b-t">BCC Python</text>
+          <rect x="470" y="96" width="150" height="18" rx="4" class="b-c"/><text x="476" y="109" class="b-t" style="fill:#111">Clang + kernel headers</text>
+          <rect x="630" y="96" width="160" height="18" rx="4" class="b-l"/><text x="636" y="109" class="b-t" style="fill:#111">load (libbcc)</text>
+        </g>
+        <g>
+          <text x="10" y="152" class="b-t">libbpf C</text>
+          <rect x="150" y="140" width="280" height="18" rx="4" class="b-c"/><text x="156" y="153" class="b-t" style="fill:#111">clang → .o → bpftool gen skeleton → cc</text>
+          <rect x="470" y="140" width="320" height="18" rx="4" class="b-l"/><text x="476" y="153" class="b-t" style="fill:#111">libbpf: CO-RE relocate with /sys/kernel/btf → load</text>
+        </g>
+        <g>
+          <text x="10" y="196" class="b-t">libbpf-rs</text>
+          <rect x="150" y="184" width="280" height="18" rx="4" class="b-c"/><text x="156" y="197" class="b-t" style="fill:#111">build.rs: clang → .skel.rs → cargo</text>
+          <rect x="470" y="184" width="320" height="18" rx="4" class="b-l"/><text x="476" y="197" class="b-t" style="fill:#111">libbpf (linked in): CO-RE → load</text>
+        </g>
+        <g>
+          <text x="10" y="240" class="b-t">cilium/ebpf</text>
+          <rect x="150" y="228" width="280" height="18" rx="4" class="b-c"/><text x="156" y="241" class="b-t" style="fill:#111">go generate: bpf2go (clang) → embed</text>
+          <rect x="470" y="228" width="320" height="18" rx="4" class="b-l"/><text x="476" y="241" class="b-t" style="fill:#111">pure Go: CO-RE in btf pkg → load</text>
+        </g>
+        <g>
+          <text x="10" y="284" class="b-t">aya</text>
+          <rect x="150" y="272" width="280" height="18" rx="4" class="b-c"/><text x="156" y="285" class="b-t" style="fill:#111">rustc nightly + bpf-linker → include_bytes</text>
+          <rect x="470" y="272" width="320" height="18" rx="4" class="b-l"/><text x="476" y="285" class="b-t" style="fill:#111">pure Rust (libc): BTF relocation → load</text>
+        </g>
+        <g>
+          <text x="10" y="328" class="b-t">eunomia-bpf</text>
+          <rect x="150" y="316" width="280" height="18" rx="4" class="b-c"/><text x="156" y="329" class="b-t" style="fill:#111">ecc: clang → package.json / Wasm → OCI</text>
+          <rect x="470" y="316" width="320" height="18" rx="4" class="b-l"/><text x="476" y="329" class="b-t" style="fill:#111">ecli: pull → CO-RE (libbpf) → load → print</text>
+        </g>
+        <rect x="150" y="352" width="14" height="12" class="b-c"/><text x="170" y="362" class="b-s">compiler runs</text>
+        <rect x="270" y="352" width="14" height="12" class="b-l"/><text x="290" y="362" class="b-s">loader / relocation runs</text>
+      </svg>
+      <figcaption>Figure 08.2 — Where compilation happens. bpftrace and BCC compile on every target host. Every other framework compiles once and relies on BTF-based relocation (CO-RE) at load time to fit the running kernel.</figcaption>
+    </figure>
+
+    <h3>Comparison table</h3>
+    <table>
+      <thead><tr><th>Framework</th><th>Compile model</th><th>CO-RE</th><th>Runtime dependencies on the target</th><th>Languages (kernel / user)</th><th>Best at</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://github.com/bpftrace/bpftrace">bpftrace</a></td><td>Script compiled by LLVM on the target at start-up</td><td>Not needed: compiles on the host and uses its BTF / tracepoint formats for types</td><td>bpftrace binary (links LLVM and libbpf); root</td><td>bpftrace language / none</td><td>Ad-hoc investigation, one-liners</td></tr>
+        <tr><td><a href="https://github.com/iovisor/bcc">BCC</a></td><td>C string compiled by embedded Clang/LLVM at run time</td><td>No for the Python tools; the <code>libbpf-tools/</code> ports use CO-RE</td><td>libbcc (with LLVM/Clang), Python bindings, kernel headers</td><td>restricted C / Python, Lua, C++</td><td>Rapid prototypes; a large library of existing tools</td></tr>
+        <tr><td><a href="https://github.com/libbpf/libbpf">libbpf</a></td><td>Ahead of time: <code>clang -target bpf</code> → ELF → skeleton</td><td>Yes (reference implementation)</td><td>libbpf (often statically linked), libelf, zlib; kernel BTF</td><td>C / C, C++</td><td>Small, portable, production tools</td></tr>
+        <tr><td><a href="https://github.com/cilium/ebpf">cilium/ebpf</a></td><td>Ahead of time via <code>bpf2go</code> during <code>go generate</code>; object embedded in the binary</td><td>Yes, implemented in Go (<code>btf</code> package)</td><td>None beyond the Go binary; kernel BTF for CO-RE</td><td>C (or Go <code>asm</code>) / Go</td><td>Long-running Go agents and cloud-native daemons</td></tr>
+        <tr><td><a href="https://github.com/aya-rs/aya">aya</a></td><td>Ahead of time: rustc BPF target + <code>bpf-linker</code>; object included with <code>include_bytes_aligned!</code></td><td>The loader does BTF relocations. Generating relocations from Rust eBPF code is less established than from C; check the Aya docs</td><td>None beyond libc; can be a static musl binary</td><td>Rust / Rust</td><td>All-Rust teams; single self-contained binaries</td></tr>
+        <tr><td><a href="https://github.com/libbpf/libbpf-rs">libbpf-rs</a></td><td>Ahead of time from <code>build.rs</code> via <code>libbpf-cargo</code> (Clang) → Rust skeleton</td><td>Yes (it is libbpf)</td><td>libbpf via <code>libbpf-sys</code>, usually vendored and statically linked</td><td>C / Rust</td><td>Rust user space with libbpf semantics</td></tr>
+        <tr><td><a href="https://github.com/eunomia-bpf/eunomia-bpf">eunomia-bpf</a></td><td>Ahead of time with <code>ecc</code> → JSON package or Wasm module, shareable as OCI image</td><td>Yes (libbpf underneath)</td><td><code>ecli</code> runtime</td><td>C (libbpf or BCC style) / none, or any Wasm language</td><td>Distributing small tools without writing a loader</td></tr>
+      </tbody>
+    </table>
+    <p>Two cautions about the table. "Runtime dependencies" means what must exist <em>on the host that runs the tool</em>. Every row except bpftrace and BCC needs Clang (or rustc) only on the build machine. And "CO-RE: yes" also requires the target kernel to expose BTF at <code>/sys/kernel/btf/vmlinux</code>; for older kernels see <a href="13-bpf-compatible.html">13 · bpf-compatible</a> and BTFHub.</p>
+
+    <h3>Choosing one</h3>
+    <div class="stepper">
+      <div class="step"><h4>1. Is this a question or a product?</h4><p>If you want an answer in the next five minutes ("which process keeps exec'ing <code>sh</code>?"), use <strong>bpftrace</strong> or a BCC/libbpf-tools tool you already have installed. Do not write a loader for a question you will only ask once.</p></div>
+      <div class="step"><h4>2. Will it run on hosts you don't control?</h4><p>If yes, avoid compiling on the target. A compiler and kernel headers on every host is BCC's main operational cost, and the reason BCC itself rewrote its tools as <code>libbpf-tools</code>. Choose a CO-RE framework: libbpf, libbpf-rs, cilium/ebpf, aya or eunomia-bpf.</p></div>
+      <div class="step"><h4>3. What does the rest of your agent use?</h4><p>Pick the user-space language your team already ships: C → <strong>libbpf</strong> (start from libbpf-bootstrap or <a href="11-starter-templates.html">libbpf-starter-template</a>); Go → <strong>cilium/ebpf</strong>; Rust → <strong>libbpf-rs</strong> if you want libbpf's exact behavior and C kernel code, <strong>aya</strong> if you want Rust on both sides and no C toolchain.</p></div>
+      <div class="step"><h4>4. Is the user space boilerplate?</h4><p>If user space would only print events or histograms, <strong>eunomia-bpf</strong> (<a href="10-eunomia-bpf-ecc-ecli.html">10</a>) generates it. If plugins must run inside another application under a sandbox, look at <strong>wasm-bpf</strong> (<a href="12-wasm-bpf.html">12</a>).</p></div>
+      <div class="step"><h4>5. Does it have to run outside the Linux kernel?</h4><p>On Windows, use <strong>eBPF for Windows</strong>, which cilium/ebpf also supports. For user-space hooks without kernel round trips (uprobes, syscalls of one process, GPU kernels), use <strong>bpftime</strong> (<a href="14-bpftime-architecture.html">14</a>). For an embeddable VM only, use <strong>uBPF</strong>, <strong>rbpf</strong> or <strong>llvmbpf</strong> (<a href="16-llvmbpf.html">16</a>).</p></div>
+    </div>
+
+    <h2>The major projects</h2>
+    <p>A few large projects show what eBPF is used for in production. Each is summarized from its own README or documentation. Use them as references for your own design, or adopt them instead of writing your own.</p>
+
+    <h3>Networking: Cilium and Hubble</h3>
+    <p><a href="https://github.com/cilium/cilium">Cilium</a> is a Kubernetes CNI (container network interface) built on eBPF from the start. It replaces iptables-based service routing and network policy with programs on tc/TCX and XDP hooks and socket hooks (<a href="07-networking-xdp-tc.html">07</a>), with per-identity state in maps. It was created by Isovalent, entered the CNCF as an incubating project in October 2021, and graduated on 11 October 2023. Its user space is Go, and the cilium/ebpf library above came out of this project. <a href="https://github.com/cilium/hubble">Hubble</a> is the observability layer on top of Cilium: per the README, a "fully distributed networking and security observability platform" that answers which services talk to each other, which HTTP calls or Kafka topics are involved, and why connections fail. Hubble reads the flow events Cilium's datapath already produces, so it adds visibility without adding another datapath.</p>
+
+    <h3>Security: Tetragon, Falco, Tracee</h3>
+    <p><a href="https://github.com/cilium/tetragon">Tetragon</a> (also in the Cilium family) provides "eBPF-based Security Observability and Runtime Enforcement". By default it emits <code>process_exec</code>/<code>process_exit</code> events (a production-grade version of the exec tracer above), and its tracing policies can hook kprobes, tracepoints and LSM hooks. Its <a href="https://tetragon.io/docs/concepts/enforcement/">enforcement documentation</a> describes two actions, overriding a function's return value and sending a signal such as <code>SIGKILL</code>, both taken in the kernel "inline with the operation itself" rather than after a user-space round trip. It understands Kubernetes identities (namespaces, pods), so policies target workloads instead of PIDs.</p>
+    <p><a href="https://github.com/falcosecurity/falco">Falco</a>, created by Sysdig in 2016 and a CNCF graduated project since 29 February 2024, is a rule-based threat detector. Its capture stack lives in <a href="https://github.com/falcosecurity/libs">falcosecurity/libs</a>: <em>drivers</em> (a kernel module and a "modern eBPF probe") put syscall events into a ring buffer, <code>libscap</code> reads them, and <code>libsinsp</code> enriches them with process and container state and evaluates rules. Falco shows a common split: eBPF does capture only, and all policy runs in user space. <a href="https://github.com/aquasecurity/tracee">Tracee</a> from Aqua Security is a "runtime security and observability tool" with a similar shape. Its eBPF programs produce raw system events plus higher-level behavioral detections, consumed as an event stream.</p>
+
+    <h3>Observability and profiling: Pixie, Parca</h3>
+    <p><a href="https://github.com/pixie-io/pixie">Pixie</a> is Kubernetes observability with "auto-telemetry": eBPF collects full-body requests, resource and network metrics, and profiles without changes to the applications. The data stays inside the cluster and is queried with PxL, a Pythonic language. <a href="https://github.com/parca-dev/parca-agent">Parca Agent</a> is an always-on sampling profiler. Its README says it samples user and kernel stacks 19 times per second with eBPF, emits pprof profiles, and needs a kernel ≥ 5.3 with BTF. Profilers like this are where eBPF's low overhead matters most, because they run all the time on every node. <a href="22-xpu-perf.html">Chapter 22 (xpu-perf)</a> extends the same idea to GPUs.</p>
+
+    <h3>Load balancing: Katran</h3>
+    <p><a href="https://github.com/facebookincubator/katran">Katran</a> is Meta's "C++ library and BPF program to build high-performance layer 4 load balancing forwarding plane" on XDP. Its README lists XDP driver mode, performance that scales linearly with NIC RX queues, and RSS-friendly encapsulation. When Meta co-founded the eBPF Foundation, the Linux Foundation's press release noted that Meta used eBPF as the primary software load balancer in its data centers. Katran is the open-source form of that design, and a good codebase to read after <a href="07-networking-xdp-tc.html">chapter 07</a>.</p>
+
+    <h3>The kernel's own tooling: bpftool and selftests</h3>
+    <p><a href="https://github.com/libbpf/bpftool">bpftool</a> lives in the kernel tree (<code>tools/bpf/bpftool</code>) and is mirrored on GitHub. It lists and dumps loaded programs and maps (<code>bpftool prog show</code>, <code>bpftool map dump</code>), generates <code>vmlinux.h</code> (<code>bpftool btf dump file /sys/kernel/btf/vmlinux format c</code>) and skeletons (<code>bpftool gen skeleton</code>), and probes kernel features. Chapter 06 used it throughout. The kernel's BPF selftests in <a href="https://github.com/torvalds/linux/tree/master/tools/testing/selftests/bpf"><code>tools/testing/selftests/bpf</code></a> are the most complete collection of eBPF examples anywhere. Almost every new feature lands with tests there (<code>test_progs</code>, the verifier tests in <code>progs/verifier_*.c</code>), and the <code>veristat</code> tool for comparing verifier statistics lives in the same directory. When documentation is missing, the selftests are the specification.</p>
+
+    <h2>eBPF beyond the Linux kernel</h2>
+    <p>eBPF is a bytecode with a formal ISA specification (<a href="https://www.rfc-editor.org/rfc/rfc9669.html">RFC 9669</a>; see <a href="02-ebpf-isa-and-vm.html">02</a>), so nothing ties it to Linux. Three groups of projects use that.</p>
+
+    <h3>eBPF for Windows and PREVAIL</h3>
+    <p><a href="https://github.com/microsoft/ebpf-for-windows">eBPF for Windows</a> lets "existing eBPF toolchains and APIs familiar in the Linux ecosystem" run on Windows by pulling existing projects in as submodules and adding a shim layer. Its README describes three ways to execute a program. In the <strong>preferred native mode</strong>, <code>bpf2c</code> runs the bytecode through the <strong>PREVAIL</strong> verifier and translates each instruction into C, which is then compiled into a signed Windows driver (<code>.sys</code>). This is also the mode compatible with Hypervisor-enforced Code Integrity. In <strong>JIT mode</strong>, a user-mode service (<code>eBPFSvc</code>) verifies the program and JIT-compiles it with uBPF. An <strong>interpreter</strong> (from uBPF) exists only in debug builds. Applications use a libbpf-compatible API exported by <code>ebpfapi.dll</code>, so libbpf-style code and cilium/ebpf work with few changes.</p>
+    <p><a href="https://github.com/vbpf/prevail">PREVAIL</a>, the "Polynomial-Runtime EBPF Verifier using an Abstract Interpretation Layer", comes from the PLDI 2019 paper by Gershuni et al. It verifies programs with abstract interpretation over a Zone domain (relations between pairs of registers) instead of the Linux verifier's path-by-path exploration, which lets it handle loops and scale polynomially. Chapter <a href="03-verifier.html">03</a> compares the two approaches, and the eunomia-bpf transformation checker in <a href="18-ebpf-correctness-verifier.html">chapter 18</a> builds on PREVAIL.</p>
+
+    <h3>Userspace VMs and runtimes: uBPF, rbpf, bpftime</h3>
+    <p><a href="https://github.com/iovisor/ubpf">uBPF</a> is an Apache-licensed user-space eBPF VM, created because the kernel's implementation is GPL and cannot be embedded in many projects. It ships an assembler, disassembler, interpreter and JIT (x86-64 and Arm64), and recently added a "safe" interpreter-only profile that tracks pointer provenance at run time. <a href="https://github.com/qmonnet/rbpf">rbpf</a> is a Rust VM based on uBPF, with an interpreter, an x86-64 JIT and a disassembler. Both are <em>VMs only</em>: you feed them bytecode and memory and get a return value. They have no verifier like the kernel's, no maps, and no hooks.</p>
+    <p><a href="https://github.com/eunomia-bpf/bpftime">bpftime</a> from eunomia-bpf goes further. In its own words, it is "not userspace eBPF VM, it's a userspace runtime framework", including loader, verifier, helpers, maps, ufuncs and event sources. It attaches programs to uprobes, USDT and syscalls by <em>binary rewriting</em> inside the target process, so uprobes no longer trap into the kernel. It keeps maps in shared memory, can share maps with kernel eBPF, and accepts unmodified clang/libbpf/bpftrace output. Its design is described in the OSDI '25 paper <em>Extending Applications Safely and Efficiently</em>. Its VM backend, <a href="https://github.com/eunomia-bpf/llvmbpf">llvmbpf</a>, is an LLVM JIT/AOT compiler for eBPF that can also emit PTX and SPIR-V for GPUs. Chapters <a href="14-bpftime-architecture.html">14</a>–<a href="16-llvmbpf.html">16</a> cover both.</p>
+
+    <h3>The eBPF Foundation</h3>
+    <p>The <a href="https://ebpf.foundation/">eBPF Foundation</a> was announced by the Linux Foundation on 12 August 2021 with founding members Meta (then Facebook), Google, Isovalent, Microsoft and Netflix. It provides vendor-neutral governance for eBPF across platforms (Linux, Windows), funds work through grants, and publishes material for the community. It does not own the Linux implementation, which is developed on the kernel's bpf mailing list. The ISA standardization that became RFC 9669 was done in the IETF BPF working group. The documentation hub <a href="https://ebpf.io/">ebpf.io</a> lists projects across the whole ecosystem.</p>
+
+    <h2>Where eunomia-bpf fits</h2>
+    <p><a href="https://github.com/eunomia-bpf">eunomia-bpf</a> is an open-source organization (its website is <a href="https://eunomia.dev/">eunomia.dev</a>) whose projects cover most of the layers in Figure 08.1. Some are developer tooling meant for daily use, and some are research prototypes behind recent systems papers. Six families cover the actively maintained repositories this curriculum follows, plus the learning material (<a href="09-bpf-developer-tutorial.html">bpf-developer-tutorial</a>) and org meta repos (<a href="31-org-meta.html">31</a>). Click a box to jump to its chapter.</p>
+
+    <figure>
+      <svg viewBox="0 0 820 520" role="img" aria-label="Map of eunomia-bpf project families linked to curriculum chapters">
+        <style>
+          .e-f { fill: var(--bg3); stroke: var(--border); }
+          .e-h { fill: var(--accent); font: bold 13px sans-serif; }
+          .e-a { fill: var(--accent2); font: 13px sans-serif; text-decoration: underline; }
+          .e-s { fill: var(--muted); font: 11px sans-serif; }
+          a:hover .e-a { fill: var(--fg); }
+        </style>
+        <!-- center -->
+        <rect x="320" y="226" width="180" height="56" rx="28" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="410" y="250" text-anchor="middle" class="e-h">eunomia-bpf org</text>
+        <text x="410" y="268" text-anchor="middle" class="e-s">github.com/eunomia-bpf</text>
+        <!-- connectors -->
+        <g stroke="var(--border)" stroke-width="1.5">
+          <line x1="320" y1="240" x2="260" y2="110"/><line x1="410" y1="226" x2="410" y2="150"/><line x1="500" y1="240" x2="560" y2="110"/>
+          <line x1="320" y1="268" x2="260" y2="380"/><line x1="410" y1="282" x2="410" y2="360"/><line x1="500" y1="268" x2="560" y2="380"/>
+        </g>
+        <!-- Tooling -->
+        <rect x="10" y="10" width="255" height="200" rx="10" class="e-f"/>
+        <text x="24" y="34" class="e-h">Tooling (Part II)</text>
+        <a href="10-eunomia-bpf-ecc-ecli.html"><text x="24" y="60" class="e-a">eunomia-bpf · ecc / ecli → 10</text></a>
+        <text x="24" y="76" class="e-s">compile kernel code only; run JSON/OCI</text>
+        <a href="12-wasm-bpf.html"><text x="24" y="102" class="e-a">wasm-bpf + guest SDKs → 12</text></a>
+        <text x="24" y="118" class="e-s">eBPF user space as Wasm modules</text>
+        <a href="11-starter-templates.html"><text x="24" y="144" class="e-a">starter templates → 11</text></a>
+        <text x="24" y="160" class="e-s">libbpf, libbpf-rs, eunomia-template</text>
+        <a href="13-bpf-compatible.html"><text x="24" y="184" class="e-a">bpf-compatible → 13</text></a>
+        <a href="09-bpf-developer-tutorial.html"><text x="180" y="184" class="e-a">tutorial → 09</text></a>
+        <text x="24" y="200" class="e-s">BTF for old kernels · learning path</text>
+        <!-- Runtimes -->
+        <rect x="282" y="10" width="255" height="140" rx="10" class="e-f"/>
+        <text x="296" y="34" class="e-h">Runtimes (Part III)</text>
+        <a href="14-bpftime-architecture.html"><text x="296" y="60" class="e-a">bpftime architecture → 14</text></a>
+        <a href="15-bpftime-in-practice.html"><text x="296" y="84" class="e-a">bpftime in practice → 15</text></a>
+        <text x="296" y="100" class="e-s">userspace uprobes, syscalls, GPU</text>
+        <a href="16-llvmbpf.html"><text x="296" y="124" class="e-a">llvmbpf → 16</text></a>
+        <text x="296" y="140" class="e-s">LLVM JIT/AOT, PTX, SPIR-V</text>
+        <!-- Verification -->
+        <rect x="555" y="10" width="255" height="200" rx="10" class="e-f"/>
+        <text x="569" y="34" class="e-h">Verification &amp; perf (Part IV)</text>
+        <a href="17-bpfix.html"><text x="569" y="60" class="e-a">bpfix → 17</text></a>
+        <text x="569" y="76" class="e-s">verifier log → source-level diagnosis</text>
+        <a href="18-ebpf-correctness-verifier.html"><text x="569" y="102" class="e-a">ebpf-correctness-verifier → 18</text></a>
+        <text x="569" y="118" class="e-s">old vs new object equivalence (Z3)</text>
+        <a href="19-bpf-benchmark.html"><text x="569" y="144" class="e-a">bpf-benchmark → 19</text></a>
+        <text x="569" y="160" class="e-s">agent-driven eBPF optimization;</text>
+        <text x="569" y="174" class="e-s">BPF-Ext artifact</text>
+        <!-- GPU -->
+        <rect x="10" y="320" width="255" height="190" rx="10" class="e-f"/>
+        <text x="24" y="344" class="e-h">GPUs (Part V)</text>
+        <a href="20-gpu-ext.html"><text x="24" y="370" class="e-a">gpu_ext → 20</text></a>
+        <text x="24" y="386" class="e-s">struct_ops in the GPU driver: UVM</text>
+        <text x="24" y="400" class="e-s">eviction, prefetch, scheduling</text>
+        <a href="21-nccl-ebpf.html"><text x="24" y="426" class="e-a">nccl-eBPF (NCCLbpf) → 21</text></a>
+        <text x="24" y="442" class="e-s">bpftime policies inside NCCL plugins</text>
+        <a href="22-xpu-perf.html"><text x="24" y="468" class="e-a">xpu-perf → 22</text></a>
+        <text x="24" y="484" class="e-s">eBPF + CUPTI CPU/GPU flame graphs</text>
+        <!-- AI agents -->
+        <rect x="282" y="360" width="255" height="150" rx="10" class="e-f"/>
+        <text x="296" y="384" class="e-h">AI agents (Part VI)</text>
+        <a href="23-agentsight.html"><text x="296" y="410" class="e-a">agentsight → 23</text></a>
+        <text x="296" y="426" class="e-s">eBPF + TLS tracing of agent effects</text>
+        <a href="24-actplane.html"><text x="296" y="452" class="e-a">ActPlane → 24</text></a>
+        <text x="296" y="468" class="e-s">information-flow policy via BPF-LSM</text>
+        <a href="25-agentcgroup.html"><text x="296" y="494" class="e-a">agentcgroup → 25</text></a>
+        <text x="420" y="494" class="e-s">+ 26, 27</text>
+        <!-- Research -->
+        <rect x="555" y="320" width="255" height="190" rx="10" class="e-f"/>
+        <text x="569" y="344" class="e-h">Kernel research (Part VII)</text>
+        <a href="28-namei-ext.html"><text x="569" y="370" class="e-a">namei_ext → 28</text></a>
+        <text x="569" y="386" class="e-s">sched_ext-style hook in VFS lookup</text>
+        <a href="29-qwen3-ebpf.html"><text x="569" y="412" class="e-a">qwen3-ebpf → 29</text></a>
+        <text x="569" y="428" class="e-s">LLM forward pass inside eBPF</text>
+        <a href="30-llm-kernel-tooling.html"><text x="569" y="454" class="e-a">schedcp, MCPtrace, GPTtrace → 30</text></a>
+        <text x="569" y="470" class="e-s">LLMs writing kernel extensions</text>
+      </svg>
+      <figcaption>Figure 08.3 — The eunomia-bpf organization by project family. Every box links to its chapter. Tooling and runtimes are general-purpose infrastructure; the GPU, agent and kernel-research families are applications of that infrastructure, mostly tied to papers.</figcaption>
+    </figure>
+
+    <h3>Tooling: eunomia-bpf, wasm-bpf, templates</h3>
+    <p>The <strong>eunomia-bpf</strong> repository is "a compiler and runtime framework to help you build and distribute eBPF program easier". Its top level contains <code>compiler/</code> (ecc), <code>ecli/</code>, <code>bpf-loader-rs/</code> (the dynamic loader that turns the JSON package into libbpf calls), <code>eunomia-sdks/</code> and <code>examples/bpftools/</code> (bootstrap, opensnoop, runqlat, sigsnoop, tcpstates, xdp and more). Per the README, it can expose kernel data through ring buffer or perf events automatically, sample hash maps into histograms, generate CLI arguments from globals, and push and pull programs as OCI images. The README also notes that the old remote-HTTP mode (<code>ecli client</code>/<code>ecli-server</code>) was removed from the main branch and kept on <code>archive/ecli-remote-http</code>. <strong>wasm-bpf</strong> moves the user half into WebAssembly: a "Wasm library, toolchain and runtime" built on CO-RE libbpf, where guest SDKs in C, Rust and Go (chapter 12) compile user space to a <code>.wasm</code> module that the host runtime (<code>cargo install wasm-bpf</code>, or the WasmEdge plugin) loads together with its eBPF object. The <strong>templates</strong> (eunomia-template, libbpf-starter-template, libbpf-rs-starter-template) are GitHub template repos with a Makefile, Dockerfile and CI action already set up for each framework from the comparison table.</p>
+
+    <h3>Runtimes: bpftime, llvmbpf</h3>
+    <p>Covered above. <strong>bpftime</strong> is the user-space runtime with hooks and maps; <strong>llvmbpf</strong> is the VM/compiler alone, which "does not include maps implement, helpers, verifiers, or loaders". The GPU projects below use these two as their execution engine.</p>
+
+    <h3>Verification and performance: bpfix, ebpf-correctness-verifier, bpf-benchmark</h3>
+    <p><strong>bpfix</strong> attacks the most common complaint about eBPF, verifier error messages. It parses the verifier log you already have (for example from <code>bpftool -d prog load</code>) and prints a Rust-compiler-style diagnostic with source spans, an error class, and a suggested repair. Its repo description adds that the output is meant to let an LLM fix the program. <strong>ebpf-correctness-verifier</strong> (<code>ebpf-tv</code>) answers a different question: given an original and a transformed object, are they equivalent? It returns <code>PASS</code>/<code>FAIL</code>/<code>UNKNOWN</code> using an SMT (Z3) model; the repo description says it is "based on Z3 and prevail". The README is explicit that it "does not prove program safety"; the verifier still does that. <strong>bpf-benchmark</strong> ("bpf-bench") treats eBPF optimization as a closed-loop search for LLM agents. It is also the artifact repository for the ACM ATC '26 paper <em>BPF-Ext: Safely Extending the eBPF Compilation Pipeline with Native Operations</em>.</p>
+
+    <h3>GPU: gpu_ext, nccl-eBPF, xpu-perf</h3>
+    <p><strong>gpu_ext</strong> brings the <code>sched_ext</code> idea to GPU drivers. Modified NVIDIA open kernel modules expose eBPF <code>struct_ops</code> hooks so that UVM memory eviction and prefetch policies (FIFO, LFU, stride, …) and per-process timeslices are programmable (arXiv 2512.12615). <strong>nccl-eBPF</strong> ("NCCLbpf") runs bpftime inside NCCL's tuner, profiler and net plugins, so eBPF policies choose the collective algorithm, protocol and channel count. Its README calls it a research prototype targeting the eBPF Workshop at SOSP 2026. <strong>xpu-perf</strong> combines eBPF CPU sampling and uprobes with NVIDIA CUPTI into CPU→GPU flame graphs; its README marks it as work in progress.</p>
+
+    <h3>AI agents: agentsight, ActPlane, agentcgroup</h3>
+    <p>These projects use eBPF to watch and control AI coding agents. <strong>agentsight</strong> is a "top/strace-like observability tool for AI agents": it captures the agent's TLS traffic to the LLM (intent) and kernel events (effects) with eBPF, without an SDK or proxy, and correlates them (arXiv 2508.02736; PACMI '25). <strong>ActPlane</strong> enforces information-flow policies such as "no <code>codex</code> may run <code>git push</code>" in the kernel, following process lineage so a shell script cannot bypass them. It blocks through BPF-LSM where the kernel supports it, and otherwise notifies or kills (arXiv 2606.25189). <strong>agentcgroup</strong> characterizes the OS resource use of coding agents and controls it per tool call with sched_ext (CPU) and <code>memcg_bpf_ops</code> (memory) (arXiv 2602.09345). The ActPlane README notes that its eBPF program ships prebuilt as CO-RE, so users install only a Rust binary. That is the "compile once" column of the comparison table in practice.</p>
+
+    <h3>Research prototypes: namei_ext, qwen3-ebpf</h3>
+    <p><strong>namei_ext</strong> prototypes a <code>sched_ext</code>-style BPF extension point in VFS path resolution. VFS, dcache and permission semantics stay in the kernel, and BPF policies decide lookups and directory enumeration; it ships a modified kernel as a submodule. <strong>qwen3-ebpf</strong> tests the limits of the platform: it runs the full Qwen3-0.6B forward pass (all 28 decoder layers, with a KV cache in a BPF map) as bounded eBPF programs. A separate XDP path keeps BF16 weights in a BPF arena and schedules inference from a BPF workqueue when a packet arrives. Its README is explicit that it is "a research prototype, not a production inference engine".</p>
+
+    <div class="callout warn"><span class="label">Maturity varies</span><p>Treat the families differently. eunomia-bpf/ecli, the templates, bpftime and llvmbpf are general tools with releases. The GPU, agent and kernel-research repositories are mostly paper artifacts: they may need a patched kernel or driver (gpu_ext, namei_ext, bpf-benchmark's BPF-Ext), a recent kernel (agentcgroup needs sched_ext, 6.12+), or specific hardware. Check each README's requirements before planning to deploy one.</p></div>
+
+    <h2>Benefits and limitations of a fragmented ecosystem</h2>
+    <p><strong>Benefits.</strong> Because the kernel interface is stable (a syscall, ELF and BTF), a program's kernel half can move between frameworks, and new loaders can appear without kernel changes. That is why pure-Go and pure-Rust loaders exist, why eBPF for Windows can reuse libbpf's API, and why bpftime can run unmodified libbpf output in user space. Competition between loaders has also improved the reference implementation; for example, both cilium/ebpf and aya reimplemented CO-RE independently.</p>
+    <p><strong>Limitations.</strong> Feature support differs. A new map type, program type or kfunc usually appears first in libbpf and the selftests, and reaches other loaders later. Error messages differ too: the same verifier rejection looks different in Go, Rust and C, which is part of what bpfix addresses. BCC-style tools and CO-RE tools also differ in portability. Code written for BCC (bare <code>task-&gt;field</code> dereferences, string substitution) cannot be pasted into libbpf, which is why BCC maintains two versions of its tools. Finally, userspace and non-Linux runtimes implement subsets: a helper or map type available in Linux may not exist in eBPF for Windows, uBPF or bpftime, so check each project's support list.</p>
+
+    <h2>Related work and further reading</h2>
+    <p>For the kernel side of everything here, the authoritative sources are the kernel's <a href="https://docs.kernel.org/bpf/">BPF documentation</a> and the selftests. For a framework-neutral reference to program types and helpers, see <a href="https://docs.ebpf.io/">docs.ebpf.io</a>. Brendan Gregg's BCC and bpftrace tools (execsnoop, opensnoop, biolatency…) are the usual starting set for observability. Comparing the BCC and libbpf-tools versions of one tool, as we did above, is a quick way to learn CO-RE. <a href="09-bpf-developer-tutorial.html">Chapter 09</a> continues with eunomia-bpf's tutorial, which writes many of these tools in libbpf, Go and Rust. <a href="32-glossary-and-reading-list.html">Chapter 32</a> collects the papers.</p>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Why does BCC's <code>execsnoop.py</code> work on a kernel without BTF, while the libbpf-tools version needs BTF (or an external BTF file)?</p>
+        <button class="opt">BCC uses a different verifier</button>
+        <button class="opt" data-right>BCC compiles the C on the target against that kernel's headers, so offsets are already correct; libbpf compiles once and relocates offsets at load time using BTF</button>
+        <button class="opt">libbpf-tools uses tracepoints, which need BTF</button>
+        <div class="why">Compiling on the target replaces relocation. The cost is a compiler and kernel headers on every host. CO-RE moves compilation to the build machine and needs BTF on the target (or BTFHub/bpf-compatible for old kernels).</div></div>
+      <div class="q"><p><strong>Q2.</strong> In the cilium/ebpf example, when does Clang run?</p>
+        <button class="opt">Every time the Go binary starts</button>
+        <button class="opt" data-right>During <code>go generate</code>, when <code>bpf2go</code> compiles <code>kprobe.c</code> and generates Go bindings that embed the object</button>
+        <button class="opt">Never; cilium/ebpf interprets C directly</button>
+        <div class="why">The <code>//go:generate go tool bpf2go …</code> line runs at development time. The shipped Go binary contains the bytecode and needs no compiler on the host.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Which pair of frameworks uses libbpf underneath?</p>
+        <button class="opt">aya and cilium/ebpf</button>
+        <button class="opt">aya and libbpf-rs</button>
+        <button class="opt" data-right>libbpf-rs and eunomia-bpf</button>
+        <div class="why">libbpf-rs wraps libbpf via libbpf-sys, and eunomia-bpf's loader drives libbpf. aya (pure Rust, libc only) and cilium/ebpf (pure Go) are independent reimplementations.</div></div>
+      <div class="q"><p><strong>Q4.</strong> In eBPF for Windows' preferred native mode, what happens to a verified program?</p>
+        <button class="opt">It is interpreted by uBPF in the kernel</button>
+        <button class="opt" data-right>bpf2c translates it to C, which is compiled into a Windows driver (.sys)</button>
+        <button class="opt">It is sent to a Linux VM to run</button>
+        <div class="why">Native mode runs PREVAIL, then bpf2c, then the normal driver toolchain, which is compatible with HVCI. uBPF provides the JIT mode, and the interpreter exists only in debug builds.</div></div>
+      <div class="q"><p><strong>Q5.</strong> How does bpftime differ from uBPF?</p>
+        <button class="opt">bpftime is a kernel module; uBPF is user space</button>
+        <button class="opt" data-right>uBPF is only a VM; bpftime is a full runtime with loader, verifier, maps, helpers and attach points (uprobes, syscalls) using binary rewriting</button>
+        <button class="opt">They are the same project under different names</button>
+        <div class="why">bpftime's README says it is "not userspace eBPF VM" but a runtime framework. It can use uBPF or llvmbpf as its VM backend.</div></div>
+      <div class="q"><p><strong>Q6.</strong> You must ship an exec-monitoring agent in Go to thousands of hosts with mixed kernels that have BTF. What is the most natural choice?</p>
+        <button class="opt">BCC Python embedded in the Go agent</button>
+        <button class="opt">bpftrace scripts called from Go</button>
+        <button class="opt" data-right>cilium/ebpf with bpf2go and CO-RE (as Tetragon does)</button>
+        <div class="why">There is no compiler on the hosts, a single Go binary, and CO-RE handles kernel differences. This is the pattern Cilium and Tetragon use.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>bpftrace — <a href="https://github.com/bpftrace/bpftrace/blob/a3db9f5222e884745d2ab7ab6bee5060254df896/tools/execsnoop.bt">tools/execsnoop.bt</a>, <a href="https://github.com/bpftrace/bpftrace/blob/a3db9f5222e884745d2ab7ab6bee5060254df896/docs/tutorial_one_liners.md">docs/tutorial_one_liners.md</a> (commit a3db9f5).</li>
+      <li>BCC — <a href="https://github.com/iovisor/bcc/blob/c398a9a7a41cba623b520cda27457b92d7fcad2b/tools/execsnoop.py">tools/execsnoop.py</a>, <a href="https://github.com/iovisor/bcc/blob/c398a9a7a41cba623b520cda27457b92d7fcad2b/libbpf-tools/execsnoop.bpf.c">libbpf-tools/execsnoop.bpf.c</a>, <a href="https://github.com/iovisor/bcc/blob/c398a9a7a41cba623b520cda27457b92d7fcad2b/libbpf-tools/execsnoop.c">libbpf-tools/execsnoop.c</a> (commit c398a9a).</li>
+      <li>cilium/ebpf — <a href="https://github.com/cilium/ebpf/tree/4efde8ed8e2cb96180971b6149170864bbe17722/examples/kprobe">examples/kprobe</a>, <a href="https://github.com/cilium/ebpf/blob/4efde8ed8e2cb96180971b6149170864bbe17722/README.md">README</a> (commit 4efde8e); docs at <a href="https://ebpf-go.dev/">ebpf-go.dev</a>.</li>
+      <li>Aya — <a href="https://github.com/aya-rs/book/tree/f1a68f4f7cbdffcd2573c6acb761ad38fea4adc4/examples/tracepoint">book/examples/tracepoint</a> (commit f1a68f4), <a href="https://github.com/aya-rs/aya">aya-rs/aya README</a>, <a href="https://aya-rs.dev/book/">The Aya book</a>.</li>
+      <li>libbpf-rs — <a href="https://github.com/libbpf/libbpf-rs/tree/9680ea7054dc92e42248ca29c8ba1ed468a2b59d/examples/runqslower">examples/runqslower</a> (commit 9680ea7).</li>
+      <li>libbpf — <a href="https://github.com/libbpf/libbpf">github.com/libbpf/libbpf</a>; <a href="https://github.com/libbpf/libbpf-bootstrap">libbpf-bootstrap</a>; A. Nakryiko, <a href="https://facebookmicrosites.github.io/bpf/blog/2020/02/19/bpf-portability-and-co-re.html">BPF Portability and CO-RE</a> (2020).</li>
+      <li>eunomia-bpf — <a href="https://github.com/eunomia-bpf/eunomia-bpf/tree/a5408a8c3614bd4e008c1f999bb4ee9738e2fc41/examples/bpftools/bootstrap">examples/bpftools/bootstrap</a>, <a href="https://github.com/eunomia-bpf/eunomia-bpf">README</a> (commit a5408a8); <a href="https://eunomia.dev/">eunomia.dev</a>.</li>
+      <li>Cilium — <a href="https://github.com/cilium/cilium">github.com/cilium/cilium</a>; CNCF, <a href="https://www.cncf.io/announcements/2023/10/11/cloud-native-computing-foundation-announces-cilium-graduation">Cilium graduation announcement</a> (2023). Hubble — <a href="https://github.com/cilium/hubble">github.com/cilium/hubble</a>. Tetragon — <a href="https://github.com/cilium/tetragon">github.com/cilium/tetragon</a>.</li>
+      <li>Falco — <a href="https://github.com/falcosecurity/falco">falcosecurity/falco</a>, <a href="https://github.com/falcosecurity/libs">falcosecurity/libs</a>; CNCF, <a href="https://www.cncf.io/announcements/2024/02/29/cloud-native-computing-foundation-announces-falco-graduation">Falco graduation announcement</a> (2024).</li>
+      <li>Tracee — <a href="https://github.com/aquasecurity/tracee">aquasecurity/tracee</a>. Pixie — <a href="https://github.com/pixie-io/pixie">pixie-io/pixie</a>. Parca Agent — <a href="https://github.com/parca-dev/parca-agent">parca-dev/parca-agent</a>. Katran — <a href="https://github.com/facebookincubator/katran">facebookincubator/katran</a>.</li>
+      <li>bpftool — <a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a>; BPF selftests — <a href="https://github.com/torvalds/linux/tree/master/tools/testing/selftests/bpf">tools/testing/selftests/bpf</a>; kernel docs — <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>.</li>
+      <li>eBPF for Windows — <a href="https://github.com/microsoft/ebpf-for-windows">microsoft/ebpf-for-windows</a> (README: architectural overview).</li>
+      <li>E. Gershuni, N. Amit, A. Gurfinkel, N. Narodytska, J. A. Navas, N. Rinetzky, L. Ryzhyk, M. Sagiv. <em>Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions</em>. PLDI 2019. <a href="https://doi.org/10.1145/3314221.3314590">doi:10.1145/3314221.3314590</a>; code: <a href="https://github.com/vbpf/prevail">vbpf/prevail</a>.</li>
+      <li>uBPF — <a href="https://github.com/iovisor/ubpf">iovisor/ubpf</a>; rbpf — <a href="https://github.com/qmonnet/rbpf">qmonnet/rbpf</a>.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn. <em>Extending Applications Safely and Efficiently</em>. OSDI '25, pp. 557–574. <a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">usenix.org</a>; code: <a href="https://github.com/eunomia-bpf/bpftime">eunomia-bpf/bpftime</a>, <a href="https://github.com/eunomia-bpf/llvmbpf">eunomia-bpf/llvmbpf</a>.</li>
+      <li>D. Thaler (ed.). <em>BPF Instruction Set Architecture (ISA)</em>. RFC 9669, 2024. <a href="https://www.rfc-editor.org/rfc/rfc9669.html">rfc-editor.org/rfc/rfc9669</a>.</li>
+      <li>Linux Foundation. <a href="https://www.linuxfoundation.org/press/press-release/facebook-google-isovalent-microsoft-and-netflix-launch-ebpf-foundation-as-part-of-the-linux-foundation">Facebook, Google, Isovalent, Microsoft and Netflix Launch eBPF Foundation</a>, 12 Aug 2021; <a href="https://ebpf.foundation/">ebpf.foundation</a>; <a href="https://ebpf.io/">ebpf.io</a>.</li>
+      <li>Y. Zheng, Y. Hu, T. Yu, A. Quinn. <em>AgentSight: System-Level Observability for AI Agents Using eBPF</em>. PACMI '25 (4th Workshop on Practical Adoption Challenges of ML for Systems). <a href="https://doi.org/10.1145/3766882.3767169">doi:10.1145/3766882.3767169</a>; <a href="https://arxiv.org/abs/2508.02736">arXiv:2508.02736</a>.</li>
+      <li>Y. Zheng et al. <em>gpu_ext: Extensible OS Policies for GPUs via eBPF</em>. <a href="https://arxiv.org/abs/2512.12615">arXiv:2512.12615</a>.</li>
+      <li><em>AgentCgroup: Understanding and Controlling OS Resources of AI Agents</em>. <a href="https://arxiv.org/abs/2602.09345">arXiv:2602.09345</a>.</li>
+      <li><em>ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses</em>. <a href="https://arxiv.org/abs/2606.25189">arXiv:2606.25189</a>.</li>
+      <li>eunomia-bpf project READMEs (read 2026-11-05): <a href="https://github.com/eunomia-bpf/wasm-bpf">wasm-bpf</a>, <a href="https://github.com/eunomia-bpf/bpfix">bpfix</a>, <a href="https://github.com/eunomia-bpf/ebpf-correctness-verifier">ebpf-correctness-verifier</a>, <a href="https://github.com/eunomia-bpf/bpf-benchmark">bpf-benchmark</a>, <a href="https://github.com/eunomia-bpf/gpu_ext">gpu_ext</a>, <a href="https://github.com/eunomia-bpf/nccl-eBPF">nccl-eBPF</a>, <a href="https://github.com/eunomia-bpf/xpu-perf">xpu-perf</a>, <a href="https://github.com/eunomia-bpf/agentsight">agentsight</a>, <a href="https://github.com/eunomia-bpf/ActPlane">ActPlane</a>, <a href="https://github.com/eunomia-bpf/agentcgroup">agentcgroup</a>, <a href="https://github.com/eunomia-bpf/namei_ext">namei_ext</a>, <a href="https://github.com/eunomia-bpf/qwen3-ebpf">qwen3-ebpf</a>, <a href="https://github.com/eunomia-bpf/libbpf-starter-template">libbpf-starter-template</a>, <a href="https://github.com/eunomia-bpf/libbpf-rs-starter-template">libbpf-rs-starter-template</a>, <a href="https://github.com/eunomia-bpf/eunomia-template">eunomia-template</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="07-networking-xdp-tc.html"><small>Previous</small>07 · XDP, AF_XDP, tc and socket programs</a>
+      <a class="next" href="09-bpf-developer-tutorial.html"><small>Next</small>09 · bpf-developer-tutorial</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,1144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · What is BPF? From packet filter to in-kernel VM · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="01">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="How a 1993 packet filter became Linux's safe in-kernel execution engine: classic BPF, seccomp-bpf, the 2014 eBPF rewrite, and a first hello world.">
+<meta name="chapter-repo" content="https://github.com/torvalds/linux">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 01 · What is BPF?</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 01</div>
+      <h1>What is BPF? From packet filter to in-kernel VM</h1>
+      <p class="lede">tcpdump uses BPF to filter packets, Chrome uses it to sandbox renderers, and Cilium uses it
+        to route traffic in a Kubernetes cluster. How did a small packet-filter language from 1993 turn into
+        the standard way to run your own code safely inside the Linux kernel?</p>
+      <div class="meta"><span>Prerequisites: C, basic Linux, what a syscall is</span><span>Repo: Linux kernel (<code>kernel/bpf/</code>, <code>net/core/filter.c</code>)</span><span>~45 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>An operating-system kernel can see everything: every packet, every system call, every page fault and
+      every context switch. It can also decide everything: which packet is dropped, which process runs next,
+      which file open is denied. If you want visibility or control at that level, you need code that runs
+      <em>inside</em> the kernel. For most of Unix history there were only two ways to get it there: get a patch
+      merged upstream and wait years for it to reach your servers, or write a loadable kernel module and accept
+      that one bad pointer can crash the machine.</p>
+    <p>BPF is a third way. You hand the kernel a small program in a restricted bytecode. The kernel checks it,
+      compiles it to native machine code, and runs it when a chosen event happens. Results go into shared data
+      structures that ordinary user-space programs can read. The kernel promises that the program will not crash it,
+      will not loop forever, and will only touch memory it is allowed to touch. If it cannot prove that, it refuses
+      to load the program.</p>
+    <p>This chapter tells the story in order, because each stage explains a design decision you will run into later:</p>
+    <ul>
+      <li><strong>1992–93:</strong> McCanne and Jacobson design the BSD Packet Filter so that tcpdump can capture
+        packets without copying every packet to user space.</li>
+      <li><strong>1990s–2012:</strong> Linux adopts the same filter machine for sockets ("Linux Socket Filter"),
+        adds a JIT, and reuses it for system-call filtering (seccomp-bpf).</li>
+      <li><strong>2014:</strong> Alexei Starovoitov, working with Daniel Borkmann, rewrites the in-kernel
+        machine into <em>extended</em> BPF: 64-bit registers, function calls, maps, a verifier and a JIT.</li>
+      <li><strong>2015 onward:</strong> new hook types arrive release after release: tracing, XDP, cgroups, LSM,
+        and in 6.12 even CPU scheduling.</li>
+    </ul>
+    <p>At the end you will run a real program, look at its bytecode, and watch the verifier reject a buggy one.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p>BPF is <strong>a safe, verifiable instruction set that the kernel runs on events</strong>. The safety
+      comes from a static check made before the program runs (the verifier), not from a sandbox at runtime. The
+      speed comes from a JIT that turns the checked bytecode into native instructions. The usefulness comes from
+      <em>hooks</em> (where programs attach), <em>helpers</em> (the kernel functions programs may call) and
+      <em>maps</em> (shared state with user space).</p>
+    </div>
+
+    <h2>The origin: the BSD Packet Filter (1993)</h2>
+    <h3>The problem: capturing packets without drowning</h3>
+    <p>In the early 1990s Steven McCanne and Van Jacobson at Lawrence Berkeley Laboratory were building network
+      monitoring tools, most famously <code>tcpdump</code>. A packet capture tool wants maybe one packet in a
+      thousand, such as "TCP traffic to port 22" or "ARP requests". The rest should be ignored as cheaply as
+      possible. If the kernel copies <em>every</em> packet to the user process and lets the process decide, most of
+      the CPU time goes into copying packets that will be thrown away.</p>
+    <p>Their paper, <a href="https://www.tcpdump.org/papers/bpf-usenix93.pdf">"The BSD Packet Filter: A New
+      Architecture for User-level Packet Capture"</a> (USENIX Winter 1993, San Diego; the preprint is dated
+      December 19, 1992), describes the answer. The user process supplies a <em>filter program</em>. The kernel
+      runs that program on each packet "in place", where the network card's DMA engine put it, and copies only the
+      packets the filter accepts. The paper's conclusion from its measurements: "filtering packets early and in
+      place pays off".</p>
+
+    <h3>Why a register machine</h3>
+    <p>The idea of a programmable in-kernel filter was not new. The CMU/Stanford Packet Filter (CSPF) already ran
+      filter programs, on a <em>stack</em> machine whose programs were boolean expression trees. McCanne and
+      Jacobson argued that a stack machine is a poor fit for RISC CPUs whose bottleneck is memory: simulating an
+      operand stack means memory loads and stores for every operation. They switched to two ideas:</p>
+    <ul>
+      <li><strong>A control-flow graph instead of an expression tree.</strong> Each node tests one packet field and
+        branches. What the program has already learned about the packet is encoded in the path taken, so a field
+        is parsed once instead of again for every sub-expression.</li>
+      <li><strong>A register machine instead of a stack machine.</strong> The abstract registers can live in real
+        CPU registers.</li>
+    </ul>
+    <p>The paper lists five design constraints, and they still explain the shape of BPF today:</p>
+    <ol>
+      <li>It must be protocol independent: adding a new protocol must not require a kernel change. Packets are
+        just byte arrays.</li>
+      <li>It must be general enough to handle unforeseen uses.</li>
+      <li>Packet data references should be minimised.</li>
+      <li>Decoding an instruction should be a single C <code>switch</code> statement.</li>
+      <li>The abstract machine registers should reside in physical registers.</li>
+    </ol>
+    <p>The measured gains were large. The abstract claims a filter evaluator "up to 20 times faster" than CSPF and
+      overall performance "up to 100 times faster than Sun's NIT" on the same hardware. On a SPARCstation 2 the
+      fixed per-packet cost of a BPF tap call was about 6&nbsp;µs against 89&nbsp;µs for NIT.</p>
+
+    <h3>The classic BPF machine</h3>
+    <p>The "BPF pseudo-machine" in the paper is tiny:</p>
+    <ul>
+      <li><strong>A</strong>, a 32-bit accumulator, where all arithmetic and comparisons happen;</li>
+      <li><strong>X</strong>, a 32-bit index register, used mainly to hold the variable length of the IP header;</li>
+      <li><strong>M[]</strong>, a small scratch memory (16 words in Linux, <code>BPF_MEMWORDS</code>);</li>
+      <li>an implicit program counter.</li>
+    </ul>
+    <p>Every instruction has the same 64-bit format: <code>opcode:16 jt:8 jf:8 k:32</code>. <code>jt</code> and
+      <code>jf</code> are the jump-if-true and jump-if-false offsets, counted from the next instruction. Because
+      the offsets are unsigned and only point forward, <strong>a classic BPF program cannot loop</strong>. Every
+      program finishes in at most as many steps as it has instructions. That property is the seed of everything
+      the eBPF verifier later does. A read past the end of the packet ends the filter with return value 0 (drop),
+      and so does a division by zero. A <code>ret</code> instruction ends the program and returns how many bytes
+      of the packet to keep, where 0 means "reject".</p>
+    <p>Linux still defines exactly this structure in its user-space API header:</p>
+    <pre data-file="linux/include/uapi/linux/filter.h"><code class="language-c">/*
+ *	Try and keep these values and structures similar to BSD, especially
+ *	the BPF code definitions which need to match so you can share filters
+ */
+ 
+struct sock_filter {	/* Filter block */
+	__u16	code;   /* Actual filter code */
+	__u8	jt;	/* Jump true */
+	__u8	jf;	/* Jump false */
+	__u32	k;      /* Generic multiuse field */
+};
+
+struct sock_fprog {	/* Required for SO_ATTACH_FILTER. */
+	unsigned short		len;	/* Number of filter blocks */
+	struct sock_filter __user *filter;
+};
+/* ... */
+#define BPF_STMT(code, k) { (unsigned short)(code), 0, 0, k }
+#define BPF_JUMP(code, k, jt, jf) { (unsigned short)(code), jt, jf, k }
+/* ... */
+#define BPF_MEMWORDS 16</code></pre>
+
+    <h2>tcpdump, libpcap and a real classic BPF program</h2>
+    <p>Nobody writes classic BPF by hand if they can avoid it. tcpdump accepts a filter expression such as
+      <code>ip and tcp dst port 22</code>, and its capture library, <strong>libpcap</strong>, compiles the
+      expression into BPF, optimises it, and attaches it to the capture socket. (The 1993 paper says the compiler
+      and optimiser were "part of tcpdump"; they later moved into libpcap.) tcpdump can show you the compiled
+      program: <code>-d</code> prints it as readable assembly, <code>-dd</code> as a C array, <code>-ddd</code> as
+      decimal numbers.</p>
+    <p>Here is real output, captured for this chapter with tcpdump 4.99.3 / libpcap 1.10.3. <code>-y EN10MB</code>
+      selects the Ethernet link type, so the command works without a capture interface or root:</p>
+    <pre><code class="language-plaintext">$ tcpdump -d -y EN10MB 'ip and tcp dst port 22'
+(000) ldh      [12]
+(001) jeq      #0x800           jt 2	jf 10
+(002) ldb      [23]
+(003) jeq      #0x6             jt 4	jf 10
+(004) ldh      [20]
+(005) jset     #0x1fff          jt 10	jf 6
+(006) ldxb     4*([14]&amp;0xf)
+(007) ldh      [x + 16]
+(008) jeq      #0x16            jt 9	jf 10
+(009) ret      #262144
+(010) ret      #0</code></pre>
+    <p>Offsets are bytes from the start of the Ethernet frame. The Ethernet header is 14 bytes (6 destination
+      MAC, 6 source MAC, 2 EtherType), so the IP header starts at byte 14. Instruction by instruction:</p>
+    <table>
+      <tr><th>#</th><th>Instruction</th><th>Meaning</th></tr>
+      <tr><td>000</td><td><code>ldh [12]</code></td><td>Load the 16-bit half-word at offset 12, the EtherType, into A. Loads convert from network to host byte order.</td></tr>
+      <tr><td>001</td><td><code>jeq #0x800 jt 2 jf 10</code></td><td>Is it IPv4 (0x0800)? If yes go to 2, otherwise to 10 (reject).</td></tr>
+      <tr><td>002</td><td><code>ldb [23]</code></td><td>Load one byte at 14 + 9 = 23: the IP <em>protocol</em> field.</td></tr>
+      <tr><td>003</td><td><code>jeq #0x6 jt 4 jf 10</code></td><td>Protocol 6 is TCP. Not TCP: reject.</td></tr>
+      <tr><td>004</td><td><code>ldh [20]</code></td><td>Load 14 + 6 = 20: the IP flags and the 13-bit fragment offset.</td></tr>
+      <tr><td>005</td><td><code>jset #0x1fff jt 10 jf 6</code></td><td><code>jset</code> tests <code>A &amp; k</code>. A non-zero fragment offset means a later fragment that carries no TCP header, so reject it.</td></tr>
+      <tr><td>006</td><td><code>ldxb 4*([14]&amp;0xf)</code></td><td>The special "MSH" addressing mode from the 1993 paper: X = 4 × (low nibble of byte 14), the IP header length in bytes (usually 20, more with IP options).</td></tr>
+      <tr><td>007</td><td><code>ldh [x + 16]</code></td><td>Indirect load at X + 16 = 14 (Ethernet) + IHL + 2, the TCP destination port. This is why X exists: the TCP header has a variable offset.</td></tr>
+      <tr><td>008</td><td><code>jeq #0x16 jt 9 jf 10</code></td><td>Port 0x16 = 22?</td></tr>
+      <tr><td>009</td><td><code>ret #262144</code></td><td>Accept and keep up to 262144 bytes (tcpdump's default snap length).</td></tr>
+      <tr><td>010</td><td><code>ret #0</code></td><td>Reject: keep 0 bytes.</td></tr>
+    </table>
+    <p>Instructions 006–007 are almost exactly the header-parsing example in section 3.5 of the 1993 paper
+      (<code>ldx 4*([14]&amp;0xf)</code>, <code>ldh [x+16]</code>). Thirty years later libpcap still emits the same
+      idiom. The same program as raw instructions, which is what the kernel actually receives:</p>
+    <pre><code class="language-plaintext">$ tcpdump -dd -y EN10MB 'ip and tcp dst port 22'
+{ 0x28, 0, 0, 0x0000000c },
+{ 0x15, 0, 8, 0x00000800 },
+{ 0x30, 0, 0, 0x00000017 },
+{ 0x15, 0, 6, 0x00000006 },
+{ 0x28, 0, 0, 0x00000014 },
+{ 0x45, 4, 0, 0x00001fff },
+{ 0xb1, 0, 0, 0x0000000e },
+{ 0x48, 0, 0, 0x00000010 },
+{ 0x15, 0, 1, 0x00000016 },
+{ 0x6, 0, 0, 0x00040000 },
+{ 0x6, 0, 0, 0x00000000 },</code></pre>
+    <p>Each line is one <code>struct sock_filter {code, jt, jf, k}</code>. In the raw form the jumps are relative:
+      instruction 1 has <code>jf = 8</code>, meaning "skip 8 instructions after the next one", which is
+      1 + 1 + 8 = 10. The <code>-d</code> listing just prints the resolved targets. Opcode <code>0x28</code> is
+      <code>BPF_LD|BPF_H|BPF_ABS</code>, <code>0x15</code> is <code>BPF_JMP|BPF_JEQ|BPF_K</code>, and
+      <code>0x06</code> is <code>BPF_RET|BPF_K</code>.</p>
+
+    <h3>Try it: run the filter on a packet</h3>
+    <p>The widget below runs these exact 11 instructions with a tiny classic BPF interpreter written in
+      JavaScript. Pick a packet and watch A, X and the program counter change. Notice that the program always
+      makes forward progress and stops after at most 11 steps.</p>
+    <div class="card" id="cbpf-widget">
+      <div id="cbpf-buttons" style="display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.6rem"></div>
+      <pre style="margin:0"><code class="language-plaintext" id="cbpf-trace">Choose a packet above.</code></pre>
+    </div>
+    <p>To attach such a filter yourself without libpcap, you pass the array to <code>setsockopt</code>. The kernel
+      documentation shows the pattern: <code>socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))</code>, then
+      <code>setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &amp;bpf, sizeof(bpf))</code>, where <code>bpf</code>
+      is a <code>struct sock_fprog</code> pointing at the array (<a href="https://docs.kernel.org/networking/filter.html">docs.kernel.org/networking/filter.html</a>).
+      The kernel checks the program (valid opcodes, jumps in range, ends in <code>ret</code>) and then runs it on every packet that reaches that socket.</p>
+
+    <h2>Classic BPF in Linux: socket filters, a JIT, and seccomp</h2>
+    <h3>Linux Socket Filter</h3>
+    <p>Linux adopted the BSD design under the name Linux Socket Filtering (LSF). The kernel documentation says it
+      plainly: "LSF follows exactly the same filter code structure as BSD's BPF, so referring to the BSD bpf.4
+      manpage is very helpful in creating filters." Linux attaches the filter to a socket instead of to a
+      <code>/dev/bpf</code> device as BSD does. LWN credits Jay Schulist with adding BPF support to Linux and notes
+      that for years afterwards the interpreter "has been relatively static, seeing only a few performance tweaks
+      and the addition of a few instructions for access to packet data"
+      (<a href="https://lwn.net/Articles/599755/">LWN, 2014</a>). Linux also added "BPF extensions": magic negative
+      load offsets that return metadata such as the interface index, the VLAN tag or a random number. The kernel
+      docs show <code>ld ifidx</code>, <code>ld vlan_tci</code> and <code>ld rand</code>. Do not confuse these with
+      <em>extended</em> BPF; the docs warn about that too.</p>
+
+    <h3>A JIT for packet filters (Linux 3.0)</h3>
+    <p>In 2011 Eric Dumazet added a just-in-time compiler that translated classic BPF directly to x86-64 machine
+      code, in Linux 3.0 (<a href="https://lwn.net/Articles/437981/">LWN, "A JIT for packet filters"</a>). Because the
+      BPF machine is so simple, "every BPF instruction maps to a straightforward x86 instruction sequence". That
+      first JIT was hard-wired to x86-64. The idea that a checked program could be compiled to native code and still
+      be safe is the second ingredient of modern eBPF.</p>
+
+    <h3>seccomp-bpf (Linux 3.5): BPF beyond networking</h3>
+    <p>The first big use of BPF outside networking was system-call filtering. The original seccomp mode
+      (Linux 2.6.12) was all-or-nothing: a process could switch into a state where only <code>read</code>,
+      <code>write</code>, <code>exit</code> and <code>sigreturn</code> were allowed. Sandboxes such as Chrome's needed
+      something more flexible. After several rejected designs, Will Drewry proposed reusing the packet filter
+      (<a href="https://lwn.net/Articles/475043/">LWN, January 2012</a>): instead of a packet, the BPF program reads
+      a <code>struct seccomp_data</code> holding the system-call number, the architecture and the arguments, and its
+      return value says what to do: allow, return an errno, send a signal, kill the process, and so on. As one LWN commenter put it,
+      "BPF is nice because it is trivial to verify and does not allow backwards branches." The feature shipped in
+      Linux 3.5, released 21 July 2012, and kernelnewbies notes that Chromium already used it to sandbox plugins
+      (<a href="https://kernelnewbies.org/Linux_3.5">kernelnewbies, Linux 3.5</a>).</p>
+    <p>The kernel's own sample, written by Will Drewry, shows a complete seccomp-bpf filter built with the
+      <code>BPF_STMT</code> and <code>BPF_JUMP</code> macros from <code>filter.h</code>:</p>
+    <pre data-file="linux/samples/seccomp/dropper.c"><code class="language-c">static int install_filter(int arch, int nr, int error)
+{
+	struct sock_filter filter[] = {
+		BPF_STMT(BPF_LD+BPF_W+BPF_ABS,
+			 (offsetof(struct seccomp_data, arch))),
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, arch, 0, 3),
+		BPF_STMT(BPF_LD+BPF_W+BPF_ABS,
+			 (offsetof(struct seccomp_data, nr))),
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, nr, 0, 1),
+		BPF_STMT(BPF_RET+BPF_K,
+			 SECCOMP_RET_ERRNO|(error &amp; SECCOMP_RET_DATA)),
+		BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog prog = {
+		.len = (unsigned short)(sizeof(filter)/sizeof(filter[0])),
+		.filter = filter,
+	};
+	/* ... */
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
+		perror("prctl(NO_NEW_PRIVS)");
+		return 1;
+	}
+	if (prctl(PR_SET_SECCOMP, 2, &amp;prog)) {
+		perror("prctl(PR_SET_SECCOMP)");
+		return 1;
+	}
+	return 0;
+}</code></pre>
+    <p>Read it as a CFG: load <code>arch</code>; if it is not the expected architecture, jump 3 ahead to
+      <code>ALLOW</code> (this sample only filters calls for the given ABI); load the syscall number <code>nr</code>;
+      if it matches, return <code>SECCOMP_RET_ERRNO</code> with the chosen errno, otherwise allow. The
+      <code>PR_SET_NO_NEW_PRIVS</code> call is required (unless the caller has <code>CAP_SYS_ADMIN</code>) so that a
+      filter can never be imposed on a more privileged program, such as a setuid binary, run by the filtered task
+      (<a href="https://docs.kernel.org/userspace-api/seccomp_filter.html">seccomp_filter docs</a>). The
+      <code>2</code> passed to <code>prctl</code> is <code>SECCOMP_MODE_FILTER</code>.</p>
+    <div class="callout tip"><span class="label">Still classic</span>
+      <p>seccomp filters are still written in <em>classic</em> BPF today: the API takes a
+      <code>struct sock_fprog</code>. Internally the kernel converts them to eBPF before running them, like all
+      classic programs (see below). Tools like Docker's default seccomp profile or systemd's
+      <code>SystemCallFilter=</code> generate such programs for you, usually through libseccomp.</p>
+    </div>
+
+    <h2>2014: extended BPF</h2>
+    <h3>Why classic BPF hit a wall</h3>
+    <p>By 2013 the kernel used BPF for socket filters, seccomp, the <code>cls_bpf</code> traffic classifier,
+      netfilter's <code>xt_bpf</code>, the team driver and the PTP classifier. But the machine was still the
+      1992 design: two 32-bit registers, no function calls, 16 scratch words. As Matt Fleming summarised in LWN,
+      "the design of the virtual machine and its instruction set architecture (ISA) were left behind as modern
+      processors moved to 64-bit registers and invented new instructions required for multiprocessor systems,
+      like the atomic exchange-and-add instruction" (<a href="https://lwn.net/Articles/740157/">LWN, "A thorough
+      introduction to eBPF", 2017</a>). Every 64-bit value had to be split into halves, and the JIT could not map
+      the abstract machine well onto CPUs with 16 or 31 general-purpose registers.</p>
+
+    <h3>The rewrite (Linux 3.15)</h3>
+    <p>Alexei Starovoitov's commit <a href="https://github.com/torvalds/linux/commit/bd4cf0ed331a275e9bf5a49e6d0fd55dffc551b8"><code>bd4cf0ed331a</code></a>
+      "net: filter: rework/optimize internal BPF interpreter's instruction set", which closes with "Joint work with
+      Daniel Borkmann", replaced the kernel's interpreter with a new instruction set "modelled closer to mimic
+      native instruction sets and ... designed to be JITed with one to one mapping". Its commit message lists the
+      changes:</p>
+    <ul>
+      <li>number of registers increases from 2 to 10;</li>
+      <li>register width increases from 32-bit to 64-bit;</li>
+      <li>conditional <code>jt</code>/<code>jf</code> targets replaced with <code>jt</code>/fall-through (better for CPU branch predictors);</li>
+      <li>adds signed <code>&gt;</code> and <code>&gt;=</code>, arithmetic right shift, endianness conversion;</li>
+      <li>16 4-byte scratch slots replaced with up to 512 bytes of stack;</li>
+      <li>a <code>bpf_call</code> instruction and a register-passing convention "for zero overhead calls from/to other kernel functions";</li>
+      <li>an atomic add instruction; <code>tax</code>/<code>txa</code> replaced with a general <code>mov</code>.</li>
+    </ul>
+    <p>The key compatibility trick: user space kept loading <em>classic</em> programs, and the kernel translated
+      them into the new format before running them. tcpdump, seccomp and <code>cls_bpf</code> got faster without
+      changing a line. LWN called this "internal BPF" at first (<a href="https://lwn.net/Articles/599755/">"BPF: the
+      universal in-kernel virtual machine"</a>); the name that stuck is <strong>eBPF</strong>. The x86-64 JIT was
+      ported to the new instruction set in 3.16.</p>
+    <p>The new instruction, as defined today in the kernel's UAPI header, is still 64 bits, but laid out for a
+      register machine:</p>
+    <pre data-file="linux/include/uapi/linux/bpf.h"><code class="language-c">enum {
+	BPF_REG_0 = 0,
+	BPF_REG_1,
+	BPF_REG_2,
+	BPF_REG_3,
+	BPF_REG_4,
+	BPF_REG_5,
+	BPF_REG_6,
+	BPF_REG_7,
+	BPF_REG_8,
+	BPF_REG_9,
+	BPF_REG_10,
+	__MAX_BPF_REG,
+};
+
+/* BPF has 10 general purpose 64-bit registers and stack frame. */
+#define MAX_BPF_REG	__MAX_BPF_REG
+
+struct bpf_insn {
+	__u8	code;		/* opcode */
+	__u8	dst_reg:4;	/* dest register */
+	__u8	src_reg:4;	/* source register */
+	__s16	off;		/* signed offset */
+	__s32	imm;		/* signed immediate constant */
+};</code></pre>
+    <p>Compare it with <code>struct sock_filter</code> above: the 16-bit opcode and two 8-bit jump targets became an
+      8-bit opcode, two 4-bit register numbers and a signed 16-bit offset. R0 holds return values, R1–R5 carry
+      function arguments, R6–R9 are callee-saved, and R10 is a read-only frame pointer. That mirrors the C calling
+      convention of x86-64 and arm64, so a call from BPF to a kernel function needs no argument shuffling. Chapter
+      <a href="02-ebpf-isa-and-vm.html">02</a> covers the ISA in detail.</p>
+
+    <table>
+      <tr><th></th><th>Classic BPF (cBPF)</th><th>Extended BPF (eBPF)</th></tr>
+      <tr><td>Registers</td><td>A (accumulator), X (index), 32-bit</td><td>R0–R9 general purpose + R10 frame pointer, 64-bit</td></tr>
+      <tr><td>Memory</td><td>16 × 32-bit scratch words</td><td>512-byte stack, plus maps</td></tr>
+      <tr><td>Instruction</td><td><code>code:16 jt:8 jf:8 k:32</code></td><td><code>code:8 dst:4 src:4 off:16 imm:32</code> (plus a 128-bit wide form for 64-bit constants)</td></tr>
+      <tr><td>Control flow</td><td>forward jumps only</td><td>jumps both ways; bounded loops accepted by the verifier since 5.3</td></tr>
+      <tr><td>Calls</td><td>none</td><td>helpers, kfuncs, BPF-to-BPF calls, tail calls</td></tr>
+      <tr><td>Input</td><td>a packet, or <code>seccomp_data</code></td><td>a typed context per program type (<code>__sk_buff</code>, <code>xdp_md</code>, <code>pt_regs</code>, tracepoint args, …)</td></tr>
+      <tr><td>Safety check</td><td>simple static checks (<code>bpf_check_classic</code>)</td><td>the verifier: path-by-path abstract interpretation</td></tr>
+      <tr><td>Written in</td><td>libpcap filter expressions, hand assembly</td><td>restricted C (clang/LLVM or GCC), Rust, bpftrace, …</td></tr>
+      <tr><td>Standard</td><td>de facto (BSD <code>bpf(4)</code>)</td><td><a href="https://www.rfc-editor.org/rfc/rfc9669.html">RFC 9669</a>, IETF Standards Track, October 2024</td></tr>
+    </table>
+
+    <h3>Opening it to user space: <code>bpf()</code> and maps (Linux 3.18)</h3>
+    <p>In 3.15 eBPF was internal: only the kernel produced it. The next step was to let user space load eBPF
+      programs directly. That meant the instruction set would become ABI and could never change incompatibly
+      again. LWN's Jonathan Corbet pointed this out in July 2014
+      (<a href="https://lwn.net/Articles/603983/">"Extending extended BPF"</a>). The patch set added three things
+      that define eBPF to this day:</p>
+    <ul>
+      <li><strong>The <code>bpf()</code> system call</strong>, a single multiplexer:
+        <code>int bpf(int cmd, union bpf_attr *attr, unsigned int size);</code>. Commands include
+        <code>BPF_PROG_LOAD</code>, <code>BPF_MAP_CREATE</code>, <code>BPF_MAP_LOOKUP_ELEM</code> and
+        <code>BPF_MAP_UPDATE_ELEM</code>. The union-plus-size design, suggested by Ingo Molnar, lets new fields be
+        added later; unused fields must be zero (<a href="https://lwn.net/Articles/612878/">LWN, "The BPF system call
+        API, version 14"</a>).</li>
+      <li><strong>Maps</strong>: kernel-resident key/value stores, each referenced by a file descriptor. A BPF program
+        updates a map when an event fires; user space reads the map with <code>bpf()</code>. Maps are how state
+        survives between program runs and how results reach user space.</li>
+      <li><strong>The verifier</strong>, the largest part of the patch set: a static analyser that simulates the
+        program, tracks the type and range of every register, and rejects anything that might read uninitialised
+        registers, access memory out of bounds, or fail to terminate.</li>
+    </ul>
+    <p>The series was accepted into net-next in late September 2014 and shipped in Linux 3.18. The bcc project's
+      feature table lists the <code>bpf()</code> syscall and maps under 3.18
+      (commit <code>99c55f7d47c0</code>), attaching eBPF to sockets plus hash and array maps under 3.19, and kprobes
+      and the <code>tc</code> classifier under 4.1 (<a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">bcc kernel-versions.md</a>).</p>
+
+    <h2>Timeline: BPF features by kernel version</h2>
+    <p>Since 2014 almost every kernel release has added BPF features. The figure shows the milestones this
+      curriculum refers to most. Versions come from the bcc feature table and kernelnewbies, except the 1993 paper
+      and the 2024 RFC. The spacing is not to scale.</p>
+    <figure>
+      <svg viewBox="0 0 1000 300" role="img" aria-label="Timeline of BPF milestones from the 1993 paper through Linux 6.12 and RFC 9669">
+        <style>
+          .f1-axis{stroke:var(--muted);stroke-width:2}
+          .f1-tick{stroke:var(--border);stroke-width:1.5}
+          .f1-dot{fill:var(--accent2)} .f1-dotc{fill:var(--accent)}
+          .f1-v{fill:var(--fg);font:700 13px var(--font, sans-serif);text-anchor:middle}
+          .f1-t{fill:var(--muted);font:11.5px var(--font, sans-serif);text-anchor:middle}
+          .f1-band{fill:var(--bg3)} .f1-era{fill:var(--muted);font:600 11px var(--font, sans-serif);letter-spacing:.06em}
+        </style>
+        <rect class="f1-band" x="20" y="140" width="190" height="20" rx="4"/>
+        <rect class="f1-band" x="222" y="140" width="758" height="20" rx="4" style="opacity:.6"/>
+        <text class="f1-era" x="30" y="154">CLASSIC BPF</text>
+        <text class="f1-era" x="232" y="154">EXTENDED BPF</text>
+        <line class="f1-axis" x1="20" y1="150" x2="980" y2="150"/>
+        <!-- top row: even indexes -->
+        <g>
+          <line class="f1-tick" x1="55" y1="95" x2="55" y2="150"/><circle class="f1-dotc" cx="55" cy="150" r="6"/>
+          <text class="f1-v" x="55" y="62">1993</text><text class="f1-t" x="55" y="78">BSD Packet</text><text class="f1-t" x="55" y="92">Filter paper</text>
+          <line class="f1-tick" x1="181" y1="95" x2="181" y2="150"/><circle class="f1-dotc" cx="181" cy="150" r="6"/>
+          <text class="f1-v" x="181" y="62">3.5 (2012)</text><text class="f1-t" x="181" y="78">seccomp-bpf</text><text class="f1-t" x="181" y="92">syscall filters</text>
+          <line class="f1-tick" x1="307" y1="95" x2="307" y2="150"/><circle class="f1-dot" cx="307" cy="150" r="6"/>
+          <text class="f1-v" x="307" y="62">3.16</text><text class="f1-t" x="307" y="78">x86-64 JIT</text><text class="f1-t" x="307" y="92">for eBPF</text>
+          <line class="f1-tick" x1="433" y1="95" x2="433" y2="150"/><circle class="f1-dot" cx="433" cy="150" r="6"/>
+          <text class="f1-v" x="433" y="62">4.1</text><text class="f1-t" x="433" y="78">kprobes,</text><text class="f1-t" x="433" y="92">tc cls_bpf</text>
+          <line class="f1-tick" x1="559" y1="95" x2="559" y2="150"/><circle class="f1-dot" cx="559" cy="150" r="6"/>
+          <text class="f1-v" x="559" y="62">4.18</text><text class="f1-t" x="559" y="78">BTF type info,</text><text class="f1-t" x="559" y="92">AF_XDP</text>
+          <line class="f1-tick" x1="685" y1="95" x2="685" y2="150"/><circle class="f1-dot" cx="685" cy="150" r="6"/>
+          <text class="f1-v" x="685" y="62">5.5</text><text class="f1-t" x="685" y="78">BPF trampoline</text><text class="f1-t" x="685" y="92">(fentry/fexit)</text>
+          <line class="f1-tick" x1="811" y1="95" x2="811" y2="150"/><circle class="f1-dot" cx="811" cy="150" r="6"/>
+          <text class="f1-v" x="811" y="62">5.8</text><text class="f1-t" x="811" y="78">ring buffer,</text><text class="f1-t" x="811" y="92">iterators</text>
+          <line class="f1-tick" x1="937" y1="95" x2="937" y2="150"/><circle class="f1-dot" cx="937" cy="150" r="6"/>
+          <text class="f1-v" x="937" y="62">2024</text><text class="f1-t" x="937" y="78">RFC 9669</text><text class="f1-t" x="937" y="92">ISA standard</text>
+        </g>
+        <!-- bottom row: odd indexes -->
+        <g>
+          <line class="f1-tick" x1="118" y1="150" x2="118" y2="205"/><circle class="f1-dotc" cx="118" cy="150" r="6"/>
+          <text class="f1-v" x="118" y="224">3.0 (2011)</text><text class="f1-t" x="118" y="240">classic BPF JIT</text><text class="f1-t" x="118" y="254">(x86-64)</text>
+          <line class="f1-tick" x1="244" y1="150" x2="244" y2="205"/><circle class="f1-dot" cx="244" cy="150" r="6"/>
+          <text class="f1-v" x="244" y="224">3.15 (2014)</text><text class="f1-t" x="244" y="240">eBPF interpreter;</text><text class="f1-t" x="244" y="254">cBPF translated</text>
+          <line class="f1-tick" x1="370" y1="150" x2="370" y2="205"/><circle class="f1-dot" cx="370" cy="150" r="6"/>
+          <text class="f1-v" x="370" y="224">3.18</text><text class="f1-t" x="370" y="240">bpf() syscall,</text><text class="f1-t" x="370" y="254">maps, verifier</text>
+          <line class="f1-tick" x1="496" y1="150" x2="496" y2="205"/><circle class="f1-dot" cx="496" cy="150" r="6"/>
+          <text class="f1-v" x="496" y="224">4.8</text><text class="f1-t" x="496" y="240">XDP</text><text class="f1-t" x="496" y="254">(driver hook)</text>
+          <line class="f1-tick" x1="622" y1="150" x2="622" y2="205"/><circle class="f1-dot" cx="622" cy="150" r="6"/>
+          <text class="f1-v" x="622" y="224">5.3</text><text class="f1-t" x="622" y="240">bounded loops</text><text class="f1-t" x="622" y="254">(1M insn limit: 5.2)</text>
+          <line class="f1-tick" x1="748" y1="150" x2="748" y2="205"/><circle class="f1-dot" cx="748" cy="150" r="6"/>
+          <text class="f1-v" x="748" y="224">5.6 / 5.7</text><text class="f1-t" x="748" y="240">struct_ops /</text><text class="f1-t" x="748" y="254">BPF LSM</text>
+          <line class="f1-tick" x1="874" y1="150" x2="874" y2="205"/><circle class="f1-dot" cx="874" cy="150" r="6"/>
+          <text class="f1-v" x="874" y="224">6.12 (2024)</text><text class="f1-t" x="874" y="240">sched_ext:</text><text class="f1-t" x="874" y="254">BPF schedulers</text>
+        </g>
+      </svg>
+      <figcaption>Figure 01.1 — From packet filter to general kernel extension. Orange dots are classic BPF, blue dots are
+        eBPF. Other points: 3.19 socket attach and hash/array maps, 4.7 tracepoints, 4.10 cgroup programs, 4.15 bpftool
+        in the kernel tree, 4.16 BPF-to-BPF calls, 5.10 sleepable programs. Sources: bcc <code>kernel-versions.md</code>,
+        kernelnewbies 3.5 and 6.12, RFC 9669.</figcaption>
+    </figure>
+    <p>The pattern is that each new hook brought eBPF into a new subsystem. Kprobes and tracepoints (4.1, 4.7)
+      made it a tracing tool; this is where Brendan Gregg's bcc and bpftrace tools come in. XDP (4.8) runs programs
+      in the network driver before the kernel allocates a socket buffer, which made eBPF a load balancer and DDoS
+      filter (chapter <a href="07-networking-xdp-tc.html">07</a>). cgroup hooks (4.10) made it a container
+      networking and policy tool. BTF (4.18) gave programs type information about the running kernel and later
+      enabled CO-RE, "compile once, run everywhere" (chapter <a href="06-btf-core-libbpf.html">06</a>). The BPF
+      trampoline (5.5) made function entry and exit hooks nearly free. The BPF LSM (5.7) let programs make security
+      decisions. <code>struct_ops</code> (5.6) let BPF implement kernel callback tables, first TCP congestion
+      control and, with sched_ext in 6.12, whole CPU scheduling policies
+      (<a href="https://kernelnewbies.org/Linux_6.12">kernelnewbies, Linux 6.12</a>). Chapter
+      <a href="05-program-types-and-hooks.html">05</a> goes through the hook types.</p>
+
+    <h2>How eBPF works: the lifecycle of a program</h2>
+    <p>Every eBPF program, whether it comes from bpftrace, bcc, libbpf, cilium/ebpf or Aya, goes through the same
+      pipeline. Learn this picture once; the rest of the curriculum fills in each box.</p>
+    <figure>
+      <svg viewBox="0 0 900 430" role="img" aria-label="eBPF lifecycle: C source compiled by clang into an ELF object, loaded with the bpf syscall, checked by the verifier, JIT compiled, attached to a hook, sharing maps with user space">
+        <style>
+          .f2-box{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .f2-k{fill:var(--bg3);stroke:var(--accent);stroke-width:1.5}
+          .f2-map{fill:var(--bg3);stroke:var(--accent2);stroke-width:2}
+          .f2-h{fill:var(--fg);font:700 13px var(--font, sans-serif);text-anchor:middle}
+          .f2-t{fill:var(--muted);font:11.5px var(--mono, monospace);text-anchor:middle}
+          .f2-a{stroke:var(--muted);stroke-width:1.8;fill:none}
+          .f2-am{stroke:var(--accent2);stroke-width:1.8;fill:none;stroke-dasharray:5 4}
+          .f2-ah{fill:var(--muted)} .f2-ahm{fill:var(--accent2)}
+          .f2-zone{fill:var(--muted);font:600 12px var(--font, sans-serif);letter-spacing:.08em}
+          .f2-line{stroke:var(--accent);stroke-width:1.5;stroke-dasharray:8 5}
+          .f2-n{fill:var(--accent);font:700 12px var(--font, sans-serif)}
+        </style>
+        <defs>
+          <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="f2-ah" d="M0,0 L10,5 L0,10 z"/></marker>
+          <marker id="f2-arrm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="f2-ahm" d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+        <text class="f2-zone" x="20" y="24">USER SPACE</text>
+        <text class="f2-zone" x="20" y="228">KERNEL</text>
+        <line class="f2-line" x1="10" y1="205" x2="890" y2="205"/>
+        <text class="f2-t" x="590" y="198" style="text-anchor:start">bpf(BPF_PROG_LOAD, …) syscall boundary</text>
+
+        <rect class="f2-box" x="20" y="45" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="32" y="62">1</text>
+        <text class="f2-h" x="95" y="78">BPF C source</text><text class="f2-t" x="95" y="96">hello.bpf.c</text><text class="f2-t" x="95" y="112">restricted C</text>
+
+        <rect class="f2-box" x="200" y="45" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="212" y="62">2</text>
+        <text class="f2-h" x="275" y="78">clang / LLVM</text><text class="f2-t" x="275" y="96">-target bpf</text><text class="f2-t" x="275" y="112">(or GCC)</text>
+
+        <rect class="f2-box" x="380" y="45" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="392" y="62">3</text>
+        <text class="f2-h" x="455" y="78">ELF object</text><text class="f2-t" x="455" y="96">bytecode, maps,</text><text class="f2-t" x="455" y="112">BTF, relocations</text>
+
+        <rect class="f2-box" x="560" y="45" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="572" y="62">4</text>
+        <text class="f2-h" x="635" y="78">Loader</text><text class="f2-t" x="635" y="96">libbpf, bpftrace,</text><text class="f2-t" x="635" y="112">bcc, cilium/ebpf</text>
+
+        <rect class="f2-box" x="740" y="45" width="140" height="80" rx="8"/>
+        <text class="f2-n" x="752" y="62">9</text>
+        <text class="f2-h" x="810" y="78">Your app</text><text class="f2-t" x="810" y="96">reads/writes maps</text><text class="f2-t" x="810" y="112">prints, exports</text>
+
+        <rect class="f2-k" x="560" y="245" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="572" y="262">5</text>
+        <text class="f2-h" x="635" y="278">Verifier</text><text class="f2-t" x="635" y="296">prove safe or</text><text class="f2-t" x="635" y="312">reject (-EACCES)</text>
+
+        <rect class="f2-k" x="380" y="245" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="392" y="262">6</text>
+        <text class="f2-h" x="455" y="278">JIT compiler</text><text class="f2-t" x="455" y="296">bytecode → x86-64,</text><text class="f2-t" x="455" y="312">arm64, riscv …</text>
+
+        <rect class="f2-k" x="200" y="245" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="212" y="262">7</text>
+        <text class="f2-h" x="275" y="278">Attach to hook</text><text class="f2-t" x="275" y="296">tracepoint, kprobe,</text><text class="f2-t" x="275" y="312">XDP, cgroup, LSM …</text>
+
+        <rect class="f2-k" x="20" y="245" width="150" height="80" rx="8"/>
+        <text class="f2-n" x="32" y="262">8</text>
+        <text class="f2-h" x="95" y="278">Event fires</text><text class="f2-t" x="95" y="296">program runs,</text><text class="f2-t" x="95" y="312">calls helpers</text>
+
+        <rect class="f2-map" x="740" y="245" width="140" height="80" rx="8"/>
+        <text class="f2-h" x="810" y="278">BPF maps</text><text class="f2-t" x="810" y="296">hash, array,</text><text class="f2-t" x="810" y="312">ring buffer …</text>
+
+        <path class="f2-a" d="M170,85 L198,85" marker-end="url(#f2-arr)"/>
+        <path class="f2-a" d="M350,85 L378,85" marker-end="url(#f2-arr)"/>
+        <path class="f2-a" d="M530,85 L558,85" marker-end="url(#f2-arr)"/>
+        <path class="f2-a" d="M635,125 L635,243" marker-end="url(#f2-arr)"/>
+        <path class="f2-a" d="M560,285 L532,285" marker-end="url(#f2-arr)"/>
+        <path class="f2-a" d="M380,285 L352,285" marker-end="url(#f2-arr)"/>
+        <path class="f2-a" d="M200,285 L172,285" marker-end="url(#f2-arr)"/>
+        <path class="f2-am" d="M95,325 L95,385 L810,385 L810,327" marker-start="url(#f2-arrm)" marker-end="url(#f2-arrm)"/>
+        <text class="f2-t" x="450" y="405">program updates/looks up maps with helpers (bpf_map_update_elem, bpf_ringbuf_output …)</text>
+        <path class="f2-am" d="M810,127 L810,243" marker-start="url(#f2-arrm)" marker-end="url(#f2-arrm)"/>
+        <text class="f2-t" x="818" y="170" style="text-anchor:start">bpf(MAP_*)</text>
+        <text class="f2-t" x="818" y="185" style="text-anchor:start">or mmap</text>
+        <path class="f2-a" d="M690,125 L740,245" style="stroke-dasharray:3 3" marker-end="url(#f2-arr)"/>
+        <text class="f2-t" x="700" y="160" style="text-anchor:start">MAP_CREATE</text>
+      </svg>
+      <figcaption>Figure 01.2 — The eBPF lifecycle. Steps 1–4 happen in user space. Step 5 onward runs in the kernel
+        after <code>bpf(BPF_PROG_LOAD)</code>. Maps (blue, dashed) are the shared state between the program and your
+        application. The loader creates maps before it loads the program that uses them.</figcaption>
+    </figure>
+    <p>Step through what happens, with the real artifacts we will produce in the hello-world section:</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Write the program in restricted C</h4>
+        <p>A BPF program is a C function placed in an ELF section whose name tells the loader where to attach it, for
+        example <code>SEC("tp/syscalls/sys_enter_write")</code>. "Restricted" means: no unbounded loops, no
+        recursion, no arbitrary pointers, no libc, a 512-byte stack, and only kernel functions exposed as helpers or
+        kfuncs. The program also declares a license string; helpers marked GPL-only require a GPL-compatible license.</p></div>
+      <div class="step"><h4>2. Compile with <code>clang -target bpf</code></h4>
+        <p>LLVM has a BPF back end; GCC has one too. <code>clang -g -O2 -target bpf -c hello.bpf.c -o hello.bpf.o</code>
+        produces BPF bytecode instead of x86 code. <code>-g</code> matters: it makes clang emit <strong>BTF</strong>,
+        the compact type information the kernel and libbpf use for CO-RE relocations and readable verifier logs.</p></div>
+      <div class="step"><h4>3. The ELF object</h4>
+        <p>The <code>.o</code> file is an ordinary ELF relocatable file ("ELF 64-bit LSB relocatable, eBPF"). Each
+        program is a code section. Global variables live in <code>.bss</code>/<code>.data</code>/<code>.rodata</code>,
+        which libbpf turns into array maps. Map definitions live in <code>.maps</code>, and type information in
+        <code>.BTF</code> and <code>.BTF.ext</code>. References to maps are still relocations at this point.</p></div>
+      <div class="step"><h4>4. The loader prepares and calls <code>bpf()</code></h4>
+        <p>A loader library such as libbpf parses the ELF, creates the maps with <code>BPF_MAP_CREATE</code>, patches
+        each map reference in the bytecode with the new map's file descriptor, applies CO-RE relocations against the
+        running kernel's BTF (<code>/sys/kernel/btf/vmlinux</code>), and finally calls
+        <code>bpf(BPF_PROG_LOAD, …)</code> with the instructions, program type, license and BTF.</p></div>
+      <div class="step"><h4>5. The verifier</h4>
+        <p>The kernel walks every possible path through the program, tracking each register's type (scalar, pointer to
+        context, pointer to map value, pointer that may be NULL, …) and value range. It rejects out-of-bounds or
+        unchecked memory accesses, reads of uninitialised registers, calls to helpers the program type may not use,
+        and programs it cannot prove will terminate. Its complexity limit is one million processed instructions. If
+        it fails, <code>bpf()</code> returns an error and a log explaining why. See chapter <a href="03-verifier.html">03</a>.</p></div>
+      <div class="step"><h4>6. JIT compilation</h4>
+        <p>The verified bytecode, after the kernel has rewritten some instructions (for example, helper IDs become
+        real call addresses), is translated into native instructions. Because the ISA was designed to map one-to-one
+        onto 64-bit CPUs, the result runs at close to the speed of compiled kernel C. Without a JIT the kernel falls
+        back to its interpreter.</p></div>
+      <div class="step"><h4>7. Attach to a hook</h4>
+        <p>Loading only gives you a program file descriptor. Attaching connects it to an event: a tracepoint, a kprobe,
+        an fentry hook, a network device (XDP), a tc qdisc, a cgroup, an LSM hook, a socket. Modern APIs return a
+        <em>BPF link</em>, another file descriptor whose lifetime controls the attachment. Objects can be
+        <em>pinned</em> in the BPF filesystem (<code>/sys/fs/bpf</code>) to outlive the loader process.</p></div>
+      <div class="step"><h4>8–9. Run, and talk through maps</h4>
+        <p>Each time the event fires, the kernel calls the program with a context pointer in R1. The program reads the
+        context, calls helpers, updates maps, and returns a value whose meaning depends on the hook (drop or pass a
+        packet, allow or deny an operation, or just 0 for tracing). User space reads the maps with
+        <code>bpf(BPF_MAP_LOOKUP_ELEM)</code>, by <code>mmap</code>ing array maps, or by consuming a ring buffer.</p></div>
+    </div>
+
+    <h2>"eBPF" vs "BPF": what the names mean today</h2>
+    <p>The vocabulary is confusing because it changed while the technology grew:</p>
+    <ul>
+      <li><strong>BPF</strong> originally meant the Berkeley (or BSD) Packet Filter of 1993. In BSD it still means
+        that: <code>/dev/bpf</code> and the classic instruction set.</li>
+      <li><strong>cBPF / classic BPF</strong> is the retroactive name for the 1993-style instruction set. Linux still
+        <em>accepts</em> it (socket filters, seccomp, <code>SO_ATTACH_FILTER</code>, <code>xt_bpf</code>) but
+        converts it to eBPF internally. The kernel docs state that the new format "is being used for running user BPF
+        programs, which includes seccomp BPF, classic socket filters, cls_bpf traffic classifier, ...", all of which are
+        "internally converted by the kernel into the new instruction set representation".</li>
+      <li><strong>eBPF / extended BPF</strong> is the 2014 instruction set and everything around it: verifier, maps,
+        helpers, hooks, BTF.</li>
+      <li><strong>BPF</strong> in Linux today almost always means eBPF. The syscall is <code>bpf()</code>, the source
+        is in <code>kernel/bpf/</code>, the tool is <code>bpftool</code>, the mailing list is bpf@vger. The
+        documentation lives at <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>, and the IETF
+        standard is titled "BPF Instruction Set Architecture".</li>
+    </ul>
+    <p>ebpf.io puts it this way: "BPF originally stood for Berkeley Packet Filter, but now that eBPF (extended BPF)
+      can do so much more than packet filtering, the acronym no longer makes sense. eBPF is now considered a
+      standalone term that doesn't stand for anything. In the Linux source code, the term BPF persists, and in
+      tooling and in documentation, the terms BPF and eBPF are generally used interchangeably." Brendan Gregg
+      joked that it "should stand for something meaningful, like Virtual Kernel Instruction Set (VKIS)". This
+      curriculum uses <em>eBPF</em> for the modern technology and <em>classic BPF</em> when it means the old
+      instruction set.</p>
+    <div class="callout warn"><span class="label">Not only Linux any more</span>
+      <p>eBPF has spread beyond the Linux kernel: Microsoft's eBPF for Windows (built on the uBPF runtime and the
+      PREVAIL verifier), user-space runtimes such as uBPF and bpftime (chapters <a href="14-bpftime-architecture.html">14</a>–<a href="16-llvmbpf.html">16</a>),
+      and offload to SmartNICs. RFC 9669 exists precisely so that these implementations agree on the instruction set.
+      "BPF" in a paper title may therefore not mean "the Linux kernel".</p>
+    </div>
+
+    <h2>Your first eBPF programs</h2>
+    <p>The commands below were run for this chapter in an x86-64 Linux 6.1 environment with Debian 12 packages:
+      bpftrace 0.17.0, bpftool 7.1.0 (libbpf 1.1) and clang 14. Outputs are copied from that run. Paths and exact
+      output will differ slightly on your machine. All of them need root, or <code>CAP_BPF</code> plus
+      <code>CAP_PERFMON</code> on newer kernels.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="bpftrace one-liners">
+<pre><code class="language-bash"># Debian/Ubuntu: sudo apt install bpftrace
+$ sudo bpftrace -e 'BEGIN { printf("hello, world\n"); exit(); }'
+Attaching 1 probe...
+hello, world
+
+# Count system calls per process name for 3 seconds (Ctrl-C also works)
+$ sudo timeout 3 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
+Attaching 1 probe...
+...
+@[sudo]: 2228
+@[git-remote-http]: 2566
+@[amp]: 3792
+@[envd]: 5973
+@[curl]: 6159
+@[git]: 12783</code></pre>
+      </div>
+      <div class="tab-panel" data-label="libbpf: kernel side">
+<pre data-file="libbpf-bootstrap/examples/c/minimal.bpf.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Copyright (c) 2020 Facebook */
+#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+int my_pid = 0;
+
+SEC("tp/syscalls/sys_enter_write")
+int handle_tp(void *ctx)
+{
+	int pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	if (pid != my_pid)
+		return 0;
+
+	bpf_printk("BPF triggered from PID %d.\n", pid);
+
+	return 0;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="libbpf: user side">
+<pre data-file="libbpf-bootstrap/examples/c/minimal.c"><code class="language-c">#include &lt;bpf/libbpf.h&gt;
+#include "minimal.skel.h"
+/* ... */
+int main(int argc, char **argv)
+{
+	struct minimal_bpf *skel;
+	int err;
+	/* ... */
+	/* Open BPF application */
+	skel = minimal_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open BPF skeleton\n");
+		return 1;
+	}
+
+	/* ensure BPF program only handles write() syscalls from our process */
+	skel-&gt;bss-&gt;my_pid = getpid();
+
+	/* Load &amp; verify BPF programs */
+	err = minimal_bpf__load(skel);
+	/* ... */
+	/* Attach tracepoint handler */
+	err = minimal_bpf__attach(skel);
+	/* ... */
+	for (;;) {
+		/* trigger our BPF program */
+		fprintf(stderr, ".");
+		sleep(1);
+	}
+
+cleanup:
+	minimal_bpf__destroy(skel);
+	return -err;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Build &amp; run (libbpf-bootstrap)">
+<pre><code class="language-bash"># From the libbpf-bootstrap README (needs clang, libelf, zlib)
+$ sudo apt install clang libelf1 libelf-dev zlib1g-dev
+$ git clone --recurse-submodules https://github.com/libbpf/libbpf-bootstrap
+$ cd libbpf-bootstrap/examples/c
+$ make minimal
+$ sudo ./minimal
+$ sudo cat /sys/kernel/debug/tracing/trace_pipe
+           &lt;...&gt;-3840345 [010] d... 3220701.101143: bpf_trace_printk: BPF triggered from PID 3840345.
+           &lt;...&gt;-3840345 [010] d... 3220702.101265: bpf_trace_printk: BPF triggered from PID 3840345.</code></pre>
+      </div>
+    </div>
+    <p><strong>bpftrace</strong> is the fastest way in. Its language is "inspired by awk, C, and predecessor tracers
+      such as DTrace and SystemTap" (<a href="https://ebpf.io/what-is-ebpf/">ebpf.io</a>), and bpftrace compiles each
+      script to BPF bytecode with LLVM, loads it, attaches it and prints the maps when it exits. <code>BEGIN</code> is
+      a special probe that fires once at start. In the second one-liner, <code>@[comm] = count()</code> is a BPF
+      <em>hash map</em> keyed by process name. The kernel-side program increments a counter on every system call, and
+      bpftrace prints the map at exit. Nothing is copied to user space per event; only the final totals are. That is
+      the same "filter and aggregate in place" idea as the 1993 paper. The commonly shown
+      <code>tracepoint:syscalls:sys_enter_openat</code> example needs the per-syscall tracepoints
+      (<code>CONFIG_FTRACE_SYSCALLS</code>), which the kernel used here did not have. That is a small reminder that
+      available hooks depend on kernel configuration.</p>
+    <p><strong>libbpf</strong> is the C library maintained in the kernel tree (<code>tools/lib/bpf</code>) and
+      mirrored at <a href="https://github.com/libbpf/libbpf">github.com/libbpf/libbpf</a>. libbpf-bootstrap's
+      <code>minimal</code> example is the smallest realistic program. The kernel side attaches to the
+      <code>sys_enter_write</code> tracepoint, gets the current process ID from a helper, compares it with a global
+      variable, and prints with <code>bpf_printk</code> into the kernel trace pipe. The user side uses a generated
+      <em>skeleton</em> (<code>minimal.skel.h</code>, produced by <code>bpftool gen skeleton</code>) whose
+      <code>open</code> / <code>load</code> / <code>attach</code> / <code>destroy</code> functions map directly onto
+      steps 3–7 of the lifecycle. Note <code>skel-&gt;bss-&gt;my_pid = getpid();</code>: user space writes a BPF global
+      variable before loading. Under the hood that global is an element of an array map. Chapter
+      <a href="06-btf-core-libbpf.html">06</a> explains skeletons, and chapter <a href="11-starter-templates.html">11</a>
+      covers eunomia-bpf's starter templates built on this layout.</p>
+
+    <h3>Look inside: bytecode, bpftool and the verifier</h3>
+    <p>To see the artifacts from the lifecycle diagram, compile the same <code>minimal.bpf.c</code> by hand and load
+      it with bpftool (on Debian the extra <code>-I</code> was needed so clang finds <code>asm/types.h</code>):</p>
+    <pre><code class="language-plaintext">$ clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
+        -c minimal.bpf.c -o minimal.bpf.o
+$ file minimal.bpf.o
+minimal.bpf.o: ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV), with debug_info, not stripped
+
+$ llvm-objdump -d --no-show-raw-insn minimal.bpf.o
+Disassembly of section tp/syscalls/sys_enter_write:
+
+0000000000000000 &lt;handle_tp&gt;:
+       0:	call 14
+       1:	r0 &gt;&gt;= 32
+       2:	r1 = 0 ll
+       4:	r1 = *(u32 *)(r1 + 0)
+       5:	if r1 != r0 goto +5 &lt;LBB0_2&gt;
+       6:	r1 = 0 ll
+       8:	r2 = 28
+       9:	r3 = r0
+      10:	call 6
+
+0000000000000058 &lt;LBB0_2&gt;:
+      11:	r0 = 0
+      12:	exit</code></pre>
+    <p>Thirteen instruction slots. <code>call 14</code> is helper number 14, <code>bpf_get_current_pid_tgid</code>,
+      which returns its result in R0. <code>r0 &gt;&gt;= 32</code> keeps the upper half (the process ID, "tgid").
+      <code>r1 = 0 ll</code> is the 16-byte wide instruction that loads a 64-bit constant; here it is a placeholder
+      relocation that will point at <code>my_pid</code> in the <code>.bss</code> map. Instructions 6–10 set up the
+      three arguments of helper 6, <code>bpf_trace_printk</code> (format string, its length 28, the pid), and the
+      program returns 0 in R0. The object's section list shows the rest of the ELF anatomy:
+      <code>tp/syscalls/sys_enter_write</code>, <code>license</code>, <code>.bss</code>, <code>.rodata</code> (the
+      format string), <code>.BTF</code>, <code>.BTF.ext</code> and DWARF debug sections.</p>
+    <p>Now load it and ask the kernel what it accepted:</p>
+    <pre><code class="language-plaintext">$ sudo bpftool prog load minimal.bpf.o /sys/fs/bpf/minimal
+$ sudo bpftool prog show pinned /sys/fs/bpf/minimal
+78: tracepoint  name handle_tp  tag 6a5dcef153b1001e  gpl
+	loaded_at 2026-11-05T23:42:35+0000  uid 0
+	xlated 104B  not jited  memlock 4096B  map_ids 9,10
+	btf_id 10
+$ sudo bpftool prog dump xlated pinned /sys/fs/bpf/minimal
+int handle_tp(void * ctx):
+; int pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+   0: (85) call bpf_get_current_pid_tgid#172016
+; int pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+   1: (77) r0 &gt;&gt;= 32
+; if (pid != my_pid)
+   2: (18) r1 = map[id:9][0]+0
+   4: (61) r1 = *(u32 *)(r1 +0)
+; if (pid != my_pid)
+   5: (5d) if r1 != r0 goto pc+5
+; bpf_printk("BPF triggered from PID %d.\n", pid);
+   6: (18) r1 = map[id:10][0]+0
+   8: (b7) r2 = 28
+   9: (bf) r3 = r0
+  10: (85) call bpf_trace_printk#-49440
+; }
+  11: (b7) r0 = 0
+  12: (95) exit
+$ sudo bpftool map list
+9: array  name minimal.bss  flags 0x400
+	key 4B  value 4B  max_entries 1  memlock 4096B
+	btf_id 10
+10: array  name minimal.rodata  flags 0x480
+	key 4B  value 28B  max_entries 1  memlock 4096B
+	btf_id 10  frozen
+$ sudo rm /sys/fs/bpf/minimal      # unpin; the program is freed</code></pre>
+    <p>Several lifecycle steps are visible here. The libbpf inside bpftool created two array maps from
+      <code>.bss</code> and <code>.rodata</code> (IDs 9 and 10) and patched the placeholder loads into
+      <code>map[id:9]</code> and <code>map[id:10]</code>. The kernel rewrote helper numbers into internal call targets
+      (<code>#172016</code>). The source lines interleaved in the dump come from the BTF line info. "xlated" means the
+      program after the verifier's rewrites. On the kernel used here the JIT was not enabled, so it reports
+      <code>not jited</code> and runs in the interpreter. With the JIT enabled, bpftool also reports a jited size and
+      <code>bpftool prog dump jited</code> shows native instructions. <code>bpftool prog load</code> loads and pins but
+      does not attach; a skeleton's <code>__attach()</code> does that.</p>
+
+    <p>Finally, the most important behaviour of eBPF: refusing bad code. The program below is
+      <strong>illustrative, not from a repository</strong>. It forgets that a map lookup can return NULL:</p>
+    <pre><code class="language-c">/* Illustrative example written for this chapter: the verifier must reject it. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} counts SEC(".maps");
+
+SEC("tp/syscalls/sys_enter_write")
+int bad(void *ctx)
+{
+	__u32 key = 0;
+	__u64 *val = bpf_map_lookup_elem(&amp;counts, &amp;key);
+	*val += 1;            /* BUG: val may be NULL */
+	return 0;
+}
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+    <pre><code class="language-plaintext">$ sudo bpftool prog load bad.bpf.o /sys/fs/bpf/bad
+libbpf: prog 'bad': BPF program load failed: Permission denied
+libbpf: prog 'bad': -- BEGIN PROG LOAD LOG --
+...
+; __u64 *val = bpf_map_lookup_elem(&amp;counts, &amp;key);
+4: (18) r1 = 0xffff888103112c00       ; R1_w=map_ptr(off=0,ks=4,vs=8,imm=0)
+6: (85) call bpf_map_lookup_elem#1    ; R0_w=map_value_or_null(id=1,off=0,ks=4,vs=8,imm=0)
+; *val += 1;            /* BUG: val may be NULL */
+7: (79) r1 = *(u64 *)(r0 +0)
+R0 invalid mem access 'map_value_or_null'
+processed 7 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0
+-- END PROG LOAD LOG --
+libbpf: prog 'bad': failed to load: -13</code></pre>
+    <p>The verifier tracked that after <code>call bpf_map_lookup_elem</code>, R0 has type
+      <code>map_value_or_null</code>, and a dereference of a maybe-NULL pointer is not allowed. The load fails with
+      <code>-13</code> (<code>EACCES</code>) before the program ever runs. A kernel module with the same bug would
+      have compiled, loaded and crashed the first time the key was missing. Adding <code>if (!val) return 0;</code>
+      makes the verifier narrow R0 to <code>map_value</code> on the fall-through path, and the program loads.
+      Fighting and understanding such messages is a big part of eBPF development; chapter <a href="03-verifier.html">03</a>
+      explains the analysis, and chapter <a href="17-bpfix.html">17</a> looks at tools that explain verifier errors.</p>
+
+    <h2>"JavaScript for the kernel": the analogy and its limits</h2>
+    <p>The most quoted one-line explanation of eBPF comes from Brendan Gregg's 2019 tutorial: "eBPF does to Linux
+      what JavaScript does to HTML. (Sort of.) So instead of a static HTML website, JavaScript lets you define mini
+      programs that run on events like mouse clicks, which are run in a safe virtual machine in the browser. And with
+      eBPF, instead of a fixed kernel, you can now write mini programs that run on events like disk I/O, which are run
+      in a safe virtual machine in the kernel." He immediately qualifies it: "In reality, eBPF is more like the v8
+      virtual machine that runs JavaScript, rather than JavaScript itself."
+      (<a href="https://www.brendangregg.com/blog/2019-01-01/learn-ebpf-tracing.html">Learn eBPF Tracing</a>).</p>
+    <p>ebpf.io develops the same analogy along three axes: <strong>safety</strong> (untrusted code is sandboxed;
+      eBPF's counterpart is the verifier), <strong>continuous delivery</strong> (new logic without shipping a new
+      browser; for eBPF, new logic without a new kernel), and <strong>performance</strong> (a JIT in both cases). Where
+      the analogy works:</p>
+    <ul>
+      <li><strong>Event-driven.</strong> Programs do not run on their own; they are callbacks on hooks, like
+        <code>onclick</code> handlers.</li>
+      <li><strong>The host stays in charge.</strong> A program can only use the APIs the host exposes for that event
+        (helpers and kfuncs per program type, like the DOM API per page).</li>
+      <li><strong>Frameworks on top.</strong> As Gregg notes, nobody writes v8 bytecode; people use JavaScript and
+        frameworks. Likewise, few people write eBPF assembly; they use bpftrace, bcc, libbpf, Cilium or Tetragon
+        (chapter <a href="08-ecosystem.html">08</a>).</li>
+      <li><strong>It is a new kind of software.</strong> In "BPF: A New Type of Software" Gregg reports that Netflix
+        ran 15 BPF programs on cloud servers by default and Facebook 40, programs that "are not processes or kernel
+        modules, and don't appear in traditional observability tools"
+        (<a href="https://www.brendangregg.com/blog/2019-12-02/bpf-a-new-type-of-software.html">2019</a>).</li>
+    </ul>
+    <p>Where it breaks, and these differences matter in practice:</p>
+    <ul>
+      <li><strong>It is not a general-purpose VM.</strong> The kernel's own BPF Design Q&amp;A answers "Is BPF a generic
+        virtual machine?" with "NO", and describes BPF as a "generic instruction set <em>with</em> C calling convention"
+        (<a href="https://docs.kernel.org/bpf/bpf_design_QA.html">docs.kernel.org/bpf/bpf_design_QA</a>). There is no
+        garbage collector, no dynamic code, no exceptions in the JavaScript sense. Programs are short, bounded C-like
+        functions. Five arguments maximum, one return value, 512 bytes of stack.</li>
+      <li><strong>Safety is proven ahead of time, not enforced at runtime.</strong> A JavaScript engine can stop a
+        runaway script. The kernel cannot afford that inside an interrupt handler, so the verifier must prove up front
+        that the program terminates and touches only valid memory. The price is that correct programs are sometimes
+        rejected because the verifier cannot prove them safe, and the only way to know is to load the program
+        (Design Q&amp;A: "The only way to know that the program is going to be accepted by the verifier is to try to load it").</li>
+      <li><strong>The sandbox protects the kernel, not your secrets.</strong> Tracing programs can <em>read</em>
+        arbitrary kernel memory with <code>bpf_probe_read_kernel()</code>, and see every process's arguments. Loading
+        them is therefore a root-level privilege (<code>CAP_BPF</code>, <code>CAP_PERFMON</code>,
+        <code>CAP_NET_ADMIN</code> or <code>CAP_SYS_ADMIN</code> depending on the program type), not something you hand
+        to web visitors. Kernels have a <code>kernel.unprivileged_bpf_disabled</code> sysctl, and the
+        <code>BPF_UNPRIV_DEFAULT_OFF</code> config option makes unprivileged <code>bpf()</code> disabled by default
+        (<a href="https://docs.kernel.org/admin-guide/sysctl/kernel.html">sysctl docs</a>).</li>
+      <li><strong>The "web platform" is not stable everywhere.</strong> The instruction set, helper functions and
+        program context types are stable ABI. But kprobe attachment points and tracepoints are explicitly <em>not</em>
+        ABI, nor are kfuncs or the kernel's internal structs your program reads. Tracing programs can break when the
+        kernel changes, which is why BTF and CO-RE exist (Design Q&amp;A).</li>
+      <li><strong>It runs in the most privileged context there is.</strong> A JIT or verifier bug is a kernel bug. The
+        kernel hardens the JIT (constant blinding since 4.7 per the bcc table, and <code>BPF_JIT_ALWAYS_ON</code> as a
+        Spectre mitigation), but "verified" is a strong engineering guarantee, not a formal proof of the whole system.
+        Research on verifying the verifier is the topic of chapters <a href="03-verifier.html">03</a> and
+        <a href="18-ebpf-correctness-verifier.html">18</a>.</li>
+    </ul>
+
+    <h2>Why not just write a kernel module or a kernel patch?</h2>
+    <p>Before eBPF, "I need custom logic in the kernel" had two answers. ebpf.io summarises the costs: for a kernel
+      change you must "convince the Linux kernel community that the change is required" and then "wait several years for
+      the new kernel version to become a commodity". For a module you must "fix it up regularly, as every kernel release may break it" and "risk corrupting
+      your Linux kernel due to lack of security boundaries" (<a href="https://ebpf.io/what-is-ebpf/">ebpf.io</a>).
+      Side by side:</p>
+    <div class="grid">
+      <div class="card"><h4>Kernel patch</h4><p>Safest once merged and reviewed, fully general. But it needs upstream
+        agreement that the feature belongs in everyone's kernel, then years to reach distribution and enterprise kernels.
+        Changing your mind means another patch cycle.</p></div>
+      <div class="card"><h4>Loadable kernel module</h4><p>Runs arbitrary C with full privileges. One NULL dereference or
+        use-after-free oopses or silently corrupts the kernel. No stable in-kernel API, so modules are rebuilt for each
+        kernel version and break with internal changes. Often needs the kernel headers on every machine. Loading is
+        frequently restricted (Secure Boot, module signing).</p></div>
+      <div class="card"><h4>eBPF program</h4><p>Restricted, but verified before it runs: it cannot crash the kernel or
+        hang it. Loaded and unloaded at runtime without reboot. With BTF/CO-RE one binary runs on many kernel versions.
+        Uses only the hooks, helpers and kfuncs the kernel exposes, so some things are simply not possible.</p></div>
+    </div>
+    <p>The two properties that made eBPF win in production are <strong>safety</strong> and
+      <strong>upgradability</strong>. Safety means operators can deploy monitoring or a firewall rule to a fleet
+      without fearing a kernel panic on some machines; the worst case is that the load is rejected. Upgradability means
+      the logic ships with the application, not with the kernel: Cilium can release a new datapath every few weeks on
+      top of whatever kernel the cluster runs, and a performance engineer can write a bpftrace script during an
+      incident and remove it ten minutes later.</p>
+    <p>Modules are not dead, and the relationship is no longer either-or. The Design Q&amp;A explains that modules
+      cannot add core BPF functionality (program types, maps, helpers) but "can expose functionality to BPF programs by
+      exporting kfuncs". If you need a new primitive, such as a driver-specific operation, a small kernel change can
+      expose it as a kfunc, and the <em>policy</em> that uses it lives in BPF. That split, mechanism in the kernel and
+      policy in BPF, is the design behind sched_ext, BPF LSM and much of the research in later parts of this curriculum
+      (for example <a href="20-gpu-ext.html">gpu_ext</a> and <a href="28-namei-ext.html">namei_ext</a>).</p>
+
+    <h2>Where the code lives</h2>
+    <p>The kernel's BPF implementation is spread over a few directories. You do not need to read them now, but the
+      map helps when later chapters cite kernel code (paths checked on GitHub <code>torvalds/linux</code> master):</p>
+    <table>
+      <tr><th>Path</th><th>What it contains</th></tr>
+      <tr><td><code>include/uapi/linux/bpf.h</code></td><td>The user-space ABI: <code>struct bpf_insn</code>, <code>union bpf_attr</code>, program/map/attach type enums, helper documentation.</td></tr>
+      <tr><td><code>include/uapi/linux/filter.h</code></td><td>Classic BPF: <code>struct sock_filter</code>, <code>sock_fprog</code>, <code>BPF_STMT</code>/<code>BPF_JUMP</code>.</td></tr>
+      <tr><td><code>kernel/bpf/syscall.c</code></td><td>The <code>bpf()</code> system call and its commands.</td></tr>
+      <tr><td><code>kernel/bpf/verifier.c</code></td><td>The verifier, by far the largest BPF source file.</td></tr>
+      <tr><td><code>kernel/bpf/core.c</code></td><td>The interpreter, JIT infrastructure and common program handling.</td></tr>
+      <tr><td><code>kernel/bpf/*map*.c</code>, <code>ringbuf.c</code>, …</td><td>Map implementations (hash, array, ring buffer, …).</td></tr>
+      <tr><td><code>net/core/filter.c</code></td><td>Socket filters, classic→eBPF conversion, networking helpers.</td></tr>
+      <tr><td><code>kernel/seccomp.c</code></td><td>seccomp, which runs (converted) classic BPF filters on system calls.</td></tr>
+      <tr><td><code>arch/x86/net/bpf_jit_comp.c</code></td><td>The x86-64 JIT; other architectures have their own under <code>arch/*/net/</code>.</td></tr>
+      <tr><td><code>tools/lib/bpf/</code></td><td>libbpf (mirrored on GitHub).</td></tr>
+      <tr><td><code>tools/bpf/bpftool/</code></td><td>bpftool, in the kernel tree since 4.15.</td></tr>
+      <tr><td><code>tools/testing/selftests/bpf/</code></td><td>Thousands of tests, the best collection of example programs, including verifier tests.</td></tr>
+      <tr><td><code>samples/bpf/</code>, <code>samples/seccomp/</code></td><td>Older samples, including <code>dropper.c</code> above.</td></tr>
+      <tr><td><code>Documentation/bpf/</code></td><td>Source of <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>, including <code>instruction-set.rst</code>, from which RFC 9669 was generated.</td></tr>
+    </table>
+
+    <h2>Benefits, limitations and related work</h2>
+    <h3>Benefits</h3>
+    <ul>
+      <li><strong>Safe by construction</strong>: verified before execution; no kernel crash from a buggy program.</li>
+      <li><strong>Fast</strong>: JIT to native code, runs in the context of the event, and aggregates in the kernel
+        so only results cross to user space.</li>
+      <li><strong>Dynamic</strong>: load, replace and unload at runtime, with no reboot and no module build.</li>
+      <li><strong>Portable</strong> across kernel versions with BTF/CO-RE, and to some extent across operating
+        systems through RFC 9669.</li>
+      <li><strong>Broad reach</strong>: networking, tracing, security, scheduling, with one toolchain.</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>Expressiveness</strong>: bounded execution, a small stack, limited calls, a complexity limit; some
+        algorithms are awkward or impossible.</li>
+      <li><strong>The verifier is conservative</strong>, and its acceptance can change with compiler versions and
+        optimisation choices, so error messages are a common pain.</li>
+      <li><strong>Kernel-version dependence</strong>: features arrive release by release, so a program written for 6.x
+        may not load on an older enterprise kernel (chapter <a href="13-bpf-compatible.html">13</a> addresses this).</li>
+      <li><strong>Privilege</strong>: most useful program types need root-equivalent capabilities.</li>
+      <li><strong>Attack surface</strong>: the verifier and JIT are complex kernel code; bugs there are kernel
+        security bugs.</li>
+    </ul>
+    <h3>Related work</h3>
+    <ul>
+      <li><strong>Predecessors</strong>: CSPF (stack-based filters) and NNStat (the first CFG-style filters), both
+        cited by the 1993 paper; Sun's NIT.</li>
+      <li><strong>Other kernel-extension approaches</strong>: loadable modules; SystemTap and DTrace for tracing
+        (bpftrace's language borrows from both); netfilter/iptables for fixed packet-processing pipelines.</li>
+      <li><strong>Other runtimes for the same ISA</strong>: uBPF, eBPF for Windows (uBPF + PREVAIL), and the
+        user-space runtimes and compilers in Part III (<a href="14-bpftime-architecture.html">bpftime</a>,
+        <a href="16-llvmbpf.html">llvmbpf</a>), and WebAssembly-hosted eBPF apps (<a href="12-wasm-bpf.html">wasm-bpf</a>).</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Why did McCanne and Jacobson choose a register-based machine for BPF
+        instead of CSPF's stack machine?</p>
+        <button class="opt">Stack machines cannot express boolean logic.</button>
+        <button class="opt" data-right>Simulating an operand stack causes memory traffic, the main bottleneck on RISC CPUs, while registers can live in real CPU registers.</button>
+        <button class="opt">Register machines make it possible to write loops.</button>
+        <button class="opt">BSD's kernel had no stack.</button>
+        <div class="why">The paper argues the stack model "worked well on the PDP-11 but is a poor match to
+          memory-bottlenecked modern CPUs". It also switched from expression trees to a control-flow graph so each
+          packet field is parsed only once.</div></div>
+
+      <div class="q"><p><strong>Q2.</strong> In the tcpdump program, what does <code>ldxb 4*([14]&amp;0xf)</code> do?</p>
+        <button class="opt">Loads the TCP destination port into A.</button>
+        <button class="opt">Checks that the packet is not a fragment.</button>
+        <button class="opt" data-right>Loads the IPv4 header length in bytes (4 × IHL) into the index register X, so the next load can reach the TCP header at a variable offset.</button>
+        <button class="opt">Multiplies the accumulator by four.</button>
+        <div class="why">Byte 14 is the first byte of the IP header; its low nibble is the header length in 32-bit
+          words. The next instruction, <code>ldh [x + 16]</code>, reads the TCP destination port.</div></div>
+
+      <div class="q"><p><strong>Q3.</strong> What happens today when tcpdump or a seccomp sandbox loads a classic BPF program on Linux?</p>
+        <button class="opt">It runs on a separate legacy cBPF interpreter that never changed since 1997.</button>
+        <button class="opt" data-right>The kernel checks it, translates it into eBPF instructions, and runs it with the eBPF interpreter or JIT.</button>
+        <button class="opt">It is rejected; only eBPF can be loaded since 3.18.</button>
+        <button class="opt">It must first be compiled by clang into an ELF object.</button>
+        <div class="why">Since 3.15 classic programs (socket filters, seccomp, cls_bpf, xt_bpf …) are converted
+          internally into the eBPF format. The classic API (<code>struct sock_fprog</code>) remains for compatibility.</div></div>
+
+      <div class="q"><p><strong>Q4.</strong> Which of these was <em>not</em> part of the 2014 move from classic to extended BPF?</p>
+        <button class="opt">Registers went from 2 to 10 and from 32 to 64 bits.</button>
+        <button class="opt">A call instruction with a C-like register calling convention.</button>
+        <button class="opt">Maps and the <code>bpf()</code> syscall for loading programs from user space.</button>
+        <button class="opt" data-right>A garbage-collected heap so programs can allocate memory freely.</button>
+        <div class="why">eBPF has a 512-byte stack and maps, and no garbage collector. The Design Q&amp;A explicitly
+          says BPF is not a generic virtual machine.</div></div>
+
+      <div class="q"><p><strong>Q5.</strong> The verifier rejected a program with <code>R0 invalid mem access 'map_value_or_null'</code>. What is the fix?</p>
+        <button class="opt">Run the loader with <code>--legacy</code> to skip verification.</button>
+        <button class="opt">Increase the instruction limit.</button>
+        <button class="opt" data-right>Check the pointer returned by <code>bpf_map_lookup_elem()</code> against NULL before dereferencing it.</button>
+        <button class="opt">Declare the map as a ring buffer instead of a hash.</button>
+        <div class="why">A lookup returns NULL when the key is missing. After <code>if (!val) return 0;</code> the
+          verifier knows R0 is a valid <code>map_value</code> pointer on the other path and accepts the load.</div></div>
+
+      <div class="q"><p><strong>Q6.</strong> Why is an eBPF tracing program usually easier to deploy across a fleet than a kernel module doing the same job?</p>
+        <button class="opt">eBPF programs run in user space, so they cannot affect the kernel.</button>
+        <button class="opt" data-right>It is verified before running, so a bug cannot crash the kernel, and it can be loaded and unloaded at runtime and, with CO-RE, run on many kernel versions without rebuilding.</button>
+        <button class="opt">Kprobe attach points are a stable kernel ABI.</button>
+        <button class="opt">eBPF programs need no privileges.</button>
+        <div class="why">eBPF runs in the kernel but is checked first. Kprobe and tracepoint locations are explicitly
+          <em>not</em> stable ABI, which is why CO-RE exists. Loading tracing programs still requires privileges.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>Steven McCanne and Van Jacobson. "The BSD Packet Filter: A New Architecture for User-level Packet Capture." <em>USENIX Winter 1993 Conference</em>, San Diego, January 1993. <a href="https://www.tcpdump.org/papers/bpf-usenix93.pdf">https://www.tcpdump.org/papers/bpf-usenix93.pdf</a></li>
+      <li>Linux kernel documentation. "Linux Socket Filtering aka Berkeley Packet Filter (BPF)." <a href="https://docs.kernel.org/networking/filter.html">https://docs.kernel.org/networking/filter.html</a></li>
+      <li>Linux kernel documentation. "Seccomp BPF (SECure COMPuting with filters)." <a href="https://docs.kernel.org/userspace-api/seccomp_filter.html">https://docs.kernel.org/userspace-api/seccomp_filter.html</a></li>
+      <li>Linux kernel documentation. "BPF Documentation" (index). <a href="https://docs.kernel.org/bpf/">https://docs.kernel.org/bpf/</a></li>
+      <li>Linux kernel documentation. "BPF Design Q&amp;A." <a href="https://docs.kernel.org/bpf/bpf_design_QA.html">https://docs.kernel.org/bpf/bpf_design_QA.html</a></li>
+      <li>Linux kernel documentation. "Documentation for /proc/sys/kernel/" (<code>unprivileged_bpf_disabled</code>). <a href="https://docs.kernel.org/admin-guide/sysctl/kernel.html">https://docs.kernel.org/admin-guide/sysctl/kernel.html</a></li>
+      <li>Alexei Starovoitov (joint work with Daniel Borkmann). "net: filter: rework/optimize internal BPF interpreter's instruction set." Linux commit bd4cf0ed331a, 2014. <a href="https://github.com/torvalds/linux/commit/bd4cf0ed331a275e9bf5a49e6d0fd55dffc551b8">https://github.com/torvalds/linux/commit/bd4cf0ed331a275e9bf5a49e6d0fd55dffc551b8</a></li>
+      <li>"A JIT for packet filters." LWN.net, 2011. <a href="https://lwn.net/Articles/437981/">https://lwn.net/Articles/437981/</a></li>
+      <li>"Yet another new approach to seccomp." LWN.net, January 2012. <a href="https://lwn.net/Articles/475043/">https://lwn.net/Articles/475043/</a></li>
+      <li>"BPF: the universal in-kernel virtual machine." LWN.net, 2014. <a href="https://lwn.net/Articles/599755/">https://lwn.net/Articles/599755/</a></li>
+      <li>Jonathan Corbet. "Extending extended BPF." LWN.net, July 2, 2014. <a href="https://lwn.net/Articles/603983/">https://lwn.net/Articles/603983/</a></li>
+      <li>Jonathan Corbet. "The BPF system call API, version 14." LWN.net, September 24, 2014. <a href="https://lwn.net/Articles/612878/">https://lwn.net/Articles/612878/</a></li>
+      <li>Matt Fleming. "A thorough introduction to eBPF." LWN.net, December 2, 2017. <a href="https://lwn.net/Articles/740157/">https://lwn.net/Articles/740157/</a></li>
+      <li>eBPF.io. "What is eBPF?" <a href="https://ebpf.io/what-is-ebpf/">https://ebpf.io/what-is-ebpf/</a></li>
+      <li>Brendan Gregg. "Learn eBPF Tracing: Tutorial and Examples." January 1, 2019. <a href="https://www.brendangregg.com/blog/2019-01-01/learn-ebpf-tracing.html">https://www.brendangregg.com/blog/2019-01-01/learn-ebpf-tracing.html</a></li>
+      <li>Brendan Gregg. "BPF: A New Type of Software." December 2, 2019. <a href="https://www.brendangregg.com/blog/2019-12-02/bpf-a-new-type-of-software.html">https://www.brendangregg.com/blog/2019-12-02/bpf-a-new-type-of-software.html</a></li>
+      <li>IOVisor bcc. "BPF Features by Linux Kernel Version." <a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md</a></li>
+      <li>Kernelnewbies. "Linux 3.5" (seccomp-based system call filtering). <a href="https://kernelnewbies.org/Linux_3.5">https://kernelnewbies.org/Linux_3.5</a></li>
+      <li>Kernelnewbies. "Linux 6.12" (sched_ext). <a href="https://kernelnewbies.org/Linux_6.12">https://kernelnewbies.org/Linux_6.12</a></li>
+      <li>D. Thaler (ed.). "BPF Instruction Set Architecture (ISA)." RFC 9669, IETF Standards Track, October 2024. <a href="https://www.rfc-editor.org/rfc/rfc9669.html">https://www.rfc-editor.org/rfc/rfc9669.html</a></li>
+      <li>libbpf-bootstrap, <code>examples/c/minimal.bpf.c</code> and <code>minimal.c</code> (commit 820a1bd8b4f4). <a href="https://github.com/libbpf/libbpf-bootstrap">https://github.com/libbpf/libbpf-bootstrap</a></li>
+      <li>Linux kernel, <code>samples/seccomp/dropper.c</code>, <code>include/uapi/linux/filter.h</code>, <code>include/uapi/linux/bpf.h</code>. <a href="https://github.com/torvalds/linux">https://github.com/torvalds/linux</a></li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="../index.html"><small>Previous</small>Curriculum home</a>
+      <a class="next" href="02-ebpf-isa-and-vm.html"><small>Next</small>02 · eBPF ISA and VM</a>
+    </div>
+  </main>
+</div>
+<script>
+// Chapter widget: a tiny classic BPF interpreter for the tcpdump program shown above.
+(function () {
+  // tcpdump -dd -y EN10MB 'ip and tcp dst port 22'
+  var prog = [[0x28,0,0,12],[0x15,0,8,0x800],[0x30,0,0,23],[0x15,0,6,6],[0x28,0,0,20],
+              [0x45,4,0,0x1fff],[0xb1,0,0,14],[0x48,0,0,16],[0x15,0,1,0x16],[0x06,0,0,262144],[0x06,0,0,0]];
+  var asm = ["ldh [12]","jeq #0x800","ldb [23]","jeq #0x6","ldh [20]","jset #0x1fff",
+             "ldxb 4*([14]&0xf)","ldh [x + 16]","jeq #0x16","ret #262144","ret #0"];
+  function eth(type) { return [0,0x11,0x22,0x33,0x44,0x55, 0,0x66,0x77,0x88,0x99,0xaa, type>>8, type&0xff]; }
+  function ipv4(proto, frag, ihl) {
+    var h = [0x40 | ihl, 0, 0, 40, 0x12, 0x34, frag>>8, frag&0xff, 64, proto, 0, 0, 10,0,0,1, 10,0,0,2];
+    for (var i = 20; i < ihl*4; i++) h.push(1); // IP options (NOPs) when ihl > 5
+    return h;
+  }
+  function tcp(sport, dport) { return [sport>>8, sport&0xff, dport>>8, dport&0xff, 0,0,0,1, 0,0,0,0, 0x50,0x02, 0xff,0xff, 0,0, 0,0]; }
+  var packets = {
+    "TCP SYN to port 22": eth(0x800).concat(ipv4(6, 0x4000, 5), tcp(50000, 22)),
+    "TCP to port 22, IP options (IHL=6)": eth(0x800).concat(ipv4(6, 0x4000, 6), tcp(50000, 22)),
+    "TCP to port 80": eth(0x800).concat(ipv4(6, 0x4000, 5), tcp(50000, 80)),
+    "UDP DNS query": eth(0x800).concat(ipv4(17, 0, 5), [0xc3,0x50,0,53,0,8,0,0]),
+    "ARP request": eth(0x806).concat([0,1,8,0,6,4,0,1]),
+    "Truncated frame (16 bytes)": eth(0x800).concat([0x45,0])
+  };
+  function hex(v) { return "0x" + (v >>> 0).toString(16); }
+  function run(p) {
+    var A = 0, X = 0, pc = 0, out = [];
+    function ld(off, n) { if (off < 0 || off + n > p.length) return null; var v = 0; for (var i = 0; i < n; i++) v = (v << 8) | p[off+i]; return v >>> 0; }
+    out.push("packet length " + p.length + " bytes");
+    for (var steps = 0; steps < 32; steps++) {
+      var ins = prog[pc], code = ins[0], jt = ins[1], jf = ins[2], k = ins[3], note = "", next = pc + 1, v;
+      var line = "(" + ("00" + pc).slice(-3) + ") " + (asm[pc] + "                  ").slice(0, 18);
+      switch (code) {
+        case 0x28: v = ld(k, 2); if (v === null) { out.push(line + "out of bounds -> filter returns 0 (drop)"); return out; } A = v; break;
+        case 0x30: v = ld(k, 1); if (v === null) { out.push(line + "out of bounds -> filter returns 0 (drop)"); return out; } A = v; break;
+        case 0xb1: v = ld(k, 1); if (v === null) { out.push(line + "out of bounds -> filter returns 0 (drop)"); return out; } X = (v & 0xf) * 4; break;
+        case 0x48: v = ld(X + k, 2); if (v === null) { out.push(line + "out of bounds -> filter returns 0 (drop)"); return out; } A = v; break;
+        case 0x15: next = pc + 1 + (A === k ? jt : jf); note = (A === k ? "true" : "false"); break;
+        case 0x45: next = pc + 1 + ((A & k) ? jt : jf); note = ((A & k) ? "true" : "false"); break;
+        case 0x06: out.push(line + "RETURN " + k + (k ? "  -> ACCEPT (copy up to " + k + " bytes)" : "  -> REJECT")); return out;
+      }
+      out.push(line + "A=" + hex(A) + " X=" + X + (note ? "  " + note + " -> pc " + next : ""));
+      pc = next;
+    }
+    return out;
+  }
+  document.addEventListener("DOMContentLoaded", function () {
+    var bar = document.getElementById("cbpf-buttons"), trace = document.getElementById("cbpf-trace");
+    if (!bar || !trace) return;
+    Object.keys(packets).forEach(function (name) {
+      var b = document.createElement("button");
+      b.type = "button"; b.textContent = name;
+      b.style.cssText = "background:var(--bg3);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:.3rem .7rem;cursor:pointer;font:inherit;font-size:.85rem";
+      b.addEventListener("click", function () { trace.textContent = run(packets[name]).join("\n"); });
+      bar.appendChild(b);
+    });
+  });
+})();
+</script>
+</body>
+</html>

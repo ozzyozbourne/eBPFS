@@ -1,0 +1,1446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Program types and hooks · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="05">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="Where eBPF programs attach — kprobes, trampolines, tracepoints, uprobes/USDT, perf sampling, LSM, cgroups, struct_ops, sched_ext, iterators and HID-BPF — and what each hook can see, change and cost.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpf-developer-tutorial">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 05 · Program types and hooks</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 05</div>
+      <h1>Program types and hooks: where eBPF runs</h1>
+      <p class="lede">An eBPF program does nothing until it is attached to a hook. The hook decides
+      when the program runs, what context pointer it receives, which helpers it may call, whether
+      its return value means anything, and how much each run costs. This chapter goes through
+      the hooks one family at a time.</p>
+      <div class="meta"><span>Prerequisites: <a href="03-verifier.html">03</a>, <a href="04-maps-helpers-kfuncs.html">04</a></span><span>Repos: libbpf-bootstrap, bpf-developer-tutorial</span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Chapters 02–04 described the eBPF machine: the instruction set, the verifier, and maps,
+    helpers and kfuncs. None of that says <em>when</em> a program runs. The kernel answers that
+    with the <strong>program type</strong> (for example <code>BPF_PROG_TYPE_KPROBE</code>,
+    <code>BPF_PROG_TYPE_LSM</code>, <code>BPF_PROG_TYPE_STRUCT_OPS</code>) and, inside many
+    types, an <strong>attach type</strong> (for example <code>BPF_TRACE_FENTRY</code> versus
+    <code>BPF_TRACE_FEXIT</code>). Together they fix four things the verifier checks at load
+    time:</p>
+    <ul>
+      <li><strong>The context.</strong> R1 holds a pointer to a type-specific structure:
+      <code>struct pt_regs</code> for a kprobe, <code>struct __sk_buff</code> for a cgroup
+      packet filter, <code>struct bpf_sock_addr</code> for a <code>connect()</code> hook, or the
+      typed arguments of a kernel function for fentry and LSM programs.</li>
+      <li><strong>Which helpers and kfuncs exist.</strong> <code>bpf_override_return()</code>
+      exists for kprobes, <code>bpf_sysctl_get_name()</code> for sysctl hooks, and the
+      <code>scx_bpf_*</code> kfuncs for sched_ext.</li>
+      <li><strong>The meaning of the return value.</strong> For tracing it is mostly ignored. For
+      cgroup hooks it is allow (1) or deny (0). For LSM it is 0 or a negative errno. For
+      struct_ops it is the return value of the kernel callback the program implements.</li>
+      <li><strong>Whether the program may sleep.</strong> Sleepable variants such as
+      <code>lsm.s</code>, <code>uprobe.s</code> and <code>fentry.s</code> may call helpers that
+      fault in user memory.</li>
+    </ul>
+    <p>Choosing a hook is the first design decision in any eBPF tool. The same question ("which
+    files does this process open?") can be answered with a kprobe, an fentry, a syscall
+    tracepoint, an LSM hook or a uprobe on libc. These differ in stability, overhead and
+    power by an order of magnitude or more.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>A hook is a contract with
+    three parts. The kernel promises to call your program at a specific point with a specific
+    context. The verifier lets you do only what that context allows. Your return value is
+    either ignored (observability) or obeyed (policy and extension). Read every row of the
+    comparison table below as a statement of that contract.</p></div>
+
+    <h3>How libbpf names hooks: <code>SEC()</code></h3>
+    <p>With libbpf you rarely set the program type by hand. You put the function in an ELF
+    section, and libbpf maps the section name to a program type, an attach type and, when
+    the name carries enough detail, an auto-attach target. The kernel documentation table
+    <a href="https://docs.kernel.org/bpf/libbpf/program_types.html">Program Types and ELF
+    Sections</a> is the authoritative list. A trailing <code>+</code> in that table means the
+    name accepts extras after a <code>/</code>: <code>SEC("kprobe/do_unlinkat")</code>
+    auto-attaches, while a bare <code>SEC("kprobe")</code> loads but needs a manual attach
+    call. A <code>.s</code> suffix (<code>lsm.s</code>, <code>uprobe.s</code>,
+    <code>fentry.s</code>) marks a sleepable program. How the skeleton turns these sections
+    into <code>bpf()</code> calls is covered in <a href="06-btf-core-libbpf.html">chapter
+    06</a>.</p>
+
+    <h2>The map: hooks on the kernel/user stack</h2>
+    <p>Figure 5.1 places every hook family covered in this chapter on the stack. Hooks in
+    the left half <em>observe</em>: they read state and push events to maps or ring buffers
+    and cannot change the outcome (with two narrow exceptions, <code>fmod_ret</code> and
+    <code>bpf_override_return</code>). Hooks in the right half <em>decide</em> or
+    <em>implement</em>: their return value, or the struct they fill in, changes what the
+    kernel does.</p>
+
+    <figure>
+      <svg viewBox="0 0 1000 640" role="img" aria-label="Map of eBPF hooks across user space, the syscall boundary, kernel subsystems and hardware">
+        <style>
+          .lay{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .obs{fill:none;stroke:var(--accent2);stroke-width:2;rx:8}
+          .act{fill:none;stroke:var(--accent);stroke-width:2;rx:8}
+          .t{fill:var(--fg);font:600 15px sans-serif}
+          .s{fill:var(--fg);font:12.5px monospace}
+          .m{fill:var(--muted);font:12px sans-serif}
+          .ln{stroke:var(--muted);stroke-width:1.2;stroke-dasharray:5 4}
+        </style>
+        <!-- user space -->
+        <rect class="lay" x="10" y="10" width="980" height="130" rx="10"/>
+        <text class="t" x="25" y="34">User space</text>
+        <text class="m" x="25" y="52">applications, shared libraries, language runtimes</text>
+        <rect class="obs" x="25" y="64" width="300" height="64"/>
+        <text class="s" x="38" y="86">uprobe / uretprobe</text>
+        <text class="s" x="38" y="104">uprobe.multi / uprobe.session</text>
+        <text class="m" x="38" y="121">any function or offset in an ELF file</text>
+        <rect class="obs" x="340" y="64" width="250" height="64"/>
+        <text class="s" x="353" y="86">usdt/&lt;path&gt;:&lt;prov&gt;:&lt;name&gt;</text>
+        <text class="m" x="353" y="106">static probes compiled into</text>
+        <text class="m" x="353" y="121">libc, Python, JVM, PostgreSQL…</text>
+        <rect class="act" x="605" y="64" width="370" height="64"/>
+        <text class="m" x="618" y="86">uprobes trap into the kernel (int3) on every hit.</text>
+        <text class="m" x="618" y="104">bpftime (ch. 14–15) runs the same programs</text>
+        <text class="m" x="618" y="121">inside the process instead, without the trap.</text>
+        <!-- syscall boundary -->
+        <rect class="lay" x="10" y="150" width="980" height="54" rx="10"/>
+        <text class="t" x="25" y="182">Syscall boundary</text>
+        <text class="s" x="200" y="182">tp/syscalls/sys_enter_*  ·  sys_exit_*  ·  ksyscall/&lt;name&gt;  ·  raw_tp/sys_enter</text>
+        <!-- kernel -->
+        <rect class="lay" x="10" y="214" width="980" height="330" rx="10"/>
+        <text class="t" x="25" y="238">Kernel</text>
+        <!-- tracing column -->
+        <rect class="obs" x="25" y="250" width="300" height="280"/>
+        <text class="t" x="38" y="274">Tracing (observe)</text>
+        <text class="s" x="38" y="298">kprobe / kretprobe</text>
+        <text class="m" x="38" y="314">any non-blacklisted instruction</text>
+        <text class="s" x="38" y="338">fentry / fexit / fsession</text>
+        <text class="s" x="38" y="354">fmod_ret  (may change return)</text>
+        <text class="m" x="38" y="370">BPF trampoline at function entry</text>
+        <text class="s" x="38" y="394">tp/&lt;cat&gt;/&lt;name&gt;</text>
+        <text class="s" x="38" y="410">raw_tp/&lt;name&gt;  ·  tp_btf/&lt;name&gt;</text>
+        <text class="m" x="38" y="426">static tracepoints in the source</text>
+        <text class="s" x="38" y="450">perf_event</text>
+        <text class="m" x="38" y="466">timer / PMU sampling, often NMI</text>
+        <text class="s" x="38" y="490">iter/&lt;object&gt;</text>
+        <text class="m" x="38" y="506">walk tasks, files, sockets, maps</text>
+        <text class="m" x="38" y="522">on read() — pull, not push</text>
+        <!-- security & cgroup -->
+        <rect class="act" x="340" y="250" width="300" height="130"/>
+        <text class="t" x="353" y="274">Security (decide)</text>
+        <text class="s" x="353" y="298">lsm/&lt;hook&gt;  ·  lsm.s/&lt;hook&gt;</text>
+        <text class="s" x="353" y="316">lsm_cgroup/&lt;hook&gt;</text>
+        <text class="m" x="353" y="336">return 0 or -errno at ~250 LSM hooks:</text>
+        <text class="m" x="353" y="352">exec, open, mmap, connect, bpf()…</text>
+        <text class="m" x="353" y="370">(seccomp stays classic BPF)</text>
+        <rect class="act" x="340" y="392" width="300" height="138"/>
+        <text class="t" x="353" y="416">cgroup (decide, per cgroup)</text>
+        <text class="s" x="353" y="440">cgroup_skb/ingress|egress</text>
+        <text class="s" x="353" y="458">cgroup/sock_create  connect4 …</text>
+        <text class="s" x="353" y="476">cgroup/getsockopt|setsockopt</text>
+        <text class="s" x="353" y="494">cgroup/dev  ·  cgroup/sysctl</text>
+        <text class="m" x="353" y="514">return 1 = allow, 0 = deny</text>
+        <!-- struct_ops -->
+        <rect class="act" x="655" y="250" width="320" height="180"/>
+        <text class="t" x="668" y="274">struct_ops (implement)</text>
+        <text class="m" x="668" y="294">BPF fills a kernel table of function pointers</text>
+        <text class="s" x="668" y="318">tcp_congestion_ops   TCP CC</text>
+        <text class="s" x="668" y="340">sched_ext_ops        CPU scheduler</text>
+        <text class="s" x="668" y="362">hid_bpf_ops          HID-BPF</text>
+        <text class="s" x="668" y="384">Qdisc_ops, …         more subsystems</text>
+        <text class="m" x="668" y="410">SEC("struct_ops") + SEC(".struct_ops.link")</text>
+        <rect class="act" x="655" y="442" width="320" height="88"/>
+        <text class="t" x="668" y="466">Networking → chapter 07</text>
+        <text class="s" x="668" y="488">xdp · tcx/ingress|egress · sockops</text>
+        <text class="s" x="668" y="506">sk_msg · sk_lookup · socket · netfilter</text>
+        <!-- hardware -->
+        <rect class="lay" x="10" y="554" width="980" height="76" rx="10"/>
+        <text class="t" x="25" y="580">Hardware</text>
+        <text class="m" x="25" y="602">CPU PMU counters and timers</text>
+        <text class="m" x="360" y="602">USB / Bluetooth HID devices</text>
+        <text class="m" x="700" y="602">NICs (XDP runs in the driver)</text>
+        <line class="ln" x1="150" y1="595" x2="150" y2="466"/>
+        <line class="ln" x1="460" y1="590" x2="740" y2="368"/>
+        <line class="ln" x1="790" y1="590" x2="790" y2="530"/>
+        <!-- legend -->
+        <rect x="600" y="160" width="18" height="12" style="fill:none;stroke:var(--accent2);stroke-width:2"/>
+        <text class="m" x="624" y="171">observe (return ignored)</text>
+        <rect x="780" y="160" width="18" height="12" style="fill:none;stroke:var(--accent);stroke-width:2"/>
+        <text class="m" x="804" y="171">decide / implement</text>
+      </svg>
+      <figcaption>Figure 5.1 — eBPF hook families on the stack. Blue boxes observe; orange
+      boxes decide or implement. Labels inside boxes are libbpf <code>SEC()</code> names.
+      Networking hooks are only sketched here; see <a href="07-networking-xdp-tc.html">chapter
+      07</a>.</figcaption>
+    </figure>
+
+    <h2>Comparison table</h2>
+    <p>The table is the reference for the rest of the chapter. "Since" is the mainline
+    kernel release where the program or attach type first appeared, checked against
+    the tagged <code>include/uapi/linux/bpf.h</code> or the files in question (method in the
+    <a href="#references">references</a>). Overhead is qualitative on purpose. Absolute numbers
+    depend on CPU, mitigations and kernel configuration. The only measured figures in this
+    chapter are the ones quoted with attribution in the uprobe section.</p>
+    <table>
+      <thead><tr><th>Hook</th><th>libbpf <code>SEC()</code></th><th>Context (R1)</th><th>Can read</th><th>Can change</th><th>Overhead</th><th>Since</th></tr></thead>
+      <tbody>
+        <tr><td>kprobe / kretprobe</td><td><code>kprobe/fn[+off]</code>, <code>kretprobe/fn</code>, <code>ksyscall/name</code></td><td><code>struct pt_regs *</code></td><td>registers; kernel memory via <code>bpf_probe_read_kernel</code> / CO-RE</td><td>nothing (except <code>bpf_override_return</code> on error-injection functions)</td><td>medium: breakpoint/ftrace path</td><td>4.1</td></tr>
+        <tr><td>kprobe.multi / session</td><td><code>kprobe.multi/pattern</code>, <code>kprobe.session/pattern</code></td><td><code>struct pt_regs *</code></td><td>same as kprobe</td><td>session: entry can cancel the return run</td><td>low–medium, one link for many functions (fprobe)</td><td>5.18 / 6.10</td></tr>
+        <tr><td>fentry / fexit</td><td><code>fentry/fn</code>, <code>fexit/fn</code>, <code>.s</code> variants</td><td>typed function args (<code>BPF_PROG</code>); fexit adds return value</td><td>args by direct BTF-typed dereference</td><td>nothing</td><td>low: direct call from BPF trampoline</td><td>5.5</td></tr>
+        <tr><td>fmod_ret</td><td><code>fmod_ret/fn</code></td><td>typed args + current ret</td><td>args</td><td>return value of <code>security_*</code> or error-injectable functions</td><td>low</td><td>5.7</td></tr>
+        <tr><td>fsession</td><td><code>fsession/fn</code></td><td>typed args (+ret on exit)</td><td>args, 8-byte per-call cookie</td><td>nothing</td><td>low; one program, one link</td><td>7.0</td></tr>
+        <tr><td>Tracepoint</td><td><code>tp/cat/name</code>, <code>tracepoint/cat/name</code></td><td>pointer to the tracepoint's record format</td><td>fields in <code>/sys/kernel/tracing/events/…/format</code></td><td>nothing</td><td>low–medium (record is built first)</td><td>4.7</td></tr>
+        <tr><td>Raw tracepoint</td><td><code>raw_tp/name</code>, <code>raw_tp.w/name</code></td><td><code>struct bpf_raw_tracepoint_args *</code> (raw u64 args)</td><td>raw args; pointers via probe_read</td><td>writable variant: a buffer the tracepoint exposes</td><td>low</td><td>4.17 (writable 5.2)</td></tr>
+        <tr><td>BTF tracepoint</td><td><code>tp_btf/name</code></td><td>typed args (<code>BPF_PROG</code>)</td><td>direct typed dereference</td><td>nothing</td><td>low</td><td>5.5</td></tr>
+        <tr><td>uprobe / uretprobe</td><td><code>uprobe/path:fn[+off]</code>, <code>uretprobe/…</code>, <code>.s</code>, <code>.multi</code>, <code>.session</code></td><td><code>struct pt_regs *</code> (user registers)</td><td>user memory via <code>bpf_probe_read_user</code></td><td>nothing (<code>bpf_probe_write_user</code> exists but taints the kernel log)</td><td><strong>high</strong>: trap into the kernel on every hit</td><td>4.3 (multi 6.6, session 6.13)</td></tr>
+        <tr><td>USDT</td><td><code>usdt/path:provider:name</code></td><td><code>struct pt_regs *</code> + libbpf arg spec</td><td>probe args via <code>bpf_usdt_arg()</code> / <code>BPF_USDT</code></td><td>nothing</td><td>same as uprobe; zero when not attached</td><td>uprobe-based</td></tr>
+        <tr><td>perf_event</td><td><code>perf_event</code></td><td><code>struct bpf_perf_event_data *</code></td><td>regs at sample, period, addr; stacks</td><td>nothing</td><td>proportional to sample rate</td><td>4.9</td></tr>
+        <tr><td>BPF LSM</td><td><code>lsm/hook</code>, <code>lsm.s/hook</code>, <code>lsm_cgroup/hook</code></td><td>typed hook args + previous ret</td><td>hook args (inode, file, cred, socket…)</td><td>access decision: 0 or <code>-EPERM</code>…</td><td>low (trampoline)</td><td>5.7 (cgroup 6.0)</td></tr>
+        <tr><td>cgroup_skb</td><td><code>cgroup_skb/ingress</code>, <code>/egress</code></td><td><code>struct __sk_buff *</code></td><td>packet, socket</td><td>allow/drop (1/0)</td><td>low, per packet</td><td>4.10</td></tr>
+        <tr><td>cgroup sock / sock_addr</td><td><code>cgroup/sock_create</code>, <code>cgroup/connect4</code>, <code>bind4</code>, <code>sendmsg4</code>…</td><td><code>struct bpf_sock *</code> / <code>struct bpf_sock_addr *</code></td><td>family, type, protocol, address</td><td>allow/deny; rewrite address/port; set mark, bound device</td><td>low, per syscall</td><td>4.10 / 4.17</td></tr>
+        <tr><td>cgroup sockopt</td><td><code>cgroup/getsockopt</code>, <code>/setsockopt</code></td><td><code>struct bpf_sockopt *</code></td><td>level, optname, optval</td><td>allow/deny; rewrite optval</td><td>low</td><td>5.3</td></tr>
+        <tr><td>cgroup device</td><td><code>cgroup/dev</code></td><td><code>struct bpf_cgroup_dev_ctx *</code></td><td>major, minor, access type</td><td>allow/deny</td><td>low</td><td>4.15</td></tr>
+        <tr><td>cgroup sysctl</td><td><code>cgroup/sysctl</code></td><td><code>struct bpf_sysctl *</code></td><td>name, current/new value</td><td>allow/deny; replace written value</td><td>low</td><td>5.2</td></tr>
+        <tr><td>struct_ops</td><td><code>struct_ops</code> + <code>SEC(".struct_ops[.link]")</code></td><td>typed callback args</td><td>callback args, kfuncs of the subsystem</td><td>implements the callback</td><td>a direct call through a trampoline</td><td>5.6</td></tr>
+        <tr><td>sched_ext</td><td>struct_ops on <code>sched_ext_ops</code></td><td>typed callback args</td><td><code>task_struct</code>, CPU state</td><td>where and when every task runs</td><td>on the scheduling hot path</td><td>6.12</td></tr>
+        <tr><td>bpf_iter</td><td><code>iter/task</code>, <code>iter/tcp</code>, <code>iter.s/…</code></td><td><code>struct bpf_iter__&lt;obj&gt; *</code></td><td>one object per call + <code>seq_file</code></td><td>output stream only</td><td>only when someone reads</td><td>5.8</td></tr>
+        <tr><td>HID-BPF</td><td><code>struct_ops/hid_device_event</code> on <code>hid_bpf_ops</code></td><td><code>struct hid_bpf_ctx *</code></td><td>raw HID report</td><td>rewrite or drop the report</td><td>per input report, IRQ context</td><td>6.3 (struct_ops 6.11)</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Tracing the kernel</h2>
+
+    <h3>kprobe and kretprobe: attach anywhere</h3>
+    <p><strong>What it is.</strong> A <a href="https://docs.kernel.org/trace/kprobes.html">kprobe</a>
+    is the oldest dynamic kernel probe. It can be placed on almost any instruction of almost
+    any kernel function, by symbol name and optional offset. A kretprobe fires when that
+    function returns. BPF programs have been able to attach to kprobes since Linux 4.1.</p>
+    <p><strong>How it works.</strong> The classic mechanism replaces the first byte of the
+    probed instruction with a breakpoint (<code>int3</code> on x86). When the CPU hits it,
+    the trap handler runs the attached handlers, then executes the displaced instruction
+    out of line and resumes. Two optimisations make this cheaper in practice. A probe at a
+    function's ftrace call site (the function entry on kernels built with ftrace) can use
+    ftrace instead of a breakpoint. "Optprobes" can replace the breakpoint with a jump. A
+    kretprobe swaps the return address on entry so that the function "returns" into a
+    trampoline that runs the handler. BPF programs see <code>struct pt_regs</code>, so they
+    must know the calling convention. The <code>BPF_KPROBE</code> and
+    <code>BPF_KRETPROBE</code> macros in <code>bpf_tracing.h</code> hide that and give you
+    named arguments.</p>
+    <pre data-file="libbpf-bootstrap/examples/c/kprobe.bpf.c"><code class="language-c">
+SEC("kprobe/do_unlinkat")
+int BPF_KPROBE(do_unlinkat, int dfd, struct filename *name)
+{
+    pid_t pid;
+    const char *filename;
+
+    pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    filename = BPF_CORE_READ(name, name);
+    bpf_printk("KPROBE ENTRY pid = %d, filename = %s\n", pid, filename);
+    return 0;
+}
+
+SEC("kretprobe/do_unlinkat")
+int BPF_KRETPROBE(do_unlinkat_exit, long ret)
+{
+    pid_t pid;
+
+    pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    bpf_printk("KPROBE EXIT: pid = %d, ret = %ld\n", pid, ret);
+    return 0;
+}</code></pre>
+    <p>Pointer arguments are not trusted. <code>name</code> is just a number taken from a
+    register, so the program reads through it with <code>BPF_CORE_READ</code> (a
+    relocatable <code>bpf_probe_read_kernel</code>; see <a href="06-btf-core-libbpf.html">chapter
+    06</a>). Without that, the verifier rejects the dereference.</p>
+    <p><strong>Strengths and limits.</strong> Kprobes reach everything, including static
+    functions and mid-function offsets, which no other hook can do. But function names and
+    signatures are not a stable ABI. Inlined functions disappear, renamed functions break the
+    attach, and functions marked <code>NOKPROBE_SYMBOL</code> cannot be probed. Variants
+    soften some of this. <code>ksyscall/&lt;name&gt;</code> lets libbpf work out the
+    architecture-specific syscall wrapper name. <code>kprobe.multi</code> (5.18) attaches one
+    program to many functions through the fprobe/ftrace API with a single link, which is far
+    faster to set up than thousands of single kprobes. <code>kprobe.session</code> (6.10)
+    runs one program on both entry and return of each call.</p>
+
+    <h3>fentry, fexit, fmod_ret: the BPF trampoline</h3>
+    <p><strong>Why it exists.</strong> Kprobes pay for a trap and give you raw registers. In
+    November 2019 Alexei Starovoitov posted the
+    <a href="https://lwn.net/Articles/804937/">BPF trampoline</a> series, merged for 5.5.
+    Its cover letter describes fentry/fexit programs as "roughly equivalent to
+    kprobe/kretprobe", but "unlike k[ret]probe there is practically zero overhead to call a
+    set of BPF programs before or after kernel function". The trampoline's stated goals are
+    "to translate kernel calling convention into BPF calling convention" and "to call a set
+    of programs efficiently".</p>
+    <p><strong>How it works.</strong> Kernels built with ftrace start every traceable
+    function with a 5-byte nop (on x86). Attaching an fentry program makes the kernel JIT a
+    small piece of machine code, the trampoline, for that one function. It then uses
+    <code>register_ftrace_direct()</code> and text patching to turn the nop into a
+    <code>call</code> to it. The trampoline saves the argument registers into a
+    stack array, calls each fentry program with a pointer to that array, then calls each
+    fmod_ret program. Unless an fmod_ret program asked to skip it, the trampoline calls the
+    original function body. Finally it calls each fexit program with the arguments
+    <em>and</em> the return value. Because the target's BTF prototype is known, the verifier
+    treats the arguments as typed, BTF-tracked pointers, so <code>name-&gt;name</code> is a
+    plain load. The same machinery powers LSM programs, <code>tp_btf</code>,
+    <code>freplace</code> (replace a global function inside another BPF program) and
+    struct_ops.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 330" role="img" aria-label="Comparison of kprobe breakpoint path and BPF trampoline path">
+        <style>
+          .b{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .hot{fill:none;stroke:var(--accent);stroke-width:2}
+          .cool{fill:none;stroke:var(--accent2);stroke-width:2}
+          .tx{fill:var(--fg);font:13px sans-serif}
+          .mo{fill:var(--fg);font:12px monospace}
+          .mu{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah5)}
+        </style>
+        <defs><marker id="ah5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="tx" x="20" y="24" style="font-weight:600">kprobe (breakpoint path)</text>
+        <rect class="b" x="20" y="40" width="160" height="44" rx="6"/><text class="mo" x="32" y="67">do_unlinkat: int3</text>
+        <rect class="hot" x="220" y="40" width="160" height="44" rx="6"/><text class="tx" x="232" y="60">trap, save pt_regs</text><text class="mu" x="232" y="76">exception entry</text>
+        <rect class="b" x="420" y="40" width="140" height="44" rx="6"/><text class="tx" x="432" y="67">BPF program</text>
+        <rect class="hot" x="600" y="40" width="170" height="44" rx="6"/><text class="tx" x="612" y="60">run displaced insn</text><text class="mu" x="612" y="76">out of line / emulate</text>
+        <rect class="b" x="800" y="40" width="80" height="44" rx="6"/><text class="tx" x="812" y="67">resume</text>
+        <path class="ar" d="M180,62 H218"/><path class="ar" d="M380,62 H418"/><path class="ar" d="M560,62 H598"/><path class="ar" d="M770,62 H798"/>
+        <text class="tx" x="20" y="140" style="font-weight:600">fentry / fexit (BPF trampoline)</text>
+        <rect class="b" x="20" y="156" width="170" height="44" rx="6"/><text class="mo" x="30" y="183">do_unlinkat: call tramp</text>
+        <rect class="cool" x="230" y="156" width="420" height="160" rx="8"/>
+        <text class="tx" x="244" y="178" style="font-weight:600">JIT-generated trampoline for do_unlinkat</text>
+        <text class="mo" x="244" y="202">1. save args to stack array</text>
+        <text class="mo" x="244" y="224">2. call fentry progs (args)</text>
+        <text class="mo" x="244" y="246">3. call fmod_ret progs → may skip body</text>
+        <text class="mo" x="244" y="268">4. call original body (if not skipped)</text>
+        <text class="mo" x="244" y="290">5. call fexit progs (args, ret)</text>
+        <text class="mu" x="244" y="308">direct calls, no exception</text>
+        <rect class="b" x="690" y="156" width="190" height="44" rx="6"/><text class="tx" x="702" y="183">return to caller</text>
+        <path class="ar" d="M190,178 H228"/><path class="ar" d="M650,178 H688"/>
+      </svg>
+      <figcaption>Figure 5.2 — A kprobe goes through an exception. An fentry program is a
+      direct call from a per-function trampoline that ftrace patches into the function's
+      entry nop. fexit and fmod_ret run from the same trampoline.</figcaption>
+    </figure>
+
+    <p>Here is the fentry/fexit version of the kprobe example. Note the direct
+    <code>name-&gt;name</code> dereference, and that fexit gets both the arguments and
+    <code>ret</code>. A kretprobe only sees the return value, because the argument registers
+    have been reused by the time the function returns.</p>
+    <pre data-file="libbpf-bootstrap/examples/c/fentry.bpf.c"><code class="language-c">SEC("fentry/do_unlinkat")
+int BPF_PROG(do_unlinkat, int dfd, struct filename *name)
+{
+    pid_t pid;
+
+    pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    bpf_printk("fentry: pid = %d, filename = %s\n", pid, name-&gt;name);
+    return 0;
+}
+
+SEC("fexit/do_unlinkat")
+int BPF_PROG(do_unlinkat_exit, int dfd, struct filename *name, long ret)
+{
+    pid_t pid;
+
+    pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    bpf_printk("fexit: pid = %d, filename = %s, ret = %ld\n", pid, name-&gt;name, ret);
+    return 0;
+}</code></pre>
+
+    <p><strong>fmod_ret</strong> (attach type <code>BPF_MODIFY_RETURN</code>, 5.7) is the one
+    tracing variant whose return value matters. A non-zero return skips the original function
+    and becomes its return value. The verifier only allows it on targets where that is
+    designed to be safe: <code>check_attach_modify_return()</code> in
+    <code>kernel/bpf/verifier.c</code> accepts functions on the error-injection list
+    (<code>ALLOW_ERROR_INJECTION</code>) and functions whose name starts with
+    <code>security_</code>. The kernel selftest shows the ordering fentry → fmod_ret →
+    fexit:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/modify_return.c"><code class="language-c">__u64 fmod_ret_result = 0;
+SEC("fmod_ret/bpf_modify_return_test")
+int BPF_PROG(fmod_ret_test, int a, int *b, int ret)
+{
+    if (bpf_get_current_pid_tgid() &gt;&gt; 32 != test_pid)
+        return ret;
+    sequence++;
+    /* This is the first fmod_ret program, the ret passed should be 0 */
+    fmod_ret_result = (sequence == 2 &amp;&amp; ret == 0);
+    return input_retval;
+}
+
+__u64 fexit_result = 0;
+SEC("fexit/bpf_modify_return_test")
+int BPF_PROG(fexit_test, int a, __u64 b, int ret)
+{
+    if (bpf_get_current_pid_tgid() &gt;&gt; 32 != test_pid)
+        return 0;
+    sequence++;
+    /* If the input_reval is non-zero a successful modification should have
+     * occurred.
+     */
+    if (input_retval)
+        fexit_result = (sequence == 3 &amp;&amp; ret == input_retval);
+    else
+        fexit_result = (sequence == 3 &amp;&amp; ret == 4);
+
+    return 0;
+}</code></pre>
+
+    <p><strong>fsession</strong> (<code>BPF_TRACE_FSESSION</code>, first in the v7.0 UAPI
+    header) merges fentry and fexit into one program. The kernel gives each call an 8-byte
+    cookie, so the program needs no hash map keyed by thread ID to carry a timestamp from
+    entry to exit. bpf-developer-tutorial lesson 52 uses it to time <code>vfs_read</code>.
+    <code>bpf_session_is_return(ctx)</code> tells the two runs apart:</p>
+    <pre data-file="bpf-developer-tutorial/src/52-fsession-latency/fsession_latency.bpf.c"><code class="language-c">SEC("fsession/vfs_read")
+int BPF_PROG(measure_vfs_read, struct file *file, char *buf, size_t count,
+         loff_t *pos, ssize_t ret)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 *started = bpf_session_cookie(ctx);
+    struct latency_event *event;
+    struct inode *inode;
+    __u32 device;
+    __u64 latency;
+
+    if (!bpf_session_is_return(ctx)) {
+        if (target_tgid &amp;&amp; pid_tgid &gt;&gt; 32 != target_tgid) {
+            *started = 0;
+            return 0;
+        }
+        *started = bpf_ktime_get_ns();
+        return 0;
+    }
+
+    if (!*started)
+        return 0;
+
+    latency = bpf_ktime_get_ns() - *started;
+/* ... */
+    return 0;
+}</code></pre>
+
+    <div class="callout warn"><span class="label">Limits of fentry</span><p>fentry needs
+    BTF for the target (<code>CONFIG_DEBUG_INFO_BTF</code>), a JIT, and arch support for
+    trampolines. It can only attach at function entry, never mid-function, and only to
+    functions ftrace can trace (not inlined, not <code>notrace</code>). Each program is
+    attached per function. A wildcard over thousands of functions is the job of
+    <code>kprobe.multi</code>. When fentry works, prefer it to kprobe: it is faster and the
+    code is simpler.</p></div>
+
+    <h3>Static tracepoints, raw tracepoints and <code>tp_btf</code></h3>
+    <p><strong>What they are.</strong> Tracepoints are hooks that kernel developers placed in
+    the source on purpose: <code>sched:sched_switch</code>,
+    <code>syscalls:sys_enter_openat</code>, <code>block:block_rq_complete</code> and
+    thousands more. They are the closest thing to a stable tracing ABI the kernel offers.
+    Their names and fields change far less often than internal function signatures, so
+    production tools prefer them whenever a tracepoint exists for the event of interest.</p>
+    <p>There are three ways for BPF to consume the same tracepoint:</p>
+    <ul>
+      <li><strong><code>tp/&lt;category&gt;/&lt;name&gt;</code></strong>
+      (<code>BPF_PROG_TYPE_TRACEPOINT</code>, 4.7). The program receives the tracepoint's
+      formatted record, the same struct described in
+      <code>/sys/kernel/tracing/events/&lt;cat&gt;/&lt;name&gt;/format</code> that ftrace and
+      perf use. The kernel fills that record before calling you, which costs something, but
+      the layout is the easiest to consume.</li>
+      <li><strong><code>raw_tp/&lt;name&gt;</code></strong>
+      (<code>BPF_PROG_TYPE_RAW_TRACEPOINT</code>, 4.17). The program receives the raw
+      arguments the kernel passed to <code>trace_&lt;name&gt;()</code>, as an array of
+      <code>u64</code>, with no record built. It is cheaper, but pointers are untyped and must
+      be read through <code>bpf_probe_read_kernel</code>/CO-RE.</li>
+      <li><strong><code>tp_btf/&lt;name&gt;</code></strong> (<code>BPF_TRACE_RAW_TP</code>
+      inside <code>BPF_PROG_TYPE_TRACING</code>, 5.5). This is a raw tracepoint with BTF types:
+      arguments arrive typed, as with fentry, and can be dereferenced directly.</li>
+    </ul>
+    <p>The libbpf-bootstrap <code>minimal</code> example is the smallest program in this
+    curriculum. It is a classic tracepoint on <code>write(2)</code>, filtered by a PID that
+    user space writes into a global variable before loading:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/minimal.bpf.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Copyright (c) 2020 Facebook */
+#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+int my_pid = 0;
+
+SEC("tp/syscalls/sys_enter_write")
+int handle_tp(void *ctx)
+{
+    int pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+    if (pid != my_pid)
+        return 0;
+
+    bpf_printk("BPF triggered from PID %d.\n", pid);
+
+    return 0;
+}</code></pre>
+    <p>For the scheduler, bpf-developer-tutorial's <code>runqlat</code> (lesson 9) uses raw
+    tracepoints, and the wall-clock profiler (lesson 32) ships both a <code>tp_btf</code> and a
+    <code>raw_tp</code> version of the same handler. The user-space loader picks
+    <code>tp_btf</code> when the kernel supports it:</p>
+    <pre data-file="bpf-developer-tutorial/src/9-runqlat/runqlat.bpf.c"><code class="language-c">SEC("raw_tp/sched_wakeup")
+int BPF_PROG(handle_sched_wakeup, struct task_struct *p)
+{
+    return trace_enqueue(BPF_CORE_READ(p, tgid), BPF_CORE_READ(p, pid));
+}
+
+SEC("raw_tp/sched_wakeup_new")
+int BPF_PROG(handle_sched_wakeup_new, struct task_struct *p)
+{
+    return trace_enqueue(BPF_CORE_READ(p, tgid), BPF_CORE_READ(p, pid));
+}
+
+SEC("raw_tp/sched_switch")
+int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
+{
+    return handle_switch(preempt, prev, next);
+}</code></pre>
+    <pre data-file="bpf-developer-tutorial/src/32-wallclock-profiler/offcputime.bpf.c"><code class="language-c">SEC("tp_btf/sched_switch")
+int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
+{
+    return handle_sched_switch(ctx, preempt, prev, next);
+}
+
+SEC("raw_tp/sched_switch")
+int BPF_PROG(sched_switch_raw, bool preempt, struct task_struct *prev, struct task_struct *next)
+{
+    return handle_sched_switch(ctx, preempt, prev, next);
+}</code></pre>
+    <p>When no tracepoint exists you fall back to fentry or kprobe. When one does, the
+    tracepoint is the better choice for anything you plan to ship.</p>
+
+    <h3>perf_event: sampling</h3>
+    <p>A <code>perf_event</code> program (4.9) attaches to a perf event opened with
+    <code>perf_event_open(2)</code>: a CPU-clock timer, a hardware counter overflow
+    (cycles, cache misses) or a software event. The kernel runs the program each time the
+    event fires, often from NMI context for hardware counters. The context is
+    <code>struct bpf_perf_event_data</code>, which wraps the interrupted registers and the
+    sample period. The classic use is a CPU profiler: on each tick, capture kernel and user
+    stacks and count them. libbpf-bootstrap's <code>profile</code> does exactly that:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/profile.bpf.c"><code class="language-c">SEC("perf_event")
+int profile(void *ctx)
+{
+    int pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    int cpu_id = bpf_get_smp_processor_id();
+    struct stacktrace_event *event;
+    int cp;
+
+    event = bpf_ringbuf_reserve(&amp;events, sizeof(*event), 0);
+    if (!event)
+        return 1;
+
+    event-&gt;pid = pid;
+    event-&gt;cpu_id = cpu_id;
+
+    if (bpf_get_current_comm(event-&gt;comm, sizeof(event-&gt;comm)))
+        event-&gt;comm[0] = 0;
+
+    event-&gt;kstack_sz = bpf_get_stack(ctx, event-&gt;kstack, sizeof(event-&gt;kstack), 0);
+
+    event-&gt;ustack_sz =
+        bpf_get_stack(ctx, event-&gt;ustack, sizeof(event-&gt;ustack), BPF_F_USER_STACK);
+
+    bpf_ringbuf_submit(event, 0);
+
+    return 0;
+}</code></pre>
+    <p>Overhead scales with the sample frequency, not with how busy the code is, which is
+    why sampling profilers can run all the time in production. User space opens one perf
+    event per CPU and attaches the same program to each with
+    <code>bpf_program__attach_perf_event()</code>. Profiling with this hook is the subject of
+    <a href="22-xpu-perf.html">chapter 22</a>.</p>
+
+    <h2>Tracing user space: uprobes and USDT</h2>
+
+    <h3>What a uprobe is</h3>
+    <p>A uprobe is a kprobe for user-space code. You name an ELF file and a function or
+    offset (<code>/bin/bash:readline</code>, <code>libc.so.6:malloc</code>,
+    <code>/proc/self/exe:uprobed_sub</code>), and the kernel runs your BPF program whenever
+    <em>any</em> process (or one PID, if you ask) executes that address. A uretprobe fires on
+    return. BPF has been able to attach to uprobes since Linux 4.3: the BPF call
+    <code>trace_call_bpf</code> appears in <code>kernel/trace/trace_uprobe.c</code> in v4.3 and
+    not in v4.2. The program type is still <code>BPF_PROG_TYPE_KPROBE</code> and the context
+    is still <code>struct pt_regs</code>, now holding <em>user</em> registers. That is why
+    the examples below use <code>BPF_KPROBE</code> even on a uprobe.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="BPF side (uprobe.bpf.c)">
+        <pre data-file="libbpf-bootstrap/examples/c/uprobe.bpf.c"><code class="language-c">SEC("uprobe")
+int BPF_KPROBE(uprobe_add, int a, int b)
+{
+    bpf_printk("uprobed_add ENTRY: a = %d, b = %d", a, b);
+    return 0;
+}
+
+SEC("uretprobe")
+int BPF_KRETPROBE(uretprobe_add, int ret)
+{
+    bpf_printk("uprobed_add EXIT: return = %d", ret);
+    return 0;
+}
+
+SEC("uprobe//proc/self/exe:uprobed_sub")
+int BPF_KPROBE(uprobe_sub, int a, int b)
+{
+    bpf_printk("uprobed_sub ENTRY: a = %d, b = %d", a, b);
+    return 0;
+}
+
+SEC("uretprobe//proc/self/exe:uprobed_sub")
+int BPF_KRETPROBE(uretprobe_sub, int ret)
+{
+    bpf_printk("uprobed_sub EXIT: return = %d", ret);
+    return 0;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="User side (uprobe.c)">
+        <pre data-file="libbpf-bootstrap/examples/c/uprobe.c"><code class="language-c">    /* Attach tracepoint handler */
+    uprobe_opts.func_name = "uprobed_add";
+    uprobe_opts.retprobe = false;
+    /* uprobe/uretprobe expects relative offset of the function to attach
+     * to. libbpf will automatically find the offset for us if we provide the
+     * function name. If the function name is not specified, libbpf will try
+     * to use the function offset instead.
+     */
+    skel-&gt;links.uprobe_add = bpf_program__attach_uprobe_opts(skel-&gt;progs.uprobe_add,
+                                 0 /* self pid */, "/proc/self/exe",
+                                 0 /* offset for function */,
+                                 &amp;uprobe_opts /* opts */);
+    if (!skel-&gt;links.uprobe_add) {
+        err = -errno;
+        fprintf(stderr, "Failed to attach uprobe: %d\n", err);
+        goto cleanup;
+    }
+
+    /* we can also attach uprobe/uretprobe to any existing or future
+     * processes that use the same binary executable; to do that we need
+     * to specify -1 as PID, as we do here
+     */
+    uprobe_opts.func_name = "uprobed_add";
+    uprobe_opts.retprobe = true;
+    skel-&gt;links.uretprobe_add = bpf_program__attach_uprobe_opts(
+        skel-&gt;progs.uretprobe_add, -1 /* self pid */, "/proc/self/exe",
+        0 /* offset for function */, &amp;uprobe_opts /* opts */);
+    if (!skel-&gt;links.uretprobe_add) {
+        err = -errno;
+        fprintf(stderr, "Failed to attach uprobe: %d\n", err);
+        goto cleanup;
+    }
+
+    /* Let libbpf perform auto-attach for uprobe_sub/uretprobe_sub
+     * NOTICE: we provide path and symbol info in SEC for BPF programs
+     */
+    err = uprobe_bpf__attach(skel);
+    if (err) {
+        fprintf(stderr, "Failed to auto-attach BPF skeleton: %d\n", err);
+        goto cleanup;
+    }</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Real target: bash readline">
+        <pre data-file="bpf-developer-tutorial/src/5-uprobe-bashreadline/bashreadline.bpf.c"><code class="language-c">SEC("uretprobe//bin/bash:readline")
+int BPF_KRETPROBE(printret, const void *ret)
+{
+    char str[MAX_LINE_SIZE];
+    char comm[TASK_COMM_LEN];
+    u32 pid;
+
+    if (!ret)
+        return 0;
+
+    bpf_get_current_comm(&amp;comm, sizeof(comm));
+
+    pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    bpf_probe_read_user_str(str, sizeof(str), ret);
+
+    bpf_printk("PID %d (%s) read: %s ", pid, comm, str);
+
+    return 0;
+};</code></pre>
+      </div>
+    </div>
+    <p>The first tab shows both styles. A bare <code>SEC("uprobe")</code> needs a manual
+    <code>bpf_program__attach_uprobe_opts()</code> call. A full
+    <code>SEC("uprobe//proc/self/exe:uprobed_sub")</code> is auto-attached by the skeleton.
+    The second tab shows that libbpf resolves <code>func_name</code> to a file offset by
+    reading the ELF symbol table, and that the PID argument chooses between "this process"
+    (0), any process (-1) and a specific PID. The third tab is the classic bashreadline
+    tool: a uretprobe on bash's <code>readline()</code> copies the returned string with
+    <code>bpf_probe_read_user_str</code>, so every command typed into any bash on the machine
+    shows up in the trace pipe.</p>
+
+    <h3>How a uprobe works inside the kernel</h3>
+    <p>The details matter because they explain the cost, and that cost is why userspace
+    eBPF runtimes such as <a href="14-bpftime-architecture.html">bpftime</a> exist. The
+    walkthrough follows <code>kernel/events/uprobes.c</code> and
+    <code>arch/x86/kernel/uprobes.c</code> at mainline commit <code>d68ce4e7</code>.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Register: an inode and an offset</h4><p>A uprobe is keyed by
+      <em>(inode, file offset)</em>, not by process or virtual address. That is why one attach
+      covers every process that maps the binary, including ones started later.
+      <code>install_breakpoint()</code> runs for each existing mapping, and the mmap path
+      (<code>uprobe_mmap</code>) installs it into new ones.</p></div>
+      <div class="step"><h4>2. Write int3 into the process's copy of the page</h4><p>
+      <code>uprobe_write_opcode()</code> writes <code>UPROBE_SWBP_INSN</code>, which is
+      <code>0xcc</code> (<code>int3</code>, one byte) on x86, over the first byte of the probed
+      instruction. The write goes into a copy-on-write copy of the page in that mapping. The
+      file on disk and the page cache are unchanged, and unprobed processes keep sharing the
+      original page. The displaced instruction is decoded and saved so it can be emulated or
+      executed later.</p></div>
+      <div class="step"><h4>3. The thread hits the breakpoint: a trap</h4><p>When a thread
+      executes the address, the CPU raises a breakpoint exception: a switch from user mode to
+      kernel mode with a full register save. The notifier sets <code>TIF_UPROBE</code>. On
+      the way back towards user space, <code>uprobe_notify_resume()</code> calls
+      <code>handle_swbp()</code>, which finds the uprobe for the address with
+      <code>find_active_uprobe_rcu()</code>.</p></div>
+      <div class="step"><h4>4. Run the consumers</h4><p><code>handler_chain()</code> runs
+      every consumer, including your BPF program, with the trapped user
+      <code>pt_regs</code>. For a uretprobe, <code>prepare_uretprobe()</code> saves the real
+      return address and replaces it on the user stack with the address of a uretprobe
+      trampoline in a special mapping.</p></div>
+      <div class="step"><h4>5. Execute the displaced instruction</h4><p>The original
+      instruction is gone from the page, so the kernel must still run it. Many x86
+      instructions (nops, pushes, jumps, calls) are emulated in the kernel. Otherwise the
+      instruction is single-stepped out of line in a per-process
+      <code>"[uprobes]"</code> XOL (execute-out-of-line) page, which costs a second trap.
+      Then the thread returns to user space after the probe.</p></div>
+      <div class="step"><h4>6. Return probes and recent speed-ups</h4><p>When the probed
+      function returns, it lands in the trampoline. Historically that was another
+      <code>int3</code>. Since Linux 6.11 on x86-64 the trampoline instead calls the dedicated
+      <code>uretprobe</code> syscall (<a href="https://www.man7.org/linux/man-pages/man2/uretprobe.2.html">uretprobe(2)</a>,
+      SIGILL if called from anywhere else). Kernelnewbies summarises the speed-up as
+      "10-30%". Since 6.18 a probe on a 5-byte nop can be rewritten after its first hit into a
+      <code>call</code> to a <code>"[uprobes-trampoline]"</code> page that issues the new
+      <code>uprobe</code> syscall (syscall 336 in v6.18's <code>syscall_64.tbl</code>),
+      avoiding the exception.</p></div>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 900 300" role="img" aria-label="Uprobe hit path crossing between user and kernel mode">
+        <style>
+          .z{fill:var(--bg3);stroke:var(--border)}
+          .k{fill:none;stroke:var(--accent);stroke-width:2}
+          .u{fill:none;stroke:var(--accent2);stroke-width:2}
+          .w{fill:var(--fg);font:13px sans-serif}
+          .c{fill:var(--fg);font:12px monospace}
+          .g{fill:var(--muted);font:12px sans-serif}
+          .p{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah6)}
+        </style>
+        <defs><marker id="ah6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <rect class="z" x="10" y="10" width="880" height="110" rx="8"/>
+        <text class="w" x="22" y="32" style="font-weight:600">user mode</text>
+        <rect class="z" x="10" y="140" width="880" height="150" rx="8"/>
+        <text class="w" x="22" y="162" style="font-weight:600">kernel mode</text>
+        <rect class="u" x="30" y="46" width="150" height="54" rx="6"/><text class="c" x="42" y="68">readline:</text><text class="c" x="42" y="88">0xcc (int3)</text>
+        <rect class="k" x="150" y="190" width="170" height="70" rx="6"/><text class="w" x="162" y="212">#BP exception</text><text class="g" x="162" y="230">save regs, set</text><text class="g" x="162" y="246">TIF_UPROBE</text>
+        <rect class="k" x="350" y="190" width="200" height="70" rx="6"/><text class="w" x="362" y="212">handle_swbp()</text><text class="g" x="362" y="230">find uprobe (inode,off)</text><text class="g" x="362" y="246">handler_chain → BPF</text>
+        <rect class="k" x="580" y="190" width="160" height="70" rx="6"/><text class="w" x="592" y="212">emulate insn</text><text class="g" x="592" y="230">or single-step in</text><text class="g" x="592" y="246">[uprobes] XOL (trap #2)</text>
+        <rect class="u" x="720" y="46" width="150" height="54" rx="6"/><text class="c" x="732" y="68">readline+N:</text><text class="c" x="732" y="88">continue</text>
+        <path class="p" d="M105,100 L205,188"/><path class="p" d="M320,225 H348"/><path class="p" d="M550,225 H578"/><path class="p" d="M690,188 L780,102"/>
+        <text class="g" x="200" y="132">mode switch #1</text><text class="g" x="700" y="132">return to user</text>
+      </svg>
+      <figcaption>Figure 5.3 — A uprobe hit. Each hit enters and leaves the kernel at least
+      once, plus a second trap when the instruction has to be single-stepped. The BPF program
+      itself is usually the cheapest part.</figcaption>
+    </figure>
+
+    <h3>What it costs</h3>
+    <p>A kprobe trap stays inside the kernel. A uprobe hit pays a user→kernel→user round
+    trip <em>per call of the probed function</em>. That is fine for <code>readline()</code>
+    but painful for <code>malloc()</code> or a per-request function in a busy server. The
+    clearest public numbers come from Jiri Olsa's December 2024 patch series
+    <a href="https://lwn.net/Articles/1001746/">"uprobes: Add support to optimize usdt probes on
+    x86_64"</a>. It reports loop throughput of a selftest benchmark on his machine (millions of
+    hits per second, higher is better):</p>
+    <table>
+      <thead><tr><th>Benchmark (from the cover letter)</th><th>M/s</th><th>≈ ns per iteration</th></tr></thead>
+      <tbody>
+        <tr><td>usermode-count (plain loop, no probe)</td><td>233.831</td><td>4</td></tr>
+        <tr><td>syscall-count (one cheap syscall per iteration)</td><td>12.107</td><td>83</td></tr>
+        <tr><td>uprobe-nop (int3 uprobe on a nop)</td><td>3.246</td><td>308</td></tr>
+        <tr><td>uprobe-nop5 (proposed syscall-based path)</td><td>6.751</td><td>148</td></tr>
+        <tr><td>uretprobe-nop</td><td>1.740</td><td>575</td></tr>
+      </tbody>
+    </table>
+    <p>The nanosecond column is just 1/throughput, computed here. It includes loop and
+    program overhead and holds only for that machine, so read it as a ratio. On that machine
+    a breakpoint uprobe cost about four syscalls' worth of time and a return probe about
+    seven. The syscall-based path that later reached mainline (6.18 for the entry probe,
+    6.11 for return probes) narrows the gap but does not close it: every hit still enters the
+    kernel.</p>
+
+    <div class="callout key"><span class="label">Why bpftime exists</span><p>Running the
+    uprobe program <em>inside the traced process</em> removes the mode switch altogether.
+    bpftime patches the target function with a jump into a userspace eBPF VM and shares maps
+    with the kernel. Its OSDI '25 paper, "Extending Applications Safely and Efficiently",
+    reports that bpftime "improves the throughput of profiling microservices by a factor of
+    1.5 compared to eBPF". The mechanism and its trade-offs are in
+    <a href="14-bpftime-architecture.html">chapter 14</a>, and the attach modes in
+    <a href="15-bpftime-in-practice.html">chapter 15</a>. The steps above are the baseline
+    they compare against.</p></div>
+
+    <h3>USDT: static probes in user space</h3>
+    <p>USDT (user statically defined tracing, the DTrace/SystemTap <code>sdt.h</code>
+    convention) is to uprobes what tracepoints are to kprobes. The application author puts
+    a macro such as <code>DTRACE_PROBE2(provider, name, a, b)</code> in the source. The
+    compiler emits a nop at that point plus an ELF note (<code>.note.stapsdt</code>) that
+    records the address and, for each argument, where it lives (register, stack slot or
+    constant). An optional semaphore lets the application skip expensive argument
+    preparation unless a tracer is attached. glibc, Python, OpenJDK, PostgreSQL, Node.js and
+    others ship such probes.</p>
+    <p>At attach time libbpf reads the note, puts a uprobe on the nop, and stores an argument
+    spec that <code>bpf_usdt_arg()</code> and the <code>BPF_USDT</code> macro
+    (<code>usdt.bpf.h</code>) decode at run time. A USDT probe costs nothing when no one is
+    attached and the same as a uprobe when someone is.</p>
+    <pre data-file="libbpf-bootstrap/examples/c/usdt.bpf.c"><code class="language-c">SEC("usdt/libc.so.6:libc:setjmp")
+int BPF_USDT(usdt_auto_attach, void *arg1, int arg2, void *arg3)
+{
+    pid_t pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+    if (pid != my_pid)
+        return 0;
+
+    bpf_printk("USDT auto attach to libc:setjmp: arg1 = %lx, arg2 = %d, arg3 = %lx", arg1, arg2,
+           arg3);
+    return 0;
+}</code></pre>
+
+    <h2>Security hooks</h2>
+
+    <h3>BPF LSM</h3>
+    <p><strong>What it is.</strong> The Linux Security Module framework puts
+    <code>security_*()</code> calls at every security-relevant decision: opening files,
+    executing binaries, <code>mmap</code>/<code>mprotect</code>, socket connect and bind, the
+    <code>bpf()</code> syscall itself and many more (the full list is in
+    <code>include/linux/lsm_hook_defs.h</code>). SELinux, AppArmor and the others implement
+    these hooks in C. Since 5.7, <code>BPF_PROG_TYPE_LSM</code> lets privileged users attach
+    eBPF programs to the same hooks to build mandatory access control and audit policies at
+    run time (<a href="https://docs.kernel.org/bpf/prog_lsm.html">kernel docs</a>).</p>
+    <p><strong>How it works.</strong> LSM programs attach through the BPF trampoline, like
+    fentry, and get the hook's typed arguments plus a final <code>ret</code> argument holding
+    the verdict of earlier BPF LSM programs on that hook. Returning 0 allows the operation,
+    and a negative errno denies it. A BPF program cannot override a denial from another
+    LSM, which is why the examples pass a non-zero <code>ret</code> straight through.
+    Sleepable <code>lsm.s/</code> programs may call helpers such as
+    <code>bpf_d_path()</code> or <code>bpf_ima_inode_hash()</code> that can fault. Since 6.0,
+    <code>lsm_cgroup/</code> (<code>BPF_LSM_CGROUP</code>) attaches a hook to a cgroup
+    instead of the whole system. Two conditions apply: the kernel needs
+    <code>CONFIG_BPF_LSM=y</code>, and <code>bpf</code> must be in the active LSM list
+    (<code>cat /sys/kernel/security/lsm</code>), usually set with the <code>lsm=</code> boot
+    parameter.</p>
+    <pre data-file="libbpf-bootstrap/examples/c/lsm.bpf.c"><code class="language-c">#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+#define EPERM  1
+
+SEC("lsm/bpf")
+int BPF_PROG(lsm_bpf, int cmd, union bpf_attr *attr, unsigned int size, int ret)
+{
+    /* ret is the return value from the previous BPF program
+     * or 0 if it's the first hook.
+     */
+    if (ret != 0)
+        return ret;
+
+    bpf_printk("LSM: block bpf() worked");
+    return -EPERM;
+}</code></pre>
+    <p>That five-line policy makes every later <code>bpf()</code> syscall fail with
+    <code>EPERM</code>, so it is a good way to lock a machine after loading its programs. It
+    is also a reminder that LSM programs are policy: a bug locks you out. A more realistic
+    one from the tutorial (lesson 19) blocks IPv4 connections to 1.1.1.1:</p>
+    <pre data-file="bpf-developer-tutorial/src/19-lsm-connect/lsm-connect.bpf.c"><code class="language-c">SEC("lsm/socket_connect")
+int BPF_PROG(restrict_connect, struct socket *sock, struct sockaddr *address, int addrlen, int ret)
+{
+    // Satisfying "cannot override a denial" rule
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    // Only IPv4 in this example
+    if (address-&gt;sa_family != AF_INET)
+    {
+        return 0;
+    }
+
+    // Cast the address to an IPv4 socket address
+    struct sockaddr_in *addr = (struct sockaddr_in *)address;
+
+    // Where do you want to go?
+    __u32 dest = addr-&gt;sin_addr.s_addr;
+    bpf_printk("lsm: found connect to %d", dest);
+
+    if (dest == blockme)
+    {
+        bpf_printk("lsm: blocking %d", dest);
+        return -EPERM;
+    }
+    return 0;
+}</code></pre>
+    <p>Projects built on this hook include Tetragon and KubeArmor
+    (<a href="08-ecosystem.html">chapter 08</a>). <a href="24-actplane.html">Chapter 24</a> uses
+    LSM-style enforcement for AI agents.</p>
+
+    <h3>What about seccomp?</h3>
+    <p>seccomp is often mentioned with BPF, and the name is accurate, but the filter language
+    is <strong>classic BPF</strong>, not eBPF. A <a href="https://docs.kernel.org/userspace-api/seccomp_filter.html">seccomp
+    filter</a> is a cBPF program installed by the process itself with
+    <code>seccomp(2)</code> or <code>prctl</code>. It sees only <code>struct
+    seccomp_data</code> (syscall number, architecture, instruction pointer and the six raw
+    argument values), cannot dereference pointers, has no maps, and returns actions such as
+    <code>SECCOMP_RET_ALLOW</code>, <code>_ERRNO</code>, <code>_KILL_PROCESS</code> or
+    <code>_USER_NOTIF</code>. There is no eBPF seccomp program type in mainline. The design
+    keeps seccomp usable by unprivileged sandboxes such as browsers, container runtimes and
+    systemd. If you need pointer arguments (the path being opened, the address being
+    connected to), use a BPF LSM hook, which runs after the kernel has copied and resolved
+    them. That also avoids the time-of-check/time-of-use race of inspecting user memory.
+    <a href="01-what-is-bpf.html">Chapter 01</a> covers where cBPF comes from.</p>
+
+    <h2>cgroup programs</h2>
+    <p>cgroup programs attach to a cgroup v2 directory instead of a kernel function. They run
+    only for tasks or sockets in that cgroup and its descendants, so a container runtime or
+    systemd can apply a policy to "this service" with no global hook. All of them are policy
+    hooks: by convention, return 1 to allow and 0 to deny (the syscall then fails with
+    <code>EPERM</code>). Attachment uses <code>BPF_PROG_ATTACH</code> or a BPF link on the
+    cgroup's file descriptor. Flags such as <code>BPF_F_ALLOW_MULTI</code> control how
+    programs in parent and child cgroups combine. The main families:</p>
+    <div class="grid">
+      <div class="card"><h4>cgroup_skb</h4><p><code>cgroup_skb/ingress|egress</code>, ctx
+      <code>__sk_buff</code>, 4.10. Per-packet allow/drop for sockets in the cgroup. Used for
+      per-service firewalls and accounting.</p></div>
+      <div class="card"><h4>sock and sock_addr</h4><p><code>cgroup/sock_create</code>,
+      <code>post_bind4</code>; <code>cgroup/connect4/6</code>, <code>bind4/6</code>,
+      <code>sendmsg4/6</code>, <code>*_unix</code> variants. They can deny, or <em>rewrite</em>
+      the destination address and port. Cilium's socket-level load balancing uses this to
+      translate service IPs at <code>connect()</code>.</p></div>
+      <div class="card"><h4>sockopt</h4><p><code>cgroup/getsockopt|setsockopt</code>, ctx
+      <code>bpf_sockopt</code>, 5.3. Inspect, deny or rewrite socket options, for example to
+      forbid a congestion-control choice or force a buffer size.</p></div>
+      <div class="card"><h4>device</h4><p><code>cgroup/dev</code>, ctx
+      <code>bpf_cgroup_dev_ctx</code> (access type, major, minor), 4.15. This is how cgroup v2
+      controls device access. Container runtimes generate these programs for their
+      <code>devices</code> rules.</p></div>
+      <div class="card"><h4>sysctl</h4><p><code>cgroup/sysctl</code>, ctx
+      <code>bpf_sysctl</code>, 5.2. Allow or deny reads and writes under
+      <code>/proc/sys</code>, and with <code>bpf_sysctl_set_new_value()</code> replace the
+      value being written.</p></div>
+      <div class="card"><h4>sock_ops</h4><p><code>sockops</code>, 4.13. TCP event callbacks
+      (connection established, RTO, …) used to tune TCP and fill sockmaps. Covered with the
+      networking hooks in <a href="07-networking-xdp-tc.html">chapter 07</a>.</p></div>
+    </div>
+    <p>The tutorial's <code>cgroup_guard</code> example puts three of these into one object.
+    Note the return-value comments, which differ in wording but follow the same 1/0
+    convention:</p>
+    <pre data-file="bpf-developer-tutorial/src/cgroup/cgroup_guard.bpf.c"><code class="language-c">/* ===== 1) Network: block TCP connect4 to specified port =====
+ * ctx: struct bpf_sock_addr
+ * user_ip4/user_port: network byte order (need conversion)
+ *
+ * Return semantics:
+ * - return 1: allow
+ * - return 0: deny (userspace gets EPERM)
+ */
+SEC("cgroup/connect4")
+int cg_connect4(struct bpf_sock_addr *ctx)
+{
+    if (blocked_tcp_dport == 0)
+        return 1;
+
+    if (ctx-&gt;protocol != IPPROTO_TCP)
+        return 1;
+
+    __u16 dport = bpf_ntohs((__u16)ctx-&gt;user_port);
+    if (dport != blocked_tcp_dport)
+        return 1;
+
+    struct event *e = bpf_ringbuf_reserve(&amp;events, sizeof(*e), 0);
+    if (e) {
+        fill_common(e, EVENT_CONNECT4);
+        e-&gt;connect4.daddr = ctx-&gt;user_ip4; /* network order */
+        e-&gt;connect4.dport = dport;         /* host order */
+        e-&gt;connect4.proto = ctx-&gt;protocol;
+        bpf_ringbuf_submit(e, 0);
+    }
+
+    return 0; /* deny -&gt; userspace gets EPERM on connect */
+}
+/* ... */
+/* ===== 2) Device: block access to specified major:minor =====
+ * ctx: struct bpf_cgroup_dev_ctx { access_type, major, minor }
+ *
+ * Return semantics:
+ * - return 0: deny (userspace gets EPERM)
+ * - return non-zero: allow
+ */
+SEC("cgroup/dev")
+int cg_dev(struct bpf_cgroup_dev_ctx *ctx)
+{
+    if (blocked_dev_major == 0 &amp;&amp; blocked_dev_minor == 0)
+        return 1;
+
+    if (ctx-&gt;major != blocked_dev_major || ctx-&gt;minor != blocked_dev_minor)
+        return 1;
+
+    struct event *e = bpf_ringbuf_reserve(&amp;events, sizeof(*e), 0);
+    if (e) {
+        fill_common(e, EVENT_DEVICE);
+        e-&gt;device.major = ctx-&gt;major;
+        e-&gt;device.minor = ctx-&gt;minor;
+        e-&gt;device.access_type = ctx-&gt;access_type;
+        bpf_ringbuf_submit(e, 0);
+    }
+
+    return 0; /* deny -&gt; -EPERM */
+}</code></pre>
+    <p>To try it, build it (<code>cd src/cgroup &amp;&amp; make</code>) and start the
+    loader against a test cgroup. These are the commands from the tutorial README:</p>
+    <pre><code class="language-bash">sudo ./cgroup_guard \
+  --cgroup /sys/fs/cgroup/ebpf_demo \
+  --block-port 9090 \
+  --deny-device 1:3 \
+  --deny-sysctl kernel/hostname</code></pre>
+    <p>Then move a shell into <code>/sys/fs/cgroup/ebpf_demo</code>. Inside that cgroup,
+    <code>connect()</code> to port 9090, opening <code>/dev/null</code> and reading
+    <code>/proc/sys/kernel/hostname</code> all fail with <code>EPERM</code>. Outside it they
+    keep working. <code>bpftool cgroup tree</code> lists what is attached where.</p>
+
+    <h2>struct_ops: implementing kernel interfaces in BPF</h2>
+    <p><strong>What it is.</strong> Much of the kernel is organised around tables of
+    function pointers: <code>struct tcp_congestion_ops</code>, <code>struct
+    file_operations</code>, scheduler classes, qdisc ops. <code>BPF_PROG_TYPE_STRUCT_OPS</code>
+    (5.6, Martin KaFai Lau's <a href="https://lwn.net/Articles/807973/">"Introduce BPF
+    STRUCT_OPS"</a>) lets a subsystem declare such a table as BPF-implementable. A BPF
+    object then provides the whole implementation. The first user was TCP congestion
+    control, with the stated aim of "a faster turnaround for testing algorithm in the
+    production".</p>
+    <p><strong>How it works.</strong> Each callback is a BPF program in
+    <code>SEC("struct_ops")</code> (any name after the slash is ignored). The table is a
+    global variable in <code>SEC(".struct_ops")</code>, or <code>SEC(".struct_ops.link")</code>
+    for link-based attach that can be updated and auto-detached, which libbpf turns into a map
+    of type <code>BPF_MAP_TYPE_STRUCT_OPS</code>. On attach the kernel builds a trampoline per
+    slot to convert calling conventions (as <a href="https://lwn.net/Articles/974848/">LWN
+    explains</a>), fills the real kernel struct with those trampolines, and registers it with
+    the subsystem as if a module had done so. Callbacks receive typed arguments and can call
+    kfuncs the subsystem exports. Here is the kernel selftest's DCTCP:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/bpf_dctcp.c"><code class="language-c">SEC("struct_ops")
+__u32 BPF_PROG(bpf_dctcp_ssthresh, struct sock *sk)
+{
+    struct bpf_dctcp *ca = inet_csk_ca(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+
+    ca-&gt;loss_cwnd = tp-&gt;snd_cwnd;
+    return max(tp-&gt;snd_cwnd - ((tp-&gt;snd_cwnd * ca-&gt;dctcp_alpha) &gt;&gt; 11U), 2U);
+}
+/* ... */
+SEC("struct_ops")
+void BPF_PROG(bpf_dctcp_cong_avoid, struct sock *sk, __u32 ack, __u32 acked)
+{
+    tcp_reno_cong_avoid(sk, ack, acked);
+}
+
+SEC(".struct_ops")
+struct tcp_congestion_ops dctcp_nouse = {
+    .init       = (void *)bpf_dctcp_init,
+    .set_state  = (void *)bpf_dctcp_state,
+    .flags      = TCP_CONG_NEEDS_ECN,
+    .name       = "bpf_dctcp_nouse",
+};
+
+SEC(".struct_ops")
+struct tcp_congestion_ops dctcp = {
+    .init       = (void *)bpf_dctcp_init,
+    .in_ack_event   = (void *)bpf_dctcp_update_alpha,
+    .cwnd_event = (void *)bpf_dctcp_cwnd_event,
+    .ssthresh   = (void *)bpf_dctcp_ssthresh,
+    .cong_avoid = (void *)bpf_dctcp_cong_avoid,
+    .undo_cwnd  = (void *)bpf_dctcp_cwnd_undo,
+    .set_state  = (void *)bpf_dctcp_state,
+    .flags      = TCP_CONG_NEEDS_ECN,
+    .name       = "bpf_dctcp",
+};</code></pre>
+    <p>Once attached, <code>bpf_dctcp</code> is just another congestion-control algorithm:
+    select it system-wide with <code>sysctl net.ipv4.tcp_congestion_control=bpf_dctcp</code>
+    or per socket with <code>setsockopt(TCP_CONGESTION)</code>. The same mechanism carries
+    sched_ext and HID-BPF below, and bpf-developer-tutorial shows more uses: a custom
+    struct_ops from a test kernel module (<code>features/struct_ops</code>) and a BPF qdisc
+    (lesson 53, <code>egress_pacer</code>).</p>
+
+    <h3>sched_ext: a CPU scheduler written in BPF</h3>
+    <p><strong>What it is.</strong> sched_ext, the extensible scheduler class, is a
+    scheduling class whose behaviour "can be defined by a set of BPF programs" (<a href="https://docs.kernel.org/scheduler/sched-ext.html">kernel
+    docs</a>). It was merged for Linux 6.12. Linus Torvalds' <a href="https://lwn.net/Articles/992184/">6.12-rc1
+    announcement</a> lists it as one of two notable features, after more than a year of debate
+    (<a href="https://lwn.net/Articles/922405/">LWN: "The extensible scheduler class"</a>). It
+    is the largest struct_ops user: a BPF object implements <code>struct
+    sched_ext_ops</code> and from then on decides where and when every task in the class
+    runs.</p>
+    <p><strong>How it works.</strong> Tasks wait in <em>dispatch queues</em> (DSQs). There is
+    one global FIFO (<code>SCX_DSQ_GLOBAL</code>), one local DSQ per CPU
+    (<code>SCX_DSQ_LOCAL</code>), and any number of custom DSQs created with
+    <code>scx_bpf_create_dsq()</code>, which can be FIFO or vtime-ordered. A CPU always runs
+    from its local DSQ. The kernel calls <code>ops.select_cpu()</code> on wakeup,
+    <code>ops.enqueue()</code> when a task becomes runnable, and <code>ops.dispatch()</code>
+    when a CPU's local queue is empty. Further callbacks such as <code>running</code>,
+    <code>stopping</code>, <code>tick</code> and <code>enable</code> let a scheduler keep
+    accounting. Every callback is optional. Only <code>ops.name</code> is required.</p>
+    <p><strong>Safety.</strong> The kernel docs promise that "system integrity is maintained
+    no matter what the BPF scheduler does". On an error, a runnable task that stalls past the
+    watchdog timeout, or the SysRq-S key, the BPF scheduler is ejected and all tasks go back
+    to the fair class. <code>/sys/kernel/sched_ext/state</code> and
+    <code>/sys/kernel/sched_ext/root/ops</code> show what is loaded. With
+    <code>SCX_OPS_SWITCH_PARTIAL</code> only tasks that set policy <code>SCHED_EXT</code> are
+    affected. Kernel config: <code>CONFIG_SCHED_CLASS_EXT=y</code> with BTF and JIT enabled.
+    The interface carries an explicit "ABI instability" warning.</p>
+    <p>The tutorial's lesson 44 is a copy of the kernel's <code>scx_simple</code>: a weighted
+    vtime scheduler with an optional FIFO mode.</p>
+    <pre data-file="bpf-developer-tutorial/src/44-scx-simple/scx_simple.bpf.c"><code class="language-c">s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+    bool is_idle = false;
+    s32 cpu;
+
+    cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &amp;is_idle);
+    if (is_idle) {
+        stat_inc(0);    /* count local queueing */
+        scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+    }
+
+    return cpu;
+}
+
+void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
+{
+    stat_inc(1);    /* count global queueing */
+
+    if (fifo_sched) {
+        scx_bpf_dispatch(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+    } else {
+        u64 vtime = p-&gt;scx.dsq_vtime;
+
+        /*
+         * Limit the amount of budget that an idling task can accumulate
+         * to one slice.
+         */
+        if (vtime_before(vtime, vtime_now - SCX_SLICE_DFL))
+            vtime = vtime_now - SCX_SLICE_DFL;
+
+        scx_bpf_dispatch_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
+                       enq_flags);
+    }
+}
+
+void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
+{
+    scx_bpf_consume(SHARED_DSQ);
+}
+/* ... */
+SCX_OPS_DEFINE(simple_ops,
+           .select_cpu      = (void *)simple_select_cpu,
+           .enqueue         = (void *)simple_enqueue,
+           .dispatch        = (void *)simple_dispatch,
+           .running         = (void *)simple_running,
+           .stopping        = (void *)simple_stopping,
+           .enable          = (void *)simple_enable,
+           .init            = (void *)simple_init,
+           .exit            = (void *)simple_exit,
+           .name            = "simple");</code></pre>
+    <div class="callout warn"><span class="label">Kfunc names moved</span><p>This copy uses
+    the 6.12 kfunc names <code>scx_bpf_dispatch()</code>,
+    <code>scx_bpf_dispatch_vtime()</code> and <code>scx_bpf_consume()</code>. From 6.13,
+    <code>kernel/sched/ext.c</code> also has the newer <code>scx_bpf_dsq_insert()</code>
+    family, which the current kernel docs use (with
+    <code>scx_bpf_dsq_move_to_local()</code> replacing <code>consume</code>). The tutorial
+    ships compat headers in <code>include/scx/</code>. Use the names your kernel's headers
+    use.</p></div>
+    <p>Running it is <code>make</code> then <code>sudo ./scx_simple</code> (add
+    <code>-f</code> for FIFO). Press Ctrl-C and the system is back on the fair scheduler.
+    Production-grade schedulers (for example <code>scx_rusty</code>, <code>scx_lavd</code>)
+    live in the <a href="https://github.com/sched-ext/scx">sched-ext/scx</a> repository. Work on
+    sub-schedulers, which would let several sched_ext schedulers share one machine, was under
+    review in early 2026 (<a href="https://lwn.net/Articles/1056014/">LWN</a>).
+    <a href="30-llm-kernel-tooling.html">Chapter 30</a> covers schedcp, which has an LLM write
+    sched_ext schedulers.</p>
+
+    <h3>HID-BPF</h3>
+    <p>HID (Human Interface Device) covers keyboards, mice, gamepads and tablets. Many
+    devices are slightly broken: a wrong report descriptor, an inverted axis, a dead zone. A
+    full kernel driver is a heavy way to fix three bytes. HID-BPF, merged in 6.3, lets a BPF
+    program see and rewrite raw HID reports before the HID core parses them. Since 6.11 the
+    programs are struct_ops on <code>struct hid_bpf_ops</code>: the 6.10 docs still show
+    <code>fmod_ret/hid_bpf_device_event</code>, the 6.11 docs show
+    <code>struct_ops/hid_device_event</code>. User-triggered actions use
+    <code>SEC("syscall")</code> programs. Event programs run in IRQ context and so cannot
+    talk back to the device. Device fixes ship as source in the kernel's
+    <code>drivers/hid/bpf/progs</code>, and udev-hid-bpf loads them
+    (<a href="https://docs.kernel.org/hid/hid-bpf.html">HID-BPF docs</a>). The tutorial's
+    lesson 49 doubles mouse movement on a virtual device:</p>
+    <pre data-file="bpf-developer-tutorial/src/49-hid/hid-input-modifier.bpf.c"><code class="language-c">SEC("struct_ops/hid_device_event")
+int BPF_PROG(hid_double_movement, struct hid_bpf_ctx *hctx, enum hid_report_type type)
+{
+    __u8 *data = hid_bpf_get_data(hctx, 0, 9);
+    __s8 x, y;
+
+    if (!data)
+        return 0;
+
+    /* Mouse HID report format (simplified):
+     * Byte 0: Report ID
+     * Byte 1: Buttons
+     * Byte 2: X movement (signed byte)
+     * Byte 3: Y movement (signed byte)
+     */
+
+    x = (__s8)data[2];
+    y = (__s8)data[3];
+
+    /* Double the movement */
+    x *= 2;
+    y *= 2;
+
+    data[2] = (__u8)x;
+    data[3] = (__u8)y;
+
+    bpf_printk("Modified: X=%d Y=%d -&gt; X=%d Y=%d",
+           (__s8)data[2]/2, (__s8)data[3]/2,
+           (__s8)data[2], (__s8)data[3]);
+
+    return 0;
+}
+
+SEC(".struct_ops.link")
+struct hid_bpf_ops input_modifier = {
+    .hid_device_event = (void *)hid_double_movement,
+};
+
+char _license[] SEC("license") = "GPL";</code></pre>
+
+    <h2>Iterators: pulling kernel state</h2>
+    <p>Every hook so far is <em>push</em>: the kernel calls you when something happens. A
+    BPF iterator (<code>BPF_TRACE_ITER</code>, 5.8) is <em>pull</em>. You write a program
+    that is called once per kernel object (each task, each open file, each TCP socket, each
+    map element), and it writes output through a <code>seq_file</code>. Nothing runs until a
+    reader calls <code>read()</code> on the iterator's file descriptor, or <code>cat</code>s
+    the file if it is pinned in bpffs. Iterators replace parsing <code>/proc</code> with
+    exactly the fields you want, in binary or text, at one consistent point. The ctx is
+    <code>struct bpf_iter__&lt;object&gt;</code>, which holds <code>meta-&gt;seq</code> and
+    the current object (it is NULL on the final call). See the
+    <a href="https://docs.kernel.org/bpf/bpf_iterators.html">BPF iterators docs</a>.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="BPF side (task_iter.bpf.c)">
+        <pre data-file="libbpf-bootstrap/examples/c/task_iter.bpf.c"><code class="language-c">SEC("iter/task")
+int get_tasks(struct bpf_iter__task *ctx)
+{
+    struct seq_file *seq = ctx-&gt;meta-&gt;seq;
+    struct task_struct *task = ctx-&gt;task;
+    struct task_info *t;
+    long res;
+
+    if (!task)
+        return 0;
+
+    t = bpf_map_lookup_elem(&amp;task_info_buf, &amp;zero);
+    if (!t)
+        return 0;
+
+    t-&gt;pid = task-&gt;tgid;
+    t-&gt;tid = task-&gt;pid;
+    t-&gt;state = get_task_state(task);
+
+    bpf_probe_read_kernel_str(t-&gt;comm, TASK_COMM_LEN, task-&gt;comm);
+
+    res = bpf_get_task_stack(task, t-&gt;kstack, sizeof(__u64) * MAX_STACK_LEN, 0);
+    t-&gt;kstack_len = res &lt;= 0 ? res : res / sizeof(t-&gt;kstack[0]);
+
+    bpf_seq_write(seq, t, sizeof(struct task_info));
+    return 0;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="User side (task_iter.c)">
+        <pre data-file="libbpf-bootstrap/examples/c/task_iter.c"><code class="language-c">    /* Attach BPF iterator program */
+    memset(&amp;linfo, 0, sizeof(linfo));
+    linfo.task.pid = pid_filter; /* If the pid is set to zero, no filtering logic is applied */
+    opts.link_info = &amp;linfo;
+    opts.link_info_len = sizeof(linfo);
+    skel-&gt;links.get_tasks = bpf_program__attach_iter(skel-&gt;progs.get_tasks, &amp;opts);
+    if (!skel-&gt;links.get_tasks) {
+        err = -errno;
+        fprintf(stderr, "Failed to attach BPF skeleton\n");
+        goto cleanup;
+    }
+    /* Alternatively, if the user doesn't want to provide any option, the following simplified
+     * version can be used:
+     * err = task_iter_bpf__attach(skel);
+     * if (err) {
+     *  fprintf(stderr, "Failed to attach BPF skeleton\n");
+     *  goto cleanup;
+     * }
+     */
+
+    iter_fd = bpf_iter_create(bpf_link__fd(skel-&gt;links.get_tasks));
+    if (iter_fd &lt; 0) {
+        err = -1;
+        fprintf(stderr, "Failed to create iter\n");
+        goto cleanup;
+    }</code></pre>
+      </div>
+    </div>
+    <p>The user side shows the three steps: attach (with an optional PID filter in
+    <code>link_info</code>), <code>bpf_iter_create()</code> to get a readable fd, then
+    <code>read()</code> until it returns 0. Tutorial lesson 51 uses <code>iter/tcp</code> to
+    find and act on TCP sockets. <code>features/bpf_iters</code> walks
+    <code>iter/task_file</code>.</p>
+
+    <h2>Networking, briefly</h2>
+    <p>The remaining large family is networking: <code>xdp</code> in the NIC driver,
+    <code>tcx/ingress|egress</code> (and the older <code>tc</code>/<code>classifier</code>,
+    now deprecated in libbpf's table) on the traffic-control layer, <code>socket</code>
+    filters, <code>sk_msg</code>/<code>sk_skb</code> for sockmap redirection,
+    <code>sk_lookup</code>, <code>sockops</code>, <code>flow_dissector</code>,
+    <code>netfilter</code>, and <code>netkit</code>. Their contexts are packet buffers
+    (<code>xdp_md</code>, <code>__sk_buff</code>), and their return values are packet
+    verdicts (pass, drop, redirect, transmit). They have enough of their own machinery to need
+    their own chapter: <a href="07-networking-xdp-tc.html">chapter 07</a>.</p>
+
+    <h2>Choosing a hook</h2>
+    <p>Choosing well matters more than micro-optimising the program afterwards. A practical
+    order of preference:</p>
+    <ol>
+      <li><strong>Need to enforce policy?</strong> If the policy is per container or per
+      service and a cgroup hook covers the operation (socket, device, sysctl), use the cgroup
+      hook. Otherwise use a BPF LSM hook, or <code>lsm_cgroup</code> for per-cgroup scope.
+      Never build enforcement on kprobes: they observe and cannot reliably block.</li>
+      <li><strong>Need to replace an algorithm?</strong> Look for a struct_ops interface:
+      TCP CC, sched_ext, HID, qdisc. If none exists, the subsystem has not opted in, and
+      <code>fmod_ret</code> on an error-injection function is the only, deliberately narrow,
+      alternative.</li>
+      <li><strong>Need to observe a kernel event?</strong> Use a tracepoint if one exists, as
+      <code>tp_btf</code> for typed args or <code>tp</code> for the stable record format.
+      Otherwise use fentry/fexit/fsession, and fall back to kprobe for mid-function offsets,
+      old kernels without BTF, or wide wildcards (<code>kprobe.multi</code>).</li>
+      <li><strong>Need to observe an application?</strong> Prefer USDT if the program ships
+      probes. Otherwise use uprobes, but budget for their per-call cost on hot functions and
+      consider a userspace runtime (<a href="15-bpftime-in-practice.html">chapter 15</a>) or
+      sampling.</li>
+      <li><strong>Need "where is time going"?</strong> Use a <code>perf_event</code> sampling
+      program, not probes on every function.</li>
+      <li><strong>Need a snapshot of kernel objects?</strong> Use an iterator, not a hook
+      plus a map you keep in sync.</li>
+    </ol>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefits</h4><p>One VM, verifier and toolchain cover tracing,
+      security, resource control and pluggable kernel policy. Hooks can be attached and
+      detached at run time without a reboot or a module. Typed hooks (fentry, tp_btf, LSM,
+      struct_ops) give near-native cost and plain C pointer access.</p></div>
+      <div class="card"><h4>Limitations</h4><p>Capabilities differ per type, so moving code
+      between hooks means re-checking helpers and context access. Dynamic hooks
+      (kprobe/fentry/uprobe) depend on unstable symbols. LSM needs boot-time enablement.
+      sched_ext and kfunc APIs are explicitly unstable. Uprobes cost a trap per hit. Most
+      types need <code>CAP_BPF</code> plus <code>CAP_PERFMON</code> or
+      <code>CAP_NET_ADMIN</code>, or root.</p></div>
+      <div class="card"><h4>Related work</h4><p>DTrace (static and dynamic probes, the origin
+      of USDT), SystemTap (kernel-module based), ftrace/perf (non-programmable or less
+      programmable tracing), kernel modules (unrestricted, unsafe), seccomp (cBPF filters),
+      and userspace runtimes (<a href="14-bpftime-architecture.html">bpftime</a>,
+      <a href="16-llvmbpf.html">llvmbpf</a>).</p></div>
+    </div>
+
+    <h2>Try it: build and run the examples</h2>
+    <p>libbpf-bootstrap needs its submodules. These commands come from its README:</p>
+    <pre><code class="language-bash">git clone --recurse-submodules https://github.com/libbpf/libbpf-bootstrap
+cd libbpf-bootstrap/examples/c
+make minimal kprobe fentry uprobe usdt profile task_iter
+sudo ./fentry            # in another terminal:
+sudo cat /sys/kernel/debug/tracing/trace_pipe</code></pre>
+    <p>To see which hooks are live on a machine, <code>sudo bpftool prog show</code> lists
+    loaded programs with their type, <code>sudo bpftool link show</code> lists links with
+    their attach targets, and <code>sudo bpftool perf</code> lists kprobe, uprobe and tracepoint
+    attachments. bpf-developer-tutorial lessons build with <code>make</code> in each directory,
+    or with <code>ecc</code>/<code>ecli</code> (<a href="10-eunomia-bpf-ecc-ecli.html">chapter
+    10</a>). <a href="09-bpf-developer-tutorial.html">Chapter 09</a> maps the whole
+    tutorial.</p>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> Why can an fexit program print the
+      <code>filename</code> argument of <code>do_unlinkat</code>, when a kretprobe on the same
+      function only gets <code>ret</code>?</p>
+        <button class="opt">kretprobes are not allowed to call bpf_printk</button>
+        <button class="opt" data-right>The trampoline saved the arguments before calling the function and passes them to fexit; at kretprobe time the argument registers have been reused</button>
+        <button class="opt">fexit runs before the function body</button>
+        <div class="why">The BPF trampoline saves the arguments to a stack array, calls the
+        original body, then calls fexit with both the saved arguments and the return value.</div></div>
+      <div class="q"><p><strong>Q2.</strong> You want to forbid a container from connecting
+      to TCP port 9090 while other containers keep working. Which hook fits best?</p>
+        <button class="opt">kprobe on tcp_v4_connect returning -EPERM</button>
+        <button class="opt" data-right>cgroup/connect4 on the container's cgroup, returning 0</button>
+        <button class="opt">a perf_event program</button>
+        <div class="why">cgroup sock_addr hooks are policy hooks scoped to one cgroup, and their
+        0 return makes connect() fail with EPERM. A kprobe's return value is ignored.</div></div>
+      <div class="q"><p><strong>Q3.</strong> What is the main source of uprobe overhead?</p>
+        <button class="opt">The verifier runs on every hit</button>
+        <button class="opt">The ELF symbol lookup on every hit</button>
+        <button class="opt" data-right>The breakpoint exception: a user→kernel→user round trip (sometimes two traps) per probed call</button>
+        <div class="why">int3 on the probed instruction traps into the kernel. Out-of-line
+        single-stepping can add a second trap. Symbol lookup and verification happen once,
+        at attach and load time.</div></div>
+      <div class="q"><p><strong>Q4.</strong> In which mainline release did sched_ext land?</p>
+        <button class="opt">6.6, together with EEVDF</button>
+        <button class="opt" data-right>6.12</button>
+        <button class="opt">7.0</button>
+        <div class="why"><code>kernel/sched/ext.c</code> is absent at v6.11 and present at
+        v6.12, and the 6.12-rc1 announcement names sched_ext as a notable addition.</div></div>
+      <div class="q"><p><strong>Q5.</strong> A security team wants to block
+      <code>openat()</code> of paths under <code>/secret</code> and asks whether to write
+      an eBPF seccomp filter. What do you tell them?</p>
+        <button class="opt">Yes, eBPF seccomp filters can read the path string</button>
+        <button class="opt" data-right>seccomp uses classic BPF and cannot dereference the path pointer; use a BPF LSM hook such as file_open instead</button>
+        <button class="opt">Use a raw tracepoint on sys_enter and return -EPERM</button>
+        <div class="why">seccomp filters see only syscall number and raw argument values. LSM
+        hooks see the resolved kernel objects and their return value is enforced.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li><a href="https://docs.kernel.org/bpf/libbpf/program_types.html">Program Types and ELF Sections</a> — libbpf, kernel docs (source of every <code>SEC()</code> name here).</li>
+      <li><a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">BPF Features by Linux Kernel Version</a> — bcc docs; cross-checked against tagged <code>include/uapi/linux/bpf.h</code> (v5.4–v7.0) on <a href="https://github.com/torvalds/linux">github.com/torvalds/linux</a>.</li>
+      <li>A. Starovoitov, <a href="https://lwn.net/Articles/804937/">"Introduce BPF trampoline"</a>, patch v4, LWN, Nov 2019 (v1: <a href="https://lwn.net/Articles/803803/">LWN 803803</a>).</li>
+      <li>M. KaFai Lau, <a href="https://lwn.net/Articles/807973/">"Introduce BPF STRUCT_OPS"</a>, LWN, Dec 2019; D. Alden, <a href="https://lwn.net/Articles/974848/">"Recent improvements to BPF's struct_ops mechanism"</a>, LWN, May 2024.</li>
+      <li><a href="https://docs.kernel.org/trace/kprobes.html">Kernel Probes (Kprobes)</a> and <a href="https://docs.kernel.org/trace/uprobetracer.html">Uprobe-tracer</a>, kernel docs.</li>
+      <li>Kernel sources at commit <code>d68ce4e7</code>: <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/events/uprobes.c">kernel/events/uprobes.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/arch/x86/kernel/uprobes.c">arch/x86/kernel/uprobes.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/kernel/bpf/verifier.c">kernel/bpf/verifier.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/testing/selftests/bpf/progs/bpf_dctcp.c">selftests bpf_dctcp.c</a>, <a href="https://github.com/torvalds/linux/blob/d68ce4e71248e1ff5af9654b407541d9260b3ba5/tools/testing/selftests/bpf/progs/modify_return.c">modify_return.c</a>.</li>
+      <li>J. Olsa, <a href="https://lwn.net/Articles/974465/">"uprobe: uretprobe speed up"</a>, LWN, May 2024; <a href="https://www.man7.org/linux/man-pages/man2/uretprobe.2.html">uretprobe(2)</a>; <a href="https://kernelnewbies.org/Linux_6.11">Kernelnewbies: Linux 6.11</a>.</li>
+      <li>J. Olsa, <a href="https://lwn.net/Articles/1001746/">"uprobes: Add support to optimize usdt probes on x86_64"</a>, LWN, Dec 2024 (benchmark numbers); merged as tip commit <a href="https://git.kernel.org/tip/56101b69c9190667f473b9f93f8b6d8209aaa816">56101b69c919</a> "uprobes/x86: Add uprobe syscall to speed up uprobe" (in v6.18).</li>
+      <li><a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>, kernel docs.</li>
+      <li><a href="https://docs.kernel.org/userspace-api/seccomp_filter.html">Seccomp BPF (SECure COMPuting with filters)</a>, kernel docs.</li>
+      <li><a href="https://docs.kernel.org/bpf/prog_cgroup_sysctl.html">BPF_PROG_TYPE_CGROUP_SYSCTL</a> and <a href="https://docs.kernel.org/bpf/prog_cgroup_sockopt.html">BPF_PROG_TYPE_CGROUP_SOCKOPT</a>, kernel docs.</li>
+      <li><a href="https://docs.kernel.org/scheduler/sched-ext.html">Extensible Scheduler Class</a>, kernel docs; J. Corbet, <a href="https://lwn.net/Articles/922405/">"The extensible scheduler class"</a>, LWN; <a href="https://lwn.net/Articles/992184/">Linux 6.12-rc1 announcement</a>; <a href="https://lwn.net/Articles/991205/">"Sched_ext at LPC 2024"</a>; <a href="https://lwn.net/Articles/1056014/">"Sub-schedulers for sched_ext"</a>, LWN, Jan 2026; <a href="https://github.com/sched-ext/scx">sched-ext/scx</a>.</li>
+      <li><a href="https://docs.kernel.org/hid/hid-bpf.html">HID-BPF</a>, kernel docs (compare <a href="https://docs.kernel.org/6.10/hid/hid-bpf.html">6.10</a> and <a href="https://docs.kernel.org/6.11/hid/hid-bpf.html">6.11</a>); <a href="https://kernelnewbies.org/Linux_6.3">Kernelnewbies: Linux 6.3</a>.</li>
+      <li><a href="https://docs.kernel.org/bpf/bpf_iterators.html">BPF Iterators</a>, kernel docs.</li>
+      <li><a href="https://github.com/libbpf/libbpf-bootstrap">libbpf/libbpf-bootstrap</a> at <code>820a1bd8</code> — minimal, kprobe, fentry, uprobe, usdt, lsm, profile, task_iter.</li>
+      <li><a href="https://github.com/eunomia-bpf/bpf-developer-tutorial">eunomia-bpf/bpf-developer-tutorial</a> at <code>110b91f8</code> — lessons 5, 9, 19, 32, 44, 49, 52 and <code>src/cgroup</code>.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn, <a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">"Extending Applications Safely and Efficiently"</a>, USENIX OSDI '25, 2025, pp. 557–574.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="04-maps-helpers-kfuncs.html"><small>Previous</small>04 · Maps, helpers and kfuncs</a>
+      <a class="next" href="06-btf-core-libbpf.html"><small>Next</small>06 · BTF, CO-RE and libbpf</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

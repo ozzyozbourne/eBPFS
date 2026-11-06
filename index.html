@@ -11,6 +11,16 @@
 <p class="lede">A chapter-wise guide: what the Berkeley Packet Filter and its extended form are, how they work
 inside the Linux kernel, and what every actively maintained <a href="https://github.com/eunomia-bpf">eunomia-bpf</a>
 project does, with diagrams, real code, papers and quizzes.</p>
-<div class="meta"><span>0 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
-
+<div class="meta"><span>8 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
+<h2>Part I · Foundations</h2>
+<div class="grid">
+<a class="card" href="chapters/01-what-is-bpf.html"><h4>01 · What is BPF? From packet filter to in-kernel VM</h4><p>How a 1993 packet filter became Linux&#x27;s safe in-kernel execution engine: classic BPF, seccomp-bpf, the 2014 eBPF rewrite, and a first hello world.</p></a>
+<a class="card" href="chapters/02-ebpf-isa-and-vm.html"><h4>02 · The eBPF Instruction Set and Virtual Machine</h4><p>The eBPF instruction set: eleven 64-bit registers, the calling convention, the 8-byte instruction format and its classes, atomics, BPF-to-BPF calls, the 512-byte stack, the interpreter and x86-64 JIT, constant blinding, and the RFC 9669 standard.</p></a>
+<a class="card" href="chapters/03-verifier.html"><h4>03 · The eBPF verifier</h4><p>How the in-kernel verifier proves an eBPF program safe: the CFG pass, path-by-path abstract interpretation, register types, tnum and range tracking, pruning, precision, loops, limits, Spectre hardening, reading error messages, and the research that checks the verifier itself.</p></a>
+<a class="card" href="chapters/04-maps-helpers-kfuncs.html"><h4>04 · Maps, helpers and kfuncs</h4><p>How eBPF programs keep state in maps, stream events to user space through the ring buffer, and call into the kernel through stable helpers, unstable kfuncs, BPF-to-BPF calls and tail calls.</p></a>
+<a class="card" href="chapters/05-program-types-and-hooks.html"><h4>05 · Program types and hooks: where eBPF runs</h4><p>Where eBPF programs attach — kprobes, trampolines, tracepoints, uprobes/USDT, perf sampling, LSM, cgroups, struct_ops, sched_ext, iterators and HID-BPF — and what each hook can see, change and cost.</p></a>
+<a class="card" href="chapters/06-btf-core-libbpf.html"><h4>06 · BTF, CO-RE and libbpf</h4><p>How BTF type information, compiler-emitted CO-RE relocations and the libbpf loader let one compiled eBPF object run on many kernels, and how skeletons, links and pinning manage its lifecycle.</p></a>
+<a class="card" href="chapters/07-networking-xdp-tc.html"><h4>07 · eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs</h4><p>Where eBPF hooks into the Linux packet path, from XDP in the NIC driver through AF_XDP, tc/TCX and socket-level programs, with real drop, redirect and tc programs and the commands to load them.</p></a>
+<a class="card" href="chapters/08-ecosystem.html"><h4>08 · The eBPF ecosystem map, and where eunomia-bpf fits</h4><p>One exec tracer written in bpftrace, BCC, libbpf, cilium/ebpf, aya, libbpf-rs and eunomia-bpf; the major eBPF projects and runtimes; and a map of the eunomia-bpf organization that the rest of the curriculum follows.</p></a>
+</div>
 </main></div></body></html>

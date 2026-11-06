@@ -1,0 +1,1678 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Maps, helpers and kfuncs · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="04">
+<meta name="chapter-part" content="Part I · Foundations">
+<meta name="chapter-summary" content="How eBPF programs keep state in maps, stream events to user space through the ring buffer, and call into the kernel through stable helpers, unstable kfuncs, BPF-to-BPF calls and tail calls.">
+<meta name="chapter-repo" content="https://github.com/torvalds/linux/tree/master/kernel/bpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part I · Foundations › 04 · Maps, helpers and kfuncs</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 04</div>
+      <h1>Maps, helpers and kfuncs</h1>
+      <p class="lede">An eBPF program runs for a few microseconds per event and then its stack is gone.
+        So where does it keep a counter, how does it hand a record to a process in user space, and
+        how does it ask the kernel for the current PID or a reference to a task? This chapter covers
+        the three answers: <strong>maps</strong> for state, <strong>helpers</strong> and
+        <strong>kfuncs</strong> for calling the kernel, and <strong>BPF-to-BPF calls</strong> and
+        <strong>tail calls</strong> for structuring programs.</p>
+      <div class="meta"><span>Prerequisites: <a href="02-ebpf-isa-and-vm.html">02</a>, <a href="03-verifier.html">03</a></span><span>Source: Linux <code>kernel/bpf/</code>, <code>tools/testing/selftests/bpf/</code> (master @ d68ce4e7)</span><span>~45 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Chapter <a href="02-ebpf-isa-and-vm.html">02</a> showed that an eBPF program is a function with
+      eleven 64-bit registers and a small stack (512 bytes, or up to 2 KiB on JITs that support large
+      stacks). Chapter <a href="03-verifier.html">03</a> showed that the verifier proves the function
+      terminates and touches only memory it is allowed to touch. Those two facts leave three problems.</p>
+    <ol>
+      <li><strong>No memory between runs.</strong> The program is invoked once per packet, system
+        call or function entry. When it returns, its registers and stack are discarded. A program
+        that counts system calls per process needs storage that outlives a single invocation.</li>
+      <li><strong>No channel to user space.</strong> A tracing tool such as <code>execsnoop</code>
+        needs to deliver thousands of variable-sized records per second to a process that prints or
+        stores them. A firewall needs the reverse: a process writes a rule table that the program
+        reads.</li>
+      <li><strong>No access to the rest of the kernel.</strong> The verifier forbids arbitrary calls
+        and arbitrary pointer dereferences. Yet a program often needs to read the clock, find the
+        current task, redirect a packet or take a reference on a kernel object.</li>
+    </ol>
+    <p>The kernel answers the first two with <em>maps</em>: kernel-managed data structures that both
+      programs and user space can reach. It answers the third with a fixed list of
+      <em>helper functions</em> and, since Linux 5.13, with <em>kfuncs</em>: ordinary kernel functions
+      that have been explicitly exposed to BPF and are type-checked through BTF. Finally, programs
+      grew too large to be one function, so the kernel added BPF-to-BPF function calls (4.16) and
+      tail calls (4.2).</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>An eBPF program owns nothing
+      except its registers and stack. Everything persistent lives in a map, which is a kernel object
+      with a file descriptor. Everything the program does to the outside world goes through a call
+      the verifier knows the signature of: a helper (stable ABI, numbered), a kfunc (unstable,
+      described by BTF) or another BPF function.</p></div>
+
+    <figure>
+      <svg viewBox="0 0 820 360" role="img" aria-label="Overview: BPF programs in the kernel use maps, helpers and kfuncs; user space reaches maps through the bpf syscall, mmap and bpffs pins">
+        <defs>
+          <marker id="a41" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+        </defs>
+        <rect x="10" y="10" width="800" height="70" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="24" y="34" fill="var(--muted)" font-size="13">USER SPACE</text>
+        <rect x="40" y="40" width="190" height="32" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="135" y="61" text-anchor="middle" fill="var(--fg)" font-size="13">loader (libbpf skeleton)</text>
+        <rect x="300" y="40" width="190" height="32" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="395" y="61" text-anchor="middle" fill="var(--fg)" font-size="13">bpftool map dump</text>
+        <rect x="560" y="40" width="220" height="32" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="670" y="61" text-anchor="middle" fill="var(--fg)" font-size="13">/sys/fs/bpf/… (pinned)</text>
+        <line x1="10" y1="100" x2="810" y2="100" stroke="var(--muted)" stroke-dasharray="6 4"/>
+        <text x="20" y="94" fill="var(--muted)" font-size="12">bpf(2) syscall · mmap() · epoll</text>
+        <text x="24" y="124" fill="var(--muted)" font-size="13">KERNEL</text>
+        <rect x="40" y="140" width="220" height="200" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="150" y="164" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="bold">BPF program</text>
+        <rect x="60" y="178" width="180" height="34" rx="5" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="150" y="200" text-anchor="middle" fill="var(--fg)" font-size="12">main prog</text>
+        <rect x="60" y="222" width="180" height="34" rx="5" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="150" y="244" text-anchor="middle" fill="var(--fg)" font-size="12">subprog (BPF-to-BPF call)</text>
+        <rect x="60" y="266" width="180" height="60" rx="5" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="150" y="288" text-anchor="middle" fill="var(--fg)" font-size="12">globals: .data .bss .rodata</text>
+        <text x="150" y="308" text-anchor="middle" fill="var(--muted)" font-size="11">(backed by array maps)</text>
+        <rect x="330" y="140" width="210" height="200" rx="8" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="435" y="164" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="bold">Maps</text>
+        <text x="435" y="190" text-anchor="middle" fill="var(--fg)" font-size="12">hash · array · per-CPU · LRU</text>
+        <text x="435" y="212" text-anchor="middle" fill="var(--fg)" font-size="12">LPM trie · stack trace</text>
+        <text x="435" y="234" text-anchor="middle" fill="var(--fg)" font-size="12">ringbuf · perf event array</text>
+        <text x="435" y="256" text-anchor="middle" fill="var(--fg)" font-size="12">prog array · map-in-map</text>
+        <text x="435" y="278" text-anchor="middle" fill="var(--fg)" font-size="12">task/sk/inode/cgrp storage</text>
+        <text x="435" y="300" text-anchor="middle" fill="var(--fg)" font-size="12">arena</text>
+        <rect x="610" y="140" width="190" height="90" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="705" y="166" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="bold">Helpers</text>
+        <text x="705" y="188" text-anchor="middle" fill="var(--muted)" font-size="12">stable ABI, numbered</text>
+        <text x="705" y="208" text-anchor="middle" fill="var(--muted)" font-size="12">bpf_get_current_pid_tgid …</text>
+        <rect x="610" y="250" width="190" height="90" rx="8" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 3"/>
+        <text x="705" y="276" text-anchor="middle" fill="var(--fg)" font-size="14" font-weight="bold">kfuncs</text>
+        <text x="705" y="298" text-anchor="middle" fill="var(--muted)" font-size="12">unstable, BTF-typed</text>
+        <text x="705" y="318" text-anchor="middle" fill="var(--muted)" font-size="12">bpf_task_acquire …</text>
+        <line x1="260" y1="230" x2="328" y2="230" stroke="var(--fg)" marker-end="url(#a41)" marker-start="url(#a41)"/>
+        <line x1="260" y1="185" x2="608" y2="185" stroke="var(--fg)" marker-end="url(#a41)"/>
+        <line x1="260" y1="320" x2="608" y2="300" stroke="var(--fg)" marker-end="url(#a41)"/>
+        <line x1="135" y1="74" x2="135" y2="138" stroke="var(--accent2)" marker-end="url(#a41)"/>
+        <line x1="395" y1="74" x2="420" y2="138" stroke="var(--accent2)" marker-end="url(#a41)" marker-start="url(#a41)"/>
+        <line x1="670" y1="74" x2="500" y2="138" stroke="var(--accent2)" marker-end="url(#a41)"/>
+      </svg>
+      <figcaption>Figure 04.1 — The moving parts of this chapter. Programs read and write maps,
+        call helpers and kfuncs, and call their own subprograms. User space reaches the same maps
+        through the <code>bpf(2)</code> system call, through <code>mmap()</code> for some map types,
+        and by path once a map is pinned in bpffs.</figcaption>
+    </figure>
+
+    <h2>Maps: kernel objects with a key/value interface</h2>
+
+    <h3>What a map is</h3>
+    <p>A map is created with the <code>BPF_MAP_CREATE</code> command of the <code>bpf(2)</code>
+      system call. The caller supplies a type, a key size, a value size, a maximum number of entries
+      and some flags; the kernel returns a file descriptor. The kernel documentation shows the raw
+      form (<a href="https://docs.kernel.org/bpf/maps.html">docs.kernel.org/bpf/maps.html</a>):</p>
+    <pre data-file="linux/Documentation/bpf/maps.rst"><code class="language-c">int fd;
+union bpf_attr attr = {
+        .map_type = BPF_MAP_TYPE_ARRAY;  /* mandatory */
+        .key_size = sizeof(__u32);       /* mandatory */
+        .value_size = sizeof(__u32);     /* mandatory */
+        .max_entries = 256;              /* mandatory */
+        .map_flags = BPF_F_MMAPABLE;
+        .map_name = "example_array";
+};
+
+fd = bpf(BPF_MAP_CREATE, &amp;attr, sizeof(attr));</code></pre>
+    <p>Inside the kernel each map type is a C implementation behind a table of function pointers
+      (<code>struct bpf_map_ops</code>): <code>kernel/bpf/hashtab.c</code> for the hash family,
+      <code>arraymap.c</code> for arrays, <code>lpm_trie.c</code>, <code>ringbuf.c</code>,
+      <code>stackmap.c</code>, <code>bpf_task_storage.c</code>, <code>arena.c</code> and so on. When
+      a program is loaded, the loader rewrites every reference to a map into a special 64-bit load
+      instruction (<code>BPF_LD_IMM64</code> with <code>BPF_PSEUDO_MAP_FD</code>). The verifier
+      replaces the file descriptor with the kernel address of the <code>struct bpf_map</code> and
+      takes a reference on the map, so the map lives at least as long as any program that uses it.</p>
+    <p>A map stays alive while anything holds a reference: an open file descriptor in some process,
+      a loaded program that uses it, an outer map that contains it, or a pin in the BPF file system.
+      When the last reference goes away, the map is freed. This reference counting is what lets a
+      loader exit while its programs keep running and keep counting.</p>
+
+    <h3>Declaring maps in C: the BTF-defined syntax</h3>
+    <p>Nobody writes <code>union bpf_attr</code> by hand for a normal program. With libbpf, a map is
+      a global variable of an anonymous struct type placed in the ELF section
+      <code>.maps</code>. The struct carries no data; its <em>type</em> carries the map's parameters,
+      and the compiler records that type in the object's BTF (BPF Type Format, see
+      <a href="06-btf-core-libbpf.html">chapter 06</a>). libbpf reads the BTF and calls
+      <code>BPF_MAP_CREATE</code> for you. The trick lies in three macros from libbpf:</p>
+    <pre data-file="linux/tools/lib/bpf/bpf_helpers.h"><code class="language-c">#define __uint(name, val) int (*name)[val]
+#define __type(name, val) typeof(val) *name
+#define __array(name, val) typeof(val) *name[]</code></pre>
+    <p><code>__uint(max_entries, 256)</code> declares a member <code>max_entries</code> that is a
+      pointer to an array of 256 ints. The number 256 is encoded in the array dimension of the type,
+      which BTF preserves; no memory is allocated. <code>__type(key, u32)</code> declares a pointer
+      to <code>u32</code>, so libbpf learns both the key size and its BTF type. The BTF type of the
+      value lets the kernel check special fields (spin locks, timers, kptrs) and lets
+      <code>bpftool map dump</code> pretty-print values. The array map example from the kernel docs:</p>
+    <pre data-file="linux/Documentation/bpf/map_array.rst"><code class="language-c">struct {
+        __uint(type, BPF_MAP_TYPE_ARRAY);
+        __type(key, u32);
+        __type(value, long);
+        __uint(max_entries, 256);
+} my_map SEC(".maps");</code></pre>
+    <p>Other members you will see are <code>map_flags</code>, <code>pinning</code>,
+      <code>numa_node</code>, <code>map_extra</code> (used by bloom filters and arenas) and
+      <code>key_size</code>/<code>value_size</code> for types whose key or value is not a C type
+      (prog arrays, perf event arrays). Older code used a <code>struct bpf_map_def</code> in a
+      <code>"maps"</code> section; libbpf 1.0 removed support for that legacy form.</p>
+    <p>In the program, the map variable is only ever used by address: <code>&amp;my_map</code> is
+      passed as the first argument of a map helper. The verifier knows the map's key and value sizes,
+      so it checks that the key pointer points at enough readable bytes and that every access through
+      the returned value pointer stays inside <code>value_size</code>.</p>
+
+    <h3>The map type zoo</h3>
+    <p>The current <code>enum bpf_map_type</code> in <code>include/uapi/linux/bpf.h</code> lists more
+      than thirty types. The table covers the ones you will meet most often. Versions are those of the
+      first mainline release that had the type, taken from the kernel's per-type documentation and
+      the bcc project's <a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">kernel-versions.md</a>.</p>
+    <table>
+      <thead><tr><th>Type</th><th>Since</th><th>Key → value</th><th>Program ops</th><th>Typical use</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>HASH</code></td><td>3.19</td><td>any → any</td><td>lookup, update, delete</td><td>per-PID or per-flow state</td><td>preallocated unless <code>BPF_F_NO_PREALLOC</code>; fails when full</td></tr>
+        <tr><td><code>ARRAY</code></td><td>3.19</td><td>u32 index → any</td><td>lookup, update (no delete)</td><td>config, counters, globals</td><td>zero-filled at creation; mmap-able with <code>BPF_F_MMAPABLE</code> (5.5)</td></tr>
+        <tr><td><code>PERCPU_HASH</code> / <code>PERCPU_ARRAY</code></td><td>4.6</td><td>as above</td><td>same, on current CPU's slot</td><td>hot counters, scratch buffers</td><td>no atomics needed; user space reads one value per possible CPU</td></tr>
+        <tr><td><code>LRU_HASH</code> / <code>LRU_PERCPU_HASH</code></td><td>4.10</td><td>any → any</td><td>lookup, update, delete</td><td>connection tables, caches</td><td>evicts least-recently-used when full; <code>BPF_F_NO_COMMON_LRU</code> for per-CPU LRU lists</td></tr>
+        <tr><td><code>LPM_TRIE</code></td><td>4.11</td><td>(prefixlen, bytes) → any</td><td>longest-prefix lookup</td><td>IP routing / CIDR allow-lists</td><td>requires <code>BPF_F_NO_PREALLOC</code>; data is big-endian</td></tr>
+        <tr><td><code>STACK_TRACE</code></td><td>4.6</td><td>stack id → array of IPs</td><td><code>bpf_get_stackid()</code></td><td>profilers, off-CPU analysis</td><td>user space symbolizes the addresses</td></tr>
+        <tr><td><code>PERF_EVENT_ARRAY</code></td><td>4.3</td><td>CPU → perf event fd</td><td><code>bpf_perf_event_output()</code></td><td>event streaming (legacy)</td><td>one buffer per CPU; see ring buffer section</td></tr>
+        <tr><td><code>RINGBUF</code></td><td>5.8</td><td>none (key/value size 0)</td><td>reserve/submit/discard, output</td><td>event streaming</td><td>one MPSC buffer shared by all CPUs; size in bytes, power of 2</td></tr>
+        <tr><td><code>USER_RINGBUF</code></td><td>6.1</td><td>none</td><td><code>bpf_user_ringbuf_drain()</code></td><td>user space → kernel messages</td><td>reverse direction of <code>RINGBUF</code></td></tr>
+        <tr><td><code>PROG_ARRAY</code></td><td>4.2</td><td>u32 → program fd</td><td><code>bpf_tail_call()</code></td><td>dispatch tables</td><td>values are programs, not data</td></tr>
+        <tr><td><code>ARRAY_OF_MAPS</code> / <code>HASH_OF_MAPS</code></td><td>4.12</td><td>u32 or any → map fd</td><td>lookup only</td><td>swap whole tables atomically, per-tenant maps</td><td>one level of nesting; inner may not be a prog array</td></tr>
+        <tr><td><code>SK_STORAGE</code></td><td>5.2</td><td>socket → value</td><td><code>bpf_sk_storage_get/delete</code></td><td>per-socket state</td><td>freed with the socket</td></tr>
+        <tr><td><code>INODE_STORAGE</code></td><td>5.10</td><td>inode → value</td><td><code>bpf_inode_storage_get/delete</code></td><td>LSM policy state</td><td>freed with the inode</td></tr>
+        <tr><td><code>TASK_STORAGE</code></td><td>5.11</td><td>task → value</td><td><code>bpf_task_storage_get/delete</code></td><td>per-thread state</td><td>freed with the task</td></tr>
+        <tr><td><code>CGRP_STORAGE</code></td><td>6.2</td><td>cgroup → value</td><td><code>bpf_cgrp_storage_get/delete</code></td><td>per-container state</td><td>replaces the deprecated <code>CGROUP_STORAGE</code> (4.19)</td></tr>
+        <tr><td><code>QUEUE</code> / <code>STACK</code></td><td>4.20</td><td>none → value</td><td>push, pop, peek</td><td>free lists, work queues</td><td>FIFO / LIFO</td></tr>
+        <tr><td><code>BLOOM_FILTER</code></td><td>5.16</td><td>none → value</td><td>push, peek</td><td>fast negative lookups</td><td>false positives possible</td></tr>
+        <tr><td><code>ARENA</code></td><td>6.9</td><td>none (pages)</td><td>pointers + <code>bpf_arena_alloc_pages()</code> kfunc</td><td>custom data structures shared with user space</td><td>sparse, up to 4 GB, mmap-ed by user space</td></tr>
+      </tbody>
+    </table>
+    <p>Not in the table: the networking redirect maps (<code>DEVMAP</code>, <code>CPUMAP</code>,
+      <code>XSKMAP</code>, <code>SOCKMAP</code>/<code>SOCKHASH</code>, <code>REUSEPORT_SOCKARRAY</code>),
+      covered in <a href="07-networking-xdp-tc.html">chapter 07</a>; <code>STRUCT_OPS</code>,
+      which holds a kernel ops table implemented in BPF (<a href="05-program-types-and-hooks.html">chapter 05</a>);
+      <code>CGROUP_ARRAY</code>; and two recent additions present in mainline as of November 2026:
+      <code>BPF_MAP_TYPE_INSN_ARRAY</code>, which tracks instruction offsets as a program is
+      rewritten and JIT-compiled, and <code>BPF_MAP_TYPE_RHASH</code>, a resizable hash built on the
+      kernel's <code>rhashtable</code> (<a href="https://lwn.net/Articles/1076648/">patch series</a>).
+      I have not verified which release first shipped these two.</p>
+
+    <h3>Hash and array: the workhorses</h3>
+    <p>The two oldest types behave differently in ways that matter. An <strong>array</strong> has
+      exactly <code>max_entries</code> slots, all allocated and zeroed at creation. Lookups of an
+      in-range index always succeed, there is no delete, and the verifier can inline a lookup into a
+      bounds check plus an address calculation. A <strong>hash</strong> allocates elements on insert.
+      By default it preallocates <code>max_entries</code> elements up front so that an insert from
+      any context (including NMI) never calls the memory allocator. <code>BPF_F_NO_PREALLOC</code>
+      trades that for memory savings. When a hash is full, <code>bpf_map_update_elem()</code> fails
+      with <code>-E2BIG</code>; the update flags are <code>BPF_ANY</code>, <code>BPF_NOEXIST</code>
+      and <code>BPF_EXIST</code>.</p>
+    <p><code>bpf_map_lookup_elem()</code> returns a <em>pointer into the map</em>, not a copy. The
+      verifier types the result as "pointer to map value or NULL" and refuses any dereference until
+      the program has checked for NULL. Writes through that pointer are visible to everyone at once,
+      so concurrent updates from several CPUs race. The fixes are atomic instructions
+      (<code>__sync_fetch_and_add</code> compiles to a BPF atomic add), per-CPU maps or a spin
+      lock, covered below.</p>
+
+    <h3>Per-CPU variants</h3>
+    <p><code>PERCPU_HASH</code> and <code>PERCPU_ARRAY</code> keep one copy of every value per CPU.
+      A program always sees the slot of the CPU it runs on, so increments need no atomics and cause
+      no cache-line bouncing. Because BPF programs are not migrated to another CPU while they run, the
+      slot is stable for the whole invocation. A per-CPU array with one element is also the classic
+      "scratch heap" for building records larger than the stack allows. User space pays the price
+      at read time: a lookup returns an array of <code>value_size</code> rounded up to 8 bytes
+      times the number of <em>possible</em> CPUs (<code>libbpf_num_possible_cpus()</code>), and the
+      reader sums or merges them. Since 5.19, <code>bpf_map_lookup_percpu_elem()</code> lets a
+      program read another CPU's slot.</p>
+
+    <h3>LRU hash</h3>
+    <p>An LRU hash never fails an insert because it is full: it evicts an element that has not been
+      used recently. That is what you want for a connection-tracking table that sees an unbounded set
+      of flows. The kernel documentation's table summarises the two knobs: map type
+      (<code>LRU_HASH</code> versus <code>LRU_PERCPU_HASH</code>) decides whether values are per CPU,
+      and <code>BPF_F_NO_COMMON_LRU</code> decides whether there is one global LRU list or one per
+      CPU. Per-CPU LRU lists scale better but evict more aggressively, because each CPU only sees its
+      share of <code>max_entries</code>. Eviction is approximate; do not use an LRU map for data you
+      cannot afford to lose.</p>
+
+    <h3>LPM trie</h3>
+    <p>The longest-prefix-match trie answers "which stored prefix is the most specific match for
+      this address?", the question behind every routing table and CIDR allow-list. The key is a
+      <code>struct bpf_lpm_trie_key_u8</code> header with a 32-bit <code>prefixlen</code>, followed by
+      the address bytes in network byte order. To look up an address, set <code>prefixlen</code> to the
+      maximum (32 for IPv4, 128 for IPv6). The map must be created with
+      <code>BPF_F_NO_PREALLOC</code>; prefix lengths are multiples of 8 from 8 to 2048.</p>
+
+    <h3>Stack trace maps</h3>
+    <p>Profilers need to record "where was the CPU" thousands of times per second. Storing full
+      stacks in every sample would be expensive. A <code>STACK_TRACE</code> map deduplicates
+      instead: <code>bpf_get_stackid(ctx, &amp;stacks, flags)</code> walks the kernel or (with
+      <code>BPF_F_USER_STACK</code>) user stack, hashes it, stores the array of instruction pointers
+      and returns a small integer ID. The program counts IDs in a hash map, and user space resolves
+      IDs to address arrays and then to symbols. <code>bpf_get_stack()</code> (4.18) is the variant
+      that copies the stack into a buffer you own.</p>
+
+    <h3>Maps of maps</h3>
+    <p><code>ARRAY_OF_MAPS</code> and <code>HASH_OF_MAPS</code> hold references to other maps. A
+      program can only look up the outer map; the result is a map pointer it can pass to the normal
+      helpers. User space can replace an inner map in one syscall, which gives an atomic swap of a
+      whole rule table: build the new table off to the side, then update one slot. All inner maps
+      must match the template map given at creation. The selftest shows both declaration styles,
+      including static initialisation of the outer map with <code>__array(values, ...)</code>:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/test_map_in_map.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, 1);
+	__uint(map_flags, 0);
+	__type(key, __u32);
+	__type(value, __u32);
+} mim_array SEC(".maps");
+
+/* ... */
+
+struct perf_event_array {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+} inner_map0 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__array(values, struct perf_event_array);
+} mim_array_pe SEC(".maps") = {
+	.values = {&amp;inner_map0}};
+
+SEC("xdp")
+int xdp_mimtest0(struct xdp_md *ctx)
+{
+	int value = 123;
+	int *value_p;
+	int key = 0;
+	void *map;
+
+	map = bpf_map_lookup_elem(&amp;mim_array, &amp;key);
+	if (!map)
+		return XDP_DROP;
+
+	bpf_map_update_elem(map, &amp;key, &amp;value, 0);
+	value_p = bpf_map_lookup_elem(map, &amp;key);
+	if (!value_p || *value_p != 123)
+		return XDP_DROP;
+	/* ... */
+	return XDP_PASS;
+}</code></pre>
+
+    <h3>Local storage: task, socket, inode, cgroup</h3>
+    <p>A common pattern is "remember something about this task (or socket) until it goes away".
+      With a hash keyed by PID you must delete entries yourself, typically by hooking process exit,
+      and PIDs get reused. <em>Local storage</em> maps attach the value to the kernel object itself.
+      The object keeps a small list of storage slots; looking one up is a short list walk, not a
+      global hash lookup, and the kernel frees the value when the object dies. The four flavours are
+      socket (5.2), inode (5.10), task (5.11) and cgroup (6.2, <code>CGRP_STORAGE</code>, which
+      replaces the older cgroup-attached <code>CGROUP_STORAGE</code>). These maps must be created with
+      <code>BPF_F_NO_PREALLOC</code>, and the "key" a program passes is the object pointer:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/task_local_storage.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, long);
+} enter_id SEC(".maps");
+
+/* ... */
+
+SEC("tp_btf/sys_enter")
+int BPF_PROG(on_enter, struct pt_regs *regs, long id)
+{
+	struct task_struct *task;
+	long *ptr;
+
+	task = bpf_get_current_task_btf();
+	if (task-&gt;pid != target_pid)
+		return 0;
+
+	ptr = bpf_task_storage_get(&amp;enter_id, task, 0,
+				   BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!ptr)
+		return 0;
+
+	__sync_fetch_and_add(&amp;enter_cnt, 1);
+	*ptr = MAGIC_VALUE + enter_cnt;
+
+	return 0;
+}</code></pre>
+    <p>From user space, the key of a task storage map is a pidfd, and for a cgroup storage map it is a
+      cgroup fd, as the kernel's <code>map_cgrp_storage.rst</code> describes.</p>
+
+    <h3>Arena: a heap shared with user space</h3>
+    <p>Maps are key/value stores. Linked lists, trees and graphs with pointers between nodes do not
+      fit that model. <code>BPF_MAP_TYPE_ARENA</code> (6.9) is a sparse memory region of up to
+      4 GB that both the program and a user-space process map. In the patch cover letter
+      (<a href="https://lwn.net/Articles/961594/">LWN</a>) Alexei Starovoitov describes it as a
+      "sparse shared memory region between the bpf program and user space". Pages are allocated on
+      demand, by user-space page faults or by the sleepable kfunc <code>bpf_arena_alloc_pages()</code>.
+      Pointers into the arena carry the <code>__arena</code> address-space tag. The compiler and JIT
+      translate between the kernel and user addresses of the same page, so a pointer stored by the
+      program is valid in the user process. The verifier treats arena memory as data only: a kernel
+      pointer written into the arena cannot be used as a pointer after it is read back. The
+      selftest declares an arena of 100 pages:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/arena_list.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_ARENA);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, 100); /* number of pages */
+#ifdef __TARGET_ARCH_arm64
+	__ulong(map_extra, 0x1ull &lt;&lt; 32); /* start of mmap() region */
+#else
+	__ulong(map_extra, 0x1ull &lt;&lt; 44); /* start of mmap() region */
+#endif
+} arena SEC(".maps");
+
+#include "bpf_arena_alloc.h"
+#include "bpf_arena_list.h"
+
+struct elem {
+	struct arena_list_node node;
+	__u64 value;
+};
+
+struct arena_list_head __arena *list_head;</code></pre>
+    <p>sched_ext schedulers are the heaviest users today. LWN's report from the 2025 LSFMM+BPF summit
+      (<a href="https://lwn.net/Articles/1019885">"A look at what's possible with BPF arenas"</a>)
+      describes how they keep the bulk of their data structures in the arena and only the
+      kernel-object references in ordinary maps.</p>
+
+    <h2>Pinning maps in bpffs</h2>
+    <p>File descriptors are per-process. If a loader exits, the only things holding a map are the
+      programs that use it, and no other process can find the map. The BPF file system (since 4.4),
+      normally mounted at <code>/sys/fs/bpf</code>, fixes that. <code>BPF_OBJ_PIN</code> creates a
+      file there that holds a reference to a map, program or link, and <code>BPF_OBJ_GET</code> turns
+      the path back into a file descriptor. Pinned objects survive the exit of every process and
+      disappear on <code>unlink()</code> or reboot.</p>
+    <p>libbpf can pin declaratively. With <code>LIBBPF_PIN_BY_NAME</code>, libbpf pins the map under
+      the pin root (default <code>/sys/fs/bpf</code>) using the map's name. If a pin of that name
+      already exists and is compatible, libbpf reuses the existing map instead of creating a new one.
+      That is how two programs loaded at different times end up sharing state:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/test_pinning.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} pinmap SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} nopinmap SEC(".maps");</code></pre>
+    <p>The same can be done by hand with bpftool. The session below was run in this curriculum's
+      sandbox (Linux 6.1, bpftool 7.1.0) against the example program later in this chapter while it
+      was running:</p>
+    <pre><code class="language-bash">$ sudo bpftool map show
+51: ringbuf  name events  flags 0x0
+	key 0B  value 0B  max_entries 262144  memlock 0B
+53: array  name execsnoo.rodata  flags 0x480
+	key 4B  value 4B  max_entries 1  memlock 4096B
+	btf_id 106  frozen
+54: array  name execsnoo.bss  flags 0x400
+	key 4B  value 8B  max_entries 1  memlock 4096B
+	btf_id 106
+$ sudo bpftool map pin id 54 /sys/fs/bpf/execsnoop_bss
+$ sudo bpftool map dump pinned /sys/fs/bpf/execsnoop_bss
+[{
+        "value": {
+            ".bss": [{
+                    "dropped": 0
+                }
+            ]
+        }
+    }
+]
+$ sudo rm /sys/fs/bpf/execsnoop_bss      # drop the pin</code></pre>
+    <p>Notice how the program's global variables appear as array maps (next section), and how BTF lets
+      bpftool print <code>dropped</code> by name. The map remained dumpable through the pin after the
+      program had exited.</p>
+
+    <h2>Using maps from user space</h2>
+    <p>User space reaches maps through the same <code>bpf(2)</code> system call. Every command takes
+      a map fd plus pointers to user buffers. Unlike the in-kernel helper, a user-space lookup
+      <em>copies</em> the value out:</p>
+    <ul>
+      <li><code>BPF_MAP_LOOKUP_ELEM</code>, <code>BPF_MAP_UPDATE_ELEM</code>,
+        <code>BPF_MAP_DELETE_ELEM</code>: one element. libbpf wraps them as
+        <code>bpf_map_lookup_elem(fd, key, value)</code>, <code>bpf_map_update_elem(fd, key, value, flags)</code>
+        and <code>bpf_map_delete_elem(fd, key)</code> in <code>tools/lib/bpf/bpf.h</code>. These are the same
+        names as the BPF-side helpers but with an fd instead of a map pointer.</li>
+      <li><code>BPF_MAP_GET_NEXT_KEY</code>: iteration. Pass <code>NULL</code> to get the first key.
+        The kernel docs warn that if the current key is deleted during iteration, the next call
+        returns the <em>first</em> key again, so use batch operations when deletes are mixed in.</li>
+      <li><code>BPF_MAP_LOOKUP_BATCH</code>, <code>BPF_MAP_LOOKUP_AND_DELETE_BATCH</code>,
+        <code>BPF_MAP_UPDATE_BATCH</code>: many elements per syscall.</li>
+      <li><code>BPF_MAP_LOOKUP_AND_DELETE_ELEM</code>: atomic pop (queues and stacks since 4.20,
+        hashes since 5.14).</li>
+      <li><code>BPF_F_LOCK</code> on lookup/update: copy the value while holding the element's
+        <code>bpf_spin_lock</code> (5.1).</li>
+      <li><code>BPF_MAP_FREEZE</code> (5.2): make the map read-only for user space from now on. libbpf
+        freezes <code>.rodata</code> after initialising it.</li>
+      <li><code>mmap()</code>: array maps created with <code>BPF_F_MMAPABLE</code> (5.5), ring
+        buffers and arenas can be mapped into the process. Then reads and writes are plain memory
+        accesses with no syscall at all.</li>
+    </ul>
+    <p>The higher-level libbpf API on <code>struct bpf_map *</code>, such as
+      <code>bpf_map__lookup_elem(map, key, key_sz, value, value_sz, flags)</code>, checks the sizes
+      against what it knows from BTF. bpftool exposes the same operations on the command line:
+      <code>bpftool map dump</code>, <code>lookup</code>, <code>update</code>, <code>delete</code>
+      and <code>pin</code>.</p>
+
+    <h2>Global variables: .data, .bss and .rodata</h2>
+    <p>Until Linux 5.2 a BPF program had no global variables; every piece of configuration went
+      through an explicit one-element array map. The 5.2 change "bpf: implement lookup-free direct
+      value access for maps" (commit <code>d8eca5bbb2be</code>) lets a <code>BPF_LD_IMM64</code>
+      instruction load the <em>address of a value inside an array map</em>. libbpf builds on that:
+      for each of the ELF sections <code>.data</code> (initialised globals), <code>.bss</code>
+      (zero-initialised) and <code>.rodata</code> (<code>const</code>), it creates a one-element array
+      map whose value is the whole section. Accesses to globals become loads and stores at fixed
+      offsets into that value, with no helper call. The selftest exercises every flavour:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/test_global_data.c"><code class="language-c">/* Relocation tests for __u64s. */
+static       __u64 num0;
+static       __u64 num1 = 42;
+static const __u64 num2 = 24;
+static       __u64 num3 = 0;
+static       __u64 num4 = 0xffeeff;
+static const __u64 num5 = 0xabab;
+static const __u64 num6 = 0xab;
+
+/* Relocation tests for strings. */
+static const char str0[32] = "abcdefghijklmnopqrstuvwxyz";
+static       char str1[32] = "abcdefghijklmnopqrstuvwxyz";
+static       char str2[32];</code></pre>
+    <p>Three details make globals more than a convenience:</p>
+    <ul>
+      <li><strong><code>const volatile</code> in <code>.rodata</code> is load-time configuration.</strong>
+        User space sets the value through the skeleton (<code>skel-&gt;rodata-&gt;target_ppid = 42</code>)
+        after <em>open</em> and before <em>load</em>. libbpf then creates the map, writes the value
+        and freezes the map. Because the map is frozen and marked <code>BPF_F_RDONLY_PROG</code>, the
+        verifier treats the value as a known constant and can prune branches that depend on it as dead
+        code. <code>volatile</code> stops the compiler from folding the initial value at compile
+        time. In the bpftool output above, <code>flags 0x480</code> is
+        <code>BPF_F_RDONLY_PROG | BPF_F_MMAPABLE</code>, and the map is listed as <code>frozen</code>.</li>
+      <li><strong><code>.bss</code> and <code>.data</code> are mmap-ed.</strong> The skeleton maps them
+        into the process, so <code>skel-&gt;bss-&gt;dropped</code> is a plain memory read of the value
+        the BPF program increments.</li>
+      <li><strong>Custom sections.</strong> A variable placed in <code>SEC(".data.foo")</code> gets its
+        own map. That is useful for a global <code>bpf_spin_lock</code>, which must sit in its own map,
+        or to size a buffer independently.</li>
+    </ul>
+
+    <h2>Getting events out: ring buffer versus perf buffer</h2>
+    <p>Counters in maps are fine for aggregates. Tracing tools need a <em>stream</em>: one record per
+      event, in order, delivered with low latency. Before 5.8 the only tool was the perf buffer.</p>
+
+    <h3>Perf buffer: one ring per CPU</h3>
+    <p>A <code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code> maps CPU numbers to perf event file descriptors,
+      each with its own mmap-ed ring. The program calls
+      <code>bpf_perf_event_output(ctx, &amp;map, BPF_F_CURRENT_CPU, data, size)</code>, which copies a
+      record into the current CPU's ring. libbpf's <code>perf_buffer__new(map_fd, page_cnt, sample_cb, lost_cb, ctx, opts)</code>
+      opens one ring of <code>page_cnt</code> pages per CPU and epolls all of them. Andrii Nakryiko's
+      <a href="https://nakryiko.com/posts/bpf-ringbuf/">post on the BPF ring buffer</a> describes two
+      structural problems with this design:</p>
+    <ul>
+      <li><strong>Memory.</strong> Each CPU's buffer must be sized for that CPU's worst burst. With
+        64 CPUs you pay 64 times the buffer, mostly empty, or you drop data when one CPU spikes.</li>
+      <li><strong>Ordering.</strong> Events from different CPUs land in different rings. A short-lived
+        process that forks on CPU 3, execs on CPU 7 and exits on CPU 1 can be seen by the consumer in
+        any order. Nakryiko says his own fork/exec/exit tracker suffered from exactly this.</li>
+    </ul>
+    <p>A third, smaller problem is the extra copy: the record must be assembled somewhere (often a
+      per-CPU array, because the stack is small) and then copied into the ring. If the ring is full,
+      all that work is wasted.</p>
+
+    <h3>BPF ring buffer: one MPSC ring for all CPUs</h3>
+    <p><code>BPF_MAP_TYPE_RINGBUF</code> (5.8) is a multi-producer, single-consumer circular buffer
+      shared by all CPUs. Its key and value sizes are zero, and <code>max_entries</code> is the size of
+      the data area in bytes, a power of 2 and a multiple of the page size. Shared means one buffer can
+      absorb a spike on any CPU, and events come out in the order their space was reserved, across CPUs.
+      Programs have two APIs:</p>
+    <ul>
+      <li><code>bpf_ringbuf_output(&amp;rb, data, size, flags)</code>: a copy, like
+        <code>bpf_perf_event_output()</code>. The size may be variable.</li>
+      <li><code>bpf_ringbuf_reserve(&amp;rb, size, 0)</code> returns a pointer <em>into the ring</em> or
+        NULL. The program fills the record in place and then calls
+        <code>bpf_ringbuf_submit(ptr, flags)</code> or <code>bpf_ringbuf_discard(ptr, flags)</code>. The
+        size must be a constant known to the verifier. No extra copy, no scratch buffer, and the
+        program learns the buffer is full <em>before</em> doing the work.</li>
+    </ul>
+    <p>The verifier tracks a reserved record like any acquired reference (see
+      <a href="03-verifier.html">chapter 03</a>). Every path must submit or discard it. When I
+      changed the example below so that one path skips <code>bpf_ringbuf_submit()</code>, the 6.1
+      verifier rejected the program at load time with:</p>
+    <pre><code class="language-plaintext">59: (b7) r0 = 0                       ; R0_w=0 refs=3
+60: (95) exit
+Unreleased reference id=3 alloc_insn=28</code></pre>
+
+    <figure>
+      <svg viewBox="0 0 820 400" role="img" aria-label="Ring buffer data flow: producers on several CPUs reserve records under a spinlock, fill and commit them, and a user-space consumer reads them through mmap and epoll">
+        <defs>
+          <marker id="a42" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+        </defs>
+        <text x="20" y="26" fill="var(--muted)" font-size="13">KERNEL — BPF programs (producers)</text>
+        <rect x="20" y="40" width="160" height="44" rx="6" fill="none" stroke="var(--accent)"/>
+        <text x="100" y="60" text-anchor="middle" fill="var(--fg)" font-size="12">CPU 0: prog</text>
+        <text x="100" y="76" text-anchor="middle" fill="var(--muted)" font-size="11">reserve → fill → submit</text>
+        <rect x="20" y="96" width="160" height="44" rx="6" fill="none" stroke="var(--accent)"/>
+        <text x="100" y="116" text-anchor="middle" fill="var(--fg)" font-size="12">CPU 1: prog</text>
+        <text x="100" y="132" text-anchor="middle" fill="var(--muted)" font-size="11">reserve → fill → discard</text>
+        <rect x="20" y="152" width="160" height="44" rx="6" fill="none" stroke="var(--accent)"/>
+        <text x="100" y="172" text-anchor="middle" fill="var(--fg)" font-size="12">CPU 2: prog</text>
+        <text x="100" y="188" text-anchor="middle" fill="var(--muted)" font-size="11">reserve (busy)</text>
+        <rect x="230" y="70" width="120" height="96" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="290" y="100" text-anchor="middle" fill="var(--fg)" font-size="12">spinlock</text>
+        <text x="290" y="118" text-anchor="middle" fill="var(--muted)" font-size="11">advances</text>
+        <text x="290" y="134" text-anchor="middle" fill="var(--muted)" font-size="11">producer_pos</text>
+        <text x="290" y="150" text-anchor="middle" fill="var(--muted)" font-size="11">(commit is lockless)</text>
+        <line x1="180" y1="62" x2="228" y2="100" stroke="var(--fg)" marker-end="url(#a42)"/>
+        <line x1="180" y1="118" x2="228" y2="118" stroke="var(--fg)" marker-end="url(#a42)"/>
+        <line x1="180" y1="174" x2="228" y2="140" stroke="var(--fg)" marker-end="url(#a42)"/>
+        <text x="400" y="34" fill="var(--muted)" font-size="12">data area (power-of-2 bytes), mapped twice back-to-back</text>
+        <rect x="400" y="44" width="400" height="56" rx="4" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <rect x="404" y="48" width="96" height="48" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="452" y="68" text-anchor="middle" fill="var(--fg)" font-size="11">hdr|rec A</text>
+        <text x="452" y="86" text-anchor="middle" fill="var(--muted)" font-size="10">committed</text>
+        <rect x="504" y="48" width="96" height="48" fill="var(--bg3)" stroke="var(--accent2)" stroke-dasharray="4 3"/>
+        <text x="552" y="68" text-anchor="middle" fill="var(--fg)" font-size="11">hdr|rec B</text>
+        <text x="552" y="86" text-anchor="middle" fill="var(--muted)" font-size="10">discard bit</text>
+        <rect x="604" y="48" width="96" height="48" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="652" y="68" text-anchor="middle" fill="var(--fg)" font-size="11">hdr|rec C</text>
+        <text x="652" y="86" text-anchor="middle" fill="var(--muted)" font-size="10">busy bit set</text>
+        <text x="750" y="76" text-anchor="middle" fill="var(--muted)" font-size="11">free</text>
+        <line x1="350" y1="118" x2="398" y2="80" stroke="var(--fg)" marker-end="url(#a42)"/>
+        <line x1="404" y1="118" x2="404" y2="104" stroke="var(--accent2)" marker-end="url(#a42)"/>
+        <text x="404" y="132" fill="var(--accent2)" font-size="11">consumer_pos</text>
+        <line x1="704" y1="118" x2="704" y2="104" stroke="var(--accent)" marker-end="url(#a42)"/>
+        <text x="704" y="132" text-anchor="middle" fill="var(--accent)" font-size="11">producer_pos</text>
+        <text x="400" y="164" fill="var(--muted)" font-size="11">Each record: 8-byte header = length + busy bit + discard bit + page offset.</text>
+        <text x="400" y="182" fill="var(--muted)" font-size="11">Consumer stops at the first busy record: C holds back anything after it.</text>
+        <line x1="10" y1="225" x2="810" y2="225" stroke="var(--muted)" stroke-dasharray="6 4"/>
+        <text x="20" y="218" fill="var(--muted)" font-size="12">mmap(): data + producer page read-only, consumer page writable · epoll wakeup via irq_work</text>
+        <text x="20" y="252" fill="var(--muted)" font-size="13">USER SPACE — single consumer</text>
+        <rect x="400" y="268" width="400" height="56" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="600" y="290" text-anchor="middle" fill="var(--fg)" font-size="12">same pages, mapped into the process</text>
+        <text x="600" y="310" text-anchor="middle" fill="var(--muted)" font-size="11">libbpf reads headers, skips discarded, calls sample_cb()</text>
+        <line x1="600" y1="100" x2="600" y2="266" stroke="var(--accent2)" stroke-dasharray="3 3" marker-end="url(#a42)"/>
+        <rect x="20" y="268" width="330" height="110" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="185" y="292" text-anchor="middle" fill="var(--fg)" font-size="12">ring_buffer__poll(rb, 100)</text>
+        <text x="185" y="312" text-anchor="middle" fill="var(--muted)" font-size="11">epoll_wait → for each record:</text>
+        <text x="185" y="330" text-anchor="middle" fill="var(--muted)" font-size="11">handle_event(ctx, data, size)</text>
+        <text x="185" y="350" text-anchor="middle" fill="var(--muted)" font-size="11">then store consumer_pos (frees space)</text>
+        <line x1="398" y1="296" x2="352" y2="310" stroke="var(--fg)" marker-end="url(#a42)"/>
+        <path d="M 185 378 C 185 395, 420 395, 420 330" fill="none" stroke="var(--accent2)" marker-end="url(#a42)"/>
+      </svg>
+      <figcaption>Figure 04.2 — Kernel-to-user data flow through <code>BPF_MAP_TYPE_RINGBUF</code>.
+        Producers on any CPU reserve space in order under a spinlock and commit without one. The
+        consumer sees records strictly in reservation order and stops at the first record that is
+        still busy. It writes <code>consumer_pos</code> back to free the space.</figcaption>
+    </figure>
+
+    <h3>How it works inside</h3>
+    <p>The design notes in <a href="https://docs.kernel.org/bpf/ringbuf.html">Documentation/bpf/ringbuf.rst</a>
+      and the code in <code>kernel/bpf/ringbuf.c</code> are short and worth reading. The ring keeps two
+      ever-increasing logical counters, <code>consumer_pos</code> and <code>producer_pos</code>, and
+      masks them with <code>size - 1</code> to find a byte offset. Reservations are serialised by a
+      spinlock, which today is a resilient queued spinlock (<code>rqspinlock_t</code>). Each record
+      starts with an 8-byte header holding its length, a <em>busy</em> bit (still being filled), a
+      <em>discard</em> bit, and the record's page offset from the start of the ring. The offset lets
+      <code>bpf_ringbuf_submit(ptr)</code> find the ring from the record pointer alone. Commit simply
+      clears the busy bit with no lock, so several CPUs can fill their records in parallel. In NMI
+      context the reservation may fail to take the lock and then returns NULL even if there is space.</p>
+    <p>Records wrap around the end of the data area without special cases, because the data pages are
+      mapped twice in a row. The kernel comment draws it:</p>
+    <pre data-file="linux/kernel/bpf/ringbuf.c"><code class="language-c">	/* Each data page is mapped twice to allow "virtual"
+	 * continuous read of samples wrapping around the end of ring
+	 * buffer area:
+	 * ------------------------------------------------------
+	 * | meta pages |  real data pages  |  same data pages  |
+	 * ------------------------------------------------------
+	 * |            | 1 2 3 4 5 6 7 8 9 | 1 2 3 4 5 6 7 8 9 |
+	 * ------------------------------------------------------
+	 * |            | TA             DA | TA             DA |
+	 * ------------------------------------------------------
+	 *                               ^^^^^^^
+	 *                                  |
+	 * Here, no need to worry about special handling of wrapped-around
+	 * data due to double-mapped data pages. This works both in kernel and
+	 * when mmap()'ed in user-space, simplifying both kernel and
+	 * user-space implementations significantly.
+	 */
+	array_size = (nr_meta_pages + 2 * nr_data_pages) * sizeof(*pages);
+	pages = bpf_map_area_alloc(array_size, numa_node);
+	if (!pages)
+		return NULL;
+
+	for (i = 0; i &lt; nr_pages; i++) {
+		page = alloc_pages_node(numa_node, flags, 0);
+		if (!page) {
+			nr_pages = i;
+			goto err_free_pages;
+		}
+		pages[i] = page;
+		if (i &gt;= nr_meta_pages)
+			pages[nr_data_pages + i] = page;
+	}</code></pre>
+    <p>Notifications pace themselves. After a commit the kernel wakes the consumer (through
+      <code>irq_work</code>, so it is safe from any context) only if the consumer has already caught
+      up to that record. If it is behind, it will see the record anyway. Programs that want manual
+      control pass <code>BPF_RB_NO_WAKEUP</code> or <code>BPF_RB_FORCE_WAKEUP</code>; the
+      <code>ringbuf_bench.c</code> selftest uses that to wake only after a batch.
+      <code>bpf_ringbuf_query()</code> reports available data, ring size and the two positions, which
+      is useful for such heuristics and for monitoring.</p>
+    <p>Mainline also has a newer <code>BPF_F_RB_OVERWRITE</code> map flag. In that mode a full ring
+      overwrites the oldest records instead of failing reservations, which is useful for
+      "flight recorder" diagnostics. It was posted to bpf-next in August 2025; I have not verified
+      which release first shipped it.</p>
+
+    <h3>The kernel's own test</h3>
+    <p>The ring buffer selftest uses every program-side API in about forty lines: reserve, submit,
+      output, discard and query. It also shows the idiom of counting reservation failures in a global
+      variable:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/test_ringbuf.c"><code class="language-c">struct sample {
+	int pid;
+	int seq;
+	long value;
+	char comm[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+} ringbuf SEC(".maps");
+
+/* inputs */
+int pid = 0;
+long value = 0;
+long flags = 0;
+
+/* outputs */
+long total = 0;
+long discarded = 0;
+long dropped = 0;
+/* ... */
+
+SEC("fentry/" SYS_PREFIX "sys_getpgid")
+int test_ringbuf(void *ctx)
+{
+	int cur_pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	struct sample *sample;
+
+	if (cur_pid != pid)
+		return 0;
+
+	sample = bpf_ringbuf_reserve(&amp;ringbuf, sizeof(*sample), 0);
+	if (!sample) {
+		__sync_fetch_and_add(&amp;dropped, 1);
+		return 0;
+	}
+
+	sample-&gt;pid = pid;
+	bpf_get_current_comm(sample-&gt;comm, sizeof(sample-&gt;comm));
+	sample-&gt;value = value;
+
+	sample-&gt;seq = seq++;
+	__sync_fetch_and_add(&amp;total, 1);
+
+	if (sample-&gt;seq &amp; 1) {
+		/* copy from reserved sample to a new one... */
+		bpf_ringbuf_output(&amp;ringbuf, sample, sizeof(*sample), flags);
+		/* ...and then discard reserved sample */
+		bpf_ringbuf_discard(sample, flags);
+		__sync_fetch_and_add(&amp;discarded, 1);
+	} else {
+		bpf_ringbuf_submit(sample, flags);
+	}
+
+	avail_data = bpf_ringbuf_query(&amp;ringbuf, BPF_RB_AVAIL_DATA);
+	/* ... */
+	return 0;
+}</code></pre>
+    <p>The map has no <code>max_entries</code>; the test's user-space side sets the size with
+      <code>bpf_map__set_max_entries()</code> before load. Its consumer callback returns a negative
+      value (<code>-EDONE</code>, defined by the test) to make <code>ring_buffer__poll()</code> stop
+      early:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/prog_tests/ringbuf.c"><code class="language-c">static int process_sample(void *ctx, void *data, size_t len)
+{
+	struct sample *s = data;
+
+	atomic_inc(&amp;sample_cnt);
+
+	switch (s-&gt;seq) {
+	case 0:
+		CHECK(s-&gt;value != 333, "sample1_value", "exp %ld, got %ld\n",
+		      333L, s-&gt;value);
+		return 0;
+	case 1:
+		CHECK(s-&gt;value != 777, "sample2_value", "exp %ld, got %ld\n",
+		      777L, s-&gt;value);
+		return -EDONE;
+	/* ... */</code></pre>
+
+    <h3>Life of one record</h3>
+    <div class="stepper">
+      <div class="step"><h4>1. Reserve</h4><p>A program on CPU 2 calls
+        <code>bpf_ringbuf_reserve(&amp;events, sizeof(*e), 0)</code>. Under the ring's spinlock the
+        kernel checks that the record plus its 8-byte header (rounded up to 8 bytes) fits in the
+        space between <code>consumer_pos</code> and <code>producer_pos</code>. If it does not,
+        it returns NULL and the program counts a drop. Otherwise it writes a header with the busy bit
+        set, advances <code>producer_pos</code> and returns a pointer just after the header.</p></div>
+      <div class="step"><h4>2. Fill in place</h4><p>The program writes fields directly into the ring:
+        PID from <code>bpf_get_current_pid_tgid()</code>, the command name, a string read with
+        <code>bpf_probe_read_kernel_str()</code>. The verifier allows writes only within the reserved
+        size. Meanwhile CPU 5 can reserve the next record; it does not wait for CPU 2.</p></div>
+      <div class="step"><h4>3. Submit (or discard)</h4><p><code>bpf_ringbuf_submit(e, 0)</code>
+        atomically clears the busy bit. <code>bpf_ringbuf_discard()</code> sets the discard bit
+        instead. If the consumer was waiting at exactly this record, the kernel queues an
+        <code>irq_work</code> to wake it.</p></div>
+      <div class="step"><h4>4. Wake up</h4><p>The consumer's <code>epoll_wait()</code> inside
+        <code>ring_buffer__poll()</code> returns. libbpf reads <code>producer_pos</code> from the
+        read-only producer page with acquire semantics.</p></div>
+      <div class="step"><h4>5. Consume</h4><p>libbpf walks headers from <code>consumer_pos</code>. A busy
+        header stops the walk: a slow producer holds back later records, and that is what preserves
+        order. Discarded records are skipped silently. For each committed record libbpf calls your
+        <code>handle_event(ctx, data, size)</code> on the mmap-ed memory, with no copy.</p></div>
+      <div class="step"><h4>6. Release space</h4><p>libbpf stores the new <code>consumer_pos</code> into
+        the one writable page of the mapping. The producer's next space check sees the freed bytes.
+        Your callback must therefore copy anything it wants to keep; the memory is reused.</p></div>
+    </div>
+
+    <h3>A complete ring buffer program</h3>
+    <p>The example below is <strong>illustrative code written for this chapter</strong>, not copied
+      from a repository. It is a minimal <code>execsnoop</code>: it reports every successful
+      <code>exec()</code> with PID, parent PID, command and file name. It uses a ring buffer with
+      reserve/submit, two helpers from this chapter, CO-RE reads through
+      <code>bpf_probe_read_kernel()</code>, a <code>.rodata</code> filter and a <code>.bss</code>
+      drop counter. I built and ran it in the curriculum's sandbox on Linux 6.1.189 with clang 14,
+      libbpf 1.1.2 and bpftool 7.1.0.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="execsnoop.h"><pre><code class="language-c">/* execsnoop.h - shared between the BPF program and the loader */
+#ifndef EXECSNOOP_H
+#define EXECSNOOP_H
+
+#define TASK_COMM_LEN 16
+#define MAX_FILENAME_LEN 128
+
+struct event {
+	int pid;          /* thread-group id, what ps(1) calls PID */
+	int ppid;         /* parent's thread-group id */
+	unsigned long long ts_ns;
+	char comm[TASK_COMM_LEN];
+	char filename[MAX_FILENAME_LEN];
+};
+
+#endif</code></pre></div>
+      <div class="tab-panel" data-label="Kernel side: execsnoop.bpf.c"><pre><code class="language-c">// SPDX-License-Identifier: GPL-2.0
+/* execsnoop.bpf.c - report every exec() through a BPF ring buffer */
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include "execsnoop.h"
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* One ring buffer shared by all CPUs: 256 KiB, a power of 2 and a
+ * multiple of the page size. */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
+/* .rodata: set by user space before load, constant to the verifier */
+const volatile int target_ppid = 0;
+
+/* .bss: read by user space after the run */
+__u64 dropped = 0;
+
+SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	struct task_struct *task;
+	struct event *e;
+	unsigned int fname_off;
+	int ppid;
+
+	task = (struct task_struct *)bpf_get_current_task();
+	/* BPF_CORE_READ expands to bpf_probe_read_kernel() calls with
+	 * CO-RE relocations for task-&gt;real_parent-&gt;tgid */
+	ppid = BPF_CORE_READ(task, real_parent, tgid);
+	if (target_ppid &amp;&amp; ppid != target_ppid)
+		return 0;
+
+	/* Reserve space first: if the buffer is full we learn it now,
+	 * before doing any work. */
+	e = bpf_ringbuf_reserve(&amp;events, sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&amp;dropped, 1);
+		return 0;
+	}
+
+	e-&gt;pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	e-&gt;ppid = ppid;
+	e-&gt;ts_ns = bpf_ktime_get_ns();
+	bpf_get_current_comm(e-&gt;comm, sizeof(e-&gt;comm));
+
+	/* filename is a __data_loc field: low 16 bits are the offset of
+	 * the string inside the tracepoint record */
+	fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+	bpf_probe_read_kernel_str(e-&gt;filename, sizeof(e-&gt;filename),
+				  (void *)ctx + fname_off);
+
+	/* The verifier refuses the program if any path forgets this */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}</code></pre></div>
+      <div class="tab-panel" data-label="User side: execsnoop.c"><pre><code class="language-c">// SPDX-License-Identifier: GPL-2.0
+/* execsnoop.c - load execsnoop.bpf.o and print events from the ring buffer */
+#include &lt;errno.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;bpf/libbpf.h&gt;
+#include "execsnoop.h"
+#include "execsnoop.skel.h"   /* generated by: bpftool gen skeleton */
+
+static volatile sig_atomic_t exiting;
+
+static void on_sigint(int sig)
+{
+	exiting = 1;
+}
+
+/* Called by libbpf once per committed record, in reservation order. */
+static int handle_event(void *ctx, void *data, size_t len)
+{
+	const struct event *e = data;
+
+	printf("%-8d %-8d %-16s %s\n", e-&gt;pid, e-&gt;ppid, e-&gt;comm, e-&gt;filename);
+	return 0;   /* a negative value stops ring_buffer__poll() */
+}
+
+int main(int argc, char **argv)
+{
+	struct ring_buffer *rb = NULL;
+	struct execsnoop_bpf *skel;
+	int err;
+
+	signal(SIGINT, on_sigint);
+	signal(SIGTERM, on_sigint);
+
+	skel = execsnoop_bpf__open();             /* parse ELF, no syscalls yet */
+	if (!skel) {
+		fprintf(stderr, "failed to open BPF skeleton\n");
+		return 1;
+	}
+	if (argc &gt; 1)                              /* patch .rodata before load */
+		skel-&gt;rodata-&gt;target_ppid = atoi(argv[1]);
+
+	err = execsnoop_bpf__load(skel);          /* create maps, verify, JIT */
+	if (err) {
+		fprintf(stderr, "failed to load BPF object: %d\n", err);
+		goto cleanup;
+	}
+	err = execsnoop_bpf__attach(skel);        /* attach to the tracepoint */
+	if (err) {
+		fprintf(stderr, "failed to attach: %d\n", err);
+		goto cleanup;
+	}
+
+	rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.events), handle_event,
+			      NULL, NULL);
+	if (!rb) {
+		err = -errno;
+		fprintf(stderr, "failed to create ring buffer: %d\n", err);
+		goto cleanup;
+	}
+
+	printf("%-8s %-8s %-16s %s\n", "PID", "PPID", "COMM", "FILENAME");
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		if (err == -EINTR) {
+			err = 0;
+			break;
+		}
+		if (err &lt; 0) {
+			fprintf(stderr, "ring_buffer__poll: %d\n", err);
+			break;
+		}
+	}
+	/* .bss is mmap()ed: reading it is a plain memory load */
+	fprintf(stderr, "dropped: %llu\n",
+		(unsigned long long)skel-&gt;bss-&gt;dropped);
+
+cleanup:
+	ring_buffer__free(rb);
+	execsnoop_bpf__destroy(skel);
+	return err &lt; 0 ? 1 : 0;
+}</code></pre></div>
+      <div class="tab-panel" data-label="Build and run"><pre><code class="language-bash"># Needs clang, libbpf (headers + libbpf.so), libelf, zlib, bpftool,
+# and a kernel with BTF (/sys/kernel/btf/vmlinux) and ring buffer (5.8+).
+bpftool btf dump file /sys/kernel/btf/vmlinux format c &gt; vmlinux.h
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -c execsnoop.bpf.c -o execsnoop.bpf.o
+bpftool gen skeleton execsnoop.bpf.o &gt; execsnoop.skel.h
+cc -g -O2 -Wall execsnoop.c -lbpf -lelf -lz -o execsnoop
+
+sudo ./execsnoop            # all execs
+sudo ./execsnoop 1977       # only children of PID 1977 (.rodata filter)</code></pre>
+      <p>Output captured in the sandbox (trimmed):</p>
+      <pre><code class="language-plaintext">PID      PPID     COMM             FILENAME
+14922    1977     git              /opt/git/bin/git
+14927    1977     bash             /usr/bin/bash
+14929    14928    id               /usr/bin/id
+14928    14927    sudo             /usr/bin/sudo
+14931    14930    grep             /usr/bin/grep
+14932    14930    head             /usr/bin/head
+dropped: 0</code></pre></div>
+    </div>
+    <p>Three things are worth noticing. First, the event struct is about 170 bytes; with
+      reserve/submit it never touches the 512-byte stack. Second, <code>comm</code> is already the
+      <em>new</em> program's name because <code>sched_process_exec</code> fires after the kernel has
+      updated it. Third, the user side never calls <code>bpf()</code> to read events: after
+      <code>ring_buffer__new()</code> mmaps the ring, every record is read straight from shared
+      memory. For the build workflow and skeletons in depth, see
+      <a href="06-btf-core-libbpf.html">chapter 06</a>; for a template project, see
+      <a href="11-starter-templates.html">chapter 11</a>.</p>
+
+    <div class="callout tip"><span class="label">Choosing</span><p>Use the ring buffer for new code
+      on 5.8+ kernels. Keep the perf buffer only if you must support older kernels, or if you need
+      its per-sample <code>lost_cb</code> (the ring buffer has none; count drops in a global as above).
+      For extreme rates you can still shard: put several ring buffers in an
+      <code>ARRAY_OF_MAPS</code> or <code>HASH_OF_MAPS</code> and pick one by CPU or by hashed TGID,
+      as <code>ringbuf.rst</code> suggests. libbpf's <code>ring_buffer__add()</code> lets one consumer
+      poll all of them.</p></div>
+
+    <h3>The other direction: user ring buffer</h3>
+    <p><code>BPF_MAP_TYPE_USER_RINGBUF</code> (6.1) reverses the roles: user space produces with
+      libbpf's <code>user_ring_buffer__reserve()</code>/<code>__submit()</code>, and a BPF program
+      drains it with <code>bpf_user_ringbuf_drain(&amp;map, callback, ctx, flags)</code>, which calls
+      a BPF callback once per sample. In the mapping, only the consumer-position page is read-only for
+      user space, the reverse of the kernel-producer layout. The kernel must "carefully check and
+      validate each sample", as the comments in <code>ringbuf.c</code> put it.</p>
+
+    <h2>Helpers: the stable kernel API</h2>
+
+    <h3>What a helper is</h3>
+    <p>A helper is a kernel C function with at most five 64-bit arguments that a program calls with
+      <code>call imm</code>, where <code>imm</code> is a number from <code>enum bpf_func_id</code>
+      (<code>BPF_FUNC_map_lookup_elem</code> = 1, and so on). The arguments go in R1–R5 and the result
+      comes back in R0, the calling convention of <a href="02-ebpf-isa-and-vm.html">chapter 02</a>.
+      In C you call it through a function-pointer constant that libbpf generates in
+      <code>bpf_helper_defs.h</code>, for example
+      <code>static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;</code>.</p>
+    <p>Each helper has a <code>struct bpf_func_proto</code> that tells the verifier the argument
+      types (pointer to map, pointer to readable memory of the size in the next argument, constant,
+      context pointer, ...), the return type and whether it is GPL-only. Each program type has a
+      <code>get_func_proto()</code> callback that decides which helpers it may call. That is why
+      <code>bpf_skb_store_bytes()</code> exists for tc programs but not for kprobes, and
+      <code>bpf_probe_read_kernel()</code> exists for tracing but not for socket filters. Here is the
+      whole of one helper:</p>
+    <pre data-file="linux/kernel/bpf/helpers.c"><code class="language-c">BPF_CALL_0(bpf_get_current_pid_tgid)
+{
+	struct task_struct *task = current;
+
+	if (unlikely(!task))
+		return -EINVAL;
+
+	return (u64) task-&gt;tgid &lt;&lt; 32 | task-&gt;pid;
+}
+
+const struct bpf_func_proto bpf_get_current_pid_tgid_proto = {
+	.func		= bpf_get_current_pid_tgid,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+};</code></pre>
+    <p>Note the naming trap: the kernel's <code>task-&gt;pid</code> is what user space calls a
+      <em>thread ID</em>, and <code>tgid</code> is what user space calls the <em>process ID</em>. So
+      <code>bpf_get_current_pid_tgid() &gt;&gt; 32</code> is the PID that <code>ps</code> shows, and the
+      low 32 bits are the TID. Both are in the initial PID namespace; inside containers use
+      <code>bpf_get_ns_current_pid_tgid()</code>.</p>
+
+    <h3>A few helpers you will use constantly</h3>
+    <ul>
+      <li><strong>Map access</strong>: <code>bpf_map_lookup_elem</code>, <code>bpf_map_update_elem</code>,
+        <code>bpf_map_delete_elem</code>, plus <code>push/pop/peek</code> for queues and
+        <code>bpf_for_each_map_elem</code> (5.13) to iterate with a callback.</li>
+      <li><strong>Context</strong>: <code>bpf_get_current_pid_tgid</code> (4.2),
+        <code>bpf_get_current_uid_gid</code>, <code>bpf_get_current_comm</code>,
+        <code>bpf_get_current_task</code> and <code>bpf_get_current_task_btf</code> (5.11, returns a
+        BTF-typed pointer the verifier lets you dereference directly), <code>bpf_ktime_get_ns</code>,
+        <code>bpf_get_smp_processor_id</code>.</li>
+      <li><strong>Memory reads</strong>: <code>bpf_probe_read_kernel</code> and
+        <code>bpf_probe_read_user</code> (and their <code>_str</code> variants), split out of the older
+        <code>bpf_probe_read</code> in 5.5 so that kernel and user address spaces are never confused.
+        They "safely attempt to read" an arbitrary address: a fault returns an error instead of
+        oopsing. They are GPL-only. CO-RE's <code>BPF_CORE_READ()</code> macro expands to these calls
+        with relocatable field offsets (<a href="06-btf-core-libbpf.html">chapter 06</a>).</li>
+      <li><strong>Output</strong>: <code>bpf_ringbuf_*</code>, <code>bpf_perf_event_output</code>,
+        <code>bpf_trace_printk</code> (debug only; it writes to the shared trace pipe).</li>
+      <li><strong>Control flow</strong>: <code>bpf_tail_call</code>, <code>bpf_loop</code> (5.17).</li>
+    </ul>
+
+    <h3>Why helpers are frozen</h3>
+    <p>The kernel's <a href="https://docs.kernel.org/bpf/bpf_design_QA.html">BPF design Q&amp;A</a>
+      states that BPF has a stable ABI: "BPF instructions, arguments to BPF programs, set of helper
+      functions and their arguments, recognized return codes are all part of ABI". A helper, once
+      merged, can never change its signature or semantics, and its number is reserved forever. That
+      promise makes every new helper expensive, because a mistake stays forever. So the same document
+      adds: "New BPF functionality is generally added through the use of kfuncs instead of new
+      helpers." LWN's summary of Alexei Starovoitov's 2024 LSFMM+BPF talk counted 211 helpers and 164
+      kfuncs at the time (<a href="https://lwn.net/Articles/977013/">LWN</a>). The helper list has
+      barely grown since, and nearly all new kernel interfaces arrive as kfuncs.</p>
+
+    <h2>kfuncs: kernel functions exposed through BTF</h2>
+
+    <h3>What and why</h3>
+    <p>Linux 5.13 let BPF programs call kernel functions directly (<a href="https://lwn.net/Articles/856005/">LWN, "Calling kernel functions from BPF"</a>).
+      The first users were BPF TCP congestion-control algorithms, which wanted to reuse helpers such
+      as <code>tcp_cong_avoid_ai()</code> that in-kernel algorithms already call. Instead of a helper
+      number, a kfunc is identified by its BTF ID in the kernel's (or a module's) BTF. The verifier
+      reads the function's BTF prototype to type-check arguments, so no hand-written
+      <code>bpf_func_proto</code> is needed. A kfunc is an ordinary C function, often a thin wrapper,
+      that a subsystem chooses to expose. Kernel modules can register kfuncs too, which they cannot do
+      with helpers.</p>
+    <p>The price is stability. The <a href="https://docs.kernel.org/bpf/kfuncs.html">kfunc documentation</a>
+      is explicit: kfuncs "do not have a stable interface and can change from one kernel release to
+      another". Their lifecycle is compared to <code>EXPORT_SYMBOL_GPL</code>. Maintainers weigh how
+      widely a kfunc is used, and a <code>KF_DEPRECATED</code> flag announces a planned removal. Even
+      so, "a kfunc will never have any hard stability guarantees".</p>
+
+    <h3>Calling a kfunc from BPF</h3>
+    <p>On the BPF side you declare the function <code>extern</code> with the <code>__ksym</code>
+      attribute (<code>__attribute__((section(".ksyms")))</code>) and call it. libbpf resolves the name
+      against the running kernel's BTF at load time and emits a <code>call</code> instruction with
+      <code>src_reg = BPF_PSEUDO_KFUNC_CALL</code> and the BTF ID as immediate. Declare a kfunc
+      <code>__weak</code> and test it with <code>bpf_ksym_exists()</code> to load on kernels that lack
+      it; the verifier removes the dead branch. Recent <code>vmlinux.h</code> files generated by
+      bpftool can include kfunc prototypes themselves, which is why some selftests define
+      <code>BPF_NO_KFUNC_PROTOTYPES</code>.</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/task_kfunc_common.h"><code class="language-c">struct __tasks_kfunc_map_value {
+	struct task_struct __kptr * task;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, int);
+	__type(value, struct __tasks_kfunc_map_value);
+	__uint(max_entries, 1);
+} __tasks_kfunc_map SEC(".maps");
+
+/* ... */
+
+struct task_struct *bpf_task_acquire(struct task_struct *p) __ksym;
+void bpf_task_release(struct task_struct *p) __ksym;
+struct task_struct *bpf_task_from_pid(s32 pid) __ksym;
+/* ... */
+
+static inline int tasks_kfunc_map_insert(struct task_struct *p)
+{
+	struct __tasks_kfunc_map_value local, *v;
+	long status;
+	struct task_struct *acquired, *old;
+	s32 pid;
+
+	status = bpf_probe_read_kernel(&amp;pid, sizeof(pid), &amp;p-&gt;pid);
+	if (status)
+		return status;
+
+	local.task = NULL;
+	status = bpf_map_update_elem(&amp;__tasks_kfunc_map, &amp;pid, &amp;local, BPF_NOEXIST);
+	if (status)
+		return status;
+
+	v = bpf_map_lookup_elem(&amp;__tasks_kfunc_map, &amp;pid);
+	if (!v) {
+		bpf_map_delete_elem(&amp;__tasks_kfunc_map, &amp;pid);
+		return -ENOENT;
+	}
+
+	acquired = bpf_task_acquire(p);
+	if (!acquired)
+		return -ENOENT;
+
+	old = bpf_kptr_xchg(&amp;v-&gt;task, acquired);
+	if (old) {
+		bpf_task_release(old);
+		return -EEXIST;
+	}
+
+	return 0;
+}</code></pre>
+    <p>This one function uses every concept in the chapter so far: a hash map, three map helpers,
+      <code>bpf_probe_read_kernel()</code>, two kfuncs and a <em>kptr</em>. The map value contains a
+      field tagged <code>__kptr</code>, a referenced kernel pointer stored in a map. The verifier
+      knows that <code>bpf_task_acquire()</code> returns a reference that must be released. Storing it
+      with <code>bpf_kptr_xchg()</code> (5.19) transfers ownership to the map, and the old value
+      that comes back is a new reference the program must release. The kernel drops references still
+      held in a map when the element or map is freed.</p>
+
+    <h3>Defining a kfunc in the kernel</h3>
+    <p>On the kernel side a kfunc is marked <code>__bpf_kfunc</code> (which stops the compiler from
+      inlining or dropping it), listed in a BTF ID set with per-function flags, and registered for the
+      program types that may call it:</p>
+    <pre data-file="linux/kernel/bpf/helpers.c"><code class="language-c">/**
+ * bpf_task_acquire - Acquire a reference to a task. A task acquired by this
+ * kfunc which is not stored in a map as a kptr, must be released by calling
+ * bpf_task_release().
+ * @p: The task on which a reference is being acquired.
+ */
+__bpf_kfunc struct task_struct *bpf_task_acquire(struct task_struct *p)
+{
+	if (refcount_inc_not_zero(&amp;p-&gt;rcu_users))
+		return p;
+	return NULL;
+}
+
+/**
+ * bpf_task_release - Release the reference acquired on a task.
+ * @p: The task on which a reference is being released.
+ */
+__bpf_kfunc void bpf_task_release(struct task_struct *p)
+{
+	put_task_struct_rcu_user(p);
+}
+
+/* ... */
+
+BTF_KFUNCS_START(generic_btf_ids)
+/* ... */
+BTF_ID_FLAGS(func, bpf_task_acquire, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_task_release, KF_RELEASE)
+/* ... */
+BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_task_from_vpid, KF_ACQUIRE | KF_RET_NULL)
+/* ... */
+
+static const struct btf_kfunc_id_set generic_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &amp;generic_btf_ids,
+};
+
+/* ... */
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &amp;generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &amp;generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &amp;generic_kfunc_set);</code></pre>
+    <p>At kernel build time the <code>resolve_btfids</code> tool fills in the BTF IDs of the set and
+      tags each kfunc in BTF with a <code>bpf_kfunc</code> declaration tag. That is how bpftool can
+      list them.</p>
+
+    <h3>The flags: how the verifier learns ownership</h3>
+    <p>The BTF prototype says what types the arguments are. The flags, defined in
+      <code>include/linux/btf.h</code>, say what the function <em>does</em> with them:</p>
+    <table>
+      <thead><tr><th>Flag</th><th>Meaning to the verifier</th></tr></thead>
+      <tbody>
+        <tr><td><code>KF_ACQUIRE</code></td><td>Returns a refcounted pointer. The program must pass it to a <code>KF_RELEASE</code> kfunc or move it into a map with <code>bpf_kptr_xchg()</code> on every path, or loading fails.</td></tr>
+        <tr><td><code>KF_RELEASE</code></td><td>Releases the referenced pointer passed in. All copies of that pointer become invalid afterwards.</td></tr>
+        <tr><td><code>KF_RET_NULL</code></td><td>The return value may be NULL; the program must check before use. Often paired with <code>KF_ACQUIRE</code>.</td></tr>
+        <tr><td><code>KF_RCU</code></td><td>Accepts RCU-protected pointers as well as trusted ones (opts out of the default trusted-argument rule).</td></tr>
+        <tr><td><code>KF_SLEEPABLE</code></td><td>May sleep; only callable from sleepable programs.</td></tr>
+        <tr><td><code>KF_DESTRUCTIVE</code></td><td>Can crash or reboot the system (for example <code>crash_kexec</code>); requires <code>CAP_SYS_BOOT</code>.</td></tr>
+        <tr><td><code>KF_RCU_PROTECTED</code></td><td>Must be called inside an RCU read-side section.</td></tr>
+        <tr><td><code>KF_ITER_NEW / NEXT / DESTROY</code></td><td>Constructor, step and destructor of an open-coded iterator.</td></tr>
+        <tr><td><code>KF_DEPRECATED</code></td><td>Scheduled for change or removal.</td></tr>
+      </tbody>
+    </table>
+    <p>Two refinements are recent. First, the current documentation says "All kfuncs now require
+      trusted arguments by default": a pointer argument must come straight from a hook argument or an
+      acquire kfunc, not from walking another pointer. The old opt-in <code>KF_TRUSTED_ARGS</code>
+      flag no longer exists in <code>btf.h</code>. Second, newer flags such as
+      <code>KF_FASTCALL</code>, <code>KF_IMPLICIT_ARGS</code>, <code>KF_SPINLOCK_SAFE</code> and
+      <code>KF_PERFMON</code> have appeared. If you read older articles that mention
+      <code>KF_TRUSTED_ARGS</code>, that is the reason. Arguments can also be annotated by name
+      suffix: <code>__sz</code> (this scalar is the size of the previous pointer), <code>__k</code>
+      (must be a constant), <code>__nullable</code>, <code>__str</code>, <code>__map</code> and
+      others.</p>
+    <p>Acquire/release is what lets BPF safely hold kernel objects. The selftest below runs on the
+      <code>task_newtask</code> BTF tracepoint, whose <code>task</code> argument is trusted, so it may
+      be passed to <code>bpf_task_acquire()</code>:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/task_kfunc_success.c"><code class="language-c">static int test_acquire_release(struct task_struct *task)
+{
+	struct task_struct *acquired = NULL;
+
+	if (!bpf_ksym_exists(bpf_task_acquire)) {
+		err = 3;
+		return 0;
+	}
+	/* ... */
+	acquired = bpf_task_acquire(task);
+	if (acquired)
+		bpf_task_release(acquired);
+	else
+		err = 6;
+	/* ... */
+}
+
+SEC("tp_btf/task_newtask")
+int BPF_PROG(test_task_acquire_release_argument, struct task_struct *task, u64 clone_flags)
+{
+	if (!is_test_kfunc_task())
+		return 0;
+
+	return test_acquire_release(task);
+}</code></pre>
+
+    <figure>
+      <svg viewBox="0 0 820 300" role="img" aria-label="Comparison of how a helper call and a kfunc call are resolved and checked">
+        <defs>
+          <marker id="a43" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+        </defs>
+        <text x="200" y="26" text-anchor="middle" fill="var(--fg)" font-size="15" font-weight="bold">Helper call</text>
+        <text x="620" y="26" text-anchor="middle" fill="var(--fg)" font-size="15" font-weight="bold">kfunc call</text>
+        <line x1="410" y1="10" x2="410" y2="290" stroke="var(--border)"/>
+        <rect x="40" y="44" width="320" height="40" rx="6" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="200" y="69" text-anchor="middle" fill="var(--fg)" font-size="12">call 14   (BPF_FUNC_get_current_pid_tgid)</text>
+        <rect x="40" y="108" width="320" height="40" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="200" y="126" text-anchor="middle" fill="var(--fg)" font-size="12">prog type's get_func_proto(14)</text>
+        <text x="200" y="141" text-anchor="middle" fill="var(--muted)" font-size="11">allowed here?</text>
+        <rect x="40" y="172" width="320" height="40" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="200" y="190" text-anchor="middle" fill="var(--fg)" font-size="12">hand-written bpf_func_proto</text>
+        <text x="200" y="205" text-anchor="middle" fill="var(--muted)" font-size="11">ARG_PTR_TO_MAP_KEY, RET_INTEGER …</text>
+        <rect x="40" y="236" width="320" height="40" rx="6" fill="none" stroke="var(--accent)"/>
+        <text x="200" y="261" text-anchor="middle" fill="var(--fg)" font-size="12">Stable ABI · number reserved forever</text>
+        <line x1="200" y1="84" x2="200" y2="106" stroke="var(--fg)" marker-end="url(#a43)"/>
+        <line x1="200" y1="148" x2="200" y2="170" stroke="var(--fg)" marker-end="url(#a43)"/>
+        <line x1="200" y1="212" x2="200" y2="234" stroke="var(--fg)" marker-end="url(#a43)"/>
+        <rect x="460" y="44" width="320" height="40" rx="6" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="620" y="62" text-anchor="middle" fill="var(--fg)" font-size="12">call (src=PSEUDO_KFUNC_CALL) imm=BTF id</text>
+        <text x="620" y="77" text-anchor="middle" fill="var(--muted)" font-size="11">libbpf resolved "bpf_task_acquire" via __ksym</text>
+        <rect x="460" y="108" width="320" height="40" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="620" y="126" text-anchor="middle" fill="var(--fg)" font-size="12">kfunc id set registered for this prog type?</text>
+        <text x="620" y="141" text-anchor="middle" fill="var(--muted)" font-size="11">register_btf_kfunc_id_set()</text>
+        <rect x="460" y="172" width="320" height="40" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="620" y="190" text-anchor="middle" fill="var(--fg)" font-size="12">BTF prototype + KF_* flags</text>
+        <text x="620" y="205" text-anchor="middle" fill="var(--muted)" font-size="11">types, trusted args, acquire/release</text>
+        <rect x="460" y="236" width="320" height="40" rx="6" fill="none" stroke="var(--accent2)" stroke-dasharray="5 3"/>
+        <text x="620" y="261" text-anchor="middle" fill="var(--fg)" font-size="12">No stability promise · like EXPORT_SYMBOL_GPL</text>
+        <line x1="620" y1="84" x2="620" y2="106" stroke="var(--fg)" marker-end="url(#a43)"/>
+        <line x1="620" y1="148" x2="620" y2="170" stroke="var(--fg)" marker-end="url(#a43)"/>
+        <line x1="620" y1="212" x2="620" y2="234" stroke="var(--fg)" marker-end="url(#a43)"/>
+      </svg>
+      <figcaption>Figure 04.3 — How the verifier handles a helper call versus a kfunc call. Helpers are
+        numbered and described by hand-written prototypes. kfuncs are found by BTF ID, typed from BTF
+        and annotated with flags.</figcaption>
+    </figure>
+
+    <h2>BPF-to-BPF calls</h2>
+    <p>Before 4.16 every function in a BPF program had to be <code>__always_inline</code>. BPF-to-BPF
+      calls added a real <code>call</code> to another function inside the same program
+      (<code>src_reg = BPF_PSEUDO_CALL</code>, immediate = relative instruction offset). The callee
+      gets its own stack frame; R1–R5 carry arguments, R0 the result, and R6–R9 are preserved, as in
+      <a href="02-ebpf-isa-and-vm.html">chapter 02</a>. The verifier enforces a maximum call depth
+      (<code>MAX_CALL_FRAMES</code>, currently 16 in <code>include/linux/bpf_verifier.h</code>; older
+      kernels and documentation say 8) and a combined stack limit over the whole call chain.</p>
+    <p>C linkage decides how a subprogram is verified:</p>
+    <ul>
+      <li><strong>Static</strong> functions (<code>static __noinline</code>) are verified <em>in the context
+        of each call site</em>, with the caller's exact register state. This is precise, but the
+        function is re-verified at every call.</li>
+      <li><strong>Global</strong> functions (non-static) are verified <em>once</em>, on their own,
+        assuming only what their BTF prototype says about the arguments. That saves verification work
+        and allows separately loaded code (<code>freplace</code>) to replace them. The cost is that
+        the body must cope with any argument value: a pointer argument may be NULL unless it is
+        annotated (for example <code>__arg_nonnull</code>).</li>
+    </ul>
+    <p>Callbacks build on the same machinery. <code>bpf_loop()</code>, <code>bpf_for_each_map_elem()</code>,
+      <code>bpf_timer_set_callback()</code> and <code>bpf_user_ringbuf_drain()</code> all take a
+      pointer to a static BPF function, which the verifier checks as a subprogram.</p>
+
+    <h2>Tail calls</h2>
+    <p>A tail call, available since 4.2, is a <em>jump</em> into another program. The caller's frame
+      is reused, so nothing comes back. <code>bpf_tail_call(ctx, &amp;prog_array, index)</code> looks
+      up a program in a <code>BPF_MAP_TYPE_PROG_ARRAY</code> and, if found, starts executing it with
+      the same context. If the slot is empty, the call does nothing and the caller continues with the
+      next instruction. The uapi documentation explains the two original motivations: "raising the
+      maximum number of available eBPF instructions" (each program is verified separately) and
+      executing "given programs in conditional blocks". Cilium, for example, uses tail calls to split
+      its datapath into stages. To bound the run time, a chain may perform at most
+      <code>MAX_TAIL_CALL_CNT</code> = 33 tail calls.</p>
+    <p>Because the prog array is a map, user space can replace a program at runtime by updating
+      one slot, which is how some tools hot-swap parsing logic without detaching. The JIT turns a
+      call with a constant index into a direct jump that is patched when the slot changes; libbpf's
+      <code>bpf_tail_call_static()</code> forces the index to stay a constant in the generated code.
+      The kernel selftest:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/tailcall1.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(max_entries, 3);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+} jmp_table SEC(".maps");
+
+#define TAIL_FUNC(x) 				\
+	SEC("tc")				\
+	int classifier_##x(struct __sk_buff *skb)	\
+	{					\
+		return x;			\
+	}
+TAIL_FUNC(0)
+TAIL_FUNC(1)
+TAIL_FUNC(2)
+
+SEC("tc")
+int entry(struct __sk_buff *skb)
+{
+	/* Multiple locations to make sure we patch
+	 * all of them.
+	 */
+	bpf_tail_call_static(skb, &amp;jmp_table, 0);
+	/* ... */
+	bpf_tail_call_static(skb, &amp;jmp_table, 1);
+	/* ... */
+	bpf_tail_call_static(skb, &amp;jmp_table, 2);
+	/* ... */
+	return 3;
+}</code></pre>
+    <p>Mixing tail calls with BPF-to-BPF calls was not allowed at first. It became possible on x86-64
+      in 5.10, arm64 in 6.0, s390 in 6.3 and LoongArch in 6.4. When a subprogram performs a tail call,
+      the verifier caps the stack of the frames above it: it rejects the program with "tail_calls are
+      not allowed when call stack of previous frames is N bytes. Too large" once that stack reaches 256
+      bytes. The reason is that each tail call in a nested frame can leave the caller's frames on the
+      stack.</p>
+
+    <h2>Concurrency: atomics, per-CPU data and spin locks</h2>
+    <p>The same program runs on many CPUs at once, and user space can update maps concurrently. In
+      order of preference, your tools are:</p>
+    <ol>
+      <li><strong>Per-CPU maps</strong>: no sharing, no synchronisation, merge in user space.</li>
+      <li><strong>Atomic instructions</strong>: <code>__sync_fetch_and_add</code> and friends compile
+        to BPF atomic ops (add, and, or, xor, xchg, cmpxchg). Fine for single counters.</li>
+      <li><strong><code>struct bpf_spin_lock</code></strong> (5.1): for updating several fields of one
+        map value together. See LWN's <a href="https://lwn.net/Articles/779120">"Concurrency management in BPF"</a>.</li>
+    </ol>
+    <p>The lock lives inside the map value and is taken with <code>bpf_spin_lock(&amp;val-&gt;lock)</code>.
+      The verifier enforces the rules listed in the helper's uapi documentation: a map value may hold
+      one lock, a program may hold one lock at a time, every path must unlock before returning, BTF for
+      the value is mandatory, and the lock field cannot be read or written directly. User space
+      participates through <code>BPF_F_LOCK</code> on lookup and update; a plain syscall lookup does
+      not copy the lock field. The selftest implements a small token-bucket "virtual queue":</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/test_spin_lock.c"><code class="language-c">struct bpf_vqueue {
+	struct bpf_spin_lock lock;
+	/* 4 byte hole */
+	unsigned long long lasttime;
+	int credit;
+	unsigned int rate;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct bpf_vqueue);
+} vqueue SEC(".maps");
+
+#define CREDIT_PER_NS(delta, rate) (((delta) * rate) &gt;&gt; 20)
+
+SEC("cgroup_skb/ingress")
+int bpf_spin_lock_test(struct __sk_buff *skb)
+{
+	/* ... */
+	q = bpf_map_lookup_elem(&amp;vqueue, &amp;key);
+	if (!q)
+		goto err;
+	curtime = bpf_ktime_get_ns();
+	bpf_spin_lock(&amp;q-&gt;lock);
+	q-&gt;credit += CREDIT_PER_NS(curtime - q-&gt;lasttime, q-&gt;rate);
+	q-&gt;lasttime = curtime;
+	if (q-&gt;credit &gt; max_credit)
+		q-&gt;credit = max_credit;
+	q-&gt;credit -= pkt_len;
+	credit = q-&gt;credit;
+	bpf_spin_unlock(&amp;q-&gt;lock);
+	/* ... */
+}
+
+struct bpf_spin_lock lockA __hidden SEC(".data.A");</code></pre>
+    <p>The last line shows a newer capability: a global lock in its own data section, added with the
+      allocated-objects work (<a href="https://lwn.net/Articles/914833">LWN</a>) so that a lock can
+      protect BPF linked lists and red-black trees. The rules have also relaxed. The uapi text still
+      says no calls are allowed under a lock, but the current selftests accept calls to static
+      subprograms while holding one (<code>lock_static_subprog_call</code> in the same file) and
+      reject only global function calls, with "global function calls are not allowed while holding a
+      lock". As always, the verifier of your target kernel has the final word.</p>
+
+    <h2>Timers</h2>
+    <p>Programs run only when an event fires. Some jobs need work <em>later</em>: expire an idle flow,
+      re-arm a watchdog, poll something periodically. <code>struct bpf_timer</code> (5.15) is a field
+      inside a map value, like a spin lock. The API is <code>bpf_timer_init(timer, map, clockid)</code>
+      (<code>CLOCK_MONOTONIC</code>, <code>CLOCK_REALTIME</code> or <code>CLOCK_BOOTTIME</code>),
+      <code>bpf_timer_set_callback(timer, fn)</code>, <code>bpf_timer_start(timer, nsecs, flags)</code>
+      and <code>bpf_timer_cancel(timer)</code>. The callback is a static BPF function that receives the
+      map, the key and the timer, and it can re-arm itself. Timers belong to the map. When the map
+      loses its last user-space reference (all fds closed and no pin), the kernel cancels and frees its
+      timers, and <code>bpf_timer_init()</code> returns <code>-EPERM</code> on a map that user space no
+      longer holds.</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/timer.c"><code class="language-c">struct elem {
+	struct bpf_timer t;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, int);
+	__type(value, struct elem);
+} array SEC(".maps");
+
+/* ... */
+
+/* callback for array and lru timers */
+static int timer_cb1(void *map, int *key, struct bpf_timer *timer)
+{
+	/* increment bss variable twice.
+	 * Once via array timer callback and once via lru timer callback
+	 */
+	bss_data += 5;
+
+	/* *key == 0 - the callback was called for array timer.
+	 * *key == 4 - the callback was called from lru timer.
+	 */
+	if (*key == ARRAY) {
+		struct bpf_timer *lru_timer;
+		int lru_key = LRU;
+
+		/* rearm array timer to be called again in ~35 seconds */
+		if (bpf_timer_start(timer, 1ull &lt;&lt; 35, 0) != 0)
+			err |= 1;
+		/* ... */
+	}
+	/* ... */
+}
+
+SEC("fentry/bpf_fentry_test1")
+int BPF_PROG2(test1, int, a)
+{
+	struct bpf_timer *arr_timer, *lru_timer;
+	struct elem init = {};
+	int lru_key = LRU;
+	int array_key = ARRAY;
+
+	arr_timer = bpf_map_lookup_elem(&amp;array, &amp;array_key);
+	if (!arr_timer)
+		return 0;
+	bpf_timer_init(arr_timer, &amp;array, CLOCK_MONOTONIC);
+	/* ... */
+	bpf_timer_set_callback(arr_timer, timer_cb1);
+	bpf_timer_start(arr_timer, 0 /* call timer_cb1 asap */, 0);
+	/* ... */
+	return 0;
+}</code></pre>
+    <p>Related deferred-work primitives have since been added as kfuncs, such as BPF workqueues
+      (<code>bpf_wq_*</code>) and task work (<code>bpf_task_work_schedule_*</code>), both mentioned in
+      <code>kfuncs.rst</code>. They follow the same pattern: an opaque struct embedded in a map value.</p>
+
+    <h2>How the code is organised</h2>
+    <p>If you want to read the implementation, these are the places to start in the Linux tree:</p>
+    <div class="grid">
+      <div class="card"><h4><code>include/uapi/linux/bpf.h</code></h4><p>The ABI: <code>enum bpf_map_type</code>, map flags, syscall commands, and the documentation comment for every helper (the source of the <code>bpf-helpers(7)</code> man page).</p></div>
+      <div class="card"><h4><code>kernel/bpf/syscall.c</code></h4><p><code>BPF_MAP_CREATE</code>, lookup/update/delete, batch ops, freeze, map fd and ID handling.</p></div>
+      <div class="card"><h4><code>kernel/bpf/{hashtab,arraymap,lpm_trie,stackmap,queue_stack_maps,bloom_filter}.c</code></h4><p>Generic map implementations behind <code>struct bpf_map_ops</code>.</p></div>
+      <div class="card"><h4><code>kernel/bpf/ringbuf.c</code></h4><p>Kernel and user ring buffers: allocation, reserve/commit, mmap permissions, notifications.</p></div>
+      <div class="card"><h4><code>kernel/bpf/bpf_local_storage.c</code>, <code>bpf_task_storage.c</code>, <code>bpf_inode_storage.c</code>, <code>bpf_cgrp_storage.c</code>, <code>net/core/bpf_sk_storage.c</code></h4><p>Object-attached storage.</p></div>
+      <div class="card"><h4><code>kernel/bpf/arena.c</code></h4><p>The arena map and its page allocation kfuncs.</p></div>
+      <div class="card"><h4><code>kernel/bpf/helpers.c</code></h4><p>Generic helpers (<code>bpf_get_current_pid_tgid</code>, spin locks, timers) and many generic kfuncs with their <code>BTF_ID_FLAGS</code> sets.</p></div>
+      <div class="card"><h4><code>kernel/bpf/inode.c</code></h4><p>The BPF file system (<code>/sys/fs/bpf</code>) and pinning.</p></div>
+      <div class="card"><h4><code>kernel/bpf/verifier.c</code></h4><p>Map pointer checks, helper and kfunc argument checks, reference tracking, call frames, tail-call rules.</p></div>
+      <div class="card"><h4><code>tools/lib/bpf/</code></h4><p>libbpf: BTF-defined map parsing, global data maps, pinning, <code>ringbuf.c</code> consumer, <code>bpf_helpers.h</code>.</p></div>
+      <div class="card"><h4><code>tools/testing/selftests/bpf/</code></h4><p><code>progs/</code> holds BPF programs, <code>prog_tests/</code> their user-space drivers, <code>benchs/</code> the ring buffer benchmarks.</p></div>
+      <div class="card"><h4><code>Documentation/bpf/</code></h4><p><code>maps.rst</code>, <code>map_*.rst</code>, <code>ringbuf.rst</code>, <code>kfuncs.rst</code>, <code>bpf_design_QA.rst</code>.</p></div>
+    </div>
+
+    <h2>Benefits and limitations</h2>
+    <h3>What this design gets right</h3>
+    <ul>
+      <li><strong>Safety by typing.</strong> Every way out of the sandbox (map access, helper, kfunc,
+        call) has a signature the verifier checks. Ownership of ring buffer records and kernel objects
+        is tracked statically, so leaks are load-time errors, not production incidents.</li>
+      <li><strong>Lifetimes via file descriptors.</strong> Maps and programs are ordinary kernel
+        objects with refcounts, fds, IDs and bpffs paths, so standard tools (<code>bpftool</code>,
+        <code>ls /sys/fs/bpf</code>) can inspect them.</li>
+      <li><strong>Zero-copy paths.</strong> mmap-able arrays, globals, ring buffers and arenas let user
+        space and programs share memory with no syscalls in the hot path.</li>
+      <li><strong>Evolvability.</strong> The stable helper set keeps old programs running. kfuncs let
+        subsystems, including modules, add capabilities without committing to them forever.</li>
+    </ul>
+    <h3>Where it hurts</h3>
+    <ul>
+      <li><strong>Fixed sizes.</strong> Most maps are sized at creation. Full hash maps fail inserts,
+        and an LRU evicts silently. (The new resizable hash addresses part of this.)</li>
+      <li><strong>Feature skew.</strong> The table above spans 3.19 to 6.9 and later. Portable tools
+        must probe for features (<code>bpftool feature probe</code>, <code>libbpf_probe_bpf_map_type()</code>)
+        and have fallbacks, for example perf buffer when ring buffer is missing.</li>
+      <li><strong>kfunc churn.</strong> A program using kfuncs may fail to load on the next kernel.
+        The kfunc docs ask users to make their use cases known upstream.</li>
+      <li><strong>Limited synchronisation.</strong> One spin lock at a time, no sleeping locks in
+        non-sleepable programs, and user space can only join in through <code>BPF_F_LOCK</code>.</li>
+      <li><strong>Data structures.</strong> Maps are not general data structures. Arenas, BPF linked
+        lists and red-black trees fill the gap but are new, and their APIs are kfuncs and therefore
+        unstable.</li>
+      <li><strong>Ring buffer caveats.</strong> A single slow producer holds back all records reserved
+        after it. Reservation can fail under NMI contention. Reserve sizes must be constants. There is
+        no built-in lost-sample count.</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>Userspace eBPF runtimes</strong> must re-create maps outside the kernel.
+        bpftime (<a href="14-bpftime-architecture.html">chapter 14</a>) implements shared-memory maps
+        that kernel-style programs in different processes, and the kernel itself, can share.</li>
+      <li><strong>eBPF for Windows</strong> and other platforms implement a compatible subset of map
+        types and helper IDs; see <a href="08-ecosystem.html">chapter 08</a>.</li>
+      <li><strong>Higher-level frontends</strong> hide maps behind language constructs: bpftrace's
+        <code>@counts[comm] = count()</code> becomes a per-CPU hash, and bcc's
+        <code>BPF_HASH</code>/<code>BPF_PERF_OUTPUT</code> macros wrap the same types
+        (<a href="08-ecosystem.html">chapter 08</a>).</li>
+      <li><strong>Reference documentation.</strong> The community-maintained
+        <a href="https://docs.ebpf.io/linux/map-type/">eBPF Docs</a> site has a page per map type,
+        helper and kfunc with version information. It is a good companion to the kernel's own docs.</li>
+      <li>Program types decide which helpers and kfuncs you can call and which context you get; see
+        <a href="05-program-types-and-hooks.html">chapter 05</a>. The networking-specific maps are in
+        <a href="07-networking-xdp-tc.html">chapter 07</a>.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> A tracing tool must report fork, exec and exit events of
+        short-lived processes in the order they happened. Which output mechanism fits best on a 6.x kernel?</p>
+        <button class="opt">A <code>PERF_EVENT_ARRAY</code> with a large per-CPU buffer</button>
+        <button class="opt" data-right>A single <code>BPF_MAP_TYPE_RINGBUF</code></button>
+        <button class="opt">A <code>PERCPU_HASH</code> keyed by PID, polled by user space</button>
+        <div class="why">The ring buffer is shared by all CPUs and delivers records in reservation order.
+          The perf buffer has one ring per CPU, so events of a process that migrates between CPUs can
+          arrive out of order, which is the motivating example in Nakryiko's post and in <code>ringbuf.rst</code>.</div></div>
+      <div class="q"><p><strong>Q2.</strong> A program calls <code>bpf_ringbuf_reserve()</code>, checks
+        for NULL, and on one branch returns without calling submit or discard. What happens?</p>
+        <button class="opt">The record is submitted automatically when the program exits</button>
+        <button class="opt">The ring buffer slowly leaks space at runtime</button>
+        <button class="opt" data-right>The verifier rejects the program at load time</button>
+        <div class="why">Reserved records are tracked like acquired references. The verifier reports an
+          unreleased reference (on 6.1: <code>Unreleased reference id=3 alloc_insn=28</code>) and refuses to load the program.</div></div>
+      <div class="q"><p><strong>Q3.</strong> What is the main difference in guarantees between a helper
+        and a kfunc?</p>
+        <button class="opt">Helpers are typed through BTF; kfuncs use hand-written prototypes</button>
+        <button class="opt" data-right>Helpers are part of the stable ABI; kfuncs have no stability guarantee</button>
+        <button class="opt">kfuncs can only be called from sleepable programs</button>
+        <div class="why">Per <code>bpf_design_QA.rst</code>, helpers and their arguments are ABI.
+          <code>kfuncs.rst</code> says kfuncs "do not have a stable interface". It is the other way round
+          for typing: kfuncs are typed through BTF. Only kfuncs flagged <code>KF_SLEEPABLE</code> need sleepable programs.</div></div>
+      <div class="q"><p><strong>Q4.</strong> Your loader sets <code>skel-&gt;rodata-&gt;target_ppid</code>
+        before <code>__load()</code>. Why can the verifier remove the filtering branch when the value is 0?</p>
+        <button class="opt" data-right>The <code>.rodata</code> map is frozen and read-only to the program, so its contents are known constants at verification time</button>
+        <button class="opt">Because <code>volatile</code> tells the verifier the value never changes</button>
+        <button class="opt">Because globals are stored on the BPF stack</button>
+        <div class="why">libbpf writes <code>.rodata</code>, freezes the map and marks it
+          <code>BPF_F_RDONLY_PROG</code>. The verifier can then read the value and prune dead branches.
+          <code>volatile</code> only stops the <em>compiler</em> from folding the initial value.</div></div>
+      <div class="q"><p><strong>Q5.</strong> You want per-thread state that disappears automatically when
+        the thread exits, without hooking exit yourself. Which map type?</p>
+        <button class="opt">An <code>LRU_HASH</code> keyed by TID</button>
+        <button class="opt" data-right><code>BPF_MAP_TYPE_TASK_STORAGE</code></button>
+        <button class="opt">A <code>PERCPU_ARRAY</code></button>
+        <div class="why">Task local storage hangs the value off the <code>task_struct</code>, and the
+          kernel frees it when the task is freed. An LRU would evict by pressure, not by lifetime, and
+          TIDs get reused.</div></div>
+      <div class="q"><p><strong>Q6.</strong> What happens when <code>bpf_tail_call()</code> finds an
+        empty slot in the prog array?</p>
+        <button class="opt">The program aborts and returns 0</button>
+        <button class="opt">The verifier rejects the program because the slot might be empty</button>
+        <button class="opt" data-right>The call has no effect and execution continues after it</button>
+        <div class="why">The uapi documentation: "If the call fails, then the helper has no effect, and
+          the caller continues to run its subsequent instructions." It also fails after 33 chained tail
+          calls (<code>MAX_TAIL_CALL_CNT</code>).</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://docs.kernel.org/bpf/maps.html">BPF maps</a> and the per-type pages (<a href="https://docs.kernel.org/bpf/map_hash.html">hash</a>, <a href="https://docs.kernel.org/bpf/map_array.html">array</a>, <a href="https://docs.kernel.org/bpf/map_lpm_trie.html">LPM trie</a>, <a href="https://docs.kernel.org/bpf/map_of_maps.html">map of maps</a>, <a href="https://docs.kernel.org/bpf/map_cgrp_storage.html">cgroup storage</a>), Linux kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/bpf/ringbuf.html">BPF ring buffer</a>, Linux kernel documentation (<code>Documentation/bpf/ringbuf.rst</code>).</li>
+      <li><a href="https://docs.kernel.org/bpf/kfuncs.html">BPF Kernel Functions (kfuncs)</a>, Linux kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/bpf/bpf_design_QA.html">BPF Design Q&amp;A</a> (stable ABI, helpers vs kfuncs, stack size), Linux kernel documentation.</li>
+      <li><a href="https://man7.org/linux/man-pages/man7/bpf-helpers.7.html">bpf-helpers(7)</a> man page, generated from <code>include/uapi/linux/bpf.h</code>.</li>
+      <li>Linux source at commit <a href="https://github.com/torvalds/linux/tree/d68ce4e71248e1ff5af9654b407541d9260b3ba5">d68ce4e7</a>: <a href="https://github.com/torvalds/linux/blob/master/kernel/bpf/ringbuf.c">kernel/bpf/ringbuf.c</a>, <a href="https://github.com/torvalds/linux/blob/master/kernel/bpf/helpers.c">kernel/bpf/helpers.c</a>, <a href="https://github.com/torvalds/linux/blob/master/include/linux/btf.h">include/linux/btf.h</a>, <a href="https://github.com/torvalds/linux/tree/master/tools/testing/selftests/bpf/progs">tools/testing/selftests/bpf/progs/</a>.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-ringbuf/">"BPF ring buffer"</a>, 26 Oct 2020, with the companion repo <a href="https://github.com/anakryiko/bpf-ringbuf-examples">anakryiko/bpf-ringbuf-examples</a>.</li>
+      <li>Andrii Nakryiko, <a href="https://lwn.net/Articles/821456/">"[PATCH v3 bpf-next 0/5] BPF ring buffer"</a>, LWN announcement, May 2020.</li>
+      <li>Jonathan Corbet, <a href="https://lwn.net/Articles/856005/">"Calling kernel functions from BPF"</a>, LWN, 13 May 2021.</li>
+      <li>Jonathan Corbet, <a href="https://lwn.net/Articles/779120">"Concurrency management in BPF"</a>, LWN, 7 Feb 2019.</li>
+      <li>Alexei Starovoitov, <a href="https://lwn.net/Articles/961594/">"[PATCH v2 bpf-next 00/20] bpf: Introduce BPF arena"</a>, LWN announcement, Feb 2024.</li>
+      <li><a href="https://lwn.net/Articles/1019885">"A look at what's possible with BPF arenas"</a>, LWN, 2025 (LSFMM+BPF summit report).</li>
+      <li><a href="https://lwn.net/Articles/977013/">"Modernizing BPF for the next 10 years"</a>, LWN, 2024 (LSFMM+BPF summit report).</li>
+      <li>Andrii Nakryiko, <a href="https://lwn.net/Articles/806328/">"Add code-generated BPF object skeleton support"</a>, LWN announcement, Dec 2019.</li>
+      <li>Kumar Kartikeya Dwivedi, <a href="https://lwn.net/Articles/914833">"Allocated objects, BPF linked lists"</a>, LWN announcement, Nov 2022.</li>
+      <li>Mykyta Yatsenko, <a href="https://lwn.net/Articles/1076648/">"bpf: Introduce resizable hash map"</a>, LWN announcement, Jun 2026.</li>
+      <li>iovisor/bcc, <a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">"BPF Features by Linux Kernel Version"</a>.</li>
+      <li><a href="https://docs.ebpf.io/linux/map-type/">eBPF Docs: map types</a> and <a href="https://docs.ebpf.io/linux/concepts/kfuncs">kfuncs</a>, Isovalent / community.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="03-verifier.html"><small>Previous</small>03 · The verifier</a>
+      <a class="next" href="05-program-types-and-hooks.html"><small>Next</small>05 · Program types and hooks</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
