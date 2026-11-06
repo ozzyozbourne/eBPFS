@@ -37,8 +37,8 @@
 
     <h2>Why this matters</h2>
     <p>Chapter <a href="02-ebpf-isa-and-vm.html">02</a> showed that an eBPF program is a function with
-      eleven 64-bit registers and a small stack (512 bytes, or up to 2 KiB on JITs that support large
-      stacks). Chapter <a href="03-verifier.html">03</a> showed that the verifier proves the function
+      eleven 64-bit registers and a small stack (512 bytes; since v7.4-rc1, up to 2 KiB on JITs that
+      support large stacks). Chapter <a href="03-verifier.html">03</a> showed that the verifier proves the function
       terminates and touches only memory it is allowed to touch. Those two facts leave three problems.</p>
     <ol>
       <li><strong>No memory between runs.</strong> The program is invoked once per packet, system
@@ -214,11 +214,11 @@ fd = bpf(BPF_MAP_CREATE, &amp;attr, sizeof(attr));</code></pre>
       <code>XSKMAP</code>, <code>SOCKMAP</code>/<code>SOCKHASH</code>, <code>REUSEPORT_SOCKARRAY</code>),
       covered in <a href="07-networking-xdp-tc.html">chapter 07</a>; <code>STRUCT_OPS</code>,
       which holds a kernel ops table implemented in BPF (<a href="05-program-types-and-hooks.html">chapter 05</a>);
-      <code>CGROUP_ARRAY</code>; and two recent additions present in mainline as of November 2026:
-      <code>BPF_MAP_TYPE_INSN_ARRAY</code>, which tracks instruction offsets as a program is
-      rewritten and JIT-compiled, and <code>BPF_MAP_TYPE_RHASH</code>, a resizable hash built on the
-      kernel's <code>rhashtable</code> (<a href="https://lwn.net/Articles/1076648/">patch series</a>).
-      I have not verified which release first shipped these two.</p>
+      <code>CGROUP_ARRAY</code>; and two recent additions:
+      <code>BPF_MAP_TYPE_INSN_ARRAY</code> (first in v6.19), which tracks instruction offsets as a program is
+      rewritten and JIT-compiled, and <code>BPF_MAP_TYPE_RHASH</code> (first in v7.2), a resizable hash built on the
+      kernel's <code>rhashtable</code> (<a href="https://lwn.net/Articles/1076648/">patch series</a>). Both versions
+      were checked against <code>include/uapi/linux/bpf.h</code> at the release tags.</p>
 
     <h3>Hash and array: the workhorses</h3>
     <p>The two oldest types behave differently in ways that matter. An <strong>array</strong> has
@@ -264,7 +264,9 @@ fd = bpf(BPF_MAP_CREATE, &amp;attr, sizeof(attr));</code></pre>
       <code>struct bpf_lpm_trie_key_u8</code> header with a 32-bit <code>prefixlen</code>, followed by
       the address bytes in network byte order. To look up an address, set <code>prefixlen</code> to the
       maximum (32 for IPv4, 128 for IPv6). The map must be created with
-      <code>BPF_F_NO_PREALLOC</code>; prefix lengths are multiples of 8 from 8 to 2048.</p>
+      <code>BPF_F_NO_PREALLOC</code>. The <em>maximum</em> prefix length, which fixes the size of the address part of
+      the key, must be a multiple of 8 from 8 to 2048 bits; individual entries can use any prefix length up to that
+      maximum (a /19 route is fine).</p>
 
     <h3>Stack trace maps</h3>
     <p>Profilers need to record "where was the CPU" thousands of times per second. Storing full
@@ -691,8 +693,22 @@ Unreleased reference id=3 alloc_insn=28</code></pre>
       is useful for such heuristics and for monitoring.</p>
     <p>Mainline also has a newer <code>BPF_F_RB_OVERWRITE</code> map flag. In that mode a full ring
       overwrites the oldest records instead of failing reservations, which is useful for
-      "flight recorder" diagnostics. It was posted to bpf-next in August 2025; I have not verified
-      which release first shipped it.</p>
+      "flight recorder" diagnostics. It was posted to bpf-next in August 2025 and first shipped in v6.19
+      (checked against <code>include/uapi/linux/bpf.h</code> at the release tags).</p>
+
+    <h3>Variable-size records: dynptrs</h3>
+    <p><code>bpf_ringbuf_reserve()</code> needs a size the verifier knows at load time. For records whose
+      length is only known at run time (a path, a packet slice), Linux 5.19 added a <em>dynptr</em> variant:
+      <code>bpf_ringbuf_reserve_dynptr(&amp;rb, size, 0, &amp;dptr)</code> fills a <code>struct bpf_dynptr</code>
+      on the stack, the program writes into it with <code>bpf_dynptr_write()</code> or gets a bounded slice with
+      <code>bpf_dynptr_data()</code>, and finishes with <code>bpf_ringbuf_submit_dynptr()</code> or
+      <code>bpf_ringbuf_discard_dynptr()</code>. A dynptr is a pointer plus a length that the kernel checks at
+      run time, so the verifier no longer needs a constant size. It is still tracked like a reference: the uapi
+      documentation says submit or discard "must be called on <em>ptr</em>, even if the reservation fails". The same
+      <code>struct bpf_dynptr</code> type is used by other helpers and kfuncs for local memory
+      (<code>bpf_dynptr_from_mem()</code>) and packet data (<code>bpf_dynptr_from_skb()</code>,
+      <code>bpf_dynptr_from_xdp()</code>); that is the "dynptr slices" origin of <code>PTR_TO_MEM</code> in
+      <a href="03-verifier.html">chapter 03</a>.</p>
 
     <h3>The kernel's own test</h3>
     <p>The ring buffer selftest uses every program-side API in about forty lines: reserve, submit,
@@ -1237,7 +1253,7 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
         <tr><td><code>KF_DESTRUCTIVE</code></td><td>Can crash or reboot the system (for example <code>crash_kexec</code>); requires <code>CAP_SYS_BOOT</code>.</td></tr>
         <tr><td><code>KF_RCU_PROTECTED</code></td><td>Must be called inside an RCU read-side section.</td></tr>
         <tr><td><code>KF_ITER_NEW / NEXT / DESTROY</code></td><td>Constructor, step and destructor of an open-coded iterator.</td></tr>
-        <tr><td><code>KF_DEPRECATED</code></td><td>Scheduled for change or removal.</td></tr>
+        <tr><td><code>KF_DEPRECATED</code></td><td>Scheduled for change or removal. Note: this flag is described in <code>kfuncs.rst</code>, but at the commit studied it has no definition in <code>btf.h</code>, so it is a documented convention rather than a flag the verifier checks.</td></tr>
       </tbody>
     </table>
     <p>Two refinements are recent. First, the current documentation says "All kfuncs now require
@@ -1326,8 +1342,8 @@ int BPF_PROG(test_task_acquire_release_argument, struct task_struct *task, u64 c
       (<code>src_reg = BPF_PSEUDO_CALL</code>, immediate = relative instruction offset). The callee
       gets its own stack frame; R1–R5 carry arguments, R0 the result, and R6–R9 are preserved, as in
       <a href="02-ebpf-isa-and-vm.html">chapter 02</a>. The verifier enforces a maximum call depth
-      (<code>MAX_CALL_FRAMES</code>, currently 16 in <code>include/linux/bpf_verifier.h</code>; older
-      kernels and documentation say 8) and a combined stack limit over the whole call chain.</p>
+      (<code>MAX_CALL_FRAMES</code> in <code>include/linux/bpf_verifier.h</code>: 16 since v7.2, 8 in
+      older kernels and documentation) and a combined stack limit over the whole call chain.</p>
     <p>C linkage decides how a subprogram is verified:</p>
     <ul>
       <li><strong>Static</strong> functions (<code>static __noinline</code>) are verified <em>in the context
@@ -1464,7 +1480,8 @@ struct bpf_spin_lock lockA __hidden SEC(".data.A");</code></pre>
       (<code>CLOCK_MONOTONIC</code>, <code>CLOCK_REALTIME</code> or <code>CLOCK_BOOTTIME</code>),
       <code>bpf_timer_set_callback(timer, fn)</code>, <code>bpf_timer_start(timer, nsecs, flags)</code>
       and <code>bpf_timer_cancel(timer)</code>. The callback is a static BPF function that receives the
-      map, the key and the timer, and it can re-arm itself. Timers belong to the map. When the map
+      map, the key and the map value that contains the timer (in the selftest below the value's only member is the
+      timer, so it is declared as <code>struct bpf_timer *</code>), and it can re-arm itself. Timers belong to the map. When the map
       loses its last user-space reference (all fds closed and no pin), the kernel cancels and frees its
       timers, and <code>bpf_timer_init()</code> returns <code>-EPERM</code> on a map that user space no
       longer holds.</p>
@@ -1572,8 +1589,8 @@ int BPF_PROG2(test1, int, a)
         lists and red-black trees fill the gap but are new, and their APIs are kfuncs and therefore
         unstable.</li>
       <li><strong>Ring buffer caveats.</strong> A single slow producer holds back all records reserved
-        after it. Reservation can fail under NMI contention. Reserve sizes must be constants. There is
-        no built-in lost-sample count.</li>
+        after it. Reservation can fail under NMI contention. Reserve sizes must be constants unless you use the
+        dynptr variant. There is no built-in lost-sample count.</li>
     </ul>
 
     <h2>Related work</h2>

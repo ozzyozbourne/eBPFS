@@ -93,7 +93,7 @@
     <h3>tc: the first hook with an sk_buff</h3>
     <p>After skb allocation, <code>__netif_receive_skb_core()</code> delivers the packet to taps (packet sockets, which is how <code>tcpdump</code> sees it) and then to the <strong>tc ingress</strong> hook. Programs here are of type <code>BPF_PROG_TYPE_SCHED_CLS</code> and see a <code>struct __sk_buff</code>: the packet bytes plus metadata such as mark, priority, the VLAN tag, the hash and the ingress ifindex. tc also has an <strong>egress</strong> hook, run just before the packet goes to the driver's transmit queue. That makes tc the usual place for egress policy, NAT, encapsulation and container networking.</p>
     <h3>Netfilter, routing and the socket layer</h3>
-    <p>Past tc, the packet enters IP: netfilter PREROUTING (iptables/nftables, and since 6.4 BPF programs of type <code>BPF_PROG_TYPE_NETFILTER</code>, covered in <a href="05-program-types-and-hooks.html">chapter 05</a>), the routing decision, then LOCAL_IN. For TCP/UDP, the transport layer then looks up the socket, and an <strong>sk_lookup</strong> program can pick the socket itself. On the socket, a <strong>socket filter</strong> can trim or reject the packet before it is queued, and sockmap's <strong>sk_skb</strong> verdict programs can splice it to another socket. On the send side, <strong>sk_msg</strong> programs see each <code>sendmsg()</code>. <strong>sockops</strong> programs, attached to a cgroup, are called on TCP events such as connection establishment, RTO and retransmit.</p>
+    <p>Past tc, the packet enters IP: netfilter PREROUTING (iptables/nftables, and since 6.4 BPF programs of type <code>BPF_PROG_TYPE_NETFILTER</code>, covered <a href="#netfilter-programs">below</a>), the routing decision, then LOCAL_IN. For TCP/UDP, the transport layer then looks up the socket, and an <strong>sk_lookup</strong> program can pick the socket itself. On the socket, a <strong>socket filter</strong> can trim or reject the packet before it is queued, and sockmap's <strong>sk_skb</strong> verdict programs can splice it to another socket. On the send side, <strong>sk_msg</strong> programs see each <code>sendmsg()</code>. <strong>sockops</strong> programs, attached to a cgroup, are called on TCP events such as connection establishment, RTO and retransmit.</p>
 
     <h2>XDP in depth</h2>
     <h3>The context: struct xdp_md</h3>
@@ -140,7 +140,7 @@ struct xdp_md {
     </ul>
     <p>If you ask for plain <code>xdp</code> without a mode, <code>ip</code> and <code>bpftool</code> try native first and fall back to generic. Programs written for one mode run unchanged in the others; only speed and the set of supported helpers differ.</p>
 
-    <div class="callout warn"><span class="label">veth gotcha</span><p>Native XDP on <code>veth</code> works, but frames that are <code>XDP_TX</code>'d or redirected <em>into</em> a veth are only delivered if the <em>peer</em> end also has an XDP program attached. That is why the eunomia tutorial's load balancer README loads a stub: <code>sudo ip l set dev veth7 xdp obj ./stub.bpf.o sec .xdp</code> (<code>bpf-developer-tutorial/src/42-xdp-loadbalancer/README.md</code>).</p></div>
+    <div class="callout warn"><span class="label">veth gotcha</span><p>Native XDP on <code>veth</code> works, but frames that are <code>XDP_TX</code>'d or redirected <em>into</em> a veth are only delivered if the receiving <em>peer</em> has NAPI enabled: it must have an XDP program attached, or (since Linux 5.13) GRO enabled with <code>ethtool -K &lt;peer&gt; gro on</code>; otherwise <code>veth_xdp_xmit()</code> drops them. That is why the eunomia tutorial's load balancer README loads a stub: <code>sudo ip l set dev veth7 xdp obj ./stub.bpf.o sec .xdp</code> (<code>bpf-developer-tutorial/src/42-xdp-loadbalancer/README.md</code>).</p></div>
 
     <h2>Parsing packets safely: data, data_end and the verifier</h2>
     <p>An XDP or tc program reads the packet through ordinary pointer dereferences ("direct packet access", Linux 4.7). The verifier must prove that every load stays within <code>[data, data_end)</code>. It tracks each pointer derived from <code>data</code> as type <code>PTR_TO_PACKET</code> with a known offset range. When you compare <code>ptr + N &gt; data_end</code> and branch away, the verifier records on the fall-through path that <code>N</code> bytes past <code>ptr</code> are safe to read. Access a byte beyond what you have checked and the program is rejected at load time with <em>"invalid access to packet"</em>. The rejection happens at load time, never at run time.</p>
@@ -806,6 +806,24 @@ $ sudo bpftool link show</code></pre></div>
     </div>
     <p>Even though <code>tcx_classifier</code> was attached first, <code>tcx_stats</code> was inserted <code>BPF_F_BEFORE</code> it. So every packet is counted, then passed on with <code>TCX_NEXT</code>, then accepted with <code>TCX_PASS</code>. libbpf maps the <code>SEC("tcx/ingress")</code> and <code>SEC("tcx/egress")</code> section names (with <code>tc/ingress</code> and <code>tc/egress</code> as aliases) to <code>BPF_PROG_TYPE_SCHED_CLS</code> with the TCX attach type. The same <code>bpf_mprog</code> machinery backs <strong>netkit</strong> (Linux 6.7), a BPF-programmable veth replacement designed for container networking. Cilium uses it on 6.8+ kernels, together with TCX for every other device [11].</p>
 
+    <h2 id="netfilter-programs">Netfilter programs (Linux 6.4)</h2>
+    <p>Florian Westphal's 6.4 series added <code>BPF_PROG_TYPE_NETFILTER</code>: a BPF program registered as a netfilter hook in its own right, next to the iptables/nftables chains instead of inside them. It runs where netfilter runs (PREROUTING, LOCAL_IN, FORWARD, LOCAL_OUT, POSTROUTING), so it sees packets after the stack has validated IP headers and, at a later priority, after conntrack. libbpf maps <code>SEC("netfilter")</code> to this type. The context is <code>struct bpf_nf_ctx</code>, which carries the <code>nf_hook_state</code> (family, hook, input and output devices) and the <code>sk_buff</code>. The verifier accepts only <code>NF_DROP</code> (0) and <code>NF_ACCEPT</code> (1) as return values. The kernel selftest is the smallest possible example:</p>
+    <pre data-file="linux/tools/testing/selftests/bpf/progs/test_netfilter_link_attach.c"><code class="language-c">// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+
+#define NF_ACCEPT 1
+
+SEC("netfilter")
+int nf_link_attach_test(struct bpf_nf_ctx *ctx)
+{
+	return NF_ACCEPT;
+}
+
+char _license[] SEC("license") = "GPL";</code></pre>
+    <p>There is no auto-attach from the section name. User space creates a BPF link with <code>BPF_LINK_CREATE</code>, or with libbpf's <code>bpf_program__attach_netfilter()</code> (libbpf 1.3), passing a <code>struct bpf_netfilter_opts</code> with <code>pf</code> (<code>NFPROTO_IPV4</code> or <code>NFPROTO_IPV6</code>; other families are rejected), <code>hooknum</code> (for example <code>NF_INET_LOCAL_IN</code>) and <code>priority</code>. <code>net/netfilter/nf_bpf_link.c</code> refuses <code>NF_IP_PRI_FIRST</code> and <code>NF_IP_PRI_LAST</code>, so conntrack confirmation always runs last. Since 6.6 the <code>BPF_F_NETFILTER_IP_DEFRAG</code> flag asks for reassembled packets. Like other links, the hook disappears when its owner closes the link fd. libbpf-rs ships a <code>netfilter_blocklist</code> example built on this hook. Choose it over tc when the decision belongs at a netfilter point (after routing, or relative to conntrack) and you want it ordered by priority among existing nftables chains.</p>
+
     <h2>Socket-level programs</h2>
     <p>The last group of hooks works on sockets rather than devices. They are covered more briefly here; <a href="05-program-types-and-hooks.html">chapter 05</a> places them among the other program types.</p>
     <h3>Socket filters</h3>
@@ -959,8 +977,8 @@ bpf-developer-tutorial/src/          (eunomia-bpf, commit 110b91f)
     <ul>
       <li><strong>Kernel bypass</strong>: DPDK and netmap take the NIC away from the kernel. AF_XDP is the in-kernel answer, and DPDK has an AF_XDP poll-mode driver, so the two now meet. Karlsson and Töpel's LPC 2018 paper "The Path to DPDK Speeds for AF_XDP" describes the AF_XDP design and its performance work [10].</li>
       <li><strong>Classic BPF</strong> socket filters and <code>tcpdump</code>'s compiler are the ancestors of everything here (<a href="01-what-is-bpf.html">chapter 01</a>).</li>
-      <li><strong>Netfilter</strong> (iptables/nftables) remains the general firewall. BPF can now also attach there (<code>BPF_PROG_TYPE_NETFILTER</code>), and Cloudflare pushes some mitigations into iptables-hosted BPF.</li>
-      <li><strong>Other hooks</strong> not covered in depth: flow dissector programs, lightweight tunnel (LWT) programs, <code>cgroup_skb</code> and cgroup socket-address hooks (<code>connect4</code>, <code>bind4</code> …), and SO_REUSEPORT selection programs. See <a href="05-program-types-and-hooks.html">chapter 05</a>.</li>
+      <li><strong>Netfilter</strong> (iptables/nftables) remains the general firewall. BPF can now also attach there as a hook of its own (<code>BPF_PROG_TYPE_NETFILTER</code>, <a href="#netfilter-programs">above</a>), and the older <code>xt_bpf</code> match (<code>iptables -m bpf</code>) runs a BPF filter inside an iptables rule.</li>
+      <li><strong>Other hooks</strong> not covered in depth: flow dissector programs, lightweight tunnel (LWT) programs, <code>cgroup_skb</code> and cgroup socket-address hooks (<code>connect4</code>, <code>bind4</code> …), and SO_REUSEPORT selection programs. The cgroup hooks are covered in <a href="05-program-types-and-hooks.html">chapter 05</a>; the others are listed, with their <code>SEC()</code> names, in libbpf's <a href="https://docs.kernel.org/bpf/libbpf/program_types.html">program types table</a>.</li>
       <li><strong>Tooling and libraries</strong>: xdp-tools (libxdp, xdp-loader, xdp-filter, xdpdump), and the Go, Rust and C libraries of <a href="08-ecosystem.html">chapter 08</a>.</li>
     </ul>
 
@@ -1020,6 +1038,7 @@ bpf-developer-tutorial/src/          (eunomia-bpf, commit 110b91f)
       <li>xdp-project, <a href="https://github.com/xdp-project/xdp-tutorial">xdp-tutorial</a> (commit 4e2bf5658434) and <a href="https://github.com/xdp-project/xdp-tools">xdp-tools</a> (libxdp, xdp-loader).</li>
       <li>eunomia-bpf, <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial">bpf-developer-tutorial</a> (commit 110b91f87320): <code>src/20-tc</code>, <code>src/21-xdp</code>, <code>src/29-sockops</code>, <code>src/42-xdp-loadbalancer</code>, <code>src/50-tcx</code>.</li>
       <li>eunomia-bpf userspace XDP: <a href="https://github.com/userspace-xdp/userspace-xdp">userspace-xdp/userspace-xdp</a>; <a href="https://github.com/eunomia-bpf/XDP-on-GPU">eunomia-bpf/XDP-on-GPU</a> (WIP).</li>
+      <li>Netfilter BPF links: F. Westphal, kernel commit <a href="https://github.com/torvalds/linux/commit/84601d6ee68a">84601d6ee68a</a> "bpf: add bpf_link support for BPF_NETFILTER programs" (Linux 6.4); <a href="https://github.com/torvalds/linux/blob/master/net/netfilter/nf_bpf_link.c">net/netfilter/nf_bpf_link.c</a>; selftest <a href="https://github.com/torvalds/linux/blob/master/tools/testing/selftests/bpf/progs/test_netfilter_link_attach.c">test_netfilter_link_attach.c</a>; libbpf-rs <a href="https://github.com/libbpf/libbpf-rs/tree/master/examples/netfilter_blocklist">netfilter_blocklist</a> example.</li>
       <li>BPF features by kernel version (bcc): <a href="https://github.com/iovisor/bcc/blob/master/docs/kernel-versions.md">iovisor/bcc docs/kernel-versions.md</a> — source for the version numbers used in this chapter.</li>
     </ol>
 

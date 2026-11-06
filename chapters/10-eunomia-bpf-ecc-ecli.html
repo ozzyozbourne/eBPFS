@@ -1,0 +1,1396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · eunomia-bpf: ecc and ecli · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="10">
+<meta name="chapter-part" content="Part II · Learning and tooling">
+<meta name="chapter-summary" content="How eunomia-bpf's ecc compiler turns kernel-only eBPF C into a self-describing JSON package, and how ecli and bpf-loader-rs load it, derive a command line and print ring-buffer, perf or map data with no hand-written userspace code, plus Wasm, OCI, the GitHub template, the in-browser compiler and the Homebrew tap.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/eunomia-bpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part II · Learning and tooling › 10 · eunomia-bpf: ecc and ecli</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 10</div>
+      <h1>eunomia-bpf: ecc and ecli</h1>
+      <p class="lede">A libbpf tool has two halves. The kernel half is the interesting part. The userspace half parses
+        flags, loads the object, attaches programs, polls a ring buffer and prints a struct, and you write it again for
+        every tool. eunomia-bpf asks: if the compiler already knows the layout of the event struct and the names of the
+        global variables, why write the userspace half at all? This chapter takes apart the compiler (<code>ecc</code>)
+        and the runner (<code>ecli</code>) that implement that idea, and the package format that sits between them.</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: eunomia-bpf/eunomia-bpf @ a5408a8</span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this exists: the two halves of every libbpf tool</h2>
+    <p>Chapter <a href="06-btf-core-libbpf.html">06</a> built <code>bootstrap</code> from
+      <a href="https://github.com/libbpf/libbpf-bootstrap">libbpf-bootstrap</a>. It traces process <code>exec()</code> and
+      exit, and sends one <code>struct event</code> per process to user space through a BPF ring buffer. At commit
+      <code>820a1bd</code> the example is three files: <code>bootstrap.bpf.c</code> (111 lines, the kernel side),
+      <code>bootstrap.h</code> (19 lines, the shared event struct) and <code>bootstrap.c</code> (172 lines, the user
+      side), plus a Makefile that runs <code>bpftool gen skeleton</code>.</p>
+    <p>Most of <code>bootstrap.c</code> is code that every tool needs and no tool cares about. Here is the core of it:</p>
+    <pre data-file="libbpf-bootstrap/examples/c/bootstrap.c"><code class="language-c">static int handle_event(void *ctx, void *data, size_t data_sz)
+{
+	const struct event *e = data;
+	/* ... format a timestamp ... */
+	if (e-&gt;exit_event) {
+		printf("%-8s %-5s %-16s %-7d %-7d [%u]", ts, "EXIT", e-&gt;comm, e-&gt;pid, e-&gt;ppid,
+		       e-&gt;exit_code);
+		/* ... */
+	} else {
+		printf("%-8s %-5s %-16s %-7d %-7d %s\n", ts, "EXEC", e-&gt;comm, e-&gt;pid, e-&gt;ppid,
+		       e-&gt;filename);
+	}
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	/* ... */
+	err = argp_parse(&amp;argp, argc, argv, 0, NULL, NULL);
+	/* ... */
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+	skel = bootstrap_bpf__open();
+	/* ... */
+	skel-&gt;rodata-&gt;min_duration_ns = env.min_duration_ms * 1000000ULL;
+	err = bootstrap_bpf__load(skel);
+	/* ... */
+	err = bootstrap_bpf__attach(skel);
+	/* ... */
+	rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.rb), handle_event, NULL, NULL);
+	/* ... */
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		/* ... */
+	}
+cleanup:
+	ring_buffer__free(rb);
+	bootstrap_bpf__destroy(skel);
+	return err &lt; 0 ? -err : 0;
+}</code></pre>
+    <p>Look at what this code actually encodes. It knows the program has a ring buffer called <code>rb</code>. It knows
+      the ring buffer carries <code>struct event</code> and which fields to print. It knows there is a read-only global
+      <code>min_duration_ns</code> that should be a command-line flag. It knows the programs can be auto-attached. All of
+      that is already present, in machine-readable form, inside the compiled <code>bootstrap.bpf.o</code>: the map
+      types are in the <code>.maps</code> section, the globals are in <code>.rodata</code>, and the field names, sizes
+      and offsets of <code>struct event</code> are in the object's BTF (<a href="06-btf-core-libbpf.html">06</a>).</p>
+    <p>There is a second, separate problem: distribution. A libbpf tool is a native executable. You build it per CPU
+      architecture, link it against libbpf and libelf (or link statically), and ship it the way you ship any binary. Two
+      people who want to share a 100-line tracing program still have to agree on a build system.</p>
+    <p>eunomia-bpf (org <a href="https://github.com/eunomia-bpf">eunomia-bpf</a>, docs at
+      <a href="https://eunomia.dev/eunomia-bpf/">eunomia.dev/eunomia-bpf</a>) attacks both problems with one move: put
+      the compiled object <em>and a description of it</em> into one data file, and give the user one generic runner
+      that can read any such file.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p><code>ecc</code> compiles only the kernel half. It then extracts what a userspace program would have hard-coded
+        (maps, programs, attach points, global variables, the layout of the event struct, doc comments) and writes it
+        as JSON next to a compressed copy of the object. <code>ecli</code> reads that JSON, builds a command line from
+        the globals, loads and attaches with libbpf, picks the ring buffer, perf buffer or annotated hash map as the
+        output channel, and prints each record using the struct layout from BTF. The kernel code is the same code you
+        would write for libbpf-bootstrap; in the <code>bootstrap</code> example it differs from libbpf-bootstrap's
+        file only in whitespace.</p>
+    </div>
+
+    <p>The price is generality. A generic runner prints events, histograms and key/value pairs; it does not run your
+      custom aggregation logic. For that, eunomia-bpf lets you write the user half as a WebAssembly module instead of a
+      native binary, which is the subject of chapter <a href="12-wasm-bpf.html">12</a>. This chapter covers the
+      JSON path end to end and the Wasm path where it touches <code>ecc</code> and <code>ecli</code>.</p>
+
+    <h2>The pieces and how they fit</h2>
+    <p>The main repository holds three Rust workspaces and some supporting material. Three more repositories in the
+      org surround it: a GitHub template that builds packages in CI, a web playground that compiles in the browser, and
+      a Homebrew tap.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 470" role="img" aria-label="Architecture of eunomia-bpf: on the developer side ecc wraps clang, a forked bpftool and libclang and emits package.json, a tar with tailored BTF, or a header for Wasm; packages travel by file, URL or OCI registry; on the target ecli resolves the source and hands JSON to bpf-loader-lib on libbpf-rs or Wasm to wasm-bpf-rs, which load programs into the kernel.">
+        <defs>
+          <marker id="a10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="g10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <text x="20" y="24" fill="var(--muted)" font-size="13" font-family="sans-serif">BUILD SIDE (developer laptop, CI, or browser)</text>
+        <text x="610" y="24" fill="var(--muted)" font-size="13" font-family="sans-serif">TARGET HOST (root)</text>
+        <line x1="590" y1="10" x2="590" y2="460" stroke="var(--border)" stroke-dasharray="5 5"/>
+
+        <!-- ecc -->
+        <rect x="20" y="40" width="270" height="200" rx="8" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="34" y="62" fill="var(--fg)" font-size="14" font-family="sans-serif" font-weight="bold">ecc  (compiler/cmd, ecc-rs)</text>
+        <text x="34" y="86" fill="var(--muted)" font-size="12" font-family="monospace">clang -target bpf -O2 -g</text>
+        <text x="34" y="106" fill="var(--muted)" font-size="12" font-family="monospace">llvm-strip -g</text>
+        <text x="34" y="126" fill="var(--muted)" font-size="12" font-family="monospace">bpftool gen skeleton -j  (fork)</text>
+        <text x="34" y="146" fill="var(--muted)" font-size="12" font-family="monospace">bpftool btf dump ... -j</text>
+        <text x="34" y="166" fill="var(--muted)" font-size="12" font-family="monospace">libclang: doc comments</text>
+        <text x="34" y="190" fill="var(--muted)" font-size="11" font-family="sans-serif">embedded workspace: bpftool binary,</text>
+        <text x="34" y="206" fill="var(--muted)" font-size="11" font-family="sans-serif">libbpf headers, vmlinux.h per arch</text>
+        <text x="34" y="226" fill="var(--muted)" font-size="11" font-family="sans-serif">(rust-embed, unpacked to a TempDir)</text>
+
+        <!-- other producers -->
+        <rect x="20" y="260" width="140" height="70" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="30" y="282" fill="var(--fg)" font-size="11" font-family="sans-serif" font-weight="bold">eunomia-template</text>
+        <text x="30" y="300" fill="var(--muted)" font-size="11" font-family="sans-serif">GitHub Actions runs</text>
+        <text x="30" y="316" fill="var(--muted)" font-size="11" font-family="sans-serif">ecc, uploads release</text>
+        <rect x="170" y="260" width="140" height="70" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="180" y="282" fill="var(--fg)" font-size="11" font-family="sans-serif" font-weight="bold">ecli-webui</text>
+        <text x="180" y="300" fill="var(--muted)" font-size="11" font-family="sans-serif">clang in Wasm</text>
+        <text x="180" y="316" fill="var(--muted)" font-size="11" font-family="sans-serif">(Emception) in browser</text>
+
+        <!-- artifacts -->
+        <rect x="320" y="40" width="250" height="68" rx="8" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="334" y="62" fill="var(--fg)" font-size="13" font-family="monospace" font-weight="bold">package.json</text>
+        <text x="334" y="82" fill="var(--muted)" font-size="11" font-family="sans-serif">zlib+base64 ELF + meta (default)</text>
+        <text x="334" y="98" fill="var(--muted)" font-size="11" font-family="sans-serif">or package.yaml with -y</text>
+        <rect x="320" y="120" width="250" height="52" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="334" y="142" fill="var(--fg)" font-size="13" font-family="monospace" font-weight="bold">&lt;name&gt;.tar  (-b)</text>
+        <text x="334" y="160" fill="var(--muted)" font-size="11" font-family="sans-serif">package.json + tailored BTF archive</text>
+        <rect x="320" y="184" width="250" height="56" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="334" y="206" fill="var(--fg)" font-size="13" font-family="monospace" font-weight="bold">ewasm-skel.h → app.wasm</text>
+        <text x="334" y="226" fill="var(--muted)" font-size="11" font-family="sans-serif">--wasm-header, then wasi-sdk clang</text>
+        <path d="M290,74 L318,74" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10)" fill="none"/>
+        <path d="M290,146 L318,146" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10)" fill="none"/>
+        <path d="M290,212 L318,212" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10)" fill="none"/>
+
+        <!-- transports -->
+        <rect x="320" y="270" width="250" height="110" rx="8" fill="none" stroke="var(--border)"/>
+        <text x="334" y="292" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">How it travels</text>
+        <text x="334" y="314" fill="var(--muted)" font-size="12" font-family="sans-serif">local file  (.json / .tar / .wasm)</text>
+        <text x="334" y="334" fill="var(--muted)" font-size="12" font-family="sans-serif">HTTP(S) URL</text>
+        <text x="334" y="354" fill="var(--muted)" font-size="12" font-family="sans-serif">OCI registry: Wasm modules only</text>
+        <text x="334" y="372" fill="var(--muted)" font-size="11" font-family="sans-serif">(ecli push --module app.wasm ...)</text>
+
+        <!-- ecli -->
+        <rect x="610" y="40" width="270" height="110" rx="8" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="624" y="62" fill="var(--fg)" font-size="14" font-family="sans-serif" font-weight="bold">ecli  (ecli/client, ecli-rs)</text>
+        <text x="624" y="84" fill="var(--muted)" font-size="12" font-family="monospace">run | push | pull</text>
+        <text x="624" y="104" fill="var(--muted)" font-size="11" font-family="sans-serif">ecli-lib: file → URL → OCI resolution,</text>
+        <text x="624" y="120" fill="var(--muted)" font-size="11" font-family="sans-serif">NativeTaskManager (one thread per task)</text>
+        <text x="624" y="138" fill="var(--muted)" font-size="11" font-family="sans-serif">bpf-oci crate for registries</text>
+
+        <rect x="610" y="175" width="130" height="110" rx="8" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="620" y="197" fill="var(--fg)" font-size="12" font-family="sans-serif" font-weight="bold">bpf-loader-lib</text>
+        <text x="620" y="215" fill="var(--muted)" font-size="11" font-family="sans-serif">JSON → libbpf-rs</text>
+        <text x="620" y="231" fill="var(--muted)" font-size="11" font-family="sans-serif">arg parser from</text>
+        <text x="620" y="247" fill="var(--muted)" font-size="11" font-family="sans-serif">.rodata/.bss</text>
+        <text x="620" y="263" fill="var(--muted)" font-size="11" font-family="sans-serif">ringbuf/perf/sample</text>
+        <text x="620" y="279" fill="var(--muted)" font-size="11" font-family="sans-serif">pollers + dumpers</text>
+        <rect x="750" y="175" width="130" height="110" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="760" y="197" fill="var(--fg)" font-size="12" font-family="sans-serif" font-weight="bold">wasm-bpf-rs</text>
+        <text x="760" y="215" fill="var(--muted)" font-size="11" font-family="sans-serif">runs app.wasm;</text>
+        <text x="760" y="231" fill="var(--muted)" font-size="11" font-family="sans-serif">module calls host</text>
+        <text x="760" y="247" fill="var(--muted)" font-size="11" font-family="sans-serif">BPF functions</text>
+        <text x="760" y="263" fill="var(--muted)" font-size="11" font-family="sans-serif">(chapter 12)</text>
+        <path d="M675,150 L675,173" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10)" fill="none"/>
+        <path d="M815,150 L815,173" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10)" fill="none"/>
+
+        <rect x="610" y="310" width="270" height="50" rx="8" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="624" y="332" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">libbpf (via libbpf-sys)</text>
+        <text x="624" y="350" fill="var(--muted)" font-size="11" font-family="sans-serif">CO-RE against /sys/kernel/btf/vmlinux</text>
+        <path d="M675,285 L675,308" stroke="var(--accent2)" stroke-width="2" marker-end="url(#g10)" fill="none"/>
+        <path d="M815,285 L815,308" stroke="var(--accent2)" stroke-width="2" marker-end="url(#g10)" fill="none"/>
+
+        <rect x="610" y="385" width="270" height="60" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="624" y="408" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">Linux kernel</text>
+        <text x="624" y="428" fill="var(--muted)" font-size="11" font-family="sans-serif">bpf() syscalls: verifier, attach, maps</text>
+        <path d="M745,360 L745,383" stroke="var(--accent2)" stroke-width="2" marker-end="url(#g10)" fill="none"/>
+
+        <path d="M570,325 L608,110" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10)" fill="none" stroke-dasharray="6 4"/>
+        <text x="20" y="410" fill="var(--muted)" font-size="11" font-family="sans-serif">Not shown: eunomia-sdks (eunomia-rs, eunomia-otel exporter), bpf-loader-c-wrapper</text>
+        <text x="20" y="426" fill="var(--muted)" font-size="11" font-family="sans-serif">(C ABI, libeunomia.a for --standalone), homebrew-tap (no ecc/ecli formula yet).</text>
+      </svg>
+      <figcaption>Figure 10.1 — Architecture. ecc and the two other producers make data files; ecli is the only thing that
+        runs on the target, and it hands JSON packages to bpf-loader-lib and Wasm modules to wasm-bpf-rs. Both end in
+        libbpf.</figcaption>
+    </figure>
+
+    <h3>Directory map</h3>
+    <p>The map below is the main repository at <code>a5408a8</code>, trimmed to what this chapter uses. The Rust
+      crates are separate Cargo workspaces, not one big workspace, so each builds on its own.</p>
+    <pre><code class="language-plaintext">eunomia-bpf/
+├── compiler/                  ecc
+│   ├── Makefile               builds bpftool, then `cargo build --release` → cmd/target/release/ecc-rs
+│   ├── dockerfile             image ghcr.io/eunomia-bpf/ecc-&lt;arch&gt; (ENTRYPOINT make build-ebpf-program)
+│   └── cmd/
+│       ├── build.rs           clones eunomia-bpf/bpftool@8ae6b98 + eunomia-bpf/vmlinux@933f83b, embeds them
+│       └── src/
+│           ├── main.rs        loads libclang, parses CompileArgs, calls compile_bpf()
+│           ├── config/        CLI flags (CompileArgs), output paths, btfgen helpers, clang args
+│           ├── bpf_compiler/  compile → skeleton JSON → doc merge → export types → package.json
+│           │   └── standalone_bpf_loader.template.c   C main() for --standalone
+│           ├── document_parser.rs   libclang AST walk: /// comments → JSON fields
+│           ├── export_types.rs      struct names from the header, dummy-pointer injection
+│           └── wasm.rs              --wasm-header → ewasm-skel.h
+├── bpf-loader-rs/             runtime library (workspace)
+│   ├── bpf-loader-lib/src/
+│   │   ├── meta/              package schema (serde), arg_builder.rs, arg_parser.rs
+│   │   ├── skeleton/          builder.rs (open), preload/ (fill .rodata, load, attach tc/xdp/perf),
+│   │   │                      poller/ (ringbuf, perf, sample map), handle.rs (pause/stop)
+│   │   ├── export_event/      checker.rs (BTF validation), data_dumper/ (plain text, JSON), event_handlers/
+│   │   └── btf_container.rs, elf_container.rs, helper/ (log2_hist, BTF helpers)
+│   ├── bpf-loader-cli/        minimal CLI on top of the lib
+│   └── bpf-loader-c-wrapper/  C ABI (eunomia-bpf.h), static libeunomia.a
+├── ecli/                      runner (workspace)
+│   ├── ecli-lib/src/runner/   helper.rs (file/URL/OCI), client/native.rs, task_manager/
+│   └── client/src/main.rs     clap: run / push / pull
+├── eunomia-sdks/              eunomia-rs, eunomia-otel (Prometheus/OpenTelemetry exporter)
+├── examples/
+│   ├── bpftools/              bootstrap, runqlat, opensnoop, sigsnoop (Wasm), tc, xdp, lsm-connect, ...
+│   ├── tests/                 integration tests (make test)
+│   └── simple-runner-rs/      embedding bpf-loader-lib in your own Rust program
+├── third_party/               submodules: bpftool (eunomia fork), vmlinux headers
+├── internal-docs/             POSITIONING.md, an old spec/ example package (historical format)
+└── .github/workflows/         ecc/ecli binaries and images, examples, gh-pages assets, release coordinator</code></pre>
+
+    <div class="callout warn"><span class="label">Docs versus code</span>
+      <p>Several README files in the repository describe features slightly differently from the code at
+        <code>a5408a8</code>. The compiler README mentions a <code>/// @export</code> annotation and
+        <code>ecli push package.json</code>; the code picks export structs from the header file you pass and
+        <code>ecli push</code> only takes <code>--module app.wasm</code>. The top-level <code>examples/README.md</code>
+        mentions an <code>xdp_drop.bpf.c</code> and flags such as <code>--interface eth0</code> that do not exist. The
+        <code>internal-docs/spec/package.json</code> uses an older <code>export_types</code> layout the current loader
+        does not read. This chapter follows the source code and the per-example READMEs, and says so where they
+        differ.</p>
+    </div>
+
+    <h2>The pipeline, end to end</h2>
+    <p>Before the internals, here is the whole path for the <code>bootstrap</code> example, from source file to
+      kernel. Every box is a function you can find in the source; the step-by-step walkthrough after the figure follows
+      the same order.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 400" role="img" aria-label="Pipeline: bootstrap.bpf.c and bootstrap.h go into ecc, which injects dummy pointers, compiles with clang, extracts skeleton JSON with bpftool, merges doc comments, extracts export types from BTF, and zlib/base64-packs the object into package.json; ecli reads package.json, builds and parses a command line, opens the object with libbpf, writes .rodata, loads and attaches, then polls the ring buffer and prints rows.">
+        <defs>
+          <marker id="a10b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+        </defs>
+        <!-- inputs -->
+        <rect x="10" y="40" width="130" height="90" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="20" y="62" fill="var(--fg)" font-size="12" font-family="monospace" font-weight="bold">bootstrap.bpf.c</text>
+        <text x="20" y="80" fill="var(--muted)" font-size="11" font-family="sans-serif">maps, progs,</text>
+        <text x="20" y="96" fill="var(--muted)" font-size="11" font-family="sans-serif">const volatile globals</text>
+        <text x="20" y="118" fill="var(--fg)" font-size="12" font-family="monospace" font-weight="bold">bootstrap.h</text>
+        <path d="M140,85 L168,85" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10b)"/>
+
+        <!-- ecc -->
+        <rect x="170" y="20" width="300" height="220" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="182" y="40" fill="var(--accent)" font-size="13" font-family="sans-serif" font-weight="bold">ecc</text>
+        <text x="182" y="62" fill="var(--fg)" font-size="12" font-family="sans-serif">1  temp.c += __eunomia_dummy_event_ptr</text>
+        <text x="182" y="84" fill="var(--fg)" font-size="12" font-family="sans-serif">2  clang -target bpf → bootstrap.bpf.o</text>
+        <text x="182" y="106" fill="var(--fg)" font-size="12" font-family="sans-serif">3  bpftool gen skeleton -j → bpf_skel</text>
+        <text x="182" y="128" fill="var(--fg)" font-size="12" font-family="sans-serif">4  libclang /// comments → merged in</text>
+        <text x="182" y="150" fill="var(--fg)" font-size="12" font-family="sans-serif">5  bpftool btf dump -j → export_types</text>
+        <text x="182" y="172" fill="var(--fg)" font-size="12" font-family="sans-serif">6  write bootstrap.skel.json</text>
+        <text x="182" y="194" fill="var(--fg)" font-size="12" font-family="sans-serif">7  zlib(ELF) → base64 → package.json</text>
+        <text x="182" y="222" fill="var(--muted)" font-size="11" font-family="sans-serif">bpf_compiler/mod.rs: compile_bpf()</text>
+        <path d="M470,110 L498,110" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10b)"/>
+
+        <!-- package -->
+        <rect x="500" y="50" width="160" height="120" rx="8" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="512" y="72" fill="var(--fg)" font-size="12" font-family="monospace" font-weight="bold">package.json</text>
+        <text x="512" y="94" fill="var(--muted)" font-size="11" font-family="monospace">bpf_object: "eJzt…"</text>
+        <text x="512" y="112" fill="var(--muted)" font-size="11" font-family="monospace">bpf_object_size</text>
+        <text x="512" y="130" fill="var(--muted)" font-size="11" font-family="monospace">meta.bpf_skel</text>
+        <text x="512" y="148" fill="var(--muted)" font-size="11" font-family="monospace">meta.export_types</text>
+        <text x="512" y="164" fill="var(--muted)" font-size="10" font-family="sans-serif">16,928 bytes in our build</text>
+        <path d="M580,170 L580,258" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10b)"/>
+        <text x="590" y="214" fill="var(--muted)" font-size="11" font-family="sans-serif">local file or URL</text>
+        <text x="590" y="230" fill="var(--muted)" font-size="11" font-family="sans-serif">(OCI only via a Wasm wrapper)</text>
+
+        <!-- ecli -->
+        <rect x="170" y="260" width="580" height="120" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="182" y="280" fill="var(--accent)" font-size="13" font-family="sans-serif" font-weight="bold">ecli run → bpf-loader-lib</text>
+        <text x="182" y="302" fill="var(--fg)" font-size="12" font-family="sans-serif">a) resolve source, guess type · b) inflate + size check · c) clap parser from .rodata vars</text>
+        <text x="182" y="324" fill="var(--fg)" font-size="12" font-family="sans-serif">d) bpf_object__open_mem (pick BTF) · e) set .rodata/.bss initial values</text>
+        <text x="182" y="346" fill="var(--fg)" font-size="12" font-family="sans-serif">f) load (CO-RE, verifier) · g) attach each prog · h) ringbuf poller + BTF-driven printer</text>
+        <text x="182" y="368" fill="var(--muted)" font-size="11" font-family="sans-serif">ecli-lib task_manager → BpfSkeletonBuilder::build → load_and_attach → wait_and_poll_to_handler</text>
+
+        <!-- kernel -->
+        <rect x="764" y="260" width="130" height="120" rx="8" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="774" y="284" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">kernel</text>
+        <text x="774" y="306" fill="var(--muted)" font-size="10" font-family="sans-serif">tp/sched/</text>
+        <text x="774" y="322" fill="var(--muted)" font-size="10" font-family="sans-serif">sched_process_exec</text>
+        <text x="774" y="338" fill="var(--muted)" font-size="10" font-family="sans-serif">+ _exit, ringbuf rb</text>
+        <path d="M750,320 L762,320" stroke="var(--accent)" stroke-width="2" marker-end="url(#a10b)"/>
+        <text x="20" y="300" fill="var(--muted)" font-size="11" font-family="sans-serif">no bootstrap.c,</text>
+        <text x="20" y="316" fill="var(--muted)" font-size="11" font-family="sans-serif">no skeleton header,</text>
+        <text x="20" y="332" fill="var(--muted)" font-size="11" font-family="sans-serif">no Makefile</text>
+      </svg>
+      <figcaption>Figure 10.2 — From source to kernel. Steps 1–7 run once on the build machine. Steps a–h run on every
+        target; only step f involves the verifier and CO-RE relocation, exactly as in a hand-written libbpf tool.</figcaption>
+    </figure>
+
+    <h2>ecc: what the compiler generates</h2>
+    <p><code>ecc</code> is a Rust binary (<code>ecc-rs</code>, crate version 0.3.4). It is not a compiler in the sense
+      of having its own code generator. It is a driver around tools you already met in chapter
+      <a href="06-btf-core-libbpf.html">06</a>: Clang for BPF code, <code>llvm-strip</code>, and <code>bpftool</code>.
+      Two things make it self-contained. First, its <code>build.rs</code> clones a pinned eunomia fork of bpftool and a
+      pinned set of <code>vmlinux.h</code> headers, builds bpftool, and embeds the result into the <code>ecc</code>
+      binary with <code>rust-embed</code>. Every run unpacks this "workspace" (<code>bin/bpftool</code>,
+      <code>include/bpf/*.h</code>, <code>include/vmlinux/&lt;arch&gt;/vmlinux.h</code>) into a temporary directory.
+      So <code>#include "vmlinux.h"</code> works without you generating one. Second, it links the
+      <code>clang</code> crate, which loads <code>libclang</code> at run time to parse your source for comments.</p>
+    <p>You still need <code>clang</code> and <code>llvm-strip</code> on <code>PATH</code> (or pass
+      <code>-c</code>/<code>-l</code>). The command line, as printed by the v1.0.38 binary in our orb:</p>
+    <pre><code class="language-plaintext">$ ./ecc -h
+eunomia-bpf compiler
+
+Usage: ecc [OPTIONS] &lt;SOURCE_PATH&gt; [EXPORT_EVENT_HEADER]
+
+Arguments:
+  &lt;SOURCE_PATH&gt;          path of the bpf.c file to compile
+  [EXPORT_EVENT_HEADER]  path of the bpf.h header for defining event struct [default: ]
+
+Options:
+  -o, --output-path &lt;OUTPUT_PATH&gt;
+  -v, --verbose
+  -y, --yaml                    output config skel file in yaml instead of JSON
+      --header-only             generate a bpf object for struct definition with header file only
+      --wasm-header             generate wasm include header
+  -b, --btfgen                  fetch custom btfhub archive file
+      --btfhub-archive &lt;BTFHUB_ARCHIVE&gt;
+  -w, --workspace-path &lt;WORKSPACE_PATH&gt;
+  -a, --additional-cflags &lt;ADDITIONAL_CFLAGS&gt;
+  -c, --clang-bin &lt;CLANG_BIN&gt;          [default: clang]
+  -l, --llvm-strip-bin &lt;LLVM_STRIP_BIN&gt; [default: llvm-strip]
+  -n, --no-generate-package-json
+  -s, --standalone              Produce standalone executable
+  -h, --help
+  -V, --version</code></pre>
+    <p>(Help text trimmed; the flag list is complete.) The second positional argument matters more than it looks: it is
+      the only way <code>ecc</code> learns which struct is the event type.</p>
+
+    <h3>Walking through compile_bpf()</h3>
+    <div class="stepper">
+      <div class="step"><h4>1. Make sure the event struct survives into BTF</h4>
+        <p>Clang only emits BTF for types the program uses. In <code>bootstrap.bpf.c</code> the ring buffer is declared
+          without a value type (ring buffers have none), and <code>struct event</code> is used only through a local
+          pointer. To be safe, <code>ecc</code> copies your source to <code>temp.c</code>, finds every
+          <code>struct NAME {</code> in the header with a regular expression, and appends a dummy global pointer for
+          each. That is why every package has a <code>.bss</code> variable called
+          <code>__eunomia_dummy_event_ptr</code>; the runtime skips it when building the command line.</p></div>
+      <div class="step"><h4>2. Compile and strip</h4>
+        <p>Clang runs with <code>-g -O2 -target bpf -Wno-unknown-attributes -D__TARGET_ARCH_&lt;arch&gt;</code>, the
+          system include dirs as <code>-idirafter</code> (the same trick as libbpf-bootstrap's Makefile), the workspace
+          include dirs, your <code>-a</code> flags and the source directory. Then <code>llvm-strip -g</code> removes
+          DWARF but keeps <code>.BTF</code> and <code>.BTF.ext</code>, which CO-RE needs.</p></div>
+      <div class="step"><h4>3. Skeleton as JSON</h4>
+        <p>Upstream <code>bpftool gen skeleton</code> prints a C header. The eunomia fork adds <code>-j</code>, which
+          prints the same information as JSON: object name, maps (with <code>ident</code> and whether they are
+          <code>mmaped</code> data sections), programs (name, section/attach string, whether they produce a link) and
+          the variables in <code>.rodata</code>/<code>.bss</code> with their C types. This becomes
+          <code>meta.bpf_skel</code>.</p></div>
+      <div class="step"><h4>4. Doc comments become configuration</h4>
+        <p><code>document_parser.rs</code> parses the original source with libclang and walks the top-level
+          declarations. For each variable, map and program named in the skeleton it reads the <code>///</code> comment.
+          Plain text becomes <code>description</code>. A Doxygen-style command such as <code>@sample</code> becomes a
+          key, and if the text after it parses as JSON it is stored as JSON. The comment on the
+          <code>LICENSE</code> variable becomes the program's <code>doc</code> block (brief, details, version).</p></div>
+      <div class="step"><h4>5. Export types from BTF</h4>
+        <p>If you passed a header, <code>bpftool btf dump file bootstrap.bpf.o format c -j</code> (again the fork's JSON
+          mode) lists every struct in the object's BTF. <code>ecc</code> keeps those whose names appear in the header
+          and stores their members, size and BTF type id under <code>meta.export_types</code>.</p></div>
+      <div class="step"><h4>6. Write the skeleton file</h4>
+        <p>The merged object plus <code>eunomia_version</code> is written to <code>&lt;name&gt;.skel.json</code> (or
+          <code>.skel.yaml</code> with <code>-y</code>). This file has no bytecode; it is the description alone.</p></div>
+      <div class="step"><h4>7. Pack the object</h4>
+        <p>The stripped ELF is compressed with zlib, base64-encoded, and wrapped with its uncompressed size and the
+          metadata into <code>package.json</code>. Optional extra outputs run after this: <code>--standalone</code>,
+          <code>--wasm-header</code>, <code>--btfgen</code>.</p></div>
+    </div>
+
+    <p>Here is the injection from step 1, and the packing from step 7, as they appear in the source:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Step 1: dummy pointers"><pre data-file="compiler/cmd/src/export_types.rs"><code class="language-rust">const REGEX_STRUCT_PATTERN: &amp;str = r#"struct\s+(\w+)\s*\{"#;
+
+// find all structs in event header
+pub fn find_all_export_structs(args: &amp;CompileArgs) -&gt; Result&lt;Vec&lt;String&gt;&gt; {
+    let mut export_structs: Vec&lt;String&gt; = Vec::new();
+    let export_struct_header = fs::read_to_string(&amp;args.export_event_header)?;
+    let re = Regex::new(REGEX_STRUCT_PATTERN).unwrap();
+
+    for cap in re.captures_iter(&amp;export_struct_header) {
+        let struct_name = &amp;cap[1];
+        export_structs.push(struct_name.to_string());
+    }
+    Ok(export_structs)
+}
+
+/// add unused_ptr_for_structs to preserve BTF info
+pub fn add_unused_ptr_for_structs(args: &amp;CompileArgs, file_path: impl AsRef&lt;Path&gt;) -&gt; Result&lt;()&gt; {
+    /* ... read file_path into `content` ... */
+    for struct_name in export_struct_names {
+        content += &amp;format!(
+            "const volatile struct {} * __eunomia_dummy_{}_ptr  __attribute__((unused));\n",
+            struct_name, struct_name
+        );
+    }
+    fs::write(file_path, content)?;
+    Ok(())
+}</code></pre></div>
+      <div class="tab-panel" data-label="Step 7: pack_object_in_config"><pre data-file="compiler/cmd/src/bpf_compiler/mod.rs"><code class="language-rust">/// pack the object file into a package.json
+fn pack_object_in_config(args: &amp;Options) -&gt; Result&lt;()&gt; {
+    info!("Generating package json..");
+    let output_bpf_object_path = args.get_output_object_path();
+    let bpf_object = fs::read(output_bpf_object_path)?;
+
+    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+    e.write_all(&amp;bpf_object)?;
+    let compressed_bytes = e.finish().unwrap();
+    let encode_bpf_object = base64::encode(compressed_bytes);
+    /* ... read the .skel.json (or .skel.yaml) back into meta_json ... */
+    let package_config = json!({
+        "bpf_object": encode_bpf_object,
+        "bpf_object_size": bpf_object.len(),
+        "meta": meta_json,
+    });
+    /* ... write package.yaml if -y, else package.json ... */
+    Ok(())
+}</code></pre></div>
+      <div class="tab-panel" data-label="Step 5: filter BTF structs"><pre data-file="compiler/cmd/src/bpf_compiler/mod.rs"><code class="language-rust">fn get_export_types_json(
+    args: &amp;Options,
+    output_bpf_object_path: impl AsRef&lt;Path&gt;,
+) -&gt; Result&lt;String&gt; {
+    /* ... */
+    command
+        .args(["btf", "dump", "file"])
+        .arg(output_bpf_object_path)
+        .args(["format", "c", "-j"]);
+    let output =
+        handle_std_command_with_log!(command, "Failed to dump BTF from the compiled file!");
+    // filter the output to get the export types json
+    let export_structs = find_all_export_structs(&amp;args.compile_opts)?;
+    /* ... */
+    let export_types_json = export_types_json["structs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| {
+            let name = x["name"].as_str().unwrap();
+            export_structs.contains(&amp;name.to_string())
+        })
+        .map(|x| x.to_owned())
+        .collect::&lt;Vec&lt;Value&gt;&gt;();
+    Ok(serde_json::to_string(&amp;export_types_json).unwrap())
+}</code></pre></div>
+    </div>
+
+    <p>Note what the struct filter implies: every struct in the header becomes an export type, in the order the header
+      declares them. The loader (as we will see) uses <code>export_types[0]</code> unless you opt in to the
+      multiple-export mode. So the header you pass should declare the event struct first, and ideally nothing else.
+      The example headers follow this convention: <code>&lt;tool&gt;.h</code> holds only exported types, and shared
+      constants go into <code>&lt;tool&gt;.bpf.h</code> (<code>examples/bpftools/README.md</code>).</p>
+
+    <h3>Annotations you can write</h3>
+    <p>Because step 4 turns any <code>@command</code> in a <code>///</code> comment into a JSON key, the set of
+      "annotations" is really the set of keys the loader's serde schema (<code>bpf-loader-lib/src/meta/mod.rs</code>)
+      understands. These are the ones the examples use:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="runqlat: @sample"><pre data-file="examples/bpftools/runqlat/runqlat.bpf.c"><code class="language-c">const volatile bool filter_cg = false;
+const volatile bool targ_per_process = false;
+const volatile bool targ_per_thread = false;
+const volatile bool targ_per_pidns = false;
+const volatile bool targ_ms = false;
+const volatile pid_t targ_tgid = 0;
+/* ... */
+/// @sample {"interval": 1000, "type" : "log2_hist"}
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u32);
+    __type(value, struct hist);
+} hists SEC(".maps");</code></pre>
+        <p>A map with <code>sample</code> is read by user space every <code>interval</code> milliseconds. The
+          <code>type</code> can be <code>log2_hist</code>, <code>linear_hist</code> or <code>default_kv</code> (the
+          default); optional keys are <code>unit</code> (default <code>"(unit)"</code>) and <code>clear_map</code>.
+          The six <code>bool</code>/<code>pid_t</code> globals become <code>--filter_cg</code>, … ,
+          <code>--targ_tgid</code>.</p></div>
+      <div class="tab-panel" data-label="opensnoop: @cmdarg"><pre data-file="examples/bpftools/opensnoop/opensnoop.bpf.c"><code class="language-c">/// Process ID to trace
+const volatile int pid_target = 0;
+/// Thread ID to trace
+const volatile int tgid_target = 0;
+/// @description User ID to trace
+const volatile int uid_target = 0;
+/// @cmdarg {"default": false, "short": "f", "long": "failed"}
+/// @description trace only failed events
+const volatile bool targ_failed = false;
+/* ... */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(u32));
+    __uint(value_size, sizeof(u32));
+} events SEC(".maps");</code></pre>
+        <p>The comment text becomes the help string. <code>@cmdarg</code> overrides the long name, adds a short name
+          and a default. Output here goes through a perf event array instead of a ring buffer; the runtime handles
+          both.</p></div>
+      <div class="tab-panel" data-label="xdp: attach options"><pre data-file="examples/bpftools/xdp/xdp.bpf.c"><code class="language-c">/// @ifindex 1
+/// @flags 0
+/// @xdpopts {"old_prog_fd":0}
+SEC("xdp")
+int xdp_pass(struct xdp_md* ctx) {
+    void* data = (void*)(long)ctx-&gt;data;
+    void* data_end = (void*)(long)ctx-&gt;data_end;
+    int pkt_sz = data_end - data;
+
+    bpf_printk("packet size is %d", pkt_sz);
+    return XDP_PASS;
+}</code></pre>
+        <p>libbpf cannot auto-attach XDP or TC programs, because it does not know the interface. These comments
+          land in the program's metadata (ifindex 1 is <code>lo</code> on most systems). In our build the resulting
+          entry was <code>{"attach": "xdp", "flags": 0, "ifindex": 1, "link": true, "name": "xdp_pass",
+          "xdpopts": {"old_prog_fd": 0}}</code>.</p></div>
+      <div class="tab-panel" data-label="tc: @tchook"><pre data-file="examples/bpftools/tc/tc.bpf.c"><code class="language-c">/// @tchook {"ifindex":1, "attach_point":"BPF_TC_INGRESS"}
+/// @tcopts {"handle":1, "priority":1}
+SEC("tc")
+/* ... */</code></pre>
+        <p>Same idea for TC: the hook (interface and direction) and the filter options go into metadata, and the loader
+          creates the qdisc hook and attaches. The defaults in the schema are ifindex 1, ingress, handle 1, priority 1.</p></div>
+    </div>
+
+    <h2>What a generated package looks like</h2>
+    <p>We compiled the repository's <code>bootstrap</code> example in this curriculum's orb with the released ecc
+      (see "Trying it" below for the exact versions and a problem we hit). The run printed:</p>
+    <pre><code class="language-plaintext">$ ecc bootstrap.bpf.c bootstrap.h
+INFO [ecc_rs::bpf_compiler] Compiling bpf object...
+INFO [ecc_rs::bpf_compiler] Generating export types...
+INFO [ecc_rs::bpf_compiler] Generating package json..
+INFO [ecc_rs::bpf_compiler] Packing ebpf object and config into package.json...</code></pre>
+    <p>and left three new files: <code>bootstrap.bpf.o</code> (30,744 bytes), <code>bootstrap.skel.json</code>
+      (951 bytes) and <code>package.json</code> (16,928 bytes, of which 15,928 characters are the base64 object). The
+      skeleton file, pretty-printed and otherwise complete, is below. It is generated output from our run, not a file
+      in the repository; the repository ships a similar one as
+      <code>bpf-loader-rs/bpf-loader-lib/assets/bootstrap.json</code>.</p>
+    <pre><code class="language-json">{
+  "bpf_skel": {
+    "data_sections": [
+      { "name": ".rodata",
+        "variables": [ { "name": "min_duration_ns", "type": "unsigned long long" } ] },
+      { "name": ".bss",
+        "variables": [ { "name": "__eunomia_dummy_event_ptr", "type": "struct event *" } ] }
+    ],
+    "maps": [
+      { "ident": "exec_start", "name": "exec_start" },
+      { "ident": "rb", "name": "rb" },
+      { "ident": "rodata", "mmaped": true, "name": "bootstra.rodata" },
+      { "ident": "bss", "mmaped": true, "name": "bootstra.bss" }
+    ],
+    "obj_name": "bootstrap_bpf",
+    "progs": [
+      { "attach": "tp/sched/sched_process_exec", "link": true, "name": "handle_exec" },
+      { "attach": "tp/sched/sched_process_exit", "link": true, "name": "handle_exit" }
+    ]
+  },
+  "eunomia_version": "0.3.4",
+  "export_types": [
+    { "name": "event", "size": 168, "type_id": 314,
+      "members": [
+        { "name": "pid", "type": "int" },
+        { "name": "ppid", "type": "int" },
+        { "name": "exit_code", "type": "unsigned int" },
+        { "name": "duration_ns", "type": "unsigned long long" },
+        { "name": "comm", "type": "char[16]" },
+        { "name": "filename", "type": "char[127]" },
+        { "name": "exit_event", "type": "unsigned char" }
+      ] }
+  ]
+}</code></pre>
+    <p>A few details are worth reading slowly:</p>
+    <ul>
+      <li><code>bootstra.rodata</code> is not a typo in this chapter. libbpf names internal maps from the first eight
+        characters of the object name plus the section name, because kernel map names are limited to 15 characters
+        plus NUL. The <code>ident</code> field (<code>rodata</code>) is the stable handle the loader uses.</li>
+      <li>The <code>type_id</code> (314) is an index into <em>the program's own</em> BTF, not the kernel's. The loader
+        uses it to look the struct up again and check that the names and member count still match.</li>
+      <li>There are no offsets in <code>members</code>. Offsets and sizes come from BTF at run time; the JSON only
+        names the fields.</li>
+      <li><code>exit_event</code> is <code>unsigned char</code> because the repository's <code>bootstrap.h</code>
+        declares it that way, so the runner prints <code>0</code>/<code>1</code>. The template repository's copy of the
+        header uses <code>bool</code>.</li>
+    </ul>
+    <p>The full <code>package.json</code> wraps that object as <code>meta</code>:</p>
+    <pre><code class="language-json">{
+  "bpf_object": "eJzt…(15,928 base64 characters)…",
+  "bpf_object_size": 30744,
+  "meta": { "bpf_skel": { … }, "eunomia_version": "0.3.4", "export_types": [ … ] }
+}</code></pre>
+    <p>The loader's side of the contract is a pair of serde types. The doc comment states the format and the
+      deserializer enforces the size field:</p>
+    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/meta/mod.rs"><code class="language-rust">/// Describe a full eunomia json(with ebpf object inside)
+/// The original json should be like:
+/// ```json
+/// {
+///    "bpf_object": "", // An base64-encoded, zlib deflate-compressed object file
+///    "bpf_object_size" : 0 , /// The uncompressed size of the object file, in bytes
+///    "meta": {} /// The meta object
+/// }
+/// ```
+pub struct ComposedObject {
+    /// The object binary
+    pub bpf_object: Vec&lt;u8&gt;,
+    /// The meta info
+    pub meta: EunomiaObjectMeta,
+}
+/* ... */
+        let uncompressed = inflate::inflate_bytes_zlib(&amp;base64_decoded)
+            .map_err(|e| Error::custom(format!("Malformed compressed data: {e}")))?;
+        if uncompressed.len() != json_val.bpf_object_size {
+            return Err(Error::custom(format!(
+                "Unmatched size: {} in the json, but {} in the decompressed file",
+                json_val.bpf_object_size,
+                uncompressed.len()
+            )));
+        }</code></pre>
+    <p><code>EunomiaObjectMeta</code> also has fields <code>ecc</code> never writes but you may add by hand, with
+      defaults: <code>perf_buffer_pages</code> (64), <code>perf_buffer_time_ms</code> (10), <code>poll_timeout_ms</code>
+      (100), <code>debug_verbose</code>, <code>print_header</code> and <code>enable_multiple_export_types</code>
+      (false). The project's introduction page describes the package as a config file you "can modify … and config
+      the eBPF program behavior to your need"; these fields are what that means in practice.</p>
+
+    <h2>bpf-loader-rs: turning JSON back into a running tool</h2>
+    <p><code>bpf-loader-lib</code> is the part that replaces <code>bootstrap.c</code>. It is a library on top of
+      <a href="https://github.com/libbpf/libbpf-rs">libbpf-rs</a> 0.20, structured in the same three phases as a libbpf
+      skeleton: open, load-and-attach, poll. Its README calls them <code>BpfSkeletonBuilder</code>,
+      <code>PreLoadBpfSkeleton</code> and <code>BpfSkeleton</code>.</p>
+
+    <h3>Phase 1: open, and pick the kernel BTF</h3>
+    <p>The builder opens the decompressed ELF from memory with <code>bpf_object__open_mem</code>. Before that it
+      decides where CO-RE should find the kernel's types. The order matters for old kernels:</p>
+    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/skeleton/builder.rs"><code class="language-rust">        let path_holder = if let Some(base_path) = self.btf_archive_path.as_ref() {
+            let path = get_current_system_btf_file(PathBuf::from(base_path).as_path())?;
+            /* ... bail if missing ... */
+            Some(path)
+        } else {
+            None
+        };
+        let env_btf_file_path = std::env::var_os(BTF_PATH_ENV_NAME);
+        /* ... vmlinux_btf_exists = /sys/kernel/btf/vmlinux is present and readable ... */
+        if path_holder.is_some() &amp;&amp; !vmlinux_btf_exists {
+            open_bpts.btf_custom_path = path_holder /* ... */;
+        } else if let Some(env_btf) = env_btf_file_path.as_ref() {
+            open_bpts.btf_custom_path = env_btf.as_bytes().as_ptr() as *const _;
+        } else if !vmlinux_btf_exists {
+            bail!("All ways tried to find vmlinux BTF, but not found. Please provide the vmlinux btf using env `BTF_FILE_PATH`. /* ... */");
+        };
+        let open_result = unsafe {
+            libbpf_sys::bpf_object__open_mem(
+                self.bpf_object.as_ptr() as *const c_void,
+                self.bpf_object.len() as libbpf_sys::size_t,
+                &amp;open_bpts,
+            )
+        };</code></pre>
+    <p>On a normal modern kernel, <code>/sys/kernel/btf/vmlinux</code> exists and libbpf uses it. If it does not exist,
+      the loader uses a BTF file from a tailored archive (the <code>.tar</code> package from <code>ecc -b</code>, matched
+      to the running kernel by <code>bpf-compatible-rs</code>; see chapter <a href="13-bpf-compatible.html">13</a>), or
+      a file you name in <code>BTF_FILE_PATH</code>. The builder also dumps the program's own BTF into a
+      <code>BtfContainer</code>; that is what the printer will use later.</p>
+
+    <h3>Phase 2: fill globals, load, attach</h3>
+    <p>Before loading, the loader writes the initial contents of <code>.rodata</code> and <code>.bss</code>. It starts
+      from the bytes in the ELF and overwrites each variable that has a value from the command line or from
+      <code>value</code> in the JSON, using the variable's BTF type to encode it. In our run,
+      <code>--min_duration_ns 200000000</code> showed up in the log as
+      <code>received bytes [0, 194, 235, 11, 0, 0, 0, 0]</code>, which is 200,000,000 as a little-endian
+      <code>u64</code>. This is the generic version of the libbpf-bootstrap line
+      <code>skel-&gt;rodata-&gt;min_duration_ns = …</code>.</p>
+    <p>Then it calls <code>load()</code> (libbpf performs CO-RE relocation and the kernel verifier runs) and tries
+      libbpf's auto-attach on each program. Programs libbpf cannot auto-attach fail with <code>EOPNOTSUPP</code>; the
+      loader catches exactly that error and attaches them itself:</p>
+    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/skeleton/preload/mod.rs"><code class="language-rust">        for prog_meta in self.meta.bpf_skel.progs.iter() {
+            /* ... */
+            match bpf_prog.attach() {
+                Ok(link) =&gt; links.push(AttachLink::BpfLink(link)),
+                // EOPNOTSUPP 95 Operation not supported
+                Err(_) if errno::errno().0 == 95 =&gt; {
+                    // Not supported for auto-attaching, needs manually operations
+                    not_attached.push(prog_meta);
+                    continue;
+                }
+                Err(err) =&gt; bail!("Failed to attach program `{}`: {}", prog_meta.name, err),
+            };
+        }
+        for prog_meta in not_attached.into_iter() {
+            /* ... */
+            match bpf_prog.section() {
+                "tc" =&gt; links.push(attach_tc(bpf_prog, prog_meta)/* ... */?),
+                "xdp" =&gt; links.push(attach_xdp(bpf_prog, prog_meta)/* ... */?),
+                "perf_event" =&gt; {
+                    let mut perf_links =
+                        attach_perf_event(bpf_prog, prog_meta)/* ... */?;
+                    links.append(&amp;mut perf_links);
+                }
+                s =&gt; bail!("Unsupported attach type: {}", s),
+            }
+        }</code></pre>
+    <p>This is where the <code>@ifindex</code> and <code>@tchook</code> comments end up. It is also the honest boundary
+      of "no userspace code needed": a program type outside libbpf's auto-attach list and outside these three manual
+      cases cannot be run this way.</p>
+
+    <h3>Phase 3: choose the output channel and print</h3>
+    <p>With no user code, the runtime has to guess where the output comes from. The rule, in the default
+      single-export mode, is: walk the maps in order; a map with <code>sample</code> metadata is a sampled map;
+      otherwise a <code>BPF_MAP_TYPE_RINGBUF</code> or <code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code> is an event stream.
+      If several qualify, the last one wins (with a warning).</p>
+    <pre data-file="bpf-loader-rs/bpf-loader-lib/src/skeleton/mod.rs"><code class="language-rust">        let mut export_map: Option&lt;(&amp;MapMeta, ExportMapType)&gt; = None;
+        for map_meta in self.meta.bpf_skel.maps.iter() {
+            /* ... look up bpf_map by name ... */
+            if let Some(sample_meta) = &amp;map_meta.sample {
+                set_and_warn_existsing_map(
+                    &amp;mut export_map,
+                    map_meta,
+                    ExportMapType::Sample(sample_meta),
+                );
+            } else if let MapType::RingBuf = bpf_map.map_type() {
+                set_and_warn_existsing_map(&amp;mut export_map, map_meta, ExportMapType::RingBuffer);
+            } else if let MapType::PerfEventArray = bpf_map.map_type() {
+                set_and_warn_existsing_map(
+                    &amp;mut export_map,
+                    map_meta,
+                    ExportMapType::PerfEventArray,
+                );
+            }
+        }
+        if let Some((map_meta, export_type)) = export_map {
+            /* ... */
+            if self.meta.export_types.is_empty() {
+                bail!(
+                    "Export map named `{}` found, but no export type is provided",
+                    map_meta.name
+                );
+            }
+            /* ... build exporter for export_types[0], then poll in a loop ... */
+        } else {
+            self.wait_for_no_export_program()
+                /* ... */;
+        }</code></pre>
+    <p>The exporter is built from <code>export_types[0]</code>. Before it prints anything, <code>checker.rs</code>
+      looks the struct up by <code>type_id</code> in the program's BTF, requires the same name and member count,
+      reads each member's bit offset and size, and rejects bitfields. Each record that arrives is then cut into fields
+      at those offsets and printed either as a text row under a generated header (<code>TIME PID PPID …</code>) or, with
+      <code>ecli run -j</code>, as one JSON object per line. For sampled maps the key and value types come from the
+      map's own BTF (<code>btf_key_type_id</code>, <code>btf_value_type_id</code>) and a <code>log2_hist</code> value is
+      drawn as the familiar BCC-style ASCII histogram.</p>
+    <p>A program with no exportable map (for example <code>minimal</code> or <code>xdp</code>, which only call
+      <code>bpf_printk</code>) is simply kept loaded until you press Ctrl-C; you read its output from
+      <code>/sys/kernel/tracing/trace_pipe</code>, as their READMEs say.</p>
+
+    <div class="callout tip"><span class="label">Multiple outputs</span>
+      <p>If you set <code>"enable_multiple_export_types": true</code> in the package's <code>meta</code>, the loader
+        ignores <code>export_types</code> and instead uses each map's <code>export_config</code>
+        (<code>btf_type_id</code>, <code>custom_members</code> or <code>default</code>) and can poll several maps at once
+        through <code>wait_and_poll_to_handler_with_multiple_exporter</code>. <code>ecc</code> does not generate this;
+        the repository's tests (<code>assets/multiple_export_ringbuf/</code>) write it by hand. A map can also declare
+        <code>"intepreter": {"stack_trace": …}</code> (the field name is spelled that way in the schema) so that
+        records are symbolized as stack traces with blazesym.</p>
+    </div>
+
+    <h3>The generated command line</h3>
+    <p><code>meta/arg_builder.rs</code> builds a <a href="https://docs.rs/clap">clap</a> parser from the data section
+      variables. Names starting with <code>__eunomia_dummy</code> are skipped. A <code>bool</code> with no default
+      becomes a switch <code>--name</code>; one defaulting to <code>false</code> becomes <code>--enable-name</code>;
+      one defaulting to <code>true</code> becomes <code>--disable-name</code>. Every other type takes a value, checked
+      against the BTF type when it is written. A <code>--verbose</code> switch (libbpf debug output) is always added.
+      The <code>doc</code> block from the <code>LICENSE</code> comment fills the version, the text before the options
+      and the text after; without it you get "A simple eBPF program" and "Built with eunomia-bpf framework.". Running
+      the generated help for bootstrap with ecli v1.0.38 gave:</p>
+    <pre><code class="language-plaintext">$ ecli run /tmp/.../bootstrap/package.json -h
+Error: Failed to run native eBPF program
+
+Caused by:
+    Bpf error: Failed to parse argument: A simple eBPF program
+
+    Usage: prog [OPTIONS]
+
+    Options:
+          --verbose
+              Whether to show libbpf debug information
+          --min_duration_ns &lt;min_duration_ns&gt;
+              Set value of `unsigned long long` variable min_duration_ns
+      -h, --help
+              Print help
+      -V, --version
+              Print version
+
+    Built with eunomia-bpf framework.
+    See https://github.com/eunomia-bpf/eunomia-bpf for more information.</code></pre>
+    <p>The help is correct but arrives wrapped in an error, because ecli treats clap's "help requested" result as a
+      parse failure. The per-example READMEs show an older help format (<code>Usage: bootstrap_bpf [--help] …</code>)
+      from an earlier version of the runtime; the information is the same.</p>
+
+    <h2>ecli: running from a file, a URL or a registry</h2>
+    <p><code>ecli</code> is a thin clap front end (<code>ecli/client/src/main.rs</code>) over <code>ecli-lib</code>.
+      Since March 2026 (PR #377) it has exactly three subcommands. The older server mode (<code>ecli client</code>,
+      <code>ecli-server</code>) was removed and lives on the <code>archive/ecli-remote-http</code> branch.</p>
+    <pre><code class="language-plaintext">$ ./ecli -h
+ecli subcommands, including run, push, pull
+
+Usage: ecli [COMMAND_LINE]... [COMMAND]
+
+Commands:
+  run   run ebpf program
+  push  Operations about pushing image to registry
+  pull  Operations about pulling image from registry
+  help  Print this message or the help of the given subcommand(s)</code></pre>
+    <p><code>ecli run [-j] [-p json|tar|wasm] &lt;prog&gt; [args…]</code> takes one program reference and passes the rest
+      of the line to the program. The bare form <code>ecli &lt;prog&gt;</code> still works for compatibility. The
+      reference is resolved by one function, which is worth reading because its fall-through order explains several
+      confusing error messages:</p>
+    <pre data-file="ecli/ecli-lib/src/runner/helper.rs"><code class="language-rust">/// Load the binary of the given url, and guess its program type
+/// If failed to guess, will just return None
+/// It will try the following order
+/// - Test if the provided string is a local file. If matches, read it
+/// - If the string is a URL, then treat it as a HTTP URL, and download it.
+/// - If the string is not an url, treat it as an OCI image tag
+pub async fn try_load_program_buf_and_guess_type(
+    url: impl AsRef&lt;str&gt;,
+) -&gt; anyhow::Result&lt;(Vec&lt;u8&gt;, Option&lt;ProgramType&gt;)&gt; {
+    let url = url.as_ref();
+    // Is it a local path?
+    let path = PathBuf::from(url);
+    let (buf, prog_type) = if path.exists() &amp;&amp; path.is_file() {
+        /* ... read file ... */
+        let prog_type = ProgramType::try_from(url).ok();
+        (buf, prog_type)
+    } else if let Ok(url) = url::Url::parse(url) {
+        /* ... reqwest::get(url), read bytes, guess type from suffix ... */
+        (data.to_vec(), prog_type)
+    } else {
+        debug!("Trying OCI tag: {}", url);
+        let image = Reference::try_from(url)
+            .with_context(|| anyhow!("Failed to parse `{}` into an OCI image reference", url))?;
+
+        let data = pull_wasm_image(&amp;image, &amp;RegistryAuth::Anonymous, None)
+            .await
+            .with_context(|| anyhow!("Failed to pull OCI image from `{}`", url))?;
+        (data, Some(ProgramType::WasmModule))
+    };
+    Ok((buf, prog_type))
+}</code></pre>
+
+    <p>Three consequences follow directly from this code:</p>
+    <ul>
+      <li>The program type comes from the file suffix: <code>.json</code> → JSON package, <code>.wasm</code> → Wasm
+        module, <code>.tar</code> → JSON package plus BTF archive. Anything else, or input from stdin
+        (<code>-</code>), needs <code>-p</code>.</li>
+      <li>A local path that does not exist is not an error. It falls through to "is it a URL?" and then to "is it an
+        image reference?". A mistyped <code>pakage.json</code> becomes a request to Docker Hub for
+        <code>library/pakage.json</code>.</li>
+      <li>Anything pulled from a registry is treated as a <strong>Wasm module</strong>. The OCI path does not carry JSON
+        packages. To publish a JSON-only tool to a registry you wrap it in a Wasm module first (next section).</li>
+    </ul>
+    <p>The widget below replays that decision for any string you type. It is a small re-implementation for teaching,
+      not code from the repository; its URL test approximates <code>url::Url::parse</code> as "starts with a scheme
+      followed by a colon".</p>
+    <div class="card" id="resolver" style="margin:1rem 0">
+      <h4>Where would <code>ecli run</code> look?</h4>
+      <p><input id="res-in" type="text" value="ghcr.io/eunomia-bpf/execve:latest" style="width:100%;font-family:monospace;padding:.3rem" aria-label="program reference"></p>
+      <p><label><input id="res-exists" type="checkbox"> a regular file with this path exists on the host</label></p>
+      <p id="res-out" style="font-family:monospace"></p>
+    </div>
+
+    <h3>Pull, push and what lives in the registry</h3>
+    <p>Registry access goes through the <a href="https://github.com/eunomia-bpf/bpf-oci">bpf-oci</a> crate, which wraps
+      <code>oci-distribution</code>. The push subcommand takes a Wasm file and an image reference:</p>
+    <pre data-file="ecli/client/src/main.rs"><code class="language-rust">    #[clap(about = "Operations about pushing image to registry", after_help = AUTH_HELP)]
+    Push {
+        /// wasm module path
+        #[arg(long, short, default_value_t = ("app.wasm").to_string(), help = "Path to the wasm module")]
+        module: String,
+        #[clap(flatten)]
+        oci: OCIArgs,
+
+        #[clap(
+            short,
+            long,
+            required = false,
+            help = "OCI Annotations to be added to the manifest. Should be like `key=value`"
+        )]
+        annotations: Vec&lt;String&gt;,
+    },</code></pre>
+    <p>Credentials come from <code>-i</code> (prompt), <code>-u USER -p TOKEN</code>, or
+      <code>~/.docker/config.json</code>, and otherwise ecli logs in anonymously. The commands from
+      <code>ecli/README.md</code>:</p>
+    <pre><code class="language-bash">./ecli pull ghcr.io/eunomia-bpf/execve:latest
+./ecli push --module app.wasm ghcr.io/yourorg/mytool:v1.0
+./ecli push --module app.wasm -i ghcr.io/yourorg/mytool:v1.0
+./ecli push --module app.wasm -u USER -p TOKEN ghcr.io/yourorg/mytool:v1.0</code></pre>
+    <p>To see what is actually stored, we fetched the manifest of the project's demo image with an anonymous ghcr.io
+      token. It is an ordinary OCI artifact with the Wasm media types used by Wasm container tooling, a two-byte config
+      and one layer:</p>
+    <pre><code class="language-json">{
+  "schemaVersion": 2,
+  "annotations": { "org.opencontainers.image.title": "execve" },
+  "config": { "mediaType": "application/vnd.wasm.config.v1+json", "size": 2, "digest": "sha256:44136f…" },
+  "layers": [
+    { "mediaType": "application/vnd.wasm.content.layer.v1+wasm", "size": 37392, "digest": "sha256:781458…" }
+  ]
+}</code></pre>
+    <p><code>ecli pull -o execve.wasm ghcr.io/eunomia-bpf/execve:latest</code> (no root needed) wrote a 37,392-byte file
+      that <code>file</code> identifies as "WebAssembly (wasm) binary module version 0x1 (MVP)".</p>
+
+    <h3>Tar packages and old kernels</h3>
+    <p><code>ecc -b</code> clones <a href="https://github.com/aquasecurity/btfhub-archive">btfhub-archive</a> (once, into
+      <code>~/.local/share/eunomia/btfhub-archive</code> by default), unpacks every <code>.btf.tar.xz</code>, runs
+      <code>bpftool gen min_core_btf</code> on each one against your object, and tars the small results together with
+      <code>package.json</code> and the object. This is the BTFGen technique from chapter
+      <a href="06-btf-core-libbpf.html">06</a>, automated. On the target, <code>ecli run tool.tar</code> unpacks the tar,
+      and the loader uses the matching tailored BTF only if <code>/sys/kernel/btf/vmlinux</code> is missing. The
+      eunomia.dev page <a href="https://eunomia.dev/eunomia-bpf/supporting-external-BTF/">"supporting-external-BTF"</a>
+      describes the same flow. We did not run <code>-b</code> here; the archive is large.</p>
+
+    <h2>The Wasm path, where it touches ecc and ecli</h2>
+    <p>A JSON package is enough when "print the struct" is the whole user side. When you need logic, for example
+      sigsnoop's mapping from signal numbers to names, you write the user side in C (or Rust, or Go) and compile it to
+      WebAssembly. The full model is chapter <a href="12-wasm-bpf.html">12</a>. The connection to this chapter is
+      small and concrete:</p>
+    <ol>
+      <li><code>ecc foo.bpf.c foo.h --wasm-header</code> writes <code>ewasm-skel.h</code>, which is the whole
+        <code>package.json</code> as one escaped C string: <code>char* program_data = "{\"bpf_object\":\"eJyt…</code>.
+        (For the xdp example: 1,431-byte package, 1,630-byte header.)</li>
+      <li>A Wasm module includes that header and passes the string to host functions provided by the runtime.</li>
+      <li><code>ecli run app.wasm</code> runs it with <code>wasm-bpf-rs</code>, which loads the embedded package through
+        the same bpf-loader machinery and delivers events back into the module.</li>
+    </ol>
+    <p>The smallest such module is in the repository's GitHub Pages build script. It wraps any JSON package into a Wasm
+      module that just prints every event, which is how a JSON tool becomes something you can
+      <code>ecli push</code> to a registry:</p>
+    <pre data-file=".github/scripts/build-gh-pages-assets.sh"><code class="language-c">#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+#include "ewasm-skel.h"
+
+int create_bpf(char *ebpf_json, int str_len);
+int run_bpf(int id);
+int wait_and_poll_bpf(int id);
+
+int bpf_main(char *env_json, int str_len)
+{
+    (void)env_json;
+    (void)str_len;
+
+    int res = create_bpf(program_data, strlen(program_data));
+    if (res &lt; 0) {
+        printf("create_bpf failed %d\n", res);
+        return -1;
+    }
+    res = run_bpf(res);
+    /* ... same check ... */
+    res = wait_and_poll_bpf(res);
+    /* ... same check ... */
+    return 0;
+}
+
+int process_event(int ctx, char *event_json, int str_len)
+{
+    (void)ctx;
+    printf("%.*s\n", str_len, event_json);
+    return -1;
+}</code></pre>
+    <p>The same script compiles it with wasi-sdk's clang:
+      <code>--target=wasm32-wasi -O0 -z stack-size=4096 -Wl,--initial-memory=65536 … -Wl,--export=bpf_main
+      -Wl,--export=process_event -Wl,--strip-all,--no-entry -Wl,--allow-undefined</code>. The
+      <code>--allow-undefined</code> is what lets <code>create_bpf</code> and friends stay as imports for the host to
+      supply. The sigsnoop example goes further: it adds <code>ecc sigsnoop.h --header-only</code> and the separate
+      <a href="https://github.com/eunomia-bpf/c-struct-bindgen">c-struct-bindgen</a> tool to generate
+      <code>sigsnoop.wasm.h</code>, so the Wasm code can read the event struct with the right layout, then builds with
+      its <code>build.sh</code>. Its README shows:</p>
+    <pre data-file="examples/bpftools/sigsnoop/README.md"><code class="language-plaintext">$ sudo ./ecli run sigsnoop.wasm -p 1641
+running and waiting for the ebpf events from perf event...
+{"pid":1641,"tpid":2368,"sig":23,"ret":0,"comm":"YDLive","sig_name":"SIGURG"}</code></pre>
+
+    <h2>Trying it: what we ran, and what happened</h2>
+    <p>The orb used for this curriculum runs Linux 6.1.189 on x86-64 with Debian clang 14.0.6 and has
+      <code>/sys/kernel/btf/vmlinux</code>. We did not build the Rust workspaces; we downloaded the release binaries,
+      which are small (v1.0.38: <code>ecc</code> 8,053,152 bytes, <code>ecli</code> 11,895,200 bytes). Both are
+      statically linked self-mounting executables (the CI packs them as AppImages with <code>cargo-appimage</code>).</p>
+    <pre><code class="language-bash"># from the README; aka.pw/bpf-ecli redirects to releases/latest/download/ecli
+wget https://github.com/eunomia-bpf/eunomia-bpf/releases/latest/download/ecli -O ecli &amp;&amp; chmod +x ./ecli
+wget https://github.com/eunomia-bpf/eunomia-bpf/releases/latest/download/ecc &amp;&amp; chmod +x ./ecc</code></pre>
+    <p>What happened, in order:</p>
+    <ol>
+      <li><strong>v1.0.38 ecc could not finish.</strong> Clang produced the object, but the documentation step failed:
+        <code>Failed to load libclang dynamically at runtime: … /tmp/.mount_ecc…/lib/x86_64-linux-gnu/libc.so.6: version
+        `GLIBC_2.36' not found (required by /lib/x86_64-linux-gnu/libLLVM-14.so.1)</code>. The slim v1.0.38 binary
+        loads the host's <code>libclang</code> but brings its own older glibc. The v1.0.37 <code>ecc</code> (65,692,064
+        bytes, which bundles libclang) worked, and we used it for everything below. Both report
+        <code>ecc-rs 0.3.4</code>.</li>
+      <li><strong>Compile.</strong> In a copy of <code>examples/bpftools/bootstrap</code>:
+        <code>ecc bootstrap.bpf.c bootstrap.h</code> produced the files shown earlier. Note the header is
+        <code>bootstrap.h</code>; the top-level examples README says <code>event.h</code>, which does not exist in that
+        directory.</li>
+      <li><strong>Run.</strong> <code>sudo ecli run /abs/path/package.json</code> printed:
+        <pre><code class="language-plaintext">TIME     PID    PPID   EXIT_CODE DURATION_NS COMM   FILENAME EXIT_EVENT
+INFO [bpf_loader_lib::skeleton] Running ebpf program...
+00:11:43  34389 34371  0         0           gh     /home/user/.amp/bin/gh 0
+00:11:43  34390 34371  0         0           head   /usr/bin/head 0
+00:11:43  34392 34391  0         0           git    /opt/git/bin/git 0
+00:11:43  34392 34391  0         1530640     git             1</code></pre>
+        That is the kernel code from libbpf-bootstrap with a userspace we never wrote.</li>
+      <li><strong>Flags and JSON.</strong>
+        <code>sudo ecli run -j /abs/path/package.json --min_duration_ns 200000000</code> printed only exits of
+        processes that lived at least 200 ms, as JSON lines:
+        <code>{"comm":"curl","duration_ns":280495571,"exit_code":0,"exit_event":1,"filename":"","pid":36093,"ppid":36092}</code>.</li>
+      <li><strong>Histograms.</strong> <code>ecc runqlat.bpf.c runqlat.h</code> then <code>sudo ecli run
+        …/runqlat/package.json</code> printed a log2 histogram every second (<code>key = 4294967295</code>,
+        <code>comm = …</code>, <code>(unit) : count distribution</code>), driven only by the <code>@sample</code>
+        comment.</li>
+      <li><strong>Registry.</strong> <code>ecli pull</code> of <code>ghcr.io/eunomia-bpf/execve:latest</code> worked
+        anonymously (above). We did not run the pulled module and did not test <code>push</code>.</li>
+      <li><strong>URL.</strong> The docs' URL example,
+        <code>https://eunomia-bpf.github.io/eunomia-bpf/sigsnoop/package.json</code>, returned HTTP 404 on 2026-11-06,
+        as did <code>bootstrap/package.json</code>. The <code>gh-pages</code> branch has the example sources but no
+        built packages. The docs now call this "historical GitHub Pages workflow, kept for compatibility". The URL code
+        path itself is plain <code>reqwest::get</code>; any web server hosting a <code>.json</code> works.</li>
+    </ol>
+    <div class="callout warn"><span class="label">Use absolute paths with sudo</span>
+      <p>In this orb, <code>sudo ecli run package.json</code> with a <em>relative</em> path sometimes failed with
+        <code>Failed to pull OCI image from `package.json` … registry-1.docker.io/v2/library/package.json/manifests/latest</code>
+        or <code>invalid reference format</code>, even though the file existed. The same command with an absolute path
+        always worked. We did not find the cause (the orb's sandboxed kernel and the binaries' self-mounting runtime are
+        both suspects), so treat it as an observation from one environment. The error message itself is the
+        fall-through described above.</p>
+    </div>
+
+    <h2>"Compile once, run everywhere": what is actually portable</h2>
+    <p>The README promises tools that run "without recompiling, kernel version and architecture independent". It helps
+      to split that claim into parts and check each against the code.</p>
+    <div class="grid">
+      <div class="card"><h4>Kernel version: yes, via CO-RE</h4>
+        <p>The package carries the object with its <code>.BTF</code> and <code>.BTF.ext</code>. libbpf relocates field
+          accesses against the target's BTF exactly as in chapter <a href="06-btf-core-libbpf.html">06</a>. Our package,
+          built against eunomia's bundled <code>vmlinux.h</code>, read <code>real_parent-&gt;tgid</code> correctly on
+          6.1. Without kernel BTF, a <code>.tar</code> from <code>ecc -b</code> or <code>BTF_FILE_PATH</code> fills in.</p></div>
+      <div class="card"><h4>Kernel features: no</h4>
+        <p>CO-RE fixes offsets, not missing features. The ring buffer needs Linux 5.8; fentry, LSM and
+          <code>struct_ops</code> need their own minimum versions (chapter <a href="05-program-types-and-hooks.html">05</a>).
+          An older kernel rejects the program at load time, with the verifier or with an unknown map type.</p></div>
+      <div class="card"><h4>Architecture: mostly, with a catch</h4>
+        <p>BPF bytecode is the same on every CPU, so one <code>package.json</code> can load on x86-64 and arm64. But
+          <code>ecc</code> compiles with <code>-D__TARGET_ARCH_&lt;build arch&gt;</code>, and
+          <code>bpf_tracing.h</code> macros such as <code>PT_REGS_PARM1</code> for kprobes expand to architecture-specific
+          register fields. A tracepoint-only tool like bootstrap is portable; a kprobe tool compiled on x86 reads x86
+          register names. The Wasm-bpf paper names this problem and describes extra relocation for it.</p></div>
+      <div class="card"><h4>Runner: per architecture</h4>
+        <p><code>ecli</code> itself is native code. Releases ship <code>ecli</code> (x86-64) and
+          <code>ecli-aarch64</code>. The package is portable; the runner is not.</p></div>
+    </div>
+
+    <h2>The GitHub template (eunomia-template)</h2>
+    <p><a href="https://github.com/eunomia-bpf/eunomia-template">eunomia-template</a> is a GitHub template repository:
+      click "Use this template", edit <code>src/template.bpf.c</code> and <code>src/template.h</code> (a copy of
+      bootstrap), push, and Actions builds a package and attaches it to a release. It also has a
+      <code>dockerfile</code> based on the <code>ghcr.io/eunomia-bpf/ecc-x86_64</code> image, a Nix flake with
+      <code>.envrc</code> for direnv, and a devcontainer for Codespaces. The local build is one Makefile line,
+      <code>cd src &amp;&amp; ecc template.bpf.c template.h</code>. The publishing workflow, trimmed:</p>
+    <pre data-file="eunomia-template/.github/workflows/publish.yml"><code class="language-yaml">name: Build and publish
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # ...
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set latest release version
+      if:   github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'
+      id: set_version
+      uses: actions/github-script@v6
+      # ... script: next patch version after the latest release, or v0.0.1 ...
+
+    - name: install deps
+      run: |
+        sudo apt update
+        sudo apt-get install -y --no-install-recommends \
+        libcurl4-openssl-dev libelf-dev clang llvm cmake zlib1g-dev
+        wget https://github.com/eunomia-bpf/eunomia-bpf/releases/latest/download/ecc &amp;&amp; chmod +x ./ecc
+
+    - name: build package
+      run: |
+        cd src
+        ../ecc template.bpf.c template.h
+
+    - name: Publish
+      if:   github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v3
+      with:
+          files: src/package.json
+          prerelease: false
+          tag_name: ${{ steps.set_version.outputs.result }}
+          generate_release_notes: true</code></pre>
+    <p>A second workflow, <code>docker.yml</code>, builds the dockerfile and pushes
+      <code>ghcr.io/&lt;owner&gt;/eunomia-template:latest</code>, whose entry point is <code>ecli run src/package.json</code>,
+      so <code>sudo docker run --rm -it --privileged ghcr.io/eunomia-bpf/eunomia-template:latest</code> runs the tool in a
+      container. The README's docs page is <a href="https://eunomia.dev/eunomia-bpf/ecc/github-template/">eunomia.dev
+      "github template"</a>; the old name <code>ebpm-template</code> redirects here.</p>
+    <p>Status, from the GitHub API: the 2023 releases v0.0.3 and v0.0.4 each carry a 16,898-byte
+      <code>package.json</code>. The two 2026 fixes ("allow release workflow to publish", July; "Pin the release action
+      to a version that uploads before publishing", September) followed a failed run, and release v0.0.5 (2026-07-19)
+      has no assets. The workflow always downloads the <em>latest</em> ecc, so it is exposed to the libclang/glibc issue
+      above if the runner image changes.</p>
+
+    <h2>The in-browser compiler (ecli-webui)</h2>
+    <p><a href="https://github.com/eunomia-bpf/ecli-webui">ecli-webui</a> is a Vue 3 + Vite playground, deployed at
+      <a href="https://ecli-webui.vercel.app">ecli-webui.vercel.app</a>, that compiles eBPF C entirely in the browser.
+      It uses <a href="https://github.com/jprendes/emception">Emception</a>, a build of LLVM/Clang (and other tools)
+      compiled to WebAssembly with Emscripten. On load the page fetches <code>vmlinux.h</code> and the libbpf headers
+      (<code>bpf_helpers.h</code>, <code>bpf_tracing.h</code>, <code>bpf_core_read.h</code>, …) and writes them into
+      Emception's in-memory file system. Clicking Compile writes the editor tabs to <code>/</code> and runs Clang:</p>
+    <pre data-file="ecli-webui/src/views/MainView.vue"><code class="language-javascript">        const result = await emception._run_process(['/usr/bin/clang', '-g', '-O2', '-target', 'bpf', '-D__TARGET_ARCH_x86', '-I/', '-c', '/' + mainC, '-o', '/main.bpf.o'], {
+            print: (s: string) =&gt; consoleCtx.value.push(s),
+            printErr: (s: string) =&gt; consoleCtx.value.push(s),
+            cwd: "/"
+        });
+        /* ... */
+        if (result.returncode === 0) {
+            const out = emception.fileSystem.readFile('/main.bpf.o');
+            /* ... convert Uint8Array to a binary string ... */
+            const base64 = window.btoa(binary);
+
+            const eunomiaPkg = {
+                bpf_object: base64,
+                bpf_object_size: out.length,
+                meta: {
+                    bpf_skel: {
+                        data_sections: [],
+                        maps: [],
+                        progs: []
+                    },
+                    eunomia_version: "0.1.0"
+                }
+            };</code></pre>
+    <p>The repository's <code>online-compile.md</code> explains two fixes made in September 2026: the
+      <code>-D__TARGET_ARCH_x86</code> define (without it, <code>bpf_tracing.h</code>'s register macros hit a
+      <code>_Pragma("GCC error")</code>), and example code adjusted to the newer kernel's <code>struct filename</code>
+      layout in the bundled <code>vmlinux.h</code>.</p>
+    <p>The browser only runs Clang. It does not run bpftool or libclang's comment parser, so the package it builds has
+      empty <code>maps</code> and <code>progs</code>, no <code>obj_name</code>, no export types, and an object that is
+      base64 but <em>not</em> zlib-compressed. Compare that with the loader's schema shown earlier. To check, we rebuilt
+      the same JSON shape in Python from our <code>bootstrap.bpf.o</code> and gave it to ecli v1.0.38. It was rejected
+      with <code>Malformed json provided: missing field `obj_name`</code>, and after adding <code>obj_name</code>, with
+      <code>Malformed compressed data: unknown ZLIB method CM=0xf</code> (<code>0x7f</code>, the first byte of every ELF
+      file, is not a valid zlib header). We did not run the web app itself, but as of <code>6816d61</code> its
+      downloaded <code>package.json</code> should not load in the current <code>ecli</code> without changes. Treat the
+      playground as a way to check that code compiles, not as a replacement for <code>ecc</code>.</p>
+
+    <h2>The Homebrew tap</h2>
+    <p><a href="https://github.com/eunomia-bpf/homebrew-tap">eunomia-bpf/homebrew-tap</a> is the org's official
+      Homebrew tap (<code>brew tap eunomia-bpf/tap</code>). At <code>aefe55a</code> it contains exactly one formula,
+      <code>Formula/agentsight.rb</code> (AgentSight v1.0.31, chapter <a href="23-agentsight.html">23</a>), which
+      downloads a release binary, patches its interpreter to Homebrew's glibc with <code>patchelf</code>, and tests
+      <code>--version</code> and <code>--help</code>. The README lists bpftime, actplane and wasm-bpf as planned. There
+      is <strong>no ecc or ecli formula</strong>; install those from GitHub Releases or use the ecc Docker image. The
+      tap's stated rule, "Formulae must install a real tool and provide at least a working <code>--version</code> or
+      <code>--help</code> test", would apply to them too.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefit: kernel code only</h4>
+        <p>For tools that emit events or histograms, the user side disappears. The kernel code stays standard libbpf C,
+          so it moves to libbpf-bootstrap (or back) unchanged.</p></div>
+      <div class="card"><h4>Benefit: one data file</h4>
+        <p>A tool is one JSON file of a few KB to tens of KB. It can be inspected with <code>jq</code>, edited (defaults,
+          poll interval) and served from any web server.</p></div>
+      <div class="card"><h4>Benefit: one runner, many sources</h4>
+        <p>Local file, URL, and OCI registry through the same <code>ecli run</code>; Wasm when you need real logic.</p></div>
+      <div class="card"><h4>Benefit: small toolchain surface</h4>
+        <p>ecc bundles bpftool, libbpf headers and <code>vmlinux.h</code>; you need clang and llvm-strip. A Docker image
+          (<code>ghcr.io/eunomia-bpf/ecc-&lt;arch&gt;</code>) removes even that.</p></div>
+      <div class="card"><h4>Limit: fixed output model</h4>
+        <p>One export struct per program by default, chosen by a header file and map-walk order. No filtering,
+          aggregation or joining in user space without Wasm. Bitfields are rejected.</p></div>
+      <div class="card"><h4>Limit: attach coverage</h4>
+        <p>What libbpf can auto-attach, plus manual TC, XDP and perf_event. Uprobes need an attach string libbpf can
+          resolve; the compiler roadmap still lists "Better uprobe support" and "Enhanced XDP support" as open.</p></div>
+      <div class="card"><h4>Limit: trust and privilege</h4>
+        <p><code>ecli run https://…</code> downloads bytecode and runs it as root. There is no signature check in the code
+          path shown above. Pin versions, or host your own packages.</p></div>
+      <div class="card"><h4>Limit: maintenance state</h4>
+        <p>Main-repo work is now mostly dependency bumps; docs and READMEs lag the code in places; published example URLs
+          404; the latest ecc failed on our host's glibc. The core load path worked well.</p></div>
+    </div>
+    <p>The project also states figures we did not measure: the introduction page says the library is "&lt;1MB" and
+      can load and run a program in "&lt;100ms". They are the project's claims.</p>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>libbpf-bootstrap</strong> (chapter <a href="06-btf-core-libbpf.html">06</a>) and the eunomia starter
+        templates (chapter <a href="11-starter-templates.html">11</a>): you write the user side; maximum control.</li>
+      <li><strong>BCC and bpftrace</strong> (chapter <a href="08-ecosystem.html">08</a>): also "kernel logic only" for the
+        user, but they compile on the target (BCC) or use their own language (bpftrace). eunomia-bpf compiles ahead of
+        time and runs plain libbpf C.</li>
+      <li><strong><a href="https://github.com/solo-io/bumblebee">BumbleBee</a></strong> (Solo.io): the closest idea.
+        It also packages libbpf programs as OCI images and generates the user side from map definitions, with a
+        <code>bee</code> CLI. The repo's own <code>internal-docs/POSITIONING.md</code> compares the two.</li>
+      <li><strong><a href="https://github.com/bpfman/bpfman">bpfman</a></strong>: loads eBPF bytecode from OCI images
+        and manages its lifecycle on a host or in Kubernetes. It is a deployment manager rather than a "no user code"
+        runner.</li>
+      <li><strong>wasm-bpf</strong> (chapter <a href="12-wasm-bpf.html">12</a>) and the paper below: the Wasm half of
+        this design. <strong>bpftime</strong> (chapter <a href="14-bpftime-architecture.html">14</a>) is the org's
+        other runtime, which runs eBPF programs in user space instead of the kernel.</li>
+      <li><strong>The bpf-developer-tutorial</strong> (chapter <a href="09-bpf-developer-tutorial.html">09</a>) uses
+        <code>ecc</code>/<code>ecli</code> in many of its early lessons.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> You run <code>ecc tool.bpf.c</code> without a header. The program writes to a
+        ring buffer. What happens when you run the package?</p>
+        <button class="opt">ecli guesses the struct from the ring buffer's value type</button>
+        <button class="opt" data-right>The loader finds the ring buffer but fails with "Export map named … found, but no
+          export type is provided"</button>
+        <button class="opt">It prints each record as hex bytes</button>
+        <button class="opt">ecc refuses to compile</button>
+        <div class="why">Export types only come from the header argument (step 5). Ring buffers have no value type to
+          guess from. <code>wait_and_poll_with_old_single_export</code> bails when it finds an export map but
+          <code>export_types</code> is empty.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Why does every package built with a header contain a <code>.bss</code>
+        variable named <code>__eunomia_dummy_event_ptr</code>?</p>
+        <button class="opt">It holds the ring buffer's file descriptor</button>
+        <button class="opt">libbpf requires one global per struct</button>
+        <button class="opt" data-right>ecc appends it so Clang is forced to emit BTF for <code>struct event</code></button>
+        <button class="opt">It is the Wasm entry point</button>
+        <div class="why"><code>add_unused_ptr_for_structs</code> appends one dummy pointer per struct in the header to a
+          temporary copy of the source. The runtime skips these names when building the command line.</div></div>
+      <div class="q"><p><strong>Q3.</strong> A global is declared as
+        <code>/// @cmdarg {"default": true}</code> followed by <code>const volatile bool verbose_mode = true;</code>.
+        Which flag does the generated command line offer?</p>
+        <button class="opt"><code>--verbose_mode</code></button>
+        <button class="opt"><code>--enable-verbose_mode</code></button>
+        <button class="opt" data-right><code>--disable-verbose_mode</code></button>
+        <button class="opt">None; bool globals never get flags</button>
+        <div class="why">A bool's default comes from <code>cmdarg.default</code> (or a <code>value</code> in the JSON).
+          In <code>arg_builder.rs</code>, default true yields <code>--disable-&lt;name&gt;</code>, default false yields
+          <code>--enable-&lt;name&gt;</code>, and no default yields <code>--&lt;name&gt;</code>. The C initializer alone
+          does not count: the skeleton JSON records only the variable's name and type.</div></div>
+      <div class="q"><p><strong>Q4.</strong> <code>sudo ecli run ghcr.io/me/tool:v1</code>. What kind of program does ecli
+        expect to receive?</p>
+        <button class="opt">A JSON package</button>
+        <button class="opt">A tar with BTF files</button>
+        <button class="opt" data-right>A Wasm module</button>
+        <button class="opt">A native ELF executable</button>
+        <div class="why">The OCI branch of <code>try_load_program_buf_and_guess_type</code> calls
+          <code>pull_wasm_image</code> and always returns <code>ProgramType::WasmModule</code>. JSON tools are pushed by
+          first wrapping them in a Wasm module.</div></div>
+      <div class="q"><p><strong>Q5.</strong> A kprobe tool reads its first argument with <code>PT_REGS_PARM1(ctx)</code>.
+        You build the package with ecc on x86-64. Which statement is right?</p>
+        <button class="opt">CO-RE makes it work on arm64 automatically</button>
+        <button class="opt" data-right>The macro was expanded for x86 (<code>-D__TARGET_ARCH_x86</code>), so the package is
+          not architecture-neutral even though the bytecode is</button>
+        <button class="opt">ecli recompiles it for the host</button>
+        <button class="opt">BPF programs cannot use kprobes through ecli</button>
+        <div class="why">CO-RE relocates struct field accesses by name; <code>PT_REGS_*</code> pick architecture-specific
+          <code>pt_regs</code> fields at compile time. Tracepoint-based tools avoid the problem.</div></div>
+      <div class="q"><p><strong>Q6.</strong> Why would a <code>package.json</code> downloaded from ecli-webui at
+        <code>6816d61</code> fail to load in ecli v1.0.38?</p>
+        <button class="opt">The browser compiles for wasm32 instead of BPF</button>
+        <button class="opt">ecli does not accept files named package.json</button>
+        <button class="opt" data-right>Its <code>bpf_skel</code> lacks <code>obj_name</code> and its object is not
+          zlib-compressed, so deserialization fails</button>
+        <button class="opt">It is missing a signature</button>
+        <div class="why"><code>BpfSkeletonMeta.obj_name</code> is a required field and <code>ComposedObject</code> inflates
+          <code>bpf_object</code> with zlib. The web UI writes plain base64 and empty skeleton fields.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/eunomia-bpf">eunomia-bpf/eunomia-bpf</a>, commit
+        <code>a5408a8c3614bd4e008c1f999bb4ee9738e2fc41</code> (2026-08-09). Files quoted:
+        <code>compiler/cmd/src/{export_types.rs, bpf_compiler/mod.rs, config/mod.rs, document_parser.rs}</code>,
+        <code>bpf-loader-rs/bpf-loader-lib/src/{meta/mod.rs, meta/arg_builder.rs, skeleton/builder.rs,
+        skeleton/preload/mod.rs, skeleton/mod.rs, export_event/checker.rs}</code>,
+        <code>ecli/client/src/main.rs</code>, <code>ecli/ecli-lib/src/runner/helper.rs</code>,
+        <code>examples/bpftools/*</code>, <code>.github/scripts/build-gh-pages-assets.sh</code>. Releases
+        <a href="https://github.com/eunomia-bpf/eunomia-bpf/releases/tag/v1.0.38">v1.0.38</a> and v1.0.37.</li>
+      <li><a href="https://github.com/eunomia-bpf/eunomia-template">eunomia-bpf/eunomia-template</a>, commit
+        <code>739efb3</code> (<code>.github/workflows/publish.yml</code>, <code>docker.yml</code>, <code>dockerfile</code>,
+        <code>Makefile</code>).</li>
+      <li><a href="https://github.com/eunomia-bpf/ecli-webui">eunomia-bpf/ecli-webui</a>, commit <code>6816d61</code>
+        (<code>src/views/MainView.vue</code>, <code>online-compile.md</code>); live at
+        <a href="https://ecli-webui.vercel.app">ecli-webui.vercel.app</a>.</li>
+      <li><a href="https://github.com/eunomia-bpf/homebrew-tap">eunomia-bpf/homebrew-tap</a>, commit <code>aefe55a</code>.</li>
+      <li>eunomia.dev documentation: <a href="https://eunomia.dev/eunomia-bpf/">eunomia-bpf Documentation</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/introduction/">introduction</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/architecture/">Project architecture</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/ecc/usage/">ecc usage</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/ecli/">ecli</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/ecc/github-template/">github template</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/supporting-external-BTF/">supporting-external-BTF</a>,
+        <a href="https://eunomia.dev/eunomia-bpf/online/">Online Demo</a> (pages last updated March 2026).</li>
+      <li>Yusheng Zheng, Tong Yu, Yiwei Yang, Andrew Quinn, <a href="https://arxiv.org/abs/2408.04856">"Wasm-bpf:
+        Streamlining eBPF Deployment in Cloud Environments with WebAssembly"</a>, arXiv:2408.04856 [cs.OS], August 2024.</li>
+      <li>eunomia.dev, <a href="https://eunomia.dev/others/miscellaneous/wasm-bpf-kubecon">"Securing and Simplifying eBPF
+        Deployments with WebAssembly"</a> (article on wasm-bpf and WasmEdge deployment).</li>
+      <li><a href="https://github.com/eunomia-bpf/bpf-oci">eunomia-bpf/bpf-oci</a> (OCI push/pull crate used by ecli);
+        <a href="https://github.com/eunomia-bpf/bpftool">eunomia-bpf/bpftool</a> (fork with JSON skeleton output);
+        <a href="https://github.com/eunomia-bpf/c-struct-bindgen">eunomia-bpf/c-struct-bindgen</a>.</li>
+      <li><a href="https://github.com/libbpf/libbpf-bootstrap">libbpf/libbpf-bootstrap</a>, commit <code>820a1bd</code>
+        (<code>examples/c/bootstrap.c</code>, <code>bootstrap.bpf.c</code>), and
+        <a href="https://github.com/libbpf/libbpf-rs">libbpf-rs</a>.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-portability-and-co-re/">"BPF CO-RE (Compile Once – Run
+        Everywhere)"</a>, 2020.</li>
+      <li>Aqua Security, <a href="https://github.com/aquasecurity/btfhub">BTFHub</a> and
+        <a href="https://github.com/aquasecurity/btfhub-archive">btfhub-archive</a>.</li>
+      <li>J. Prendes, <a href="https://github.com/jprendes/emception">Emception</a> (Clang/LLVM compiled to WebAssembly).</li>
+      <li>Solo.io, <a href="https://github.com/solo-io/bumblebee">BumbleBee</a>; <a href="https://github.com/bpfman/bpfman">bpfman</a>.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/btf.html">"BPF Type Format (BTF)"</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="09-bpf-developer-tutorial.html"><small>Previous</small>09 · bpf-developer-tutorial</a>
+      <a class="next" href="11-starter-templates.html"><small>Next</small>11 · Starter templates</a>
+    </div>
+  </main>
+</div>
+<script>
+(function () {
+  var input = document.getElementById('res-in');
+  var exists = document.getElementById('res-exists');
+  var out = document.getElementById('res-out');
+  if (!input || !exists || !out) return;
+  function suffixType(s) {
+    var ext = s.split('.').pop();
+    if (ext === 'json') return 'JSON package';
+    if (ext === 'wasm') return 'Wasm module';
+    if (ext === 'tar') return 'tar (JSON + BTF archive)';
+    return 'unknown: pass -p json|tar|wasm';
+  }
+  function looksLikeUrl(s) {
+    // url::Url::parse accepts "scheme:rest" where scheme starts with a letter.
+    return /^[A-Za-z][A-Za-z0-9+.\-]*:/.test(s);
+  }
+  function update() {
+    var s = input.value.trim();
+    var msg;
+    if (s === '-') {
+      msg = 'read from stdin; you must pass -p';
+    } else if (exists.checked) {
+      msg = '1. local file → type from suffix: ' + suffixType(s);
+    } else if (looksLikeUrl(s)) {
+      msg = '2. URL → HTTP GET with reqwest → type from suffix: ' + suffixType(s);
+    } else {
+      msg = '3. OCI reference → pull_wasm_image (anonymous) → always Wasm module';
+      if (s.indexOf('/') === -1) msg += ' (no registry or namespace: Docker Hub library/' + s + ')';
+    }
+    out.textContent = msg;
+  }
+  input.addEventListener('input', update);
+  exists.addEventListener('change', update);
+  update();
+})();
+</script>
+</body>
+</html>

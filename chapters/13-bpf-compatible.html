@@ -1,0 +1,1259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · bpf-compatible: CO-RE on kernels without BTF · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="13">
+<meta name="chapter-part" content="Part II · Learning and tooling">
+<meta name="chapter-summary" content="How bpf-compatible trims BTFHub's kernel type files down to what one eBPF object needs, embeds them in the binary, and picks the right one at run time so CO-RE programs load on kernels without /sys/kernel/btf/vmlinux.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpf-compatible">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part II · Learning and tooling › 13 · bpf-compatible</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 13</div>
+      <h1>bpf-compatible: CO-RE on kernels without BTF</h1>
+      <p class="lede">CO-RE lets one compiled eBPF object run on many kernels, but only if the kernel can describe its
+        own types through <code>/sys/kernel/btf/vmlinux</code>. Millions of machines run CentOS 8.1, Debian 10 or
+        Ubuntu 20.04 kernels that cannot. How do you ship one binary that still runs there, without a compiler on the
+        target and without carrying gigabytes of type data?</p>
+      <div class="meta"><span>Prerequisites: <a href="06-btf-core-libbpf.html">06</a>, <a href="10-eunomia-bpf-ecc-ecli.html">10</a></span><span>Repo: eunomia-bpf/bpf-compatible @ 4ed5e65</span><span>~40 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p><a href="06-btf-core-libbpf.html">Chapter 06</a> explained CO-RE. When you compile an eBPF program,
+      clang writes relocation records into the object's <code>.BTF.ext</code> section. Each record says, in effect,
+      "this instruction reads field <code>real_parent</code> of <code>struct task_struct</code>". When the program is
+      loaded, libbpf finds the same field in the <em>running</em> kernel's BTF and patches the instruction with the
+      correct offset. Two inputs are needed: the program's own BTF, which the compiler always provides, and the
+      kernel's BTF, which the kernel provides only if it was built with <code>CONFIG_DEBUG_INFO_BTF=y</code>.</p>
+    <p>Mainstream distributions turned that option on gradually. The BTFHub table of supported distributions shows,
+      for example, that CentOS 8.0 and 8.1 (kernels <code>4.18.0-80</code> and <code>4.18.0-147</code>) have neither
+      BPF-ready settings nor BTF. From 8.2 on they have both. CentOS 7 kernels never have BTF. On those machines libbpf
+      prints <code>kernel BTF is missing at '/sys/kernel/btf/vmlinux', was CONFIG_DEBUG_INFO_BTF enabled?</code>, and
+      any object with CO-RE relocations fails to load. The relocation <em>mechanism</em> is in libbpf, in user space, so
+      it works on those kernels. Only the type data is missing.</p>
+    <p>There are three ways to deal with this:</p>
+    <ol>
+      <li><strong>Compile on the target.</strong> This is BCC's model. It ships C source and builds it with an
+        embedded LLVM against the target's kernel headers at startup.</li>
+      <li><strong>Download the kernel's BTF at run time</strong> from a store such as BTFHub. That needs network access
+        at startup and a few megabytes per kernel.</li>
+      <li><strong>Ship the BTF with the program</strong>, trimmed down to the handful of types and fields the program
+        actually uses. This is what <code>bpftool gen min_core_btf</code> (BTFgen) makes possible, and it is what
+        <a href="https://github.com/eunomia-bpf/bpf-compatible">eunomia-bpf/bpf-compatible</a> packages into a
+        toolchain.</li>
+    </ol>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p>A CO-RE program only touches a few kernel types. Strip every kernel's multi-megabyte BTF down to just those types
+        and fields, and each file shrinks to a few hundred bytes. Compressed, the files for 85 kernels fit in about
+        <strong>2&nbsp;KB</strong> (measured below). That is small enough to link into the executable. At startup the
+        program reads <code>/etc/os-release</code> and <code>uname</code>, extracts the matching file, and gives its path
+        to libbpf through <code>bpf_object_open_opts.btf_custom_path</code>.</p>
+    </div>
+
+    <p>bpf-compatible is small: 44 files, a ~110-line shell script, two little Rust crates, and a C header. It is worth
+      a chapter because it shows the whole "portable eBPF on old kernels" pipeline from end to end. It is also the code
+      behind <code>ecc --btfgen</code> and ecli's <code>.tar</code> packages
+      (<a href="10-eunomia-bpf-ecc-ecli.html">chapter 10</a>).</p>
+
+    <h2>What bpf-compatible is</h2>
+    <p>The README describes it as "a set of toolchain to simplify the building and running eBPF program on kernels
+      without native BTF support", built on BTFHub's archive. It has three parts:</p>
+    <div class="grid">
+      <div class="card"><h4>script/btfgen</h4><p>A bash script. <code>fetch</code> clones one or more btfhub-archive
+        repositories into a cache. <code>btfgen</code> extracts each kernel's BTF, trims it against your
+        <code>.bpf.o</code> files with bpftool, and packs the results into a <code>.tar.gz</code>.</p></div>
+      <div class="card"><h4>bpf-compatible-rs</h4><p>A Rust crate (crates.io 0.1.3). It builds the archive path for the
+        running system from os-release and uname, and unpacks tar packages. ecli and bpf-loader-rs use it.</p></div>
+      <div class="card"><h4>bpf-compatible-sys + btf_helpers.h</h4><p>A Rust static library with a C ABI
+        (<code>libbpf_compatible.a</code>) plus a header. It finds the right BTF inside a tar.gz embedded in the
+        executable and sets <code>btf_custom_path</code>. It is a drop-in replacement for BCC libbpf-tools'
+        <code>ensure_core_btf()</code>.</p></div>
+      <div class="card"><h4>example/</h4><p>A copy of libbpf-bootstrap adapted to the toolchain, with two apps,
+        <code>bootstrap</code> (ring buffer) and <code>execsnoop</code> (perf buffer). Their Makefile wires all the steps
+        together.</p></div>
+    </div>
+
+    <h3>Project status</h3>
+    <p>The repository has 22 commits. The first is dated 20 May 2023. Almost all the work happened between May and
+      October 2023, by Officeyutong (the Rust crates and the example), ocfox (the <code>btfgen</code> script), Yang Hanlin
+      (support for several archive repos, PR #6, and several BPF objects, PR #7) and yunwei37. The only 2026 commit is
+      <code>4ed5e65</code> (14 July 2026), a one-line Makefile fix from PR #9. It adds <code>-lzstd</code> to the example's
+      static link because Ubuntu 24.04's static <code>libelf</code> needs it (issue #8). The crate on crates.io has not
+      changed since 28 May 2023 (version 0.1.3). The repo has 14 stars, uses the MIT license, and is not archived.</p>
+    <p>In short, it works, it is maintained, and it is feature-frozen. The roadmap in <code>README_zh.md</code> and
+      <code>design.md</code> lists a compatibility API (for example a <code>bpf_buffer</code> that picks ring buffer or perf
+      buffer), an online BTF store in git or OCI, and binary releases. None of these has been built. Read the repo as a
+      compact reference implementation, not as a growing framework.</p>
+
+    <h2>The problem in numbers</h2>
+    <p>The figures in this section were measured in the orb used to write this chapter: Debian 12, kernel
+      <code>6.1.189+</code> x86_64, clang 14.0.6, bpftool v7.1.0 linked with libbpf 1.1. The exact steps are in the
+      hands-on section below.</p>
+    <table>
+      <thead><tr><th>Thing</th><th>Size</th></tr></thead>
+      <tbody>
+        <tr><td>Orb's <code>/sys/kernel/btf/vmlinux</code></td><td>4,854,827 bytes, 113,213 types</td></tr>
+        <tr><td>Full BTFHub archive (aquasecurity/btfhub-archive, GitHub tree API, 6 Nov 2026)</td><td>4,461 kernels (3,065 x86_64, 1,396 arm64); 6.69 GB of <code>.btf.tar.xz</code></td></tr>
+        <tr><td>eunomia-bpf's demo fork of the archive (CentOS 8, Debian 10, Ubuntu 20.04, x86_64)</td><td>85 kernels; 93.7 MB compressed, 538 MB uncompressed</td></tr>
+        <tr><td>Largest and smallest BTF in that fork</td><td>44.0 MB (CentOS <code>4.18.0-147.8.1.el8_1</code>) and 2.87 MB (Debian <code>4.19.0-21-cloud-amd64</code>)</td></tr>
+        <tr><td><code>execsnoop.bpf.o</code> trimmed BTF, per kernel</td><td>358 bytes, 10 types</td></tr>
+        <tr><td><code>execsnoop</code> trimmed BTFs for all 85 kernels, packed as tar.gz</td><td><strong>2,012 bytes</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Shipping full BTF for 85 kernels would mean 538 MB in the binary, or 94 MB compressed with xz. Trimmed, the same
+      coverage costs about 2 KB. BTFHub's own write-up gives a similar figure for a much larger program: "a complex bpf
+      object might support nearly 400 kernels by having BTF files summing only 1.5 MB". The repo's design document
+      estimates about 10 MB for "hundreds of distributions". That is a projection, not a measurement.</p>
+
+    <h2>How it works: the build-time pipeline</h2>
+    <p>The build has four stages. Two of them are ordinary libbpf-bootstrap (compile, skeleton). The other two are
+      new: trim-and-pack, and embed.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 400" role="img" aria-label="Build pipeline. btfhub-archive is fetched into a cache of .btf.tar.xz files, which are extracted to full .btf files. In parallel, execsnoop.bpf.c is compiled by clang into execsnoop.bpf.o. bpftool gen min_core_btf takes each full BTF plus the .bpf.o and writes a tiny BTF. tar czf packs these into min_core_btfs.tar.gz, ld -r -b binary turns it into min_core_btf_tar.o, and cc links that with the user program, libbpf.a and libbpf_compatible.a into one static executable.">
+        <defs>
+          <marker id="a13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="a13b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <text x="16" y="22" fill="var(--muted)" font-size="12" font-family="sans-serif">1 · FETCH (once, cached)</text>
+        <rect x="16" y="34" width="170" height="54" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="101" y="56" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">btfhub-archive</text>
+        <text x="101" y="74" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">git clone --depth 1 + rsync</text>
+        <rect x="220" y="34" width="190" height="54" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="315" y="54" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">ubuntu/20.04/x86_64/</text>
+        <text x="315" y="70" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">5.4.0-26-generic.btf.tar.xz</text>
+        <text x="315" y="84" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">× 85 kernels</text>
+        <path d="M186,61 L218,61" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+        <rect x="444" y="34" width="150" height="54" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="519" y="56" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">tar xfJ</text>
+        <text x="519" y="74" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">xargs -P 8</text>
+        <path d="M410,61 L442,61" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+        <rect x="628" y="34" width="150" height="54" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="703" y="56" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">*.btf (full)</text>
+        <text x="703" y="74" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">2.9–44 MB each</text>
+        <path d="M594,61 L626,61" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+
+        <text x="16" y="128" fill="var(--muted)" font-size="12" font-family="sans-serif">2 · COMPILE (ordinary CO-RE build)</text>
+        <rect x="16" y="140" width="170" height="54" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="101" y="164" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">execsnoop.bpf.c</text>
+        <text x="101" y="180" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">+ vmlinux.h (6.1)</text>
+        <rect x="220" y="140" width="190" height="54" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="315" y="162" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">clang -target bpf</text>
+        <text x="315" y="180" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">bpftool gen object</text>
+        <path d="M186,167 L218,167" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+        <rect x="444" y="140" width="150" height="54" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="519" y="162" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">execsnoop.bpf.o</text>
+        <text x="519" y="180" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">.BTF + .BTF.ext relos</text>
+        <path d="M410,167 L442,167" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+
+        <text x="628" y="128" fill="var(--muted)" font-size="12" font-family="sans-serif">3 · TRIM + PACK</text>
+        <rect x="628" y="140" width="256" height="54" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="756" y="162" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">bpftool gen min_core_btf</text>
+        <text x="756" y="180" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">FULL.btf FULL.btf *.bpf.o</text>
+        <path d="M703,88 L720,138" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+        <path d="M594,167 L626,167" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+        <rect x="628" y="222" width="256" height="54" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="756" y="244" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">min_core_btfs.tar.gz</text>
+        <text x="756" y="262" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">85 × 358 B → 2,012 B</text>
+        <path d="M756,194 L756,220" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13a)" fill="none"/>
+
+        <text x="16" y="312" fill="var(--muted)" font-size="12" font-family="sans-serif">4 · EMBED + LINK</text>
+        <rect x="628" y="324" width="256" height="54" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="756" y="346" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">ld -r -b binary … -o</text>
+        <text x="756" y="364" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">min_core_btf_tar.o</text>
+        <path d="M756,276 L756,322" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a13b)" fill="none"/>
+        <rect x="350" y="324" width="244" height="54" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="472" y="344" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">cc execsnoop.o libbpf.a</text>
+        <text x="472" y="362" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">libbpf_compatible.a … -static</text>
+        <path d="M628,351 L596,351" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a13b)" fill="none"/>
+        <rect x="16" y="324" width="290" height="54" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="161" y="346" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">./execsnoop</text>
+        <text x="161" y="364" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">skeleton + BTF archive inside one ELF</text>
+        <path d="M350,351 L308,351" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a13b)" fill="none"/>
+        <path d="M519,194 L472,322" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a13b)" fill="none" stroke-dasharray="4 3"/>
+        <text x="420" y="262" fill="var(--muted)" font-size="10" font-family="sans-serif">skel.h</text>
+      </svg>
+      <figcaption>Figure 13.1 — The build-time pipeline, as wired in <code>example/c/Makefile</code> and
+        <code>script/btfgen</code>. Sizes come from the experiment in this chapter. Blue arrows: BTF processing.
+        Green arrows: linking the executable.</figcaption>
+    </figure>
+
+    <h3>Stage 1: fetching the archive</h3>
+    <p>BTFHub (Aqua Security) takes the debug-info packages that distributions publish for each kernel build, runs
+      <code>pahole</code> on them to produce BTF, and stores the results in a separate repository,
+      <a href="https://github.com/aquasecurity/btfhub-archive">btfhub-archive</a>. Files are laid out by
+      os-release ID, version, architecture and kernel release, for example
+      <code>ubuntu/20.04/x86_64/5.4.0-26-generic.btf.tar.xz</code>. The top-level directories are <code>amzn</code>,
+      <code>centos</code>, <code>debian</code>, <code>fedora</code>, <code>ol</code>, <code>rhel</code>,
+      <code>sles</code> and <code>ubuntu</code>. Some names, such as <code>focal</code> and <code>buster</code>, are
+      symlinks to the numbered versions.</p>
+    <p>The <code>fetch</code> action of <code>script/btfgen</code> mirrors one or more such repositories into a local
+      cache:</p>
+    <pre data-file="bpf-compatible/script/btfgen"><code class="language-bash">BTFHUB_CACHE_DIR="${BTFHUB_CACHE:-$HOME/.cache/eunomia/btfhub}"
+BTFHUB_REPO_URL="${BTFHUB_REPO:-https://github.com/aquasecurity/btfhub-archive}"
+/* ... */
+fetch() {
+  if [ -d "$BTFHUB_CACHE_DIR" ]; then
+    echo "BTFHUB_CACHE_DIR does exist, skip fetch"
+    return
+  fi
+
+  if ! command -v git &amp;&gt; /dev/null; then echo "Error: git is not installed."; exit 1; fi
+  if ! command -v rsync &amp;&gt; /dev/null; then echo "Error: rsync is not installed."; exit 1; fi
+  
+  local repos repo repo_dir
+  IFS=',' read -r -a repos &lt;&lt;&lt; "$BTFHUB_REPO_URL"
+  for repo in "${repos[@]}"; do
+    repo_dir="$BTFHUB_CACHE_DIR/btfhub-archive-repos/${repo//[^A-Za-z0-9._-]/_}/"
+    mkdir -p "$repo_dir"
+    git clone --depth 1 "$repo" "$repo_dir"
+    rsync -av --quiet --ignore-existing \
+      --exclude 'LICENSE' \
+      --exclude 'README.md' \
+      --exclude '.gitignore' \
+      --exclude '.git' \
+      "$repo_dir" "$BTFHUB_CACHE_DIR/btfhub-archive/"
+  done
+}</code></pre>
+    <p>Three details matter in practice:</p>
+    <ul>
+      <li>The environment variables the script actually reads are <code>BTFHUB_CACHE</code> and
+        <code>BTFHUB_REPO</code>. The README mentions <code>BTFHUB_REPO_URL</code> and <code>BTFHUB_CACHE_DIR</code>,
+        but those are only the internal names. The script's <code>--help</code> text and the example Makefile use the
+        right ones.</li>
+      <li><code>BTFHUB_REPO</code> can be a comma-separated list. <code>rsync --ignore-existing</code> merges the
+        repositories, and the first one listed wins when two contain the same path. You can therefore put your own
+        archive of in-house kernels in front of the public one.</li>
+      <li>If the cache directory already exists, fetch does nothing. Nothing is updated. To pick up new kernels, delete
+        the cache.</li>
+    </ul>
+    <p>The full archive holds 6.69 GB of compressed files, so the example Makefile points at a small demo fork,
+      <a href="https://github.com/eunomia-bpf/btfhub-archive">eunomia-bpf/btfhub-archive</a>. It holds 85 x86_64
+      kernels from CentOS 8, Debian 10 and Ubuntu 20.04 and was last pushed in May 2023.</p>
+
+    <h3>Stage 3: trimming with bpftool gen min_core_btf</h3>
+    <p>The <code>btfgen</code> action is where the work happens. After parsing its options, it runs three pipelines:</p>
+    <pre data-file="bpf-compatible/script/btfgen"><code class="language-bash">btfgen() {
+  fetch
+  if ! command -v bpftool &amp;&gt; /dev/null; then echo "Error: bpftool is not installed."; exit 1; fi
+  short_args="j:f:o:"
+	long_args="json:,file:,output:"
+	/* ... getopt parsing: -j/--json, -o/--output, -f/--file, remaining args are BPF objects ... */
+
+  if [ -z "$output" ]; then output="output.tar"; fi
+ 
+  dir=$(pwd)
+
+  find $BTFHUB_CACHE_DIR -name "*.tar.xz" -not -path "$BTFHUB_CACHE_DIR/btfhub-archive-repos/*" | \
+  xargs -P 8 -I fileName sh -c 'tar xfJ "fileName" -C "$(dirname "fileName")"'
+  find $BTFHUB_CACHE_DIR -name "*.btf" -not -path "$BTFHUB_CACHE_DIR/btfhub-archive-repos/*" | \
+  xargs -P 8 -I fileName sh -c 'bpftool gen min_core_btf "fileName" "fileName" "$@"' _ "${files[@]}"
+
+  if [ -n "$json" ]; then cp $json $BTFHUB_CACHE_DIR; fi
+
+  cd $BTFHUB_CACHE_DIR &amp;&amp; tar \
+    --exclude="./btfhub-archive-repos" \
+    --exclude="*.xz" \
+    -czf $dir/$output .
+}</code></pre>
+    <p>Each <code>.btf.tar.xz</code> is extracted next to itself. Each full <code>.btf</code> is then trimmed
+      <em>in place</em>: input and output are the same file. Finally the cache directory is tarred with gzip, leaving out
+      the <code>.xz</code> originals and the mirrored repos. The trimming is not destructive across builds, because the
+      next run extracts every <code>.tar.xz</code> again and overwrites the trimmed file with the full one before
+      trimming. The output is always gzip, even with the default name <code>output.tar</code>. The README therefore
+      uses <code>-o min_core_btfs.tar.gz</code>.</p>
+    <p>Trimming is done by bpftool, not by bpf-compatible. The subcommand came from Kinvolk's
+      <a href="https://github.com/kinvolk/btfgen">BTFGen</a> prototype, built with Aqua Security and Elastic, and was
+      merged into bpftool in 2022 (<a href="https://lore.kernel.org/bpf/20220215225856.671072-1-mauricio@kinvolk.io/">patch
+      series "bpftool: Implement btfgen"</a>). Its algorithm is described in a comment in bpftool's
+      <code>gen.c</code>:</p>
+    <pre data-file="bpftool/src/gen.c"><code class="language-c">/* Create minimized BTF file for a set of BPF objects.
+ *
+ * The BTFGen algorithm is divided in two main parts: (1) collect the
+ * BTF types that are involved in relocations and (2) generate the BTF
+ * object using the collected types.
+ *
+ * In order to collect the types involved in the relocations, we parse
+ * the BTF and BTF.ext sections of the BPF objects and use
+ * bpf_core_calc_relo_insn() to get the target specification, this
+ * indicates how the types and fields are used in a relocation.
+ *
+ * Types are recorded in different ways according to the kind of the
+ * relocation. For field-based relocations only the members that are
+ * actually used are saved in order to reduce the size of the generated
+ * BTF file. For type-based relocations empty struct / unions are
+ * generated and for enum-based relocations the whole type is saved.
+ *
+ * The second part of the algorithm generates the BTF object. It creates
+ * an empty BTF object and fills it with the types recorded in the
+ * previous step. This function takes care of only adding the structure
+ * and union members that were marked as used and it also fixes up the
+ * type IDs on the generated BTF object.
+ */
+static int minimize_btf(const char *src_btf, const char *dst_btf, const char *objspaths[])</code></pre>
+    <p>The key call is <code>bpf_core_calc_relo_insn()</code>, the same libbpf function that does the real relocation
+      at load time. bpftool runs every CO-RE record of your object against the <em>target</em> BTF, as libbpf will
+      later, and records which target types and members the result touched. Marking is simple: the member's
+      <code>name_off</code> in a scratch copy of the BTF is overwritten with the sentinel <code>UINT32_MAX</code>
+      (<code>MARKED</code>). A second pass then copies only the marked types and members into a fresh BTF object, keeping
+      their <em>original bit offsets</em>, and renumbers the type IDs.</p>
+    <p>So the trimmed file is a faithful slice. <code>struct task_struct</code> keeps its real <code>size</code>
+      (7,616 bytes on the orb) and the true bit offsets of the two fields used, while every other member is dropped.
+      Here is the trimmed BTF that <code>execsnoop.bpf.o</code> produces from the orb's own kernel:</p>
+    <pre><code class="language-plaintext">$ bpftool gen min_core_btf /sys/kernel/btf/vmlinux execsnoop.min.btf execsnoop.bpf.o
+$ bpftool btf dump file execsnoop.min.btf format raw
+[1] INT 'long unsigned int' size=8 bits_offset=0 nr_bits=64 encoding=(none)
+[2] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED
+[3] INT 'long int' size=8 bits_offset=0 nr_bits=64 encoding=SIGNED
+[4] TYPEDEF '__kernel_pid_t' type_id=2
+[5] TYPEDEF 'pid_t' type_id=4
+[6] STRUCT 'task_struct' size=7616 vlen=2
+	'tgid' type_id=5 bits_offset=11104
+	'real_parent' type_id=7 bits_offset=11200
+[7] PTR '(anon)' type_id=6
+[8] ARRAY '(anon)' type_id=1 index_type_id=2 nr_elems=6
+[9] STRUCT 'trace_event_raw_sys_enter' size=64 vlen=1
+	'args' type_id=8 bits_offset=128
+[10] STRUCT 'trace_event_raw_sys_exit' size=24 vlen=1
+	'ret' type_id=3 bits_offset=128</code></pre>
+    <p>(Output captured in the orb.) These ten types cover exactly what <code>execsnoop.bpf.c</code> reads:
+      <code>ctx-&gt;args[0]</code> and <code>ctx-&gt;args[1]</code> in the <code>sys_enter_execve</code> tracepoint,
+      <code>ctx-&gt;ret</code> in <code>sys_exit_execve</code>, and <code>BPF_CORE_READ(task, real_parent, tgid)</code>.
+      The other 113,203 kernel types are gone.</p>
+
+    <h3>Stage 4: embedding the archive in the executable</h3>
+    <p>The tar.gz then becomes part of the program. GNU <code>ld</code> can wrap any file as a relocatable object with
+      <code>-r -b binary</code>. It makes up symbol names from the file name, replacing <code>.</code> with
+      <code>_</code>:</p>
+    <pre><code class="language-plaintext">$ ld -r -b binary min_core_btfs.tar.gz -o min_core_btf_tar.o
+$ nm min_core_btf_tar.o
+00000000000007dc D _binary_min_core_btfs_tar_gz_end
+00000000000007dc A _binary_min_core_btfs_tar_gz_size
+0000000000000000 D _binary_min_core_btfs_tar_gz_start</code></pre>
+    <p>(Captured in the orb. <code>0x7dc</code> = 2,012, the archive size.) The file must be called exactly
+      <code>min_core_btfs.tar.gz</code>, because the runtime library refers to those symbol names. The example Makefile
+      copies each app's archive to that name before calling <code>ld</code>:</p>
+    <pre data-file="bpf-compatible/example/c/Makefile"><code class="language-makefile"># Build application binary
+$(APPS): %: $(OUTPUT)/%.o $(OUTPUT)/%-btf.tar.gz $(LIBBPF_OBJ) $(OUTPUT)/libbpf_compatible.a  | $(OUTPUT)
+	cp $(word 2,$^) $(OUTPUT)/min_core_btfs.tar.gz
+	$(call msg,LD,$(OUTPUT)/min_core_btf_tar.o)
+	cd $(OUTPUT) &amp;&amp; ld -r -b binary min_core_btfs.tar.gz -o min_core_btf_tar.o
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $&lt; $(LIBBPF_OBJ) $(OUTPUT)/libbpf_compatible.a $(OUTPUT)/min_core_btf_tar.o $(ALL_LDFLAGS) -lelf -lz -lzstd -o $@ -static
+
+$(OUTPUT)/libbpf_compatible.a:
+	make -C ../../bpf-compatible-sys
+	cp ../../bpf-compatible-sys/libbpf_compatible.a $(OUTPUT)
+
+$(OUTPUT)/btfhub-cache:
+	BTFHUB_REPO=https://github.com/eunomia-bpf/btfhub-archive \
+	BTFHUB_CACHE=$(OUTPUT)/btfhub-cache \
+	../../script/btfgen fetch
+
+$(OUTPUT)/%-btf.tar.gz: $(OUTPUT)/%.bpf.o $(OUTPUT)/btfhub-cache 
+	BTFHUB_CACHE=$(OUTPUT)/btfhub-cache \
+	../../script/btfgen btfgen $&lt; -o $@</code></pre>
+    <p>The result is a single static ELF. It carries the BPF object (through the skeleton, see
+      <a href="06-btf-core-libbpf.html">chapter 06</a>), libbpf, the Rust runtime, and a 2 KB tarball of type
+      information. It does not need a compiler, kernel headers or a network connection on the target.</p>
+
+    <h2>How it works: choosing the BTF at run time</h2>
+    <p>On the target machine the program must answer one question: <em>which of the 85 entries describes this
+      kernel?</em> bpf-compatible answers it the same way BCC's libbpf-tools does, with a path built from four strings:</p>
+    <pre data-file="bpf-compatible/bpf-compatible-rs/src/lib.rs"><code class="language-rust">/// Generate the btf archive path of the running kernel
+/// It returns somethings like `ubuntu/20.04/x86_64/xxxxxxx.btf`
+pub fn generate_current_system_btf_archive_path() -&gt; Result&lt;String&gt; {
+    let release_info = os_release::OsRelease::new().map_err(Error::OsReleaseError)?;
+    let uname = uname_rs::Uname::new().map_err(Error::UnameError)?;
+    let btf_path = format!(
+        "{}/{}/{}/{}.btf",
+        release_info.id, release_info.version_id, uname.machine, uname.release
+    );
+    Ok(btf_path)
+}</code></pre>
+    <p><code>ID</code> and <code>VERSION_ID</code> come from <code>/etc/os-release</code>. The <code>os-release</code>
+      crate strips surrounding quotes, so <code>VERSION_ID="20.04"</code> becomes <code>20.04</code>.
+      <code>machine</code> and <code>release</code> come from <code>uname(2)</code>, the same values that
+      <code>uname -m</code> and <code>uname -r</code> print. On an Ubuntu 20.04 box running the GA kernel, the key is
+      <code>ubuntu/20.04/x86_64/5.4.0-26-generic.btf</code>.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 420" role="img" aria-label="Runtime selection. ensure_core_btf is called before opening the skeleton. If /sys/kernel/btf/vmlinux exists it returns 0 and libbpf uses kernel BTF. Otherwise it gunzips the embedded archive, builds the key ./btfhub-archive/ID/VERSION_ID/machine/release.btf from os-release and uname, walks tar entries comparing paths, and on a match writes the bytes to /tmp/eunomia.btf.XXXXXX and stores that path in opts->btf_custom_path. If no entry matches it returns -ENOENT and the program exits.">
+        <defs>
+          <marker id="a13c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="a13d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <rect x="320" y="12" width="260" height="44" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="450" y="39" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="monospace">ensure_core_btf(&amp;open_opts)</text>
+        <path d="M450,56 L450,80" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13c)" fill="none"/>
+        <polygon points="450,82 600,118 450,154 300,118" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="450" y="114" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">/sys/kernel/btf/vmlinux</text>
+        <text x="450" y="130" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="sans-serif">exists?</text>
+        <path d="M600,118 L680,118" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a13d)" fill="none"/>
+        <text x="640" y="110" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">yes</text>
+        <rect x="682" y="92" width="202" height="54" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="783" y="114" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="sans-serif">return 0, path stays NULL</text>
+        <text x="783" y="132" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">libbpf uses kernel BTF as usual</text>
+        <path d="M450,154 L450,178" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13c)" fill="none"/>
+        <text x="462" y="172" fill="var(--muted)" font-size="11" font-family="sans-serif">no</text>
+        <rect x="290" y="180" width="320" height="44" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="450" y="198" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="sans-serif">gunzip _binary_min_core_btfs_tar_gz_start..end</text>
+        <text x="450" y="214" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">(flate2, whole archive into memory)</text>
+        <rect x="16" y="180" width="244" height="104" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="26" y="200" fill="var(--muted)" font-size="10" font-family="sans-serif">/etc/os-release</text>
+        <text x="26" y="216" fill="var(--fg)" font-size="11" font-family="monospace">ID=ubuntu</text>
+        <text x="26" y="232" fill="var(--fg)" font-size="11" font-family="monospace">VERSION_ID="20.04"</text>
+        <text x="26" y="252" fill="var(--muted)" font-size="10" font-family="sans-serif">uname(2)</text>
+        <text x="26" y="268" fill="var(--fg)" font-size="11" font-family="monospace">x86_64  5.4.0-26-generic</text>
+        <path d="M260,262 L288,262" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13c)" fill="none"/>
+        <path d="M450,224 L450,240" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13c)" fill="none"/>
+        <rect x="290" y="242" width="320" height="44" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="450" y="260" text-anchor="middle" fill="var(--fg)" font-size="10" font-family="monospace">./btfhub-archive/ubuntu/20.04/</text>
+        <text x="450" y="276" text-anchor="middle" fill="var(--fg)" font-size="10" font-family="monospace">x86_64/5.4.0-26-generic.btf</text>
+        <path d="M450,286 L450,302" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13c)" fill="none"/>
+        <polygon points="450,304 590,334 450,364 310,334" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="450" y="338" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="sans-serif">tar entry with that path?</text>
+        <path d="M590,334 L680,334" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a13d)" fill="none"/>
+        <text x="634" y="326" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">yes</text>
+        <rect x="682" y="300" width="202" height="70" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="783" y="320" text-anchor="middle" fill="var(--fg)" font-size="10" font-family="sans-serif">write bytes to</text>
+        <text x="783" y="336" text-anchor="middle" fill="var(--fg)" font-size="10" font-family="monospace">/tmp/eunomia.btf.XXXXXX</text>
+        <text x="783" y="354" text-anchor="middle" fill="var(--fg)" font-size="10" font-family="monospace">opts-&gt;btf_custom_path = it</text>
+        <path d="M310,334 L222,334" stroke="var(--accent)" stroke-width="2" marker-end="url(#a13c)" fill="none"/>
+        <text x="268" y="326" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="sans-serif">no</text>
+        <rect x="16" y="310" width="204" height="50" rx="7" fill="none" stroke="var(--border)" stroke-dasharray="4 3"/>
+        <text x="118" y="331" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">return -ENOENT</text>
+        <text x="118" y="348" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">app prints error, exits</text>
+        <text x="16" y="402" fill="var(--muted)" font-size="11" font-family="sans-serif">Next: skel__open_opts(&amp;open_opts) → libbpf relocates against btf_custom_path · at exit: cleanup_core_btf() unlinks the temp file</text>
+      </svg>
+      <figcaption>Figure 13.2 — Run-time BTF selection in <code>bpf-compatible-sys/src/lib.rs</code>. A kernel with
+        native BTF always wins. The embedded archive is a fallback, and it is an exact-match lookup.</figcaption>
+    </figure>
+
+    <h3>The C-callable runtime: bpf-compatible-sys</h3>
+    <p>libbpf-based programs are usually C, so the runtime is exposed through a C ABI. The core function takes a
+      pointer to the tar.gz bytes and a length:</p>
+    <pre data-file="bpf-compatible/bpf-compatible-sys/src/lib.rs"><code class="language-rust">const VMLINUX_BTF_PATH: &amp;str = "/sys/kernel/btf/vmlinux";
+
+#[no_mangle]
+pub extern "C" fn ensure_core_btf_with_tar_binary(
+    path: *mut *const c_char,
+    tar_bin: *const u8,
+    tar_len: c_int,
+) -&gt; c_int {
+    if PathBuf::from(VMLINUX_BTF_PATH).exists() {
+        return 0;
+    }
+    let tar_bytes = unsafe { slice::from_raw_parts(tar_bin, tar_len as usize) };
+    let decompressed_bytes = {
+        let mut val = vec![];
+        let mut gzip_reader = GzDecoder::new(tar_bytes);
+        if let Err(e) = gzip_reader.read_to_end(&amp;mut val) {
+            eprintln!("Failed to decompress: {}", e);
+            return -EINVAL;
+        }
+        val
+    };
+
+    let mut tar = Archive::new(&amp;decompressed_bytes[..]);
+    let local_btf_path =
+        PathBuf::from("./btfhub-archive").join(match generate_current_system_btf_archive_path() {
+            Ok(v) =&gt; v,
+            Err(e) =&gt; {
+                eprintln!("Failed to generate running kernel btf path: {:?}", e);
+                return -ENOENT;
+            }
+        });
+    /* ... iterate tar.entries() ... */
+        // path of a entry looks like `./btfhub-archive/ubuntu/20.04/x86_64/5.4.0-40-generic.btf`
+        /* ... */
+        if path == local_btf_path {
+            let mut temp_file = match mkstemp::TempFile::new("/tmp/eunomia.btf.XXXXXX", false) {
+                /* ... */
+            };
+            let file_bytes = &amp;decompressed_bytes[entry.raw_file_position() as usize
+                ..(entry.raw_file_position() + entry.size()) as usize];
+            if let Err(e) = temp_file.write_all(file_bytes) {
+                /* ... */
+            }
+            btf_path = Some(temp_file.path().to_string());
+        }
+    /* ... */
+    // The buffer will be passed to C program, so allocate it with malloc
+    let holder = unsafe { malloc(btf_path_bytes.len() + 1) } as *mut u8;
+    /* ... copy bytes, add trailing NUL ... */
+    *unsafe { &amp;mut *path } = holder as *const c_char;
+    0
+}
+
+extern "C" {
+    static _binary_min_core_btfs_tar_gz_start: c_char;
+    static _binary_min_core_btfs_tar_gz_end: c_char;
+}
+
+#[no_mangle]
+pub extern "C" fn ensure_core_btf_with_linked_tar(path: *mut *const c_char) -&gt; c_int {
+    let len = unsafe {
+        &amp;_binary_min_core_btfs_tar_gz_end as *const c_char as usize
+            - &amp;_binary_min_core_btfs_tar_gz_start as *const c_char as usize
+    };
+    ensure_core_btf_with_tar_binary(
+        path,
+        unsafe { &amp;_binary_min_core_btfs_tar_gz_start as *const c_char } as *const u8,
+        len as c_int,
+    )
+}</code></pre>
+    <p>Why write the BTF to a temporary file? Because the libbpf API is file-based. The
+      <code>btf_custom_path</code> field of <code>bpf_object_open_opts</code> takes a path, and libbpf parses that file
+      itself. The string is allocated with <code>malloc</code> so that C code can later hand it back to
+      <code>clean_core_btf_rs()</code>, which unlinks the file and frees the string.</p>
+    <p>The C header wraps these functions in the names that BCC's libbpf-tools made familiar:</p>
+    <pre data-file="bpf-compatible/bpf-compatible-sys/btf_helpers.h"><code class="language-c">#ifndef _BTF_HELPER_H
+#define _BTF_HELPER_H
+
+#include &lt;bpf/libbpf.h&gt;
+
+int ensure_core_btf_with_tar_binary(const char** path,
+                                    const char* tar_bin,
+                                    int tar_len);
+
+int ensure_core_btf_with_linked_tar(const char** path);
+
+void clean_core_btf_rs(const char* path);
+
+static int ensure_core_btf(struct bpf_object_open_opts* opts) {
+    return ensure_core_btf_with_linked_tar(&amp;opts-&gt;btf_custom_path);
+}
+
+static int ensure_core_btf_tar(struct bpf_object_open_opts* opts,
+                               const char* tar_bin,
+                               int tar_len) {
+    return ensure_core_btf_with_tar_binary(&amp;opts-&gt;btf_custom_path, tar_bin,
+                                           tar_len);
+}
+
+static void cleanup_core_btf(struct bpf_object_open_opts* opts) {
+    clean_core_btf_rs(opts-&gt;btf_custom_path);
+}
+
+// Allow for not linking the tar binary
+char _binary_min_core_btfs_tar_gz_start __attribute__((weak));
+char _binary_min_core_btfs_tar_gz_end __attribute__((weak));
+
+#endif  // _BTF_HELPER_H</code></pre>
+    <p>The last two lines are a linker trick. They are weak <em>definitions</em> of the two symbols. When
+      <code>min_core_btf_tar.o</code> is linked in, its strong definitions win. When it is not, the weak ones keep the
+      link from failing. Both weak symbols are then separate one-byte objects, so the computed "length" is whatever
+      distance the linker puts between them. The gunzip would almost certainly fail and return <code>-EINVAL</code>
+      instead of a clean "not supported" error. (That last point comes from reading the code. I did not test it.) If
+      you want a cleaner way to load an archive that is not linked in, use <code>ensure_core_btf_tar()</code> with a
+      buffer you read yourself, for example from a file next to the binary.</p>
+    <p>Note a naming slip in the README: it says to call <code>clean_core_btf</code> before exiting, but the header
+      defines <code>cleanup_core_btf</code>. The example uses the header's name.</p>
+
+    <h3>Using it from a libbpf program</h3>
+    <p>Porting an existing libbpf-bootstrap app takes three lines: include the header, call
+      <code>ensure_core_btf()</code> before the skeleton's <code>__open_opts</code>, and call
+      <code>cleanup_core_btf()</code> on the way out. This is the example's <code>execsnoop.c</code>:</p>
+    <pre data-file="bpf-compatible/example/c/execsnoop.c"><code class="language-c">#include "btf_helpers.h"
+/* ... */
+int main(int argc, char **argv)
+{
+	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+	/* ... */
+	struct perf_buffer *pb = NULL;
+	struct execsnoop_bpf *obj;
+	int err;
+	/* ... argp_parse ... */
+
+	libbpf_set_print(libbpf_print_fn);
+
+	err = ensure_core_btf(&amp;open_opts);
+	if (err) {
+		fprintf(stderr, "failed to fetch necessary BTF for CO-RE: %s\n", strerror(-err));
+		return 1;
+	}
+
+	obj = execsnoop_bpf__open_opts(&amp;open_opts);
+	if (!obj) {
+		fprintf(stderr, "failed to open BPF object\n");
+		return 1;
+	}
+	/* ... set rodata, load, attach, poll the perf buffer ... */
+
+cleanup:
+	perf_buffer__free(pb);
+	execsnoop_bpf__destroy(obj);
+	cleanup_core_btf(&amp;open_opts);
+	/* ... */
+	return err != 0;
+}</code></pre>
+    <p>On a kernel with BTF, <code>ensure_core_btf</code> returns 0 straight away, and the program behaves exactly as
+      the unmodified libbpf-bootstrap version would. The fallback costs nothing where it is not needed.</p>
+
+    <h3>What libbpf does with btf_custom_path</h3>
+    <p>The libbpf side was added for this purpose. BTFHub's README points to libbpf commit
+      <a href="https://github.com/libbpf/libbpf/commit/4920031c8809696debf43f7b0c8f95ea24b8f61c">4920031</a> as the
+      start of support for external BTF files. The header comment states the contract and its limit:</p>
+    <pre data-file="libbpf/src/libbpf.h"><code class="language-c">	/* Path to the custom BTF to be used for BPF CO-RE relocations.
+	 * This custom BTF completely replaces the use of vmlinux BTF
+	 * for the purpose of CO-RE relocations.
+	 * NOTE: any other BPF feature (e.g., fentry/fexit programs,
+	 * struct_ops, etc) will need actual kernel BTF at /sys/kernel/btf/vmlinux.
+	 */
+	const char *btf_custom_path;</code></pre>
+    <p>And in <code>libbpf.c</code>, the check that decides whether the kernel's BTF must be loaded at all:</p>
+    <pre data-file="libbpf/src/libbpf.c"><code class="language-c">static bool obj_needs_vmlinux_btf(const struct bpf_object *obj)
+{
+	struct bpf_program *prog;
+	struct bpf_map *map;
+	int i;
+
+	/* CO-RE relocations need kernel BTF, only when btf_custom_path
+	 * is not specified
+	 */
+	if (obj-&gt;btf_ext &amp;&amp; obj-&gt;btf_ext-&gt;core_relo_info.len &amp;&amp; !obj-&gt;btf_custom_path)
+		return true;
+
+	/* Support for typed ksyms needs kernel BTF */
+	/* ... */</code></pre>
+    <p>This sets the scope of the whole approach. bpf-compatible fixes <strong>CO-RE field and type relocations</strong>.
+      It cannot help with fentry/fexit, <code>tp_btf</code>, LSM-BPF, struct_ops, typed ksyms or kfuncs. All of these need
+      the kernel's real BTF, and kernels old enough to lack <code>/sys/kernel/btf/vmlinux</code> mostly lack those
+      features anyway. A program meant for old kernels has to stick to kprobes, tracepoints, perf events and similar
+      hooks (<a href="05-program-types-and-hooks.html">chapter 05</a>).</p>
+
+    <h3>Walk through one load</h3>
+    <div class="stepper">
+      <div class="step"><h4>1. Start-up on Ubuntu 20.04, kernel 5.4.0-26-generic, no BTF</h4>
+        <p><code>./execsnoop</code> starts. <code>LIBBPF_OPTS</code> zero-initializes <code>open_opts</code>, so
+          <code>btf_custom_path</code> is <code>NULL</code>.</p></div>
+      <div class="step"><h4>2. ensure_core_btf()</h4>
+        <p><code>/sys/kernel/btf/vmlinux</code> is absent. The runtime gunzips the 2,012-byte blob between
+          <code>_binary_min_core_btfs_tar_gz_start</code> and <code>_end</code> into memory: a tar of 85 small files (30,432 bytes of BTF plus tar headers).</p></div>
+      <div class="step"><h4>3. Build the key</h4>
+        <p><code>/etc/os-release</code> gives <code>ubuntu</code> and <code>20.04</code>, <code>uname</code> gives
+          <code>x86_64</code> and <code>5.4.0-26-generic</code>. The key is
+          <code>./btfhub-archive/ubuntu/20.04/x86_64/5.4.0-26-generic.btf</code>.</p></div>
+      <div class="step"><h4>4. Extract</h4>
+        <p>The entry is found. Its 358 bytes go to <code>/tmp/eunomia.btf.a1B2c3</code> (random suffix), and that path
+          is stored in <code>open_opts.btf_custom_path</code>.</p></div>
+      <div class="step"><h4>5. Open and load</h4>
+        <p><code>execsnoop_bpf__open_opts(&amp;open_opts)</code> records the custom path. At load time libbpf parses the
+          358-byte file instead of the kernel's BTF and finds <code>task_struct.real_parent</code> at byte 2,280. It
+          patches instruction #48 from the compile-time 1,416 to 2,280. The verifier accepts the program.</p></div>
+      <div class="step"><h4>6. Clean up</h4>
+        <p>On exit, <code>cleanup_core_btf()</code> unlinks the temp file and frees the string. If the process is
+          killed with SIGKILL, the file is left behind in <code>/tmp</code>.</p></div>
+    </div>
+    <p>The offsets in step 5 are real. They come from libbpf's debug log when the Ubuntu 5.4.0-26 trimmed file is used,
+      shown in the hands-on section.</p>
+
+    <h3>Try the lookup yourself</h3>
+    <p>This widget runs the same <code>format!("{}/{}/{}/{}.btf", …)</code> as
+      <code>generate_current_system_btf_archive_path()</code> and checks the result against a sample of entries from
+      eunomia-bpf's demo archive. The sample is a few real file names from the 85, not the full list.</p>
+    <div class="card" id="keydemo">
+      <p>
+        <label>ID <input id="kd-id" value="ubuntu" size="8"></label>
+        <label>VERSION_ID <input id="kd-ver" value="20.04" size="6"></label>
+        <label>uname -m <input id="kd-m" value="x86_64" size="8"></label>
+        <label>uname -r <input id="kd-r" value="5.4.0-26-generic" size="22"></label>
+      </p>
+      <p><code id="kd-out"></code></p>
+      <p id="kd-res"></p>
+      <p><small>Try <code>aarch64</code> for the machine, <code>"20.04"</code> with quotes, or the kernel
+        <code>5.4.0-27-generic</code>, which is not in the sample.</small></p>
+    </div>
+
+    <h2>How the code is organized</h2>
+    <pre><code class="language-plaintext">bpf-compatible/                         (@ 4ed5e65, 44 files)
+├── README.md, README_zh.md             usage; the zh README also has API design + roadmap
+├── design.md                           design document (Chinese): problem, goals, alternatives, risks
+├── doc/image/flow.png, flow-dev.png    flowcharts of the user and developer flows
+├── Makefile                            only a `clean` target
+├── script/
+│   └── btfgen                          bash: `fetch` and `btfgen` actions (~110 lines)
+├── bpf-compatible-rs/                  Rust crate, crates.io 0.1.3
+│   ├── Cargo.toml                      deps: uname-rs, os-release, tar, tempfile, thiserror
+│   └── src/lib.rs, src/error.rs        archive-path builder, unpack_tar()
+├── bpf-compatible-sys/                 Rust → C static library
+│   ├── Cargo.toml                      lib name bpf_compatible, crate-type cdylib + staticlib
+│   ├── Makefile                        cargo build --release; cp libbpf_compatible.a .
+│   ├── src/lib.rs                      ensure_core_btf_with_{tar_binary,linked_tar}, clean_core_btf_rs
+│   └── btf_helpers.h                   C wrappers + weak _binary_* symbols
+└── example/                            adapted libbpf-bootstrap
+    ├── libbpf/  bpftool/  blazesym/    git submodules
+    ├── vmlinux/&lt;arch&gt;/vmlinux.h        pre-generated headers (x86 → vmlinux_601.h, etc.)
+    ├── tools/                          gen_vmlinux_h.sh, cmake helpers
+    └── c/
+        ├── Makefile                    the whole pipeline (Figure 13.1)
+        ├── btf_helpers.h               symlink → ../../bpf-compatible-sys/btf_helpers.h
+        ├── bootstrap.{bpf.c,c,h}       exec/exit tracking via ring buffer
+        └── execsnoop.{bpf.c,c,h}       exec tracing via perf buffer</code></pre>
+    <p>There are two runtime crates because they serve two kinds of consumer. <code>bpf-compatible-rs</code> is a
+      normal Rust library for Rust loaders. It works with <em>uncompressed</em> tar and needs a
+      <code>package.json</code> inside, the format ecc produces. <code>bpf-compatible-sys</code> is for C programs. It
+      handles <em>gzip</em> archives that are embedded or passed in, has no <code>package.json</code> requirement, and
+      reuses only the path builder from the first crate.</p>
+
+    <h2>Building and using it</h2>
+    <h3>Manually, step by step (from the README)</h3>
+    <div class="tabs">
+      <div class="tab-panel" data-label="1. Prepare">
+        <pre><code class="language-bash"># Build the runtime library (needs Rust/cargo)
+cd bpf-compatible-sys &amp;&amp; make          # → libbpf_compatible.a
+
+# Mirror btfhub-archive into ~/.cache/eunomia/btfhub
+./script/btfgen fetch
+# or a smaller/custom archive and cache location:
+BTFHUB_REPO=https://github.com/eunomia-bpf/btfhub-archive \
+BTFHUB_CACHE=/tmp/btfhub-cache ./script/btfgen fetch</code></pre>
+      </div>
+      <div class="tab-panel" data-label="2. Trim + pack">
+        <pre><code class="language-bash"># xxx.o is your compiled kernel-side object (clang -target bpf …)
+./script/btfgen btfgen xxx.o -o min_core_btfs.tar.gz
+
+# Since PR #7 several objects are accepted; the BTF covers all of them
+./script/btfgen btfgen a.bpf.o b.bpf.o -o min_core_btfs.tar.gz</code></pre>
+      </div>
+      <div class="tab-panel" data-label="3. Embed">
+        <pre><code class="language-bash">ld -r -b binary min_core_btfs.tar.gz -o min_core_btfs_tar.o
+# defines _binary_min_core_btfs_tar_gz_start / _end</code></pre>
+      </div>
+      <div class="tab-panel" data-label="4. Link">
+        <pre><code class="language-bash"># README: "clang &lt;your_program&gt; libbpf_compatible.a min_core_btf.tar.o"
+# The example Makefile's full static link line is:
+cc -g -Wall .output/execsnoop.o .output/libbpf.a .output/libbpf_compatible.a \
+   .output/min_core_btf_tar.o -lelf -lz -lzstd -o execsnoop -static</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Or: the example">
+        <pre><code class="language-bash">git clone --recursive https://github.com/eunomia-bpf/bpf-compatible
+cd bpf-compatible/example/c
+make bootstrap        # or: make execsnoop
+# To add your own app: put xxx.c and xxx.bpf.c here and append xxx to
+# "APPS = bootstrap execsnoop" in example/c/Makefile, then `make xxx`.</code></pre>
+      </div>
+    </div>
+    <p>The example needs cargo, because it builds <code>bpf-compatible-sys</code>, plus clang, git, rsync and static
+      versions of libelf, zlib and zstd. If your target kernel is not in the demo archive, the example README says
+      plainly that the executable "will fail to start". For real use, point <code>BTFHUB_REPO</code> at the full
+      aquasecurity archive, or at your own archive placed in front of it.</p>
+
+    <h3>Through ecc and ecli</h3>
+    <p><a href="10-eunomia-bpf-ecc-ecli.html">Chapter 10</a> introduced ecc (compile once into a JSON package) and
+      ecli (load and run it). ecc has a <code>-b, --btfgen</code> flag and a <code>--btfhub-archive &lt;DIR&gt;</code>
+      option. The compiler README shows them:</p>
+    <pre data-file="eunomia-bpf/compiler/README.md"><code class="language-bash"># Download btfhub archive and generate minimal BTF
+ecc program.bpf.c --btfgen
+
+# Use custom btfhub location
+ecc program.bpf.c --btfgen --btfhub-archive /path/to/btfhub</code></pre>
+    <p>ecc does <em>not</em> call <code>script/btfgen</code>. It has its own Rust copy of the same steps. If the
+      directory is missing, <code>fetch_btfhub_repo</code> runs
+      <code>git clone --depth 1 https://github.com/aquasecurity/btfhub-archive</code> into it. That is the full
+      multi-gigabyte archive, so the first run is slow and needs disk space. <code>generate_tailored_btf</code> then
+      extracts each file and runs <code>bpftool gen min_core_btf</code>, and <code>package_btfhub_tar</code> writes the
+      package:</p>
+    <pre data-file="eunomia-bpf/compiler/cmd/src/config/mod.rs"><code class="language-rust">pub fn package_btfhub_tar(args: &amp;Options) -&gt; Result&lt;()&gt; {
+    let tar_path = args.get_output_tar_path();
+    let btf_path = args.get_output_directory().join("custom-archive");
+    let package =
+        fs::File::create(tar_path).with_context(|| anyhow!("Failed to create the tar"))?;
+
+    let mut tar = Builder::new(package);
+    /* ... open the .bpf.o and package.json ... */
+    tar.append_dir_all(".", btf_path)
+        .with_context(|| anyhow!("Failed to add btf archives into tar"))?;
+    tar.append_file("package.json", &amp;mut json)
+        .with_context(|| anyhow!("Failed to add package.json into tar"))?;
+    tar.append_file(&amp;args.object_name, &amp;mut object)
+        .with_context(|| anyhow!("Failed to add target object into the tar"))?;
+    tar.finish()
+        .with_context(|| anyhow!("Failed to write out the tar"))?;
+    Ok(())
+}</code></pre>
+    <p>The output is an <em>uncompressed</em> tar named <code>&lt;object_name&gt;.tar</code>, for example
+      <code>client.tar</code> for <code>client.bpf.c</code>. It sits next to <code>package.json</code> and contains a
+      <code>btfhub-archive/</code> tree, <code>package.json</code> and the object. (The compiler README says
+      "→ btfgen.tar.gz", but the code in <code>options.rs</code> writes <code>{object_name}.tar</code>.)</p>
+    <p>On the run side, ecli treats a file with a <code>.tar</code> suffix as <code>ProgramType::Tar</code> and unpacks
+      it with <code>bpf_compatible_rs::unpack_tar</code>:</p>
+    <pre data-file="eunomia-bpf/ecli/ecli-lib/src/runner/task_manager/mod.rs"><code class="language-rust">        let (buf, ty, btf) = if matches!(prog_type, ProgramType::Tar) {
+            let v =
+                unpack_tar(prog_buf).map_err(|e| Error::Tar(format!("Failed to unpack: {}", e)))?;
+            (
+                v.0,
+                ProgramType::JsonEunomia,
+                match v.1 {
+                    Some(v) =&gt; BtfArchivePath::WithTempdir(v.0.to_string_lossy().to_string(), v.1),
+                    None =&gt; BtfArchivePath::None,
+                },
+            )
+        } else {
+            /* ... JSON / Wasm: use an explicitly supplied btf_archive_path, if any ... */
+        };</code></pre>
+    <p>The <code>TempDir</code> is stored in the running task, so the extracted archive lives exactly as long as the
+      program does. The archive root is then passed to bpf-loader-rs. Its selection order differs a little from the C
+      runtime:</p>
+    <pre data-file="eunomia-bpf/bpf-loader-rs/bpf-loader-lib/src/skeleton/builder.rs"><code class="language-rust">        let path_holder = if let Some(base_path) = self.btf_archive_path.as_ref() {
+            let path = get_current_system_btf_file(PathBuf::from(base_path).as_path())?;
+            if !path.exists() {
+                bail!("BTF file not found for current system: {}", path.display());
+            }
+            Some(path)
+        } else {
+            None
+        };
+        // Ditto
+        let env_btf_file_path = std::env::var_os(BTF_PATH_ENV_NAME);
+        /* ... vmlinux_btf_exists = /sys/kernel/btf/vmlinux exists and mode &amp; 0o400 ... */
+        if path_holder.is_some() &amp;&amp; !vmlinux_btf_exists {
+            // We have to manually modify open_opts and open bpf_object, because libbpf-rs currently doesn't support customizing this..
+            open_bpts.btf_custom_path = /* ... path_holder ... */;
+        } else if let Some(env_btf) = env_btf_file_path.as_ref() {
+            open_bpts.btf_custom_path = env_btf.as_bytes().as_ptr() as *const _;
+        } else if !vmlinux_btf_exists {
+            bail!("All ways tried to find vmlinux BTF, but not found. /* ... */");
+        };</code></pre>
+    <p>The order is: kernel BTF if readable; otherwise the archive entry; otherwise the file named by
+      <code>BTF_FILE_PATH</code>; otherwise an error. There is one sharp edge. The "archive entry exists" check runs
+      <em>before</em> the kernel BTF check. If a <code>.tar</code> package is run on a modern kernel that is not in the
+      archive, loading fails with "BTF file not found for current system", even though
+      <code>/sys/kernel/btf/vmlinux</code> would have worked. The C runtime checks kernel BTF first and does not have
+      this problem. (This comes from reading the code at commit <code>a5408a8</code>. I did not test it with ecli.)</p>
+    <p>So, assuming ecli's usual <code>run</code> command from chapter 10, running such a package looks like
+      <code>sudo ./ecli run client.tar</code>. The <code>.tar</code> form is inferred from the suffix handling in
+      <code>ecli-lib/src/config/mod.rs</code>. The ecli README's own examples use <code>package.json</code>.</p>
+
+    <h2>Hands-on: trimming for real</h2>
+    <p>Here are the experiments behind the numbers above, done in the orb. The kernel there has BTF, so it could not
+      show a real no-BTF boot. It could show everything else: compiling, trimming, packing and embedding, and loading with
+      <code>btf_custom_path</code> pointed at trimmed files.</p>
+    <h3>Compile the two example objects</h3>
+    <pre><code class="language-bash">E=bpf-compatible/example
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -I$E/vmlinux/x86 -I$E/c \
+      -c $E/c/execsnoop.bpf.c -o execsnoop.tmp.bpf.o
+bpftool gen object execsnoop.bpf.o execsnoop.tmp.bpf.o      # 73,288 bytes
+# same for bootstrap.bpf.c                                     # 34,856 bytes</code></pre>
+    <h3>Trim against the orb's kernel</h3>
+    <table>
+      <thead><tr><th>Input BTF</th><th>Object(s)</th><th>Output</th></tr></thead>
+      <tbody>
+        <tr><td>/sys/kernel/btf/vmlinux (4,854,827 B, 113,213 types)</td><td>execsnoop.bpf.o</td><td>358 B, 10 types</td></tr>
+        <tr><td>same</td><td>bootstrap.bpf.o</td><td>331 B, 9 types</td></tr>
+        <tr><td>same</td><td>both objects</td><td>522 B, 14 types</td></tr>
+      </tbody>
+    </table>
+    <h3>Run the real script over 85 kernels</h3>
+    <pre><code class="language-plaintext">$ BTFHUB_REPO=https://github.com/eunomia-bpf/btfhub-archive BTFHUB_CACHE=/tmp/ch13/btfhub-cache \
+    bpf-compatible/script/btfgen fetch                       # 2.5 s, 269 MB cache incl. git clone
+$ BTFHUB_CACHE=/tmp/ch13/btfhub-cache \
+    bpf-compatible/script/btfgen btfgen /tmp/ch13/execsnoop.bpf.o -o execsnoop-btf.tar.gz
+BTFHUB_CACHE_DIR does exist, skip fetch                    # 2.5 s wall on 8 vCPUs
+$ ls -l execsnoop-btf.tar.gz
+-rw-r--r-- 1 user user 2012 Nov  6 00:11 execsnoop-btf.tar.gz
+$ tar tzf execsnoop-btf.tar.gz | grep -c '\.btf$'
+85</code></pre>
+    <p>All 85 entries are 358 bytes. Only 12 are byte-distinct (checked with md5sum), because many kernel builds from
+      the same series share their layout for these few fields. That redundancy, plus mostly empty tar headers, is why gzip squeezes 30,432 bytes of
+      BTF (more with tar headers) down to 2,012. Packing both objects gives 2,642 bytes, and the bootstrap archive is 2,056 bytes. The
+      kept fields differ from distribution to distribution:</p>
+    <table>
+      <thead><tr><th>Kernel (trimmed file)</th><th><code>task_struct</code> size</th><th><code>tgid</code> bit offset</th><th><code>real_parent</code> bit offset</th></tr></thead>
+      <tbody>
+        <tr><td>CentOS 8 <code>4.18.0-80.el8.x86_64</code></td><td>9,344</td><td>18,464</td><td>18,560</td></tr>
+        <tr><td>Debian 10 <code>4.19.0-24-amd64</code></td><td>7,104</td><td>9,888</td><td>9,984</td></tr>
+        <tr><td>Ubuntu 20.04 <code>5.4.0-26-generic</code></td><td>9,280</td><td>18,144</td><td>18,240</td></tr>
+        <tr><td>Debian 10 <code>5.10.0-0.deb10.22-cloud-amd64</code></td><td>9,280</td><td>17,888</td><td>17,984</td></tr>
+        <tr><td>Orb <code>6.1.189+</code></td><td>7,616</td><td>11,104</td><td>11,200</td></tr>
+      </tbody>
+    </table>
+    <p>That spread, from byte 1,236 to byte 2,308 for the same field, is exactly why a hard-coded offset fails and why
+      CO-RE needs the per-kernel table.</p>
+
+    <h3>Load with btf_custom_path</h3>
+    <p>A short scratch loader (not part of any repo) opens <code>execsnoop.bpf.o</code> with
+      <code>btf_custom_path</code> set from <code>argv</code> and prints libbpf's CO-RE log lines. Three runs, all as
+      root on the 6.1 orb:</p>
+    <pre><code class="language-plaintext"># 1) BTF trimmed from the orb's own kernel → correct
+relo #1: patched insn #48 (ALU/ALU64) imm 1416 -&gt; 1400        (real_parent)
+relo #2: patched insn #55 (ALU/ALU64) imm 1404 -&gt; 1388        (tgid)
+load: 0
+
+# 2) bootstrap's trimmed BTF used for execsnoop → rejected
+1: &lt;invalid CO-RE relocation&gt;
+failed to resolve CO-RE relocation &lt;byte_off&gt; [32] struct trace_event_raw_sys_enter.args[1] (0:2:1 @ offset 24)
+load: -22
+
+# 3) Ubuntu 5.4.0-26's trimmed BTF on the 6.1 kernel → loads, wrong offsets!
+relo #1: patched insn #48 (ALU/ALU64) imm 1416 -&gt; 2280
+relo #2: patched insn #55 (ALU/ALU64) imm 1404 -&gt; 2268
+load: 0</code></pre>
+    <p>Run 1 shows the mechanism working: the compile-time offsets from the 6.1-based <code>vmlinux.h</code> (1,416
+      and 1,404) are rewritten to this kernel's 1,400 and 1,388. Run 2 shows that a trimmed file belongs to <em>one</em>
+      object. Types another program never used are simply missing. BTFHub's docs warn about this too: the files "are
+      specifically tailored to the given eBPF object and are incompatible with other eBPF objects".</p>
+    <p>Run 3 is the important warning. libbpf has no way to check that a custom BTF really describes the running
+      kernel. Hand it the wrong kernel's file, and it patches in that kernel's offsets. The verifier accepts the program
+      because <code>bpf_probe_read_kernel</code>-based reads are allowed to read any address, and you get garbage
+      <code>ppid</code> values with no error. Exact-match selection by <code>uname -r</code> is what stops this from
+      happening, which is why the runtime never "falls back to the closest kernel".</p>
+
+    <div class="callout danger"><span class="label">Danger</span>
+      <p>Never point <code>btf_custom_path</code> (or ecli's <code>BTF_FILE_PATH</code>) at a BTF file from a
+        "similar" kernel. A different build of the same version can have a different <code>task_struct</code>, because
+        configuration options change the layout. CO-RE is only as correct as the BTF you give it.</p>
+    </div>
+
+    <h3>Trimming does not check compatibility</h3>
+    <p>A last test compiled a tiny program that reads <code>task-&gt;__state</code>. The field was named
+      <code>state</code> before Linux 5.14. Trimming it against Ubuntu's 5.4.0-26 BTF <em>succeeded</em> (exit 0) and
+      wrote a 25-byte file with no types. Loading with it failed with
+      <code>relo #0: no matching targets found</code> and <code>&lt;invalid CO-RE relocation&gt;</code>. In other
+      words, <code>btfgen</code> builds an archive without complaint for kernels your program cannot run on. You find
+      out only on the target. The script also never checks the exit status of each <code>bpftool</code> call it starts
+      through <code>xargs</code>. Handling renamed fields remains your job, with the flavor structs and
+      <code>bpf_core_field_exists()</code> covered in <a href="06-btf-core-libbpf.html">chapter 06</a>. When you do, the
+      trimmed BTF records both variants.</p>
+
+    <h2>Comparisons</h2>
+    <h3>bpf-compatible vs. BCC libbpf-tools' own BTFgen support</h3>
+    <p>BCC's libbpf-tools already had the same mechanism, built with <code>make ENABLE_MIN_CORE_BTFS=1</code>. Its
+      <code>Makefile.btfgen</code> runs <code>bpftool gen min_core_btf $&lt; $@ $(OUTPUT)/*.bpf.o</code> on each
+      archive file, tars the results with gzip, and embeds them with <code>ld -r -b binary</code>. Its
+      <code>btf_helpers.c</code> has the original <code>ensure_core_btf()</code>. README_zh says bpf-compatible
+      deliberately keeps "the same semantics" as that function.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="BCC btf_helpers.c">
+        <pre data-file="bcc/libbpf-tools/btf_helpers.c"><code class="language-c">int ensure_core_btf(struct bpf_object_open_opts *opts)
+{
+	char name_fmt[] = "./%s/%s/%s/%s.btf";
+	char btf_path[] = "/tmp/bcc-libbpf-tools.btf.XXXXXX";
+	/* ... */
+	/* do nothing if the system provides BTF */
+	if (vmlinux_btf_exists())
+		return 0;
+
+	/* compiled without min core btfs */
+	if (!_binary_min_core_btfs_tar_gz_start)
+		return -EOPNOTSUPP;
+
+	info = get_os_info();
+	/* ... mkstemp(btf_path), fdopen ... */
+	ret = snprintf(name, sizeof(name), name_fmt, info-&gt;id, info-&gt;version,
+		       info-&gt;arch, info-&gt;kernel_release);
+	/* ... */
+	ret = inflate_gz(_binary_min_core_btfs_tar_gz_start,
+			 _binary_min_core_btfs_tar_gz_end - _binary_min_core_btfs_tar_gz_start,
+			 &amp;dst_buf, &amp;dst_size);
+	/* ... */
+	file_start = tar_file_start((struct tar_header *)dst_buf, name, &amp;dst_size);
+	/* ... fwrite ... */
+	opts-&gt;btf_custom_path = strdup(btf_path);
+	/* ... */
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Differences">
+        <table>
+          <thead><tr><th></th><th>BCC libbpf-tools</th><th>bpf-compatible</th></tr></thead>
+          <tbody>
+            <tr><td>Language</td><td>~250 lines of C, zlib, hand-written tar walker</td><td>Rust (flate2, tar crates) behind a C ABI</td></tr>
+            <tr><td>Archive key</td><td><code>./ID/VERSION_ID/arch/release.btf</code></td><td><code>./btfhub-archive/ID/VERSION_ID/arch/release.btf</code></td></tr>
+            <tr><td>os-release parsing</td><td><code>sscanf("ID=%64s")</code>, expects <code>VERSION_ID</code> quoted</td><td><code>os-release</code> crate; quoted or unquoted</td></tr>
+            <tr><td>No archive linked</td><td>weak <em>extern</em> declaration is NULL → <code>-EOPNOTSUPP</code></td><td>weak one-byte <em>definitions</em> → bogus length (see above)</td></tr>
+            <tr><td>Runtime-supplied archive</td><td>no</td><td><code>ensure_core_btf_tar(opts, buf, len)</code></td></tr>
+            <tr><td>Reuse outside the bcc tree</td><td>copy the files</td><td>link one <code>.a</code>, include one header</td></tr>
+            <tr><td>Rust / ecli integration</td><td>no</td><td><code>bpf-compatible-rs</code> crate</td></tr>
+            <tr><td>Extra build dependency</td><td>none beyond libbpf-tools'</td><td>cargo to build <code>libbpf_compatible.a</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <h3>bpf-compatible vs. BTFHub</h3>
+    <p>These two are layers of one stack, not competitors. BTFHub is the <em>data source</em>. It is a Go tool
+      (<code>cmd/btfhub</code>) that downloads distribution debug packages and converts them with pahole, and the archive
+      repo holds the results. BTFHub also has a trimming script, <code>tools/btfgen.sh</code>
+      (<code>-a x86_64|arm64 -o obj.bpf.o [-j N]</code>), which writes a <code>custom-archive/</code> tree.
+      Tracee is BTFHub's main user and does its own embedding and selection. What BTFHub does not ship is a runtime
+      library for choosing and loading the right file. bpf-compatible adds that, plus an embed step and an example build.</p>
+    <table>
+      <thead><tr><th></th><th>BTFHub (+ tools/btfgen.sh)</th><th>bpf-compatible</th></tr></thead>
+      <tbody>
+        <tr><td>Produces BTF from distro debug packages</td><td>yes (Go, pahole)</td><td>no, consumes btfhub-archive</td></tr>
+        <tr><td>Trims for your object</td><td>yes, per-arch (<code>-a</code>), parallel <code>-j</code>, reports failures</td><td>yes, all arches in the archive, 8-way <code>xargs</code>, failures not checked</td></tr>
+        <tr><td>Packs + embeds</td><td>left to the application</td><td>tar.gz + <code>ld -r -b binary</code></td></tr>
+        <tr><td>Runtime selection library</td><td>no</td><td>yes (C and Rust)</td></tr>
+        <tr><td>Merges several archives</td><td>no</td><td>yes (<code>BTFHUB_REPO=a,b</code>)</td></tr>
+        <tr><td>Activity</td><td>active (commit 3 Nov 2026)</td><td>maintenance (last commit 14 Jul 2026)</td></tr>
+      </tbody>
+    </table>
+    <p>One practical difference: <code>script/btfgen</code> trims every <code>.btf</code> in the cache whatever its
+      architecture. With the full archive, an x86 object is also trimmed against the 1,396 arm64 kernels. That is
+      harmless but slow, and the arm64 entries are useless to an x86 binary. BTFHub's <code>-a</code> filter and BCC's
+      <code>-iregex ".*x86_64.*"</code> avoid it.</p>
+
+    <h3>bpf-compatible vs. BCC runtime compilation</h3>
+    <p>Classic BCC solves portability the other way round. It ships C source and compiles it on the target with an
+      embedded clang/LLVM against that kernel's headers. Everything is then correct for the running kernel, including
+      <code>#ifdef</code>s on kernel config. The cost is the toolchain and the headers on every host. The orb shows the
+      scale: Debian's <code>libbcc.so.0</code> (BCC 0.26) is 3.4 MB, but it links against <code>libLLVM-14.so.1</code>
+      (110 MB) and <code>libclang-cpp.so.14</code> (59 MB). The orb also has no <code>/lib/modules/$(uname -r)/build</code>,
+      so BCC would not find kernel headers at all. bpf-compatible's per-target cost for <code>execsnoop</code> is a
+      2 KB blob and a static library. The design document lists BCC's drawbacks: a compiler and kernel headers needed on
+      the target, and CPU spent compiling, "which is not allowed or inconvenient in many production environments".</p>
+    <table>
+      <thead><tr><th></th><th>BCC (runtime compile)</th><th>CO-RE + bpf-compatible</th></tr></thead>
+      <tbody>
+        <tr><td>Needs on target</td><td>LLVM/clang libs, kernel headers</td><td>nothing; kernel BTF optional</td></tr>
+        <tr><td>Kernel coverage</td><td>any kernel with headers installed</td><td>kernels with BTF + kernels listed in the embedded archive</td></tr>
+        <tr><td>Start-up cost</td><td>compile each run (seconds, CPU, memory; not measured here)</td><td>gunzip ~KB, write a temp file</td></tr>
+        <tr><td>Kconfig-dependent code</td><td>native (<code>#ifdef</code>)</td><td><code>__kconfig</code> externs, CO-RE existence checks</td></tr>
+        <tr><td>New kernel release</td><td>works if headers present</td><td>needs BTF in kernel or an archive rebuild</td></tr>
+        <tr><td>Program size</td><td>source text</td><td>binary + archive</td></tr>
+      </tbody>
+    </table>
+    <p>Note the last-but-one row. An embedded archive is frozen at build time. A kernel security update to
+      <code>5.4.0-27-generic</code> on a no-BTF Ubuntu host is a new key, and your binary will not find it until you
+      rebuild against a refreshed archive. BTFHub has to publish the new kernel first, too. The design document's
+      proposed online BTF store was meant to close that gap. It was not built.</p>
+
+    <h2>Benefits and limitations</h2>
+    <h3>Benefits</h3>
+    <ul>
+      <li><strong>Tiny overhead.</strong> Kilobytes, not hundreds of megabytes, for broad no-BTF coverage. Measured:
+        2,012 bytes for 85 kernels.</li>
+      <li><strong>No target toolchain.</strong> One static binary, the same model as any CO-RE program.</li>
+      <li><strong>Zero cost on modern kernels.</strong> The fallback returns at once when
+        <code>/sys/kernel/btf/vmlinux</code> exists.</li>
+      <li><strong>Three-line port</strong> for libbpf C programs, with an API that matches BCC libbpf-tools.</li>
+      <li><strong>Merges archives</strong>, so in-house kernels can be added in front of the public archive.</li>
+      <li><strong>Built into eunomia-bpf</strong>: <code>ecc --btfgen</code> produces a self-describing
+        <code>.tar</code> that ecli runs.</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>Exact-match lookup.</strong> The key is <code>ID/VERSION_ID/machine/release</code>. If any part
+        differs from the archive's directory names, there is no match. Two cases worth knowing, both found by reading
+        the code and the archive layout and <em>not tested on real hosts</em>:
+        <ul>
+          <li>On 64-bit ARM, <code>uname -m</code> prints <code>aarch64</code>, but btfhub-archive uses
+            <code>arm64</code> directories. Neither BCC's helper nor bpf-compatible translates the name.</li>
+          <li>RHEL-family <code>VERSION_ID</code> values often contain a minor version (such as <code>8.4</code>),
+            while the archive has <code>rhel/8</code> and <code>ol/8</code>. Whether the lookup misses depends on the
+            exact os-release on the host. Unverified.</li>
+        </ul></li>
+      <li><strong>CO-RE only.</strong> fentry/fexit, <code>tp_btf</code>, LSM, struct_ops, kfuncs and typed ksyms
+        still need real kernel BTF (libbpf's own note).</li>
+      <li><strong>Per-object archives.</strong> Rebuild the archive whenever the BPF code changes. Passing all of an
+        app's objects in one <code>btfgen</code> call (PR #7) gives one archive that works for all of them.</li>
+      <li><strong>Frozen at build time</strong>, and limited to what BTFHub has published. Kernels newer than the
+        archive, or custom kernels, are not covered unless you add them.</li>
+      <li><strong>Silent failure modes.</strong> <code>btfgen</code> ignores per-kernel failures and makes archives for
+        kernels the program cannot run on. A wrong BTF file leads to wrong reads, not errors (run 3 above).</li>
+      <li><strong>Temp files.</strong> The C runtime writes to a fixed <code>/tmp/eunomia.btf.XXXXXX</code> pattern and
+        relies on cleanup at exit. A read-only or full <code>/tmp</code> makes it fail with <code>-EIO</code>.</li>
+      <li><strong>Rough edges</strong>: README naming mismatches (<code>BTFHUB_REPO_URL</code> vs
+        <code>BTFHUB_REPO</code>, <code>clean_core_btf</code> vs <code>cleanup_core_btf</code>); <code>-j</code> copies
+        <code>package.json</code> into the cache and never removes it, so it ends up in later archives too (code
+        reading); the ecli/bpf-loader-rs ordering issue described above.</li>
+      <li><strong>CO-RE does not add features.</strong> An old kernel without ring buffer or a helper still rejects the
+        program. The proposed <code>bpf_buffer</code> compatibility API was never built. BCC's
+        <code>libbpf-tools/compat.h</code> is the working example of that idea.</li>
+    </ul>
+
+    <div class="callout tip"><span class="label">Tip</span>
+      <p>Before shipping, test the archive the way the target will use it. On a build host with BTF you can still
+        check each trimmed file: point <code>btf_custom_path</code> at it and run <code>bpf_object__load()</code>
+        (as in the experiment above). A load that fails with <code>&lt;invalid CO-RE relocation&gt;</code> marks a
+        kernel your program cannot support. Delete that entry, or add a flavor fallback in the BPF code. A load that
+        succeeds proves only that relocation worked, not that the offsets suit this host.</p>
+    </div>
+
+    <h2>Related work and where to go next</h2>
+    <ul>
+      <li><strong>Upstream pieces</strong>: libbpf's <code>btf_custom_path</code> and <code>bpftool gen
+        min_core_btf</code> (<a href="https://github.com/libbpf/bpftool/blob/main/docs/bpftool-gen.rst">bpftool-gen</a>),
+        whose design is described in BTFHub's
+        <a href="https://github.com/aquasecurity/btfhub/blob/main/docs/btfgen-internals.md">"BTFgen internals"</a>.
+        The idea was presented in "Towards truly portable eBPF" at Linux Plumbers 2021.</li>
+      <li><strong>BCC libbpf-tools</strong>: <code>Makefile.btfgen</code> and <code>btf_helpers.c</code>, the model this
+        repo follows. <code>compat.h</code> handles feature differences between kernels.</li>
+      <li><strong><a href="https://github.com/eunomia-bpf/btf-relocate-demo">eunomia-bpf/btf-relocate-demo</a></strong>
+        (last commit January 2024). <code>src/relo.c</code> is bpftool's BTFgen marking code with <code>printf</code>s
+        added ("marking member %s of type %s"), so you can watch which members a relocation pulls in. Its
+        <code>src/relocation.c</code> and <code>examples/</code> take the same machinery to <em>user-space</em> structs.
+        It builds two programs with different <code>struct data</code> layouts and makes their BTF with
+        <code>pahole --btf_encode_detached</code>. This is groundwork for CO-RE against application types in bpftime
+        (<a href="14-bpftime-architecture.html">chapter 14</a>; tutorial
+        <a href="https://eunomia.dev/tutorials/38-btf-uprobe/">"Expanding eBPF CO-RE to userspace compatibility"</a>).</li>
+      <li><strong><a href="https://github.com/eunomia-bpf/multiarch-relocate-example">eunomia-bpf/multiarch-relocate-example</a></strong>
+        (last commit May 2024) pushes in another direction: one <code>uprobe.bpf.o</code> for x86_64 and aarch64. A
+        Rust tool reads the <code>.BTF.ext</code> CO-RE records, rewrites <code>struct pt_regs</code> accesses to aarch64
+        offsets, and then removes <code>.BTF.ext</code>. The README says it was tested on Debian 12 ARM64.</li>
+      <li><strong>Tracee</strong> (Aqua Security) is BTFHub's reference user. It embeds tailored BTFs in production.</li>
+      <li>Within this curriculum: <a href="06-btf-core-libbpf.html">06</a> for CO-RE itself,
+        <a href="10-eunomia-bpf-ecc-ecli.html">10</a> for ecc/ecli packaging,
+        <a href="11-starter-templates.html">11</a> for starter templates that this toolchain could be added to, and
+        <a href="12-wasm-bpf.html">12</a> for another eunomia packaging format.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> What does <code>bpftool gen min_core_btf FULL.btf OUT.btf prog.bpf.o</code>
+        keep for a field relocation such as <code>BPF_CORE_READ(task, real_parent)</code>?</p>
+        <button class="opt">All of <code>struct task_struct</code>, so later programs can use it too</button>
+        <button class="opt" data-right><code>struct task_struct</code> with its real size and only the
+          <code>real_parent</code> member at its original bit offset, plus the types that member refers to</button>
+        <button class="opt">Only the numeric offset of <code>real_parent</code>, without type information</button>
+        <button class="opt">The object's own local BTF copy of <code>task_struct</code></button>
+        <div class="why">For field-based relocations BTFgen marks only the members actually used and writes them at
+          their original offsets in the target kernel. The trimmed <code>task_struct</code> in the experiment had
+          <code>size=7616 vlen=2</code>.</div></div>
+      <div class="q"><p><strong>Q2.</strong> On a kernel that <em>does</em> have <code>/sys/kernel/btf/vmlinux</code>,
+        what does <code>ensure_core_btf()</code> from bpf-compatible do?</p>
+        <button class="opt">Extracts the matching archive entry anyway, to make sure offsets are consistent</button>
+        <button class="opt">Fails with <code>-EEXIST</code></button>
+        <button class="opt" data-right>Returns 0 at once and leaves <code>btf_custom_path</code> NULL, so libbpf uses
+          kernel BTF</button>
+        <button class="opt">Copies <code>/sys/kernel/btf/vmlinux</code> into <code>/tmp</code> and sets the custom
+          path to it</button>
+        <div class="why">The first statement of <code>ensure_core_btf_with_tar_binary</code> checks
+          <code>PathBuf::from(VMLINUX_BTF_PATH).exists()</code> and returns 0. Native BTF always wins.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does the embedded archive have to be named exactly
+        <code>min_core_btfs.tar.gz</code> when it is passed to <code>ld -r -b binary</code>?</p>
+        <button class="opt">libbpf only accepts files with that name in <code>btf_custom_path</code></button>
+        <button class="opt" data-right><code>ld</code> derives the symbol names from the file name, and the runtime
+          references <code>_binary_min_core_btfs_tar_gz_start</code>/<code>_end</code></button>
+        <button class="opt">gzip refuses to decompress files with other names</button>
+        <button class="opt">bpftool writes that name into the BPF object</button>
+        <div class="why"><code>ld -b binary</code> turns <code>min_core_btfs.tar.gz</code> into
+          <code>_binary_min_core_btfs_tar_gz_{start,end,size}</code>. The Rust code declares those exact externs.</div></div>
+      <div class="q"><p><strong>Q4.</strong> You load <code>execsnoop.bpf.o</code> on a 6.1 kernel, but set
+        <code>btf_custom_path</code> to the trimmed BTF for Ubuntu <code>5.4.0-26-generic</code>. What happened in the
+        experiment?</p>
+        <button class="opt">libbpf detected the kernel mismatch and refused to load</button>
+        <button class="opt">The verifier rejected the out-of-range offsets</button>
+        <button class="opt" data-right>It loaded, with <code>real_parent</code> patched to 2,280 instead of the correct
+          1,400, so it would read the wrong memory</button>
+        <button class="opt">libbpf ignored the custom path because kernel BTF exists</button>
+        <div class="why">libbpf cannot tell whether a custom BTF matches the running kernel. It relocates against
+          whatever you give it. This is why the lookup must be an exact match on the kernel release.</div></div>
+      <div class="q"><p><strong>Q5.</strong> Which program would bpf-compatible <em>not</em> make work on a kernel without
+        <code>/sys/kernel/btf/vmlinux</code>?</p>
+        <button class="opt">A tracepoint program reading <code>ctx-&gt;args[1]</code></button>
+        <button class="opt">A kprobe program using <code>BPF_CORE_READ(task, real_parent, tgid)</code></button>
+        <button class="opt" data-right>An <code>fentry</code> program, or a struct_ops scheduler</button>
+        <button class="opt">A perf-event sampling program with CO-RE reads</button>
+        <div class="why">libbpf's own comment says <code>btf_custom_path</code> replaces vmlinux BTF only for CO-RE
+          relocations. fentry/fexit and struct_ops still need the kernel's real BTF.</div></div>
+      <div class="q"><p><strong>Q6.</strong> Compared with BCC's runtime compilation, what is the main thing a
+        bpf-compatible binary gives up?</p>
+        <button class="opt">It needs clang on the target</button>
+        <button class="opt" data-right>Coverage of no-BTF kernels is fixed at build time. A new kernel release needs a
+          rebuilt archive, while BCC only needs that kernel's headers.</button>
+        <button class="opt">It cannot run on kernels that do have BTF</button>
+        <button class="opt">It must download BTF from the network on every start</button>
+        <div class="why">The archive is embedded and keyed by exact <code>uname -r</code>. BCC compiles against
+          whatever headers are installed, at the cost of shipping LLVM and needing those headers.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/bpf-compatible">eunomia-bpf/bpf-compatible</a>, commit
+        <code>4ed5e6510ff59cc901052bd65b0a77326c21107e</code> (14 Jul 2026). Files quoted: <code>script/btfgen</code>,
+        <code>bpf-compatible-rs/src/lib.rs</code>, <code>bpf-compatible-sys/src/lib.rs</code>,
+        <code>bpf-compatible-sys/btf_helpers.h</code>, <code>example/c/Makefile</code>, <code>example/c/execsnoop.c</code>,
+        <code>README.md</code>, <code>README_zh.md</code>, <code>design.md</code>.</li>
+      <li><a href="https://crates.io/crates/bpf-compatible-rs">bpf-compatible-rs on crates.io</a> (0.1.3).</li>
+      <li><a href="https://github.com/eunomia-bpf/btfhub-archive">eunomia-bpf/btfhub-archive</a>, demo fork used by the
+        example.</li>
+      <li><a href="https://github.com/eunomia-bpf/eunomia-bpf">eunomia-bpf/eunomia-bpf</a>, commit
+        <code>a5408a8c3614bd4e008c1f999bb4ee9738e2fc41</code>: <code>compiler/cmd/src/config/mod.rs</code>,
+        <code>compiler/cmd/src/config/options.rs</code>, <code>compiler/README.md</code>,
+        <code>ecli/ecli-lib/src/runner/task_manager/mod.rs</code>,
+        <code>bpf-loader-rs/bpf-loader-lib/src/skeleton/builder.rs</code>.</li>
+      <li><a href="https://github.com/aquasecurity/btfhub">aquasecurity/btfhub</a> (commit <code>6348f13</code>) and
+        <a href="https://github.com/aquasecurity/btfhub-archive">aquasecurity/btfhub-archive</a>; docs
+        <a href="https://github.com/aquasecurity/btfhub/blob/main/docs/generating-tailored-btfs.md">"Generating tailored
+        BTFs"</a>, <a href="https://github.com/aquasecurity/btfhub/blob/main/docs/btfgen-internals.md">"BTFgen
+        internals"</a>, <a href="https://github.com/aquasecurity/btfhub/blob/main/docs/supported-distros.md">supported
+        distributions</a>.</li>
+      <li>Mauricio Vásquez Bernal et al., <a href="https://lore.kernel.org/bpf/20220215225856.671072-1-mauricio@kinvolk.io/">"bpftool:
+        Implement btfgen"</a>, patch series on the bpf mailing list, February 2022; <a href="https://github.com/kinvolk/btfgen">kinvolk/btfgen</a>.</li>
+      <li><a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a>, commit <code>1f6bbb7</code>,
+        <code>src/gen.c</code>; <a href="https://github.com/libbpf/bpftool/blob/main/docs/bpftool-gen.rst">bpftool-gen man
+        page</a>.</li>
+      <li><a href="https://github.com/libbpf/libbpf">libbpf/libbpf</a>, commit
+        <code>872299d94e27d2fa9f119667c7e52268698dc760</code>: <code>src/libbpf.h</code> (<code>btf_custom_path</code>),
+        <code>src/libbpf.c</code> (<code>obj_needs_vmlinux_btf</code>); commit
+        <a href="https://github.com/libbpf/libbpf/commit/4920031c8809696debf43f7b0c8f95ea24b8f61c">4920031</a> (custom BTF
+        support, as cited by BTFHub).</li>
+      <li><a href="https://github.com/iovisor/bcc/tree/master/libbpf-tools">iovisor/bcc libbpf-tools</a>, commit
+        <code>c398a9a</code>: <code>btf_helpers.c</code>, <code>Makefile.btfgen</code>, <code>README.md</code>,
+        <code>compat.h</code>.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-portability-and-co-re/">"BPF CO-RE (Compile Once – Run
+        Everywhere)"</a>, 2020.</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/btf.html">"BPF Type Format (BTF)"</a> and
+        <a href="https://docs.kernel.org/bpf/llvm_reloc.html">"BPF LLVM Relocations"</a>.</li>
+      <li>Rafael David Tinoco, Mauricio Vásquez Bernal, <a href="https://www.youtube.com/watch?v=igJLKyP1lFk">"Towards
+        truly portable eBPF"</a>, Linux Plumbers Conference 2021 (video, linked from BTFHub's docs).</li>
+      <li><a href="https://github.com/eunomia-bpf/btf-relocate-demo">eunomia-bpf/btf-relocate-demo</a> (commit
+        <code>a26f157</code>) and <a href="https://github.com/eunomia-bpf/multiarch-relocate-example">eunomia-bpf/multiarch-relocate-example</a>
+        (commit <code>cbc7be4</code>); eunomia tutorial <a href="https://eunomia.dev/tutorials/38-btf-uprobe/">"Expanding
+        eBPF CO-RE to userspace compatibility"</a>.</li>
+      <li><a href="https://github.com/aquasecurity/tracee">aquasecurity/tracee</a>, BTFHub's reference consumer.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="12-wasm-bpf.html"><small>Previous</small>12 · Wasm-bpf</a>
+      <a class="next" href="14-bpftime-architecture.html"><small>Next</small>14 · bpftime architecture</a>
+    </div>
+  </main>
+</div>
+<script>
+(function () {
+  // Sample of real entries from eunomia-bpf/btfhub-archive (not the full list of 85).
+  var sample = [
+    "ubuntu/20.04/x86_64/5.4.0-26-generic.btf",
+    "ubuntu/20.04/x86_64/5.4.0-48-generic.btf",
+    "ubuntu/20.04/x86_64/5.4.0-89-generic.btf",
+    "debian/10/x86_64/4.19.0-24-amd64.btf",
+    "debian/10/x86_64/4.19.0-21-cloud-amd64.btf",
+    "debian/10/x86_64/5.10.0-0.deb10.22-cloud-amd64.btf",
+    "centos/8/x86_64/4.18.0-80.el8.x86_64.btf",
+    "centos/8/x86_64/4.18.0-147.8.1.el8_1.x86_64.btf"
+  ];
+  var ids = ["kd-id", "kd-ver", "kd-m", "kd-r"];
+  function v(id) { return document.getElementById(id).value; }
+  function update() {
+    var key = v("kd-id") + "/" + v("kd-ver") + "/" + v("kd-m") + "/" + v("kd-r") + ".btf";
+    document.getElementById("kd-out").textContent = "./btfhub-archive/" + key;
+    var hit = sample.indexOf(key) >= 0;
+    document.getElementById("kd-res").textContent = hit
+      ? "Match: this entry is extracted and passed as btf_custom_path."
+      : "No match in the sample: ensure_core_btf() would return -ENOENT (unless the kernel has its own BTF).";
+  }
+  ids.forEach(function (id) { document.getElementById(id).addEventListener("input", update); });
+  update();
+})();
+</script>
+</body>
+</html>

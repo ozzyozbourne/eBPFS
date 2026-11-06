@@ -217,9 +217,9 @@ bpf_exit</code></pre>
     <p>Two details are worth knowing. First, the program as a whole is called with one argument, the context
     pointer in <code>R1</code> (<em>"For practical reasons all eBPF programs have only one argument 'ctx' which
     is already placed into R1"</em>). Second, the five-argument limit is no longer absolute in very recent
-    mainline. v7.3 added a hidden <code>BPF_REG_PARAMS</code> pseudo-register to
+    mainline. v7.2 added a hidden <code>BPF_REG_PARAMS</code> pseudo-register to
     <code>include/linux/filter.h</code>, together with helpers such as <code>is_stack_arg_ldx()</code>, for
-    arguments passed on the stack. The x86 JIT notes that <em>"x86-64 uses R9 for both private stack frame
+    arguments passed on the stack. A comment in <code>kernel/bpf/verifier.c</code> notes that <em>"x86-64 uses R9 for both private stack frame
     pointer and arg6"</em>. Treat this as new, moving work. Everything RFC 9669 and older kernels define uses
     five register arguments.</p>
 
@@ -376,9 +376,12 @@ bpf_exit</code></pre>
       <li>Division by zero does not fault: <em>"If BPF program execution would result in division by zero, the
       destination register is instead set to zero."</em> Modulo by zero leaves the destination unchanged (for
       <code>ALU</code> the upper 32 bits are zeroed).</li>
-      <li><code>LLONG_MIN / -1</code> yields <code>LLONG_MIN</code> instead of trapping as it would on x86.</li>
+      <li>Signed division <code>LLONG_MIN / -1</code> yields <code>LLONG_MIN</code> instead of trapping as it would on x86.
+      This rule is in the kernel's current <code>instruction-set.rst</code>; it was added after RFC 9669, which does not
+      mention the case.</li>
       <li>Shift amounts are masked to 63 (64-bit) or 31 (32-bit). The interpreter applies the mask explicitly to
-      avoid undefined behaviour in C. JITs rely on the hardware doing the same thing.</li>
+      avoid undefined behaviour in C. On x86-64 and arm64 the hardware masks shift counts the same way, so their JITs
+      need no extra instruction.</li>
       <li>Immediates are sign-extended from 32 to 64 bits for <code>ALU64</code>, so <code>r2 += -4</code> really
       subtracts 4.</li>
     </ul>
@@ -529,9 +532,10 @@ $ clang -target bpf -O2 -mcpu=v3 -c atomics.c -o atomics.o &amp;&amp; llvm-objdu
     jumps to <code>PC + imm + 1</code>, the callee's own <code>exit</code> returns, and the callee gets a fresh stack
     frame with its own <code>R10</code>. The registers follow the normal convention, so the callee may clobber
     <code>R1</code>–<code>R5</code> but must preserve <code>R6</code>–<code>R9</code>.</p>
-    <p>The verifier analyses each subprogram in the context of its call site. It limits the depth of nesting with
+    <p>The verifier analyses each static subprogram in the context of its call site (global, non-static functions
+    are verified once on their own; see <a href="04-maps-helpers-kfuncs.html">Chapter 04</a>). It limits the depth of nesting with
     <code>MAX_CALL_FRAMES</code> in <code>include/linux/bpf_verifier.h</code>. That constant was 8 for years
-    (v6.12 and v6.18 still have 8) and is 16 in v7.3 and later. The combined stack of all active frames must fit
+    (v6.12, v6.18 and v7.1 still have 8) and is 16 from v7.2 on. The combined stack of all active frames must fit
     in the stack limit. For JITed programs, each subprogram is compiled as a native function, so a BPF-to-BPF call
     is an ordinary native <code>call</code>. In the interpreter, the verifier rewrites such calls to an internal
     opcode, <code>JMP_CALL_ARGS</code>, which recursively enters an interpreter instance sized for the callee's
@@ -701,13 +705,44 @@ $ llvm-objdump -d count_v3.o     # (count_packets only; scale is unchanged)
     resolves relocations and calls <code>bpf(BPF_PROG_LOAD)</code>. The verifier then checks the program and
     <em>rewrites</em> it: context field loads become real offsets, some helper calls are inlined, map fds become
     pointers, and division instructions gain zero-checks where needed. You can see both versions on a live system
-    with bpftool. These commands are real but were not run in this orb, whose kernel does not allow loading BPF
-    programs:</p>
-    <pre><code class="language-bash"># load and pin (needs CAP_BPF / root)
-sudo bpftool prog load count.o /sys/fs/bpf/count
-sudo bpftool prog show pinned /sys/fs/bpf/count        # prints the program id
-sudo bpftool prog dump xlated pinned /sys/fs/bpf/count # bytecode after verifier rewrites
-sudo bpftool prog dump jited  pinned /sys/fs/bpf/count # native code produced by the JIT</code></pre>
+    with bpftool. The <code>xlated</code> dump below was captured in this orb (Linux 6.1, bpftool 7.1.0) for the
+    <code>count.o</code> built above; source-line comments are trimmed. This kernel has no JIT, so
+    <code>dump jited</code> has nothing to show here:</p>
+    <pre><code class="language-plaintext"># load and pin (needs CAP_BPF / root)
+$ sudo bpftool prog load count.o /sys/fs/bpf/count
+$ sudo bpftool prog dump xlated pinned /sys/fs/bpf/count   # bytecode after verifier rewrites
+int count_packets(struct xdp_md * ctx):
+   0: (bf) r7 = r1
+   1: (b7) r1 = 0
+   2: (63) *(u32 *)(r10 -4) = r1
+   3: (bf) r2 = r10
+   4: (07) r2 += -4
+   5: (18) r1 = map[id:225]
+   7: (85) call bpf_map_lookup_elem#171408
+   8: (bf) r6 = r0
+   9: (15) if r6 == 0x0 goto pc+7
+  10: (79) r2 = *(u64 *)(r7 +0)
+  11: (79) r1 = *(u64 *)(r7 +8)
+  12: (1f) r1 -= r2
+  13: (67) r1 &lt;&lt;= 32
+  14: (77) r1 &gt;&gt;= 32
+  15: (85) call pc+3#__bpf_prog_run_args32
+  16: (db) lock *(u64 *)(r6 +0) += r0
+  17: (b7) r0 = 2
+  18: (95) exit
+__u64 scale(__u64 bytes):
+  19: (bf) r0 = r1
+  20: (27) r0 *= 3
+  21: (07) r0 += 7
+  22: (95) exit
+$ sudo bpftool prog dump jited pinned /sys/fs/bpf/count    # native code (needs a JIT-enabled kernel)
+$ sudo rm /sys/fs/bpf/count</code></pre>
+    <p>Compare it with the <code>llvm-objdump</code> output. The map relocation became <code>map[id:225]</code>.
+    Helper number 1 became a call to the kernel's <code>bpf_map_lookup_elem</code>. The two 32-bit context loads
+    at offsets 0 and 4 of <code>struct xdp_md</code> became 64-bit loads at offsets 0 and 8 of the kernel's real
+    <code>struct xdp_buff</code>. The subprogram <code>scale</code> was appended at index 19, and because this kernel
+    runs the interpreter, the BPF-to-BPF call was rewritten to the internal <code>JMP_CALL_ARGS</code> form
+    (<code>__bpf_prog_run_args32</code>: the interpreter instance for a 32-byte stack, described below).</p>
 
     <h2>Running the bytecode: interpreter and JIT</h2>
     <figure>
@@ -1046,9 +1081,11 @@ r1 += ax                  /* ALU|X form of the original instruction             
     <div class="callout warn"><span class="label">Limits of blinding</span>
       <p>Blinding stops the <em>immediate-as-code</em> trick. It does not address the attack class in
       <a href="https://www.usenix.org/conference/atc23/presentation/jin">EPF: Evil Packet Filter</a> (USENIX ATC 2023),
-      which uses BPF programs and data as payloads to bypass kernel isolation defences. Today the main defences are
-      to keep unprivileged BPF disabled (<code>kernel.unprivileged_bpf_disabled</code>) and to require
-      <code>CAP_BPF</code>.</p>
+      which uses BPF code supplied by unprivileged users as attack payloads to bypass kernel isolation defences such as
+      those against ret2usr and ret2dir. Note that <code>kernel.unprivileged_bpf_disabled</code> does not close this
+      door by itself: it gates the <code>bpf()</code> syscall, while classic BPF socket filters and seccomp filters stay
+      available to unprivileged processes. The paper proposes its own defences, which isolate BPF instructions from
+      other kernel data and protect the integrity of BPF program execution.</p>
     </div>
 
     <h2>The standard: RFC 9669</h2>
@@ -1061,11 +1098,11 @@ r1 += ax                  /* ALU|X form of the original instruction             
     noted the publication on 5 November 2024 (<a href="https://lwn.net/Articles/997002/">"The BPF instruction set
     architecture is now RFC 9669"</a>).</p>
     <p>The RFC was generated from <code>Documentation/bpf/standardization/instruction-set.rst</code> in the kernel
-    tree, and the two documents are kept in sync. Its parts are:</p>
+    tree. The kernel file has kept evolving since publication (for example, it now specifies
+    <code>LLONG_MIN / -1</code>, which the RFC does not), so the two are no longer identical. Its parts are:</p>
     <ul>
       <li><strong>Encoding and semantics</strong> (§3–5): everything in this chapter's encoding and class sections,
-      written in MUST/SHALL language, including the corner cases such as division by zero and
-      <code>LLONG_MIN / -1</code>.</li>
+      written in MUST/SHALL language, including corner cases such as division and modulo by zero.</li>
       <li><strong>Conformance groups</strong> (§2.4). An implementation does not have to support every instruction.
       It MUST support <code>base32</code>, and MAY support <code>base64</code>, <code>atomic32</code>,
       <code>atomic64</code>, <code>divmul32</code>, <code>divmul64</code> and the deprecated <code>packet</code>
@@ -1210,8 +1247,8 @@ r1 += ax                  /* ALU|X form of the original instruction             
         <button class="opt" data-right>It defines conformance groups; base32 is mandatory, and new instructions must go into new groups via an IANA registry</button>
         <button class="opt">It replaced the Linux documentation, which no longer describes the ISA</button>
         <div class="why">The RFC covers the instruction set only. Helpers, BTF and maps are left for future work, and the
-        calling convention is in the separate abi.rst. It was generated from, and is kept in sync with,
-        <code>Documentation/bpf/standardization/instruction-set.rst</code>.</div></div>
+        calling convention is in the separate abi.rst. It was generated from
+        <code>Documentation/bpf/standardization/instruction-set.rst</code>, which has kept evolving since.</div></div>
       <div class="q"><p><strong>Q6.</strong> Why does the interpreter keep the 512-byte stack limit even on kernels where the x86-64 JIT allows 2048 bytes?</p>
         <button class="opt">The interpreter cannot address negative offsets past −512</button>
         <button class="opt" data-right>Its stack is a local array in one of a fixed set of wrapper functions generated for sizes 32…512</button>

@@ -1,0 +1,1350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · wasm-bpf: eBPF user space in WebAssembly · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="12">
+<meta name="chapter-part" content="Part II · Learning and tooling">
+<meta name="chapter-summary" content="How wasm-bpf moves the user-space half of an eBPF application into a WebAssembly sandbox: the seven host functions, how the Wasmtime and WAMR runtimes map them onto libbpf, how data crosses between linear memory, maps and ring buffers, and how the result is built, packaged as OCI images and run.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/wasm-bpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part II · Learning and tooling › 12 · wasm-bpf</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 12</div>
+      <h1>wasm-bpf: eBPF user space in WebAssembly</h1>
+      <p class="lede">An eBPF tool has two halves. The kernel half is portable bytecode that the verifier checks. The
+        user-space half, the loader that opens the object, attaches programs, reads maps and prints results, is an
+        ordinary native binary built for one CPU architecture and one libc, usually run as root. What happens if that
+        second half is also compiled to a portable, sandboxed bytecode, so a whole eBPF application ships as one 70 KB
+        <code>.wasm</code> file?</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="06-btf-core-libbpf.html">06</a>, <a href="10-eunomia-bpf-ecc-ecli.html">10</a></span><span>Repo: eunomia-bpf/wasm-bpf @ 01f1419</span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters: the native half of every eBPF tool</h2>
+    <p>Chapter <a href="06-btf-core-libbpf.html">06</a> showed how CO-RE makes the <em>kernel</em> half of an eBPF
+      application portable: one <code>.bpf.o</code> file, compiled once, is patched by libbpf at load time to fit the
+      running kernel. The <em>user-space</em> half does not get that treatment. In libbpf-bootstrap's
+      <code>bootstrap</code> example, <code>bootstrap.c</code> is compiled with the host C compiler, linked against
+      libbpf, libelf and zlib, and produces an x86-64 (or arm64, or riscv64) ELF executable. To ship that tool you
+      build it once per architecture, pick a libc, and decide between static linking and runtime dependencies.</p>
+    <p>That is manageable for a single tool on a single server. It gets harder in three situations that the wasm-bpf
+      authors put at the centre of their design.</p>
+    <ul>
+      <li><strong>Heterogeneous fleets.</strong> A Kubernetes cluster can mix x86-64 and arm64 nodes and several kernel
+        versions. Each eBPF tool then needs a matrix of builds and a container image per architecture.</li>
+      <li><strong>Heavy packaging for small programs.</strong> The usual way to deploy a tracing tool to a cluster is a
+        privileged DaemonSet whose container image holds the loader, its libraries and a base distribution. The
+        program that does the work may be a few kilobytes of bytecode; the image is megabytes.</li>
+      <li><strong>Plugins.</strong> Observability agents and proxies want to load third-party probes at run time. If a
+        probe's user-space logic is native code, loading it means running arbitrary native code inside the agent's
+        process, with the agent's privileges.</li>
+    </ul>
+    <p>WebAssembly (Wasm) was designed for exactly the "portable, sandboxed user code" problem. A Wasm module is
+      architecture-neutral bytecode. A Wasm runtime compiles or interprets it, confines it to its own memory, and lets
+      it do nothing except call functions the host explicitly provides. The <a href="https://wasi.dev/">WebAssembly
+      System Interface (WASI)</a> standardises a set of such functions for files, clocks, arguments and so on.
+      <a href="https://github.com/eunomia-bpf/wasm-bpf">wasm-bpf</a>, from the eunomia-bpf community, adds a small set
+      of extra host functions for eBPF: load an object, attach a program, operate on a map, poll a ring buffer. With
+      them, the user-space half of an eBPF tool can be compiled to Wasm and run by any runtime that implements those
+      functions.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p>wasm-bpf does not run eBPF bytecode inside WebAssembly. The kernel still verifies and runs the eBPF programs.
+        What moves into the Wasm sandbox is the <em>control plane</em>: the code that libbpf-based tools normally run as
+        a native process. The Wasm guest embeds the <code>.bpf.o</code> bytes in its own memory and asks the host runtime,
+        through seven imported functions in a module called <code>wasm_bpf</code>, to hand them to libbpf. The host owns
+        every kernel object (file descriptors, links, ring buffers); the guest only ever holds opaque handles and integer
+        file descriptor numbers.</p>
+    </div>
+
+    <p>The project started in November 2022. The README describes it as "a WebAssembly eBPF library, toolchain and
+      runtime powered by CO-RE libbpf". Its design and evaluation are written up in the arXiv preprint
+      <a href="https://arxiv.org/abs/2408.04856">"Wasm-bpf: Streamlining eBPF Deployment in Cloud Environments with
+      WebAssembly"</a> (Zheng, Yu, Yang and Quinn, 2024), and it was presented at KubeCon + CloudNativeCon North America
+      2023 as <a href="https://kccncna2023.sched.com/event/1R2uf">"eBPF + Wasm: Lightweight Observability on
+      Steroids"</a> (Michael Yuan of WasmEdge and Yusheng Zheng of eunomia-bpf). This chapter reads the code at commit
+      <code>01f1419</code> (4 September 2026) and the three guest SDK repositories, and builds and runs the C++ runtime
+      and a C guest on the curriculum's orb (Linux 6.1, x86-64).</p>
+
+    <h2>A WebAssembly primer for eBPF readers</h2>
+    <p>You need five Wasm facts to follow the rest of the chapter. They are all in the core specification
+      (<a href="https://webassembly.github.io/spec/">webassembly.github.io/spec</a>); Haas et al.,
+      <a href="https://doi.org/10.1145/3062341.3062363">"Bringing the Web up to Speed with WebAssembly"</a> (PLDI 2017),
+      explains the design.</p>
+    <ol>
+      <li><strong>Linear memory.</strong> A module's data lives in one contiguous, growable byte array. Pointers in C or
+        Rust code compiled to <code>wasm32</code> are 32-bit offsets into this array. The host can read and write it,
+        and can turn an offset into a real host pointer by adding the array's base address. The guest cannot address
+        anything outside it.</li>
+      <li><strong>Imports and exports.</strong> A module declares the functions it needs as imports, each named by a
+        <em>module name</em> and a <em>field name</em> with a fixed signature of <code>i32</code>, <code>i64</code>,
+        <code>f32</code> and <code>f64</code> values. The host must supply every import before the module can be
+        instantiated. Exports work the other way: the module names functions, its memory or its tables for the host to
+        use.</li>
+      <li><strong>Function tables.</strong> Wasm code cannot jump to an address. A C function pointer compiled to Wasm is
+        an index into a table of functions, usually exported as <code>__indirect_function_table</code>. A host that wants
+        to call a guest callback calls "table entry N" with type-checked arguments.</li>
+      <li><strong>WASI.</strong> A standard set of imports (module names starting with <code>wasi_</code>) for
+        arguments, environment, clocks, random numbers and file descriptors. WASI is capability-based: a guest cannot open
+        <code>/etc/passwd</code> by name; it can only use directories the host <em>preopened</em> for it, and only with
+        the rights the host granted.</li>
+      <li><strong>Engines.</strong> A Wasm runtime can interpret, JIT-compile or ahead-of-time compile the module.
+        wasm-bpf ships runtimes built on two engines from the Bytecode Alliance:
+        <a href="https://wasmtime.dev/">Wasmtime</a> (Rust, Cranelift JIT) and
+        <a href="https://github.com/bytecodealliance/wasm-micro-runtime">WAMR</a>, the WebAssembly Micro Runtime (C,
+        interpreter and AOT). A third, a plugin for <a href="https://github.com/WasmEdge/WasmEdge/tree/master/plugins/wasm_bpf">WasmEdge</a>,
+        lives in the WasmEdge repository.</li>
+    </ol>
+    <p>It is worth placing the two virtual machines side by side, because they are easy to confuse.</p>
+    <table>
+      <thead><tr><th></th><th>eBPF (kernel)</th><th>WebAssembly (user space)</th></tr></thead>
+      <tbody>
+        <tr><td>Where it runs</td><td>Inside the kernel, at hooks</td><td>Inside a host process</td></tr>
+        <tr><td>Safety mechanism</td><td>Static verifier proves termination and memory safety before load (<a href="03-verifier.html">03</a>)</td><td>Bounds-checked linear memory, typed calls, no raw jumps; any loop allowed</td></tr>
+        <tr><td>Word size</td><td>64-bit registers and pointers</td><td><code>wasm32</code>: 32-bit pointers, 64-bit integers available</td></tr>
+        <tr><td>Calling the outside world</td><td>Helpers and kfuncs (<a href="04-maps-helpers-kfuncs.html">04</a>)</td><td>Imported host functions (WASI and custom)</td></tr>
+        <tr><td>Role in wasm-bpf</td><td>The data plane: probes, filters, LSM hooks</td><td>The control plane: load, attach, read maps, print</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Architecture</h2>
+    <p>Figure 12.1 shows the pieces. The guest is a normal WASI command module (it has a <code>_start</code> export, like
+      a <code>main</code>). Its data section contains the bytes of the compiled <code>.bpf.o</code>, embedded at build
+      time. It imports WASI functions for printing and sleeping, and the wasm-bpf functions for everything eBPF. The host
+      runtime is a native program that links a Wasm engine and libbpf. When the guest calls an import, the engine
+      transfers control to a host function, which translates the guest's 32-bit offsets into host pointers (after
+      bounds-checking them), calls libbpf, and returns an integer.</p>
+
+    <figure>
+      <svg viewBox="0 0 860 470" role="img" aria-label="Architecture of wasm-bpf: a Wasm guest module containing the embedded BPF object, the libbpf-wasm SDK and the application callback, calls seven wasm_bpf imports implemented by the host runtime; the runtime uses libbpf to issue bpf syscalls; the kernel verifies and runs the programs, and maps and ring buffers flow back to guest memory.">
+        <defs>
+          <marker id="a12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="b12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <!-- host process -->
+        <rect x="20" y="20" width="820" height="300" rx="10" fill="none" stroke="var(--border)" stroke-dasharray="6 4"/>
+        <text x="34" y="42" fill="var(--muted)" font-size="13" font-family="sans-serif">HOST PROCESS (root or CAP_BPF + CAP_PERFMON): wasm-bpf CLI, ecli, WasmEdge, or your own program</text>
+        <!-- guest -->
+        <rect x="40" y="58" width="370" height="246" rx="8" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="54" y="82" fill="var(--fg)" font-size="14" font-family="sans-serif" font-weight="bold">Wasm guest (bootstrap.wasm, ~73 KB)</text>
+        <text x="54" y="100" fill="var(--muted)" font-size="11" font-family="sans-serif">one 32-bit linear memory; sees only its imports</text>
+        <rect x="56" y="112" width="160" height="56" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="66" y="134" fill="var(--fg)" font-size="12" font-family="sans-serif">main() / handle_event()</text>
+        <text x="66" y="154" fill="var(--muted)" font-size="11" font-family="sans-serif">application logic</text>
+        <rect x="232" y="112" width="162" height="56" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="242" y="134" fill="var(--fg)" font-size="12" font-family="sans-serif">bootstrap.skel.h</text>
+        <text x="242" y="154" fill="var(--muted)" font-size="11" font-family="sans-serif">embedded .bpf.o bytes</text>
+        <rect x="56" y="180" width="338" height="44" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="66" y="200" fill="var(--fg)" font-size="12" font-family="sans-serif">libbpf-wasm.h (C) · wasm-bpf-binding (Rust) · go_sdk</text>
+        <text x="66" y="216" fill="var(--muted)" font-size="11" font-family="sans-serif">libbpf-like API over the imports</text>
+        <rect x="56" y="236" width="338" height="54" rx="6" fill="none" stroke="var(--accent)"/>
+        <text x="66" y="256" fill="var(--accent)" font-size="12" font-family="monospace">import "wasm_bpf": load / attach / attach_fd</text>
+        <text x="66" y="274" fill="var(--accent)" font-size="12" font-family="monospace">map_fd_by_name / map_operate / poll / close</text>
+        <!-- runtime -->
+        <rect x="450" y="58" width="370" height="246" rx="8" fill="var(--bg3)" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="464" y="82" fill="var(--fg)" font-size="14" font-family="sans-serif" font-weight="bold">Host runtime</text>
+        <text x="464" y="102" fill="var(--muted)" font-size="11" font-family="sans-serif">runtime/wasm-bpf-rs (Wasmtime) or runtime/cpp (WAMR)</text>
+        <rect x="466" y="114" width="338" height="62" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="476" y="134" fill="var(--fg)" font-size="12" font-family="sans-serif">host functions: bounds-check guest offsets,</text>
+        <text x="476" y="152" fill="var(--fg)" font-size="12" font-family="sans-serif">translate to host pointers, keep handle table</text>
+        <text x="476" y="168" fill="var(--muted)" font-size="11" font-family="monospace">object_map: u64 → bpf_object + links + poller</text>
+        <rect x="466" y="186" width="338" height="44" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="476" y="206" fill="var(--fg)" font-size="12" font-family="sans-serif">WASI implementation (stdio, args, clocks,</text>
+        <text x="476" y="222" fill="var(--fg)" font-size="12" font-family="sans-serif">rights-free preopened dirs for attach targets)</text>
+        <rect x="466" y="240" width="338" height="50" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="476" y="262" fill="var(--fg)" font-size="12" font-family="sans-serif" font-weight="bold">libbpf (C) / libbpf-rs</text>
+        <text x="476" y="280" fill="var(--muted)" font-size="11" font-family="sans-serif">open_mem, CO-RE, load, attach, buffer poll</text>
+        <path d="M396,262 L464,262" stroke="var(--accent)" stroke-width="2" marker-end="url(#a12)" fill="none"/>
+        <text x="402" y="254" fill="var(--accent)" font-size="10" font-family="sans-serif">call</text>
+        <path d="M464,150 L396,150" stroke="var(--accent2)" stroke-width="2" marker-end="url(#b12)" fill="none" stroke-dasharray="5 3"/>
+        <text x="400" y="144" fill="var(--accent2)" font-size="10" font-family="sans-serif">callback</text>
+        <!-- kernel -->
+        <rect x="20" y="350" width="820" height="104" rx="10" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="34" y="374" fill="var(--muted)" font-size="13" font-family="sans-serif">LINUX KERNEL</text>
+        <rect x="40" y="384" width="230" height="56" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="52" y="406" fill="var(--fg)" font-size="12" font-family="sans-serif">verifier + JIT</text>
+        <text x="52" y="424" fill="var(--muted)" font-size="11" font-family="sans-serif">checks programs as usual (03)</text>
+        <rect x="300" y="384" width="250" height="56" rx="6" fill="none" stroke="var(--border)"/>
+        <text x="312" y="406" fill="var(--fg)" font-size="12" font-family="sans-serif">programs at hooks</text>
+        <text x="312" y="424" fill="var(--muted)" font-size="11" font-family="sans-serif">tracepoint, kprobe, LSM, XDP, sockops…</text>
+        <rect x="580" y="384" width="240" height="56" rx="6" fill="none" stroke="var(--accent2)"/>
+        <text x="592" y="406" fill="var(--fg)" font-size="12" font-family="sans-serif">maps, ring buffer, perf buffer</text>
+        <text x="592" y="424" fill="var(--muted)" font-size="11" font-family="sans-serif">shared with the host process</text>
+        <path d="M635,292 L635,382" stroke="var(--accent2)" stroke-width="2" marker-end="url(#b12)" fill="none"/>
+        <text x="642" y="340" fill="var(--accent2)" font-size="11" font-family="monospace">bpf() syscalls</text>
+        <path d="M760,382 L760,292" stroke="var(--accent)" stroke-width="2" marker-end="url(#a12)" fill="none" stroke-dasharray="5 3"/>
+        <text x="768" y="345" fill="var(--accent)" font-size="11" font-family="sans-serif">events</text>
+      </svg>
+      <figcaption>Figure 12.1 — The guest holds the program bytes and the logic; the host holds every kernel resource. The
+        only path between them is the <code>wasm_bpf</code> import module (plus standard WASI).</figcaption>
+    </figure>
+
+    <p>Three consequences follow from this split and come back throughout the chapter.</p>
+    <ul>
+      <li>The guest needs no libelf and no syscalls. ELF parsing, BTF handling and CO-RE relocation happen in the host's
+        libbpf, exactly as in a native tool (<a href="06-btf-core-libbpf.html">06</a>). The guest is small because it only
+        carries the object bytes and its own logic.</li>
+      <li>Data has to cross a boundary twice: between the kernel and host memory (as in any eBPF tool) and between host
+        memory and the guest's linear memory. wasm-bpf arranges for the second crossing to be a plain copy or a direct
+        pointer, never serialisation.</li>
+      <li>The <em>kernel</em> sees an ordinary libbpf user. The verifier, the JIT, the program types and the map types are
+        the same ones described in Part I. Nothing in the kernel knows a Wasm module is involved.</li>
+    </ul>
+
+    <h2>How the code is organised</h2>
+    <p>The main repository holds the runtimes, the examples and documentation; the guest SDKs were split into their own
+      repositories in May 2023 (pull request #119) and are pulled back in as git submodules under
+      <code>wasm-sdk/</code>.</p>
+    <table>
+      <thead><tr><th>Path</th><th>What it contains</th></tr></thead>
+      <tbody>
+        <tr><td><code>runtime/wasm-bpf-rs/</code></td><td>The <code>wasm-bpf-rs</code> library crate: Wasmtime 5 + libbpf-rs 0.20. <code>src/runner.rs</code> registers the host functions; <code>src/bpf/*.rs</code> implements one host function per file (<code>load</code>, <code>attach</code>, <code>fd</code>, <code>fd_by_name</code>, <code>map_operate</code>, <code>poll</code>, <code>wrapper_poll</code>, <code>close</code>); <code>src/state.rs</code> holds the per-instance handle table; <code>src/handle.rs</code> pause/resume/terminate; <code>tests/</code> prebuilt <code>.wasm</code> guests and their sources.</td></tr>
+        <tr><td><code>runtime/cli/</code></td><td>The <code>wasm-bpf</code> command built on the crate (<code>--verbose</code>, <code>--dir HOST:GUEST</code>, Go callback options).</td></tr>
+        <tr><td><code>runtime/c-wrapper/</code></td><td>A C ABI over the Rust library (<code>wasm_bpf_module_run</code>), for embedding in C/C++ programs.</td></tr>
+        <tr><td><code>runtime/cpp/</code></td><td>The "minimal" runtime: about 800 lines of C++ in <code>src/wasm-bpf.cpp</code> on WAMR, with libbpf built from the vendored bpftool submodule. Also <code>third_party/vmlinux/&lt;arch&gt;/vmlinux.h</code> and libbpf headers used by every example, and C++ tests (attach dispatch, fd attach, hostile-init, memory checks).</td></tr>
+        <tr><td><code>wasm-sdk/c</code> → <a href="https://github.com/eunomia-bpf/wasm-bpf-guest-sdk-c">wasm-bpf-guest-sdk-c</a></td><td>One header, <code>libbpf-wasm.h</code>: import declarations plus a libbpf-compatible skeleton, buffer and map API for C guests.</td></tr>
+        <tr><td><code>wasm-sdk/rust/wasm-bpf-binding</code> → <a href="https://github.com/eunomia-bpf/wasm-bpf-guest-sdk-rust">wasm-bpf-guest-sdk-rust</a></td><td>Two crates: <code>wasm-bpf-binding</code> (raw imports) and <code>wasm-bpf-libbpf-rs</code> (a small libbpf-rs-like API: <code>ObjectBuilder</code>, <code>Map</code>, <code>PollBuilder</code>).</td></tr>
+        <tr><td><code>wasm-sdk/go_sdk</code> → <a href="https://github.com/eunomia-bpf/wasm-bpf-guest-sdk-go">wasm-bpf-guest-sdk-go</a></td><td><code>helper.go</code>: TinyGo <code>//go:wasm-module</code> import declarations.</td></tr>
+        <tr><td><code>examples/</code></td><td>14 examples in C, Rust and Go (table below). Each has a Makefile in the libbpf-bootstrap style.</td></tr>
+        <tr><td><code>docs/</code>, <code>Dockerfile</code>, <code>.github/workflows/</code></td><td>Build notes, the podman/WasmEdge guide, the container image, and CI that builds every example and pushes it to ghcr.io as an OCI artifact.</td></tr>
+      </tbody>
+    </table>
+    <p>Two tools live outside the repository and matter for the build: eunomia-bpf's fork of
+      <a href="https://github.com/eunomia-bpf/bpftool">bpftool</a> (submodule <code>runtime/cpp/third_party/bpftool</code>),
+      which adds a <code>-w</code> flag to generate Wasm skeletons, and the <code>ecc</code>/<code>ecli</code> tools from
+      <a href="10-eunomia-bpf-ecc-ecli.html">chapter 10</a>, used for struct headers and OCI push/pull.</p>
+
+    <h2>The host ABI: seven functions</h2>
+    <p>Everything a guest can do with eBPF goes through these imports. The C guest SDK declares them with Clang's
+      <code>import_module</code>/<code>import_name</code> attributes, which make <code>wasm-ld</code> emit Wasm imports
+      instead of unresolved symbols:</p>
+    <pre data-file="wasm-bpf-guest-sdk-c/libbpf-wasm.h"><code class="language-c">#define IMPORT_MODULE "wasm_bpf"
+#define ATTR(name) \
+    __attribute__((import_module(IMPORT_MODULE), import_name(name)))
+/// should be externref type for bpf_object_skel.
+typedef uint64_t bpf_object_skel;
+/// lookup a bpf map fd by name.
+ATTR("wasm_bpf_map_fd_by_name")
+int wasm_bpf_map_fd_by_name(bpf_object_skel obj, const char* name);
+/// detach and close a bpf program.
+ATTR("wasm_close_bpf_object")
+int wasm_close_bpf_object(bpf_object_skel obj);
+/// CO-RE load a bpf object into the kernel.
+ATTR("wasm_load_bpf_object")
+bpf_object_skel wasm_load_bpf_object(const void* obj_buf, int obj_buf_sz);
+/// attach a bpf program to a kernel hook.
+ATTR("wasm_attach_bpf_program")
+int wasm_attach_bpf_program(bpf_object_skel obj,
+                            const char* name,
+                            const char* attach_target);
+/* ... wasm_attach_bpf_program_fd: see "Attach targets" below ... */
+/// poll a bpf buffer, and call a wasm callback indicated by sample_func.
+/// the first time to call this function will open and create a bpf buffer.
+ATTR("wasm_bpf_buffer_poll")
+int wasm_bpf_buffer_poll(bpf_object_skel program,
+                         int fd,
+                         int32_t sample_func,
+                         uint32_t ctx,
+                         char* data,
+                         int max_size,
+                         int timeout_ms);
+/// lookup, update, delete, and get_next_key operations on a bpf map.
+ATTR("wasm_bpf_map_operate")
+int wasm_bpf_map_operate(int fd,
+                         int cmd,
+                         void* key,
+                         void* value,
+                         void* next_key,
+                         uint64_t flags);</code></pre>
+    <p>Note the comment "should be externref": the object handle is a plain 64-bit integer today. Wasm's
+      <code>externref</code> type, an opaque host reference the guest cannot forge or do arithmetic on, would be the
+      cleaner choice, but it is not usable from C without extra toolchain support.</p>
+    <p>The C++ runtime registers the same functions with WAMR, using WAMR's signature strings. They are the most compact
+      statement of the ABI: <code>i</code> is <code>i32</code>, <code>I</code> is <code>i64</code>, <code>*</code> is a
+      guest pointer that WAMR bounds-checks and converts to a host pointer, <code>~</code> is the length of the preceding
+      buffer, and <code>$</code> is a NUL-terminated string.</p>
+    <pre data-file="wasm-bpf/runtime/cpp/src/wasm-bpf.cpp"><code class="language-cpp">    static NativeSymbol native_symbols[] = {
+        EXPORT_WASM_API_WITH_SIG(wasm_load_bpf_object, "(*~)I"),
+        EXPORT_WASM_API_WITH_SIG(wasm_attach_bpf_program, "(I$$)i"),
+        EXPORT_WASM_API_WITH_SIG(wasm_attach_bpf_program_fd, "(I$i)i"),
+        EXPORT_WASM_API_WITH_SIG(wasm_bpf_buffer_poll, "(Iiii*~i)i"),
+        EXPORT_WASM_API_WITH_SIG(wasm_bpf_map_fd_by_name, "(I$)i"),
+        EXPORT_WASM_API_WITH_SIG(wasm_bpf_map_operate, "(ii***I)i"),
+        EXPORT_WASM_API_WITH_SIG(wasm_close_bpf_object, "(I)i"),
+    };
+    /* ... */
+    init_args.native_module_name = "wasm_bpf";
+    init_args.native_symbols = native_symbols;</code></pre>
+    <p>To see what a compiled guest actually asks for, I parsed the import section of the prebuilt
+      <code>runtime/wasm-bpf-rs/tests/runqlat.wasm</code> with a short script (the output is real; the script is not part
+      of the repository):</p>
+    <pre><code class="language-plaintext">== runqlat.wasm 110081 bytes
+  import wasm_bpf wasm_load_bpf_object    (i32, i32) -&gt; i64
+  import wasm_bpf wasm_bpf_map_fd_by_name (i64, i32) -&gt; i32
+  import wasm_bpf wasm_bpf_map_operate    (i32, i32, i32, i32, i32, i64) -&gt; i32
+  import wasm_bpf wasm_attach_bpf_program (i64, i32, i32) -&gt; i32
+  import wasm_bpf wasm_close_bpf_object   (i64) -&gt; i32
+  wasi imports: 12
+  exports: memory, _start, __indirect_function_table</code></pre>
+    <table>
+      <thead><tr><th>Function</th><th>Wasm signature</th><th>What the host does</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>wasm_load_bpf_object</code></td><td><code>(i32 buf, i32 len) → i64</code></td><td>libbpf open-from-memory + load (CO-RE relocation, verifier)</td><td>object handle, 0 on failure</td></tr>
+        <tr><td><code>wasm_attach_bpf_program</code></td><td><code>(i64 obj, i32 name, i32 target) → i32</code></td><td>attach program by name; target string for sockops (cgroup path) and xdp (interface name); otherwise auto-attach by section name</td><td>0 or negative</td></tr>
+        <tr><td><code>wasm_attach_bpf_program_fd</code></td><td><code>(i64 obj, i32 name, i32 fd) → i32</code></td><td>attach with a target named by a preopened WASI directory fd (added August–September 2026)</td><td>0 or negative</td></tr>
+        <tr><td><code>wasm_bpf_map_fd_by_name</code></td><td><code>(i64 obj, i32 name) → i32</code></td><td>find a map in the object</td><td>host map fd</td></tr>
+        <tr><td><code>wasm_bpf_map_operate</code></td><td><code>(i32 fd, i32 cmd, i32 key, i32 value, i32 next_key, i64 flags) → i32</code></td><td>lookup / update / delete / get-next-key with key and value in guest memory</td><td>0 or negative</td></tr>
+        <tr><td><code>wasm_bpf_buffer_poll</code></td><td><code>(i64 obj, i32 fd, i32 cb, i32 ctx, i32 data, i32 max, i32 timeout) → i32</code></td><td>create (first call) and poll a ring buffer or perf buffer, copy each sample into <code>data</code>, call guest callback</td><td>libbpf poll result</td></tr>
+        <tr><td><code>wasm_close_bpf_object</code></td><td><code>(i64 obj) → i32</code></td><td>destroy links, poller and object</td><td>0 or −1</td></tr>
+      </tbody>
+    </table>
+    <p>This is a deliberately small surface. There is no "create a map", "load one program" or "pin" call: the unit of
+      work is a whole ELF object, and the guest otherwise sees only the four map commands. The README invites anyone to
+      implement the same interface "in any languages, any eBPF libraries and any Wasm runtimes", and the eunomia-bpf
+      author proposed it for standardisation as <a href="https://github.com/WebAssembly/WASI/issues/513">WASI issue
+      #513, "WASI proposal for eBPF related API"</a> (opened February 2023; still open).</p>
+    <div class="callout warn"><span class="label">Watch the documented signatures</span>
+      <p>The README and the WasmEdge plugin README list <code>wasm_bpf_map_operate(u64 fd, …)</code>, but both runtimes
+        and the C SDK use an <code>i32</code> fd, as the import above shows. The Rust (<code>wasm-bpf-binding</code>) and
+        Go SDKs declare the three pointer arguments of <code>wasm_bpf_map_operate</code> as <code>i64</code>, while the
+        runtimes take 32-bit pointers. Wasmtime checks import types when it instantiates a module, so a Rust or Go guest
+        that calls this function through those bindings would probably be rejected at start-up. I found this by reading
+        the source and did not test it (no Rust or TinyGo toolchain on the orb). None of the shipped Rust or Go examples
+        call map operations.</p>
+    </div>
+
+    <h2>Inside the runtime</h2>
+    <p>Both runtimes follow the same structure: an instance-wide table maps object handles to a libbpf object plus its
+      links and its poller, and each host function is a thin wrapper that validates guest memory and calls libbpf. The
+      Rust runtime is the more complete of the two (the runtime README notes it is the only one that runs TinyGo
+      modules), so most excerpts below come from it, with the C++ version where the two differ.</p>
+
+    <h3>Start-up and linking</h3>
+    <p><code>WasmBpfModuleRunner::new</code> builds a Wasmtime engine, adds WASI to the linker, and registers each host
+      function under the module name <code>wasm_bpf</code> via the <code>add_bind_function!</code> macro (which expands
+      to <code>linker.func_wrap("wasm_bpf", stringify!(f), f)</code>):</p>
+    <pre data-file="wasm-bpf/runtime/wasm-bpf-rs/src/runner.rs"><code class="language-rust">        let engine_config = wasmtime::Config::new()
+            .epoch_interruption(true) // It must be enabled
+            .to_owned();
+        let engine = Engine::new(&amp;engine_config)?;
+        let mut linker = Linker::new(&amp;engine);
+        wasmtime_wasi::add_to_linker(&amp;mut linker, |s: &amp;mut AppState| &amp;mut s.wasi)
+            .with_context(|| anyhow!("Failed to add wasmtime_wasi to linker"))?;
+        /* ... WASI context with stdin/stdout/stderr, args, preopens ... */
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |v| {
+            // There should call `unwrap`.
+            match v.operation_rx.recv()? {
+                ProgramOperation::Resume =&gt; Ok(1),
+                ProgramOperation::Terminate =&gt; Err(anyhow!("Wasm program terminated")),
+            }
+        });
+        let main_module = Module::from_binary(&amp;engine, module_binary)
+            .with_context(|| anyhow!("Failed to read wasm module file"))?;
+        add_bind_function!(linker, wasm_load_bpf_object)?;
+        add_bind_function!(linker, wasm_close_bpf_object)?;
+        add_bind_function!(linker, wasm_attach_bpf_program)?;
+        add_bind_function!(linker, wasm_attach_bpf_program_fd)?;
+        add_bind_function!(linker, wasm_bpf_buffer_poll)?;
+        add_bind_function!(linker, wasm_bpf_map_fd_by_name)?;
+        add_bind_function!(linker, wasm_bpf_map_operate)?;</code></pre>
+    <p>The epoch settings implement pause, resume and terminate for embedders. Wasmtime's epoch interruption inserts cheap
+      checks into compiled code; when the host calls <code>engine.increment_epoch()</code> (that is what
+      <code>WasmProgramHandle::pause()</code> and <code>terminate()</code> do), the next check runs the deadline callback,
+      which blocks on a channel until it receives <code>Resume</code> or <code>Terminate</code>. This is how
+      <code>ecli</code>'s task manager stops a running Wasm eBPF program: it calls
+      <code>run_wasm_bpf_module_async</code> and keeps the returned handle.</p>
+
+    <h3>Loading: the object never leaves guest memory</h3>
+    <pre data-file="wasm-bpf/runtime/wasm-bpf-rs/src/bpf/load.rs"><code class="language-rust">pub fn wasm_load_bpf_object(
+    mut caller: CallerType,
+    obj_buf: WasmPointer,
+    obj_buf_size: u32,
+) -&gt; u64 {
+    debug!("Load bpf object caller");
+    let memory = caller.get_memory().expect("Expected exported `memory`");
+    let mut buf = vec![0u8];
+    if let Err(err) = memory.read(
+        &amp;mut caller,
+        obj_buf as usize + obj_buf_size as usize - 1,
+        &amp;mut buf[..],
+    ) {
+        /* ... log and return 0 ... */
+        return 0;
+    }
+    let open_object = match ObjectBuilder::default().open_memory(
+        "",
+        &amp;memory.data(&amp;mut caller)[obj_buf as usize..(obj_buf + obj_buf_size) as usize],
+    ) {
+        Ok(v) =&gt; v,
+        /* ... */
+    };
+    let object = match open_object.load() {
+        Ok(v) =&gt; v,
+        /* ... */
+    };
+    let mut state = caller.data_mut();
+    let next_id = state.next_object_id;
+    state.next_object_id += 1;
+    state.object_map.insert(
+        next_id,
+        WrapperObject {
+            object: Rc::new(RefCell::new(object)),
+            poll_buffer: None,
+        },
+    );
+    next_id
+}</code></pre>
+    <p>The host checks that the last byte of the buffer is inside linear memory (reading it with a bounds-checked
+      <code>memory.read</code>), then gives libbpf a slice of linear memory directly. From there it is the libbpf load
+      path of chapter <a href="06-btf-core-libbpf.html">06</a>: parse ELF, find kernel BTF, apply CO-RE relocations,
+      create maps, send programs to the verifier. If anything fails, the guest just gets 0; the reason is in the host's
+      debug log (<code>wasm-bpf --verbose</code>). Handles in the Rust runtime are a counter starting at 1. The C++
+      runtime uses the address of its <code>wasm_bpf_program</code> object as the handle, but only ever uses it as a key
+      in an <code>unordered_map</code>, so a forged handle just fails the lookup.</p>
+
+    <h3>Attaching, and why attach targets became file descriptors</h3>
+    <p>Most program types need no target at all: libbpf's <code>bpf_program__attach()</code> reads the section name
+      (<code>tp/sched/sched_process_exec</code>, <code>lsm/path_rmdir</code>, <code>kprobe/…</code>) and picks the hook
+      (<a href="05-program-types-and-hooks.html">05</a>). The runtime calls it when the target is null or empty. Two
+      section names get special treatment because they need something only the caller knows: <code>sockops</code> needs a
+      cgroup and <code>xdp</code> needs a network interface. With the original API, the guest passed a string: a cgroup
+      path such as <code>"/sys/fs/cgroup/"</code> (see <code>examples/sockops/sockops.c</code>) or an interface name.</p>
+    <p>A path string from the guest is a problem in a sandbox. The runtime runs with root-level privileges and opened
+      whatever path the guest named, which is the opposite of WASI's capability model. Issue
+      <a href="https://github.com/eunomia-bpf/wasm-bpf/issues/48">#48</a> ("Pass file descriptor instead of file path at
+      <code>wasm_attach_bpf_program</code>") recorded this in March 2023. It was fixed in two pull requests in
+      August–September 2026, #160 for the Rust runtime and #163 for the C++ runtime, with matching SDK updates. The new
+      <code>wasm_attach_bpf_program_fd</code> takes a WASI descriptor instead:</p>
+    <ul>
+      <li>The operator preopens directories with <code>wasm-bpf --dir /sys/fs/cgroup:/guestmnt</code> (Rust CLI) or
+        <code>--dir /sys/fs/cgroup</code> (C++ CLI).</li>
+      <li>The runtime gives each preopen <em>no rights at all</em>. The guest can discover it (via
+        <code>fd_prestat_get</code>) and hold its number, but cannot open, list or create anything beneath it. The C++
+        runtime goes further and injects the preopens only after instantiation, so that module initialisation code
+        never sees them; a test called <code>hostile_init_test</code> checks this.</li>
+      <li>The host resolves the guest's fd only through its own registry of preopens. stdout, an unopened number, or
+        anything the guest opened itself is refused. XDP targets are interfaces, not files, so the fd path rejects
+        <code>xdp</code> programs and they keep using the string API.</li>
+    </ul>
+    <pre data-file="wasm-bpf/runtime/wasm-bpf-rs/src/bpf/attach.rs"><code class="language-rust">/// Pick the [`FdAttachAction`] for a section. Runs before any descriptor is resolved, so it
+/// sees only whether a target was passed, never what it resolves to.
+pub(crate) fn fd_attach_action(section: &amp;str, has_target_fd: bool) -&gt; FdAttachAction {
+    match (section, has_target_fd) {
+        ("sockops", true) =&gt; FdAttachAction::AttachCgroupByFd,
+        ("xdp", _) =&gt; FdAttachAction::RejectXdp,
+        _ =&gt; FdAttachAction::AutoAttach,
+    }
+}</code></pre>
+    <p>The C SDK exposes this as <code>bpf_set_prog_attach_target_fd(prog, fd)</code> next to the older
+      <code>bpf_set_prog_attach_target(prog, path)</code>. Its README warns about a compatibility side effect worth
+      knowing: <code>bpf_object__attach_skeleton()</code> contains both calls, so any C guest rebuilt with the new header
+      imports <code>wasm_attach_bpf_program_fd</code> even if it never uses it, and will not instantiate on a runtime
+      older than #160/#163. I confirmed it: a <code>bootstrap.wasm</code> built on the orb from the current sources
+      imports six <code>wasm_bpf</code> functions, while the prebuilt one in the repository imports five.</p>
+
+    <h3>Map operations: the kernel copies straight into guest memory</h3>
+    <p>For maps, wasm-bpf avoids copies entirely. The host asks the kernel for the map's key and value sizes, checks that
+      the guest's pointers have that many bytes available, and passes <em>host pointers into linear memory</em> to
+      libbpf's syscall wrappers. The kernel's <code>copy_to_user</code>/<code>copy_from_user</code> then read and write
+      guest memory directly.</p>
+    <pre data-file="wasm-bpf/runtime/wasm-bpf-rs/src/bpf/map_operate.rs"><code class="language-rust">    let (key_size, value_size) = {
+        // SAFETY: The fd is only used to query map info, which will not be used to write or read
+        let map_info = match MapInfo::new(unsafe { BorrowedFd::borrow_raw(fd) }) {
+            /* ... */
+        };
+        (
+            map_info.info.key_size as usize,
+            map_info.info.value_size as usize,
+        )
+    };
+
+    match cmd as u32 {
+        /* ... BPF_MAP_GET_NEXT_KEY ... */
+        BPF_MAP_LOOKUP_ELEM =&gt; {
+            ensure_enough_memory!(caller, key, key_size, EINVAL);
+            ensure_enough_memory!(caller, value, value_size, EINVAL);
+            // SAFETY: memory addresses are checked to be valid
+            let ret_val = unsafe {
+                bpf_map_lookup_elem_flags(
+                    fd,
+                    caller.raw_pointer_at_unchecked(key as usize) as *const _,
+                    caller.raw_mut_pointer_at_unchecked(value as usize) as *mut _,
+                    flags,
+                )
+            };
+            /* ... */
+        }
+        /* ... BPF_MAP_UPDATE_ELEM, BPF_MAP_DELETE_ELEM ... */
+        // More syscall commands can be allowed here
+        s =&gt; {
+            debug!("Map operation `{}` currently not supported", s);
+            return -EINVAL;
+        }
+    };</code></pre>
+    <p>Only commands 1–4 (<code>LOOKUP_ELEM</code>, <code>UPDATE_ELEM</code>, <code>DELETE_ELEM</code>,
+      <code>GET_NEXT_KEY</code>) are allowed; batch operations, <code>LOOKUP_AND_DELETE</code> and per-object commands are
+      not exposed. The C SDK turns these into the libbpf names a C programmer expects (<code>bpf_map_lookup_elem</code>,
+      <code>bpf_map_get_next_key</code>, …), which is why <code>runqlat.c</code>'s histogram loop compiles to Wasm
+      unchanged. One detail to keep in mind if you build a runtime for untrusted guests: the fd argument is a raw host
+      descriptor number, and the runtime does not check that it belongs to one of the guest's objects. A guest could pass
+      the number of some other BPF map the host process has open.</p>
+
+    <h3>Polling: callbacks across the boundary</h3>
+    <p>Ring buffers and perf buffers are where the two worlds meet most often. The guest wants libbpf's callback style
+      ("call <code>handle_event</code> for every sample"), but its callback is Wasm code, and a C function pointer in
+      Wasm is a table index. Figure 12.2 shows the full sequence from start-up to the first event.</p>
+
+    <figure>
+      <svg viewBox="0 0 860 560" role="img" aria-label="Sequence diagram: guest calls wasm_load_bpf_object, host calls libbpf open_mem and load, kernel verifies; guest attaches; guest calls wasm_bpf_buffer_poll with a table index, host creates a ring buffer on first call and calls ring_buffer__poll; kernel delivers a record; host copies it into guest memory and calls the guest callback through the function table; the callback returns, poll returns.">
+        <defs>
+          <marker id="s12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="s12b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <rect x="40" y="14" width="150" height="34" rx="6" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="115" y="36" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="sans-serif">Wasm guest</text>
+        <rect x="270" y="14" width="150" height="34" rx="6" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="345" y="36" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="sans-serif">host function</text>
+        <rect x="500" y="14" width="150" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="575" y="36" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="sans-serif">libbpf</text>
+        <rect x="690" y="14" width="150" height="34" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="765" y="36" text-anchor="middle" fill="var(--fg)" font-size="13" font-family="sans-serif">kernel</text>
+        <line x1="115" y1="48" x2="115" y2="550" stroke="var(--border)" stroke-dasharray="4 4"/>
+        <line x1="345" y1="48" x2="345" y2="550" stroke="var(--border)" stroke-dasharray="4 4"/>
+        <line x1="575" y1="48" x2="575" y2="550" stroke="var(--border)" stroke-dasharray="4 4"/>
+        <line x1="765" y1="48" x2="765" y2="550" stroke="var(--border)" stroke-dasharray="4 4"/>
+        <g font-family="monospace" font-size="11">
+          <path d="M115,74 L341,74" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="122" y="68" fill="var(--fg)">wasm_load_bpf_object(buf, len)</text>
+          <path d="M345,98 L571,98" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="352" y="92" fill="var(--fg)">open_mem(linear mem slice)</text>
+          <path d="M575,122 L761,122" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="582" y="116" fill="var(--fg)">CO-RE, BPF_PROG_LOAD</text>
+          <path d="M765,144 L579,144" stroke="var(--muted)" stroke-dasharray="4 3" marker-end="url(#s12)"/>
+          <text x="600" y="158" fill="var(--muted)">verified, prog/map fds</text>
+          <path d="M345,170 L119,170" stroke="var(--muted)" stroke-dasharray="4 3" marker-end="url(#s12)"/>
+          <text x="140" y="164" fill="var(--muted)">handle = 1</text>
+          <path d="M115,200 L341,200" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="122" y="194" fill="var(--fg)">attach(1, "handle_exec", NULL)</text>
+          <path d="M345,220 L761,220" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="440" y="214" fill="var(--fg)">bpf_program__attach → link</text>
+          <path d="M115,252 L341,252" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="122" y="246" fill="var(--fg)">map_fd_by_name(1, "rb") → fd</text>
+          <path d="M115,290 L341,290" stroke="var(--accent)" stroke-width="2" marker-end="url(#s12)"/>
+          <text x="122" y="284" fill="var(--accent)">buffer_poll(1, fd, cb=#7, ctx, data, 4096, 100)</text>
+          <text x="352" y="308" fill="var(--muted)">1st call: ring_buffer__new()</text>
+          <path d="M345,338 L571,338" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="352" y="332" fill="var(--fg)">ring_buffer__poll(100 ms)</text>
+          <path d="M575,350 L761,350" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="600" y="364" fill="var(--muted)">epoll_wait</text>
+          <path d="M765,382 L579,382" stroke="var(--accent2)" stroke-width="2" marker-end="url(#s12b)"/>
+          <text x="590" y="376" fill="var(--accent2)">record (168 B event)</text>
+          <path d="M575,404 L349,404" stroke="var(--fg)" marker-end="url(#s12)"/>
+          <text x="380" y="398" fill="var(--fg)">sample_cb(data, size)</text>
+          <text x="352" y="424" fill="var(--accent2)">memcpy → guest data[0..size]</text>
+          <path d="M345,446 L119,446" stroke="var(--accent2)" stroke-width="2" marker-end="url(#s12b)"/>
+          <text x="128" y="440" fill="var(--accent2)">table[#7](ctx, data, size)</text>
+          <text x="122" y="466" fill="var(--fg)">handle_event() prints</text>
+          <path d="M115,484 L341,484" stroke="var(--muted)" stroke-dasharray="4 3" marker-end="url(#s12)"/>
+          <text x="140" y="478" fill="var(--muted)">return 0</text>
+          <path d="M345,512 L119,512" stroke="var(--muted)" stroke-dasharray="4 3" marker-end="url(#s12)"/>
+          <text x="140" y="506" fill="var(--muted)">poll returns; guest loops</text>
+        </g>
+        <text x="352" y="544" fill="var(--muted)" font-size="11" font-family="sans-serif">(C++ runtime: once per record inside the poll. Rust runtime: once per poll, after it returns.)</text>
+      </svg>
+      <figcaption>Figure 12.2 — Loading, attaching and the first ring-buffer event. The guest's callback is identified by
+        its index in <code>__indirect_function_table</code>; the host copies each record into a buffer the guest supplied
+        and calls back into Wasm.</figcaption>
+    </figure>
+
+    <p>On its first call, <code>wasm_bpf_buffer_poll</code> looks at the map type and creates either a libbpf ring buffer
+      (<code>BPF_MAP_TYPE_RINGBUF</code>) or a perf buffer (<code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code>, 64 pages per CPU in
+      the C++ runtime). The guest code is the same for both, which mirrors the <code>bpf_buffer</code> compatibility
+      wrapper in BCC's libbpf-tools that the C++ runtime credits. The C++ runtime's sample callback does the copy and the
+      call back into Wasm:</p>
+    <pre data-file="wasm-bpf/runtime/cpp/src/wasm-bpf.cpp"><code class="language-cpp">int bpf_buffer::bpf_buffer_sample(void* data, size_t size) {
+    size_t sample_size = size;
+    if (max_poll_size &lt; size) {
+        sample_size = max_poll_size;
+    }
+    memcpy(poll_data, data, sample_size);
+    wasm_module_inst_t module_inst =
+        wasm_runtime_get_module_inst(callback_exec_env);
+    uint32_t argv[] = {wasm_ctx,
+                       wasm_runtime_addr_native_to_app(module_inst, poll_data),
+                       (uint32_t)size};
+    // call the wasm callback handler
+    if (!wasm_runtime_call_indirect(callback_exec_env, wasm_sample_function, 3,
+                                    argv)) {
+        printf("indirect call sample_function failed\n");
+        return -EINVAL;
+    }
+    return 0;
+}</code></pre>
+    <p>Two details. First, the record is copied into a buffer that lives in guest memory (the C SDK uses a 4,096-byte
+      stack array in <code>bpf_buffer__poll</code>); records longer than that are truncated, but the size passed to the
+      callback is the untruncated one, so callbacks should not trust <code>size</code> beyond their buffer. Second, the
+      call goes through the function table, which is why every example links with <code>-Wl,--export-table</code>
+      (C) or <code>cargo:rustc-link-arg=--export-table</code> in <code>build.rs</code> (Rust): without that flag
+      <code>wasm-ld</code> does not export <code>__indirect_function_table</code>, and the Rust runtime's error message
+      says so.</p>
+    <p>The Rust runtime takes a different route because of Rust's borrowing rules: it cannot call into the Wasm store
+      from inside libbpf-rs's callback while the poll holds a borrow. Instead the libbpf-rs callback stores the sample in
+      a shared cell, and the guest is called once after <code>poll()</code> returns:</p>
+    <pre data-file="wasm-bpf/runtime/wasm-bpf-rs/src/bpf/poll.rs"><code class="language-rust">            MapType::RingBuf =&gt; {
+                let local_cb = {
+                    let result_recv = result_recv.clone();
+                    Box::new(move |data: &amp;[u8]| -&gt; i32 {
+                        result_recv.borrow_mut().replace(data.to_vec());
+                        0
+                    })
+                };
+                /* ... build the RingBuffer around local_cb ... */
+            }
+    /* ... poll with timeout_ms ... */
+    // Here we could try to extract the result
+    if let Some(v) = result_container.borrow_mut().take() {
+        /* ... */
+        let bytes_to_write = v.len().min(max_size as usize);
+        if let Err(e) = memory.write(&amp;mut caller, data as usize, &amp;v[..bytes_to_write]) {
+            /* ... */
+        }
+        /* ... then call the guest: through the Go export if the TinyGo wrapper was used,
+               otherwise perform_indirect_call(sample_func, (ctx, data, bytes_to_write)) ... */
+    }</code></pre>
+    <div class="callout warn"><span class="label">A consequence worth testing</span>
+      <p><code>replace()</code> overwrites the cell. libbpf's ring-buffer poll consumes <em>every</em> record available
+        when it wakes up, so if several events arrive within one poll, this code delivers only the last one to the guest.
+        That is what the code says; I did not build the Rust runtime to measure it. The C++ runtime calls the guest once
+        per record and does not have this behaviour. If you depend on every event, check this with the Rust runtime and
+        your event rate before relying on it.</p>
+    </div>
+    <p>TinyGo adds one more wrinkle. A Go function cannot be passed as a raw table index, so the Go SDK imports
+      <code>wasm_bpf_buffer_poll</code> from a separate module, <code>callback-wrapper</code>, without the callback
+      argument, and exports the callback under a fixed name, <code>go-callback</code>. The Rust runtime registers a
+      wrapper (<code>bpf_buffer_poll_wrapper</code>) under that module name, and when it is used, calls the export by
+      name instead of a table entry. The CLI's <code>-m</code> and <code>-c</code> options set those two names; the
+      defaults match the Go SDK. (Embedders should set them explicitly: the library's <code>Config::default()</code>
+      assigns the two strings the other way round from the CLI.)</p>
+
+    <h2>Memory, struct layout and code generation</h2>
+    <p>A user-space eBPF program and its kernel half share data structures: the event in the ring buffer, the key and
+      value of every map, the read-only configuration in <code>.rodata</code>. In a native tool, both sides are compiled
+      for a 64-bit target and agree on the layout by construction. In wasm-bpf, the kernel side is compiled for
+      <code>-target bpf</code> (64-bit) and the user side for <code>wasm32</code>, a 32-bit target. C types that depend on
+      the pointer width change size. Here is a measurement with the orb's Clang 14 for the same struct on both targets:</p>
+    <pre><code class="language-c">/* illustrative test struct, not from the repo */
+struct exec_start_t { int pid; long start_ns; const char *name; char comm[16]; };</code></pre>
+    <figure>
+      <svg viewBox="0 0 860 210" role="img" aria-label="Byte layout of the test struct: on -target bpf, pid at 0, padding, start_ns at 8 (8 bytes), name pointer at 16 (8 bytes), comm at 24, size 40. On wasm32, pid at 0, start_ns at 4 (4 bytes), name at 8 (4 bytes), comm at 12, size 28.">
+        <text x="20" y="30" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">-target bpf (kernel side): sizeof = 40</text>
+        <g font-family="monospace" font-size="11">
+          <rect x="20" y="40" width="72" height="34" fill="var(--bg3)" stroke="var(--border)"/><text x="30" y="61" fill="var(--fg)">pid</text>
+          <rect x="92" y="40" width="72" height="34" fill="none" stroke="var(--border)" stroke-dasharray="3 3"/><text x="100" y="61" fill="var(--muted)">pad</text>
+          <rect x="164" y="40" width="144" height="34" fill="var(--bg3)" stroke="var(--accent)"/><text x="174" y="61" fill="var(--fg)">start_ns (long)</text>
+          <rect x="308" y="40" width="144" height="34" fill="var(--bg3)" stroke="var(--accent2)"/><text x="318" y="61" fill="var(--fg)">name (ptr)</text>
+          <rect x="452" y="40" width="288" height="34" fill="var(--bg3)" stroke="var(--border)"/><text x="462" y="61" fill="var(--fg)">comm[16]</text>
+          <text x="20" y="90" fill="var(--muted)">0</text><text x="160" y="90" fill="var(--muted)">8</text><text x="300" y="90" fill="var(--muted)">16</text><text x="446" y="90" fill="var(--muted)">24</text><text x="732" y="90" fill="var(--muted)">40</text>
+        </g>
+        <text x="20" y="130" fill="var(--fg)" font-size="13" font-family="sans-serif" font-weight="bold">wasm32 (guest side): sizeof = 28</text>
+        <g font-family="monospace" font-size="11">
+          <rect x="20" y="140" width="72" height="34" fill="var(--bg3)" stroke="var(--border)"/><text x="30" y="161" fill="var(--fg)">pid</text>
+          <rect x="92" y="140" width="72" height="34" fill="var(--bg3)" stroke="var(--accent)"/><text x="98" y="161" fill="var(--fg)">start_ns</text>
+          <rect x="164" y="140" width="72" height="34" fill="var(--bg3)" stroke="var(--accent2)"/><text x="174" y="161" fill="var(--fg)">name</text>
+          <rect x="236" y="140" width="288" height="34" fill="var(--bg3)" stroke="var(--border)"/><text x="246" y="161" fill="var(--fg)">comm[16]</text>
+          <text x="20" y="190" fill="var(--muted)">0</text><text x="88" y="190" fill="var(--muted)">4</text><text x="160" y="190" fill="var(--muted)">8</text><text x="228" y="190" fill="var(--muted)">12</text><text x="516" y="190" fill="var(--muted)">28</text>
+        </g>
+        <text x="560" y="160" fill="var(--muted)" font-size="12" font-family="sans-serif">every field after pid is at the</text>
+        <text x="560" y="176" fill="var(--muted)" font-size="12" font-family="sans-serif">wrong offset if the guest reads</text>
+        <text x="560" y="192" fill="var(--muted)" font-size="12" font-family="sans-serif">kernel bytes with its own type</text>
+      </svg>
+      <figcaption>Figure 12.3 — Same C declaration, two targets (measured with <code>clang -target bpf</code> and
+        <code>clang -target wasm32</code> on the orb). <code>long</code> and pointers are 8 bytes in BPF and 4 bytes in
+        wasm32.</figcaption>
+    </figure>
+    <p>Bootstrap's <code>struct event</code> happens to be safe: it uses <code>int</code>, <code>unsigned</code>,
+      <code>unsigned long long</code> and <code>char</code> arrays, whose sizes and alignments agree on both targets
+      (offsets 16, 24 and 167 for <code>duration_ns</code>, <code>comm</code> and <code>exit_event</code>; 168 bytes total
+      in both). Structs with <code>long</code>, <code>size_t</code>, pointers, or kernel typedefs built on them are not.
+      wasm-bpf offers three answers, in increasing order of automation.</p>
+
+    <h3>1. Hand-written packed structs</h3>
+    <p>The bootstrap README's advice: write the shared structs yourself with <code>__attribute__((packed))</code>,
+      fixed-width types and explicit padding, and turn pointers into <code>uint64_t</code>. For simple events this is
+      easy and it is what the Rust and Go examples do (the Rust <code>Event</code> below is <code>#[repr(C, packed)]</code>
+      with an explicit <code>__pad0: [u8; 4]</code>).</p>
+
+    <h3>2. A layout header generated from BTF</h3>
+    <p>The BPF object already contains BTF describing every type the kernel side uses, with exact byte offsets. The
+      eunomia-bpf bpftool fork used to turn that into a header of packed, explicitly padded structs with a
+      <code>static_assert</code> on each size. The committed <code>examples/bootstrap/bootstrap.wasm.h</code> is such
+      output:</p>
+    <pre data-file="wasm-bpf/examples/bootstrap/bootstrap.wasm.h"><code class="language-c">/* THIS FILE IS AUTOGENERATED BY BPFTOOL! */
+#ifndef _BPF_WASM_EVENT_H_
+#define _BPF_WASM_EVENT_H_
+
+#include &lt;stdint.h&gt;
+#include &lt;stddef.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;assert.h&gt;
+
+struct event {
+    int pid;
+    int ppid;
+    unsigned int exit_code;
+    char __pad0[4];
+    unsigned long long duration_ns;
+    char comm[16];
+    char filename[127];
+    char exit_event;
+} __attribute__((packed));
+static_assert(sizeof(struct event) == 168, "Size of event is not 168");
+
+#endif /* __VMLINUX_H__ */</code></pre>
+    <p>The generator (<code>dump_btf_wasm</code> in the <code>wasm-bpftool</code> branch's <code>src/btf.c</code>) walks
+      the members of each struct, emits <code>char __padN[k]</code> wherever the BTF offset is ahead of the running
+      offset, prints pointer members as integers of the BPF pointer size, and, at this stage of the tool, skips bitfields
+      and nested structs. The <code>struct event</code> type only appears in the object's BTF if some code mentions it;
+      the example's Makefile first runs <code>ecc bootstrap.h --header-only</code> (chapter
+      <a href="10-eunomia-bpf-ecc-ecli.html">10</a>) to add BTF for every struct in the header. Two caveats from building
+      on the orb: in the bpftool revision pinned at the studied commit, the documented command
+      <code>bpftool btf dump file bootstrap.bpf.o format c -j</code> now prints a JSON description of struct layouts
+      rather than this header; and the Makefile does not make <code>bootstrap.wasm</code> depend on
+      <code>bootstrap.wasm.h</code>, so a normal <code>make</code> uses the committed file. Treat the generated header as
+      a starting point you check in, not as a build step.</p>
+    <p>For other guest languages, the same BTF can drive other code generators. <a href="https://github.com/eunomia-bpf/btf2wit">btf2wit</a>
+      converts BTF to WIT, the interface definition language of the WebAssembly
+      <a href="https://github.com/WebAssembly/component-model">Component Model</a>, so that <code>wit-bindgen</code> can
+      generate Rust (or other) types. The <code>rust-bootstrap</code> example generates both its event record and its
+      import declarations this way:</p>
+    <pre data-file="wasm-bpf/examples/rust-bootstrap/btf/Makefile"><code class="language-makefile">generate: install-deps import.wit
+	clang -target bpf -g event-def.c -c -o event.def.o
+	cargo install btf2wit
+	btf2wit event.def.o -o event-def.wit --world-name event-def
+	cp *.wit ../wit/
+
+import.o: import.c
+	gcc import.c -c -o import.o -g 
+	pahole -J import.o
+
+import.wit: import.o
+	btf2wit import.o -o import.wit --world-name import
+	
+	# Currently, WIT doesn't support identifiers with two continuous `-`
+	sed -i 's/--/s-/g' import.wit </code></pre>
+    <p>The second half is a neat trick: compile the C prototypes of the host functions with <code>gcc -g</code>, convert
+      DWARF to BTF with <code>pahole -J</code>, and turn that BTF into a WIT world of imports. The resulting
+      <code>wit/import.wit</code> uses the pre-1.0 WIT syntax (<code>default world %import { … }</code>) and a
+      <code>wit-bindgen</code> pinned to a 2023 git revision; the example's README calls the Wasmtime/WIT path
+      experimental, and by default the example uses the hand-written <code>wasm-bpf-binding</code> crate instead. A third
+      tool, <a href="https://github.com/eunomia-bpf/c-struct-bindgen">c-struct-bindgen</a>, is a proof of concept that
+      generates C struct bindings and JSON marshalling functions from the same information. btf2wit and c-struct-bindgen
+      were last updated in early 2023.</p>
+
+    <h3>3. The Wasm skeleton and the <code>.rodata</code> trick</h3>
+    <p>libbpf skeletons (<a href="06-btf-core-libbpf.html">06</a>) give typed access to global variables: after
+      <code>bootstrap_bpf__open()</code>, <code>skel-&gt;rodata-&gt;min_duration_ns</code> points into a memory-mapped copy
+      of the <code>.rodata</code> map that libbpf writes into the kernel at load time. A Wasm guest has no libbpf and no
+      mmap of kernel maps, so the forked bpftool generates a different skeleton with <code>bpftool -w gen skeleton</code>.
+      It includes <code>libbpf-wasm.h</code> instead of <code>bpf/libbpf.h</code>, embeds the ELF bytes as usual, and
+      records one extra number: the file offset of the <code>.rodata</code> section inside those bytes. From the skeleton
+      generated on the orb:</p>
+    <pre><code class="language-c">/* bootstrap.skel.h, generated on the orb by: bpftool -w gen skeleton bootstrap.bpf.o */
+	s-&gt;sz = sizeof(*s);
+	s-&gt;name = "bootstrap_bpf";
+	s-&gt;rodata_offset = 1264;
+/* ... */
+	map = (struct bpf_map_skeleton *)((char *)s-&gt;maps + 2 * s-&gt;map_skel_sz);
+	map-&gt;name = "bootstra.rodata";
+	map-&gt;map = &amp;obj-&gt;maps.rodata;
+	map-&gt;mmaped = (void **)&amp;obj-&gt;rodata;</code></pre>
+    <p><code>readelf -S bootstrap.bpf.o</code> on the same object shows <code>.rodata</code> at file offset
+      <code>0x4f0</code>, which is 1264. The SDK's <code>bpf_object__open_skeleton</code> then points the
+      <code>rodata</code> pointer straight into the embedded ELF image:</p>
+    <pre data-file="wasm-bpf-guest-sdk-c/libbpf-wasm.h"><code class="language-c">        if (str_has_surfix(map_skel-&gt;name, "rodata") &amp;&amp; map_skel-&gt;mmaped) {
+            // set the address to mmaped rodata variable
+            *map_skel-&gt;mmaped = s-&gt;data + s-&gt;rodata_offset;
+        }
+        // it will not work for bss, because bss is not mmaped
+        // if (str_has_surfix(map_skel-&gt;name, "bss") &amp;&amp; map_skel-&gt;mmaped) {
+        //     *map_skel-&gt;mmaped = s-&gt;data + s-&gt;bss_offset;
+        // }</code></pre>
+    <p>So <code>skel-&gt;rodata-&gt;min_duration_ns = …</code> patches the bytes of the object file in guest memory, and
+      the subsequent <code>wasm_load_bpf_object</code> hands the patched ELF to the host's libbpf, which creates the
+      <code>.rodata</code> map with the new value and freezes it. Configuration through <code>const volatile</code>
+      globals works with no extra host function. <code>.bss</code> and <code>.data</code> are not supported this way,
+      because the guest would need to see the live kernel map, not the initial image. On the orb,
+      <code>bootstrap.wasm -d 50</code> printed only <code>EXIT</code> events with durations of about 200 ms or more,
+      which shows the patched constant reached the kernel.</p>
+
+    <h2>Building and running it</h2>
+    <p>Everything in this section was run on the orb unless marked otherwise. The C++ runtime is the quickest to build:
+      it needs CMake, a C++17 compiler, libelf and zlib, and two submodules.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Get the runtime sources</h4>
+        <p>The README's quick path is <code>cargo install wasm-bpf</code> (the Rust CLI) or the
+          <code>ghcr.io/eunomia-bpf/wasm-bpf:latest</code> container. Note that the newest <code>wasm-bpf</code> crate on
+          crates.io is 0.2.0 from April 2023, which predates fd attach. To build from source, as
+          <code>docs/build.md</code> describes:</p>
+        <pre><code class="language-bash">git clone https://github.com/eunomia-bpf/wasm-bpf
+cd wasm-bpf
+git submodule update --init --recursive
+# Ubuntu/Debian build deps (from docs/build.md)
+sudo apt install clang libelf1 libelf-dev zlib1g-dev</code></pre></div>
+      <div class="step"><h4>2. Build the C++ (WAMR) runtime</h4>
+        <pre><code class="language-bash">cd runtime/cpp
+make build            # cmake -Bbuild -DCMAKE_BUILD_TYPE=Release; cmake --build build
+ls -l build/bin/Release/wasm-bpf
+# orb: 28.7 s wall time, 1,774,520 bytes (639,512 after strip),
+#      dynamically linked against libelf, libz, libstdc++</code></pre>
+        <p>The Rust runtime is <code>cd runtime/cli &amp;&amp; make build</code> (that is, <code>cargo build
+          --release</code>); its binary lands in <code>runtime/target/release/wasm-bpf</code>. I did not build it.</p></div>
+      <div class="step"><h4>3. Compile the kernel half</h4>
+        <p>Exactly as in libbpf-bootstrap, using the headers vendored in <code>runtime/cpp/third_party</code> (the
+          example Makefiles add Clang's system include directories as well):</p>
+        <pre><code class="language-bash">cd examples/bootstrap
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
+  -I../../runtime/cpp/third_party/vmlinux/x86/ -I../../runtime/cpp/third_party/ \
+  -c bootstrap.bpf.c -o bootstrap.bpf.o
+llvm-strip -g bootstrap.bpf.o       # 30,376 bytes on the orb</code></pre></div>
+      <div class="step"><h4>4. Generate the Wasm skeleton</h4>
+        <pre><code class="language-bash">make -C ../../runtime/cpp/third_party/bpftool/src     # the eunomia-bpf fork
+../../runtime/cpp/third_party/bpftool/src/bpftool -w gen skeleton bootstrap.bpf.o &gt; bootstrap.skel.h</code></pre></div>
+      <div class="step"><h4>5. Compile the user half to Wasm</h4>
+        <p>With <a href="https://github.com/WebAssembly/wasi-sdk">wasi-sdk</a> (the README installs release 17 into
+          <code>/opt/wasi-sdk</code>; CI uses 20, which is what I used):</p>
+        <pre><code class="language-bash">ln -f -s ../../wasm-sdk/c/libbpf-wasm.h libbpf-wasm.h
+/opt/wasi-sdk/bin/clang -O2 --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
+  -Wl,--allow-undefined,--export-table -o bootstrap.wasm bootstrap.c
+ls -l bootstrap.wasm                # 72,984 bytes, built in 0.14 s</code></pre>
+        <p><code>--allow-undefined</code> lets the <code>wasm_bpf</code> imports stay unresolved at link time (the
+          runtime supplies them); <code>--export-table</code> exports the function table for callbacks. Steps 3–5 are what
+          <code>make</code> in the example directory runs.</p></div>
+      <div class="step"><h4>6. Run it</h4>
+        <pre><code class="language-plaintext">$ sudo ./wasm-bpf bootstrap.wasm
+
+TIME     EVENT COMM             PID     PPID    FILENAME/EXIT CODE
+00:13:12 EXIT  curl             39342   39341   [0]
+00:13:12 EXIT  head             39344   39341   [0]
+00:13:12 EXIT  grep             39343   39341   [1]
+00:13:12 EXEC  sleep            39363   39322   /usr/bin/sleep
+00:13:12 EXEC  python3          39365   39331   /usr/local/bin/python3
+00:13:12 EXIT  curl             39364   39331   [0] (143ms)
+^C
+Ctrl C exit...</code></pre>
+        <p>Arguments after the module go to the guest (<code>bootstrap.wasm -d 50</code>). The runtime needs the same
+          privileges as any libbpf tool. A second example, the prebuilt <code>runqlat.wasm</code>, printed two
+          run-queue latency histograms with <code>sudo ./wasm-bpf runqlat.wasm 1 2</code>.</p></div>
+    </div>
+    <p>The repository's own test target runs every example under a runtime you choose:
+      <code>cd examples &amp;&amp; IMPL=cpp make</code> (or <code>IMPL=rust</code>). Each example's <code>make test</code>
+      runs the module for three seconds with <code>sudo timeout -s 2</code>.</p>
+
+    <h2>Code walkthrough: one tool, three guest languages</h2>
+    <p>The same bootstrap program (kernel half unchanged from libbpf-bootstrap) has guests in C and Rust, and a related
+      execve tracer has a Go guest. Compare them with the native <code>bootstrap.c</code> from chapter
+      <a href="06-btf-core-libbpf.html">06</a>.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="C guest (libbpf-wasm.h)"><pre data-file="wasm-bpf/examples/bootstrap/bootstrap.c"><code class="language-c">#include &lt;stdio.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;time.h&gt;
+#include "bootstrap.wasm.h"
+#include "bootstrap.skel.h"
+/* ... env, usage text ... */
+static int handle_event(void* ctx, void* data, size_t data_sz) {
+    const struct event* e = data;
+    /* ... format timestamp ts ... */
+    if (e-&gt;exit_event) {
+        printf("%-8s %-5s %-16s %-7d %-7d [%u]", ts, "EXIT", e-&gt;comm, e-&gt;pid,
+               e-&gt;ppid, e-&gt;exit_code);
+        if (e-&gt;duration_ns)
+            printf(" (%llums)", e-&gt;duration_ns / 1000000);
+        printf("\n");
+    } else {
+        printf("%-8s %-5s %-16s %-7d %-7d %s\n", ts, "EXEC", e-&gt;comm, e-&gt;pid,
+               e-&gt;ppid, e-&gt;filename);
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    struct bpf_buffer* rb = NULL;
+    struct bootstrap_bpf* skel;
+    int err;
+    /* ... parse -d by hand (no argp in wasi-libc) ... */
+
+    /* Load and verify BPF application */
+    skel = bootstrap_bpf__open();
+    /* ... */
+    /* Parameterize BPF code with minimum duration parameter */
+    skel-&gt;rodata-&gt;min_duration_ns = env.min_duration_ms * 1000000ULL;
+
+    /* Load &amp; verify BPF programs */
+    err = bootstrap_bpf__load(skel);
+    /* ... */
+    /* Attach tracepoints */
+    err = bootstrap_bpf__attach(skel);
+    /* ... */
+    /* Set up ring buffer polling */
+    rb = bpf_buffer__open(skel-&gt;maps.rb, handle_event, NULL);
+    /* ... print header ... */
+    while (!exiting) {
+        // poll buffer
+        err = bpf_buffer__poll(rb, 100 /* timeout, ms */);
+        /* Ctrl-C will cause -EINTR */
+        if (err == -EINTR) {
+            err = 0;
+            break;
+        }
+        if (err &lt; 0) {
+            printf("Error polling perf buffer: %d\n", err);
+            break;
+        }
+    }
+
+cleanup:
+    bpf_buffer__free(rb);
+    bootstrap_bpf__destroy(skel);
+    return err &lt; 0 ? -err : 0;
+}</code></pre></div>
+      <div class="tab-panel" data-label="Rust guest (raw bindings)"><pre data-file="wasm-bpf/examples/rust-bootstrap/src/main.rs"><code class="language-rust">#![no_main]
+/* ... wit_bindgen module, feature switch between wit and wasm_bpf_binding ... */
+#[export_name = "__main_argc_argv"]
+fn main(_env_json: u32, _str_len: i32) -&gt; i32 {
+    // embed and open the bpf object
+    let bpf_object = include_bytes!("../bootstrap.bpf.o");
+    // load the object
+    let obj_ptr =
+        binding::wasm_load_bpf_object(bpf_object.as_ptr() as u32, bpf_object.len() as i32);
+    if obj_ptr == 0 {
+        println!("Failed to load bpf object");
+        return 1;
+    }
+    // attach bpf program to func
+    let attach_result = binding::wasm_attach_bpf_program(
+        obj_ptr,
+        "handle_exec\0".as_ptr() as u32,
+        "\0".as_ptr() as u32,
+    );
+    /* ... same for handle_exit ... */
+    // get the map fd for ring buffer
+    let map_fd = binding::wasm_bpf_map_fd_by_name(obj_ptr, "rb\0".as_ptr() as u32);
+    /* ... */
+    let buffer = [0u8; 256];
+    loop {
+        // polling the buffer
+        binding::wasm_bpf_buffer_poll(
+            obj_ptr,
+            map_fd,
+            handle_event as i32,
+            0,
+            buffer.as_ptr() as u32,
+            buffer.len() as i32,
+            100,
+        );
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+struct Event {
+    pid: i32,
+    ppid: i32,
+    exit_code: u32,
+    __pad0: [u8; 4],
+    duration_ns: u64,
+    comm: [u8; 16],
+    filename: [u8; 127],
+    exit_event: u8,
+}
+
+/// handle ring buffer events
+extern "C" fn handle_event(_ctx: u32, data: u32, _data_sz: u32) -&gt; i32{
+    let event_slice = unsafe { slice::from_raw_parts(data as *const Event, 1) };
+    let event = &amp;event_slice[0];
+    /* ... print like the C version ... */
+    return 0;
+}</code></pre></div>
+      <div class="tab-panel" data-label="Rust guest (libbpf-rs-like SDK)"><pre data-file="wasm-bpf/examples/bootstrap-libbpf-rs/src/main.rs"><code class="language-rust">use wasm_bpf_libbpf_rs::{object::ObjectBuilder, poll::PollBuilder};
+/* ... same packed Event struct ... */
+fn main() -&gt; Result&lt;()&gt; {
+    let bpf_object = include_bytes!("../bootstrap.bpf.o");
+    let obj = ObjectBuilder::default()
+        .open_memory(bpf_object)
+        .with_context(|| anyhow!("Failed to open"))?
+        .load()
+        .with_context(|| anyhow!("Failed to load"))?;
+    obj.prog("handle_exec").unwrap().attach()?;
+    let map = obj.map("rb").unwrap();
+    let mut buf = [0u8; 2048];
+    let poll = PollBuilder::new(&amp;map, &amp;mut buf)
+        .sample_cb(|v| {
+            let event_slice = unsafe { slice::from_raw_parts(v.as_ptr() as *const Event, 1) };
+            let event = &amp;event_slice[0];
+            /* ... print ... */
+            0
+        })
+        .build();
+    loop {
+        poll.poll(Duration::from_millis(100))?;
+    }
+}</code></pre></div>
+      <div class="tab-panel" data-label="Go guest (TinyGo)"><pre data-file="wasm-bpf/examples/go-execve/main.go"><code class="language-go">//go:embed execve.bpf.o
+var obj []byte
+
+//export go-callback
+func callback(ctx, data, size uint32) uint32 {
+	/* ... struct comm_event { int pid; char parent_proc[16]; char command[352]; } ... */
+	ptr := (unsafe.Pointer(uintptr(data)))
+	pid := (unsafe.Slice((*int32)(ptr), 1))[0]
+	byte_arr := unsafe.Slice((*byte)(ptr), size)
+	parent_proc := string(byte_arr[4 : 4+16])
+	command := string(byte_arr[4+16 : 4+16+352])
+
+	fmt.Printf("[%d] %s -&gt; %s\n", pid, parent_proc, command)
+	return 0
+}
+
+func main() {
+	var bpfObj int32 = int32(uintptr(unsafe.Pointer(&amp;obj[0])))
+	objPtr := helper.WasmLoadBpfObject(bpfObj, int32(len(obj)))
+	helper.WasmAttachBpfProgram(objPtr, CString{}.new("sys_enter_execve").toWasmPtr(), 0)
+	mapFd := helper.WasmBpfMapFdByName(objPtr, CString{}.new("comm_event").toWasmPtr())
+	buf := make([]byte, 512, 512)
+
+	for {
+		helper.PerfBufferPoll(objPtr, mapFd, 0, int32(uintptr(unsafe.Pointer(&amp;buf[0]))), int32(len(buf)), 100)
+	}
+}</code></pre></div>
+    </div>
+    <p>What to notice:</p>
+    <ul>
+      <li>The C guest is nearly line-for-line the libbpf-bootstrap program. The differences are the extra
+        <code>bootstrap.wasm.h</code> include, <code>bpf_buffer__open</code>/<code>bpf_buffer__poll</code> instead of
+        <code>ring_buffer__new</code>/<code>ring_buffer__poll</code>, and hand-written argument parsing, because
+        wasi-libc has no <code>argp</code> and the guest cannot install a <code>SIGINT</code> handler (WASI has no
+        signals). Ctrl-C is handled by the host: the C++ runtime installs a handler that prints <code>Ctrl C
+        exit...</code> and exits, which is what you see at the end of the run above.</li>
+      <li>The raw Rust guest shows what the C SDK hides. Strings are passed as guest offsets and must be NUL-terminated
+        by hand (<code>"handle_exec\0"</code>); the callback is passed as <code>handle_event as i32</code>, which in Wasm
+        is its table index; the entry point is exported as <code>__main_argc_argv</code> with <code>#![no_main]</code>.
+        The packed <code>Event</code> has the explicit 4-byte pad that the BTF header generator would add.</li>
+      <li>The libbpf-rs-like SDK (<code>wasm-bpf-libbpf-rs</code>, added June 2023) wraps the same calls in
+        <code>Object</code>, <code>Map</code> and <code>Poll</code> types. Its callback is a Rust closure: the SDK passes
+        a fixed trampoline (<code>call_sample_cb</code>) as the table index and a pointer to the boxed closure as
+        <code>ctx</code>.</li>
+      <li>The Go guest uses TinyGo's <code>//go:embed</code> for the object and the special
+        <code>callback-wrapper</code> import with an exported <code>go-callback</code>. The CI builds Go examples with
+        TinyGo 0.29 and runs them only under the Rust runtime (<code>examples/go-execve/Makefile</code> skips the test for
+        <code>IMPL=cpp</code>).</li>
+    </ul>
+
+    <h2>The examples</h2>
+    <table>
+      <thead><tr><th>Example</th><th>Guest language</th><th>Kernel side</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td><code>bootstrap</code>, <code>rust-bootstrap</code>, <code>bootstrap-libbpf-rs</code></td><td>C, Rust, Rust</td><td>tracepoints <code>sched_process_exec/exit</code>, hash map, ring buffer, <code>.rodata</code> config</td><td>the full skeleton flow; three guest styles</td></tr>
+        <tr><td><code>runqlat</code></td><td>C</td><td>BCC libbpf-tools runqlat (with <code>core_fixes.bpf.h</code>)</td><td>map iteration with <code>bpf_map_get_next_key</code>/<code>lookup</code>/<code>delete</code> from Wasm; histograms</td></tr>
+        <tr><td><code>execve</code>, <code>go-execve</code></td><td>C, Go</td><td>tracepoint <code>tp/syscalls/sys_enter_execve</code>, ring buffer <code>comm_event</code></td><td>ring-buffer polling (the Go SDK calls it <code>PerfBufferPoll</code>, but the same host function serves both buffer types); TinyGo callback path</td></tr>
+        <tr><td><code>opensnoop</code></td><td>C</td><td>libbpf-tools opensnoop</td><td>porting a real tool with its <code>trace_helpers.c</code></td></tr>
+        <tr><td><code>lsm</code>, <code>go-lsm</code></td><td>C, Go</td><td><code>SEC("lsm/path_rmdir")</code> returning −1 for a directory named <code>can_not_rm</code></td><td>security policy loaded from Wasm (needs BPF LSM enabled in the kernel)</td></tr>
+        <tr><td><code>sockops</code></td><td>C</td><td>sockops program adding a TCP option with the PID</td><td>cgroup attach target (<code>/sys/fs/cgroup/</code>)</td></tr>
+        <tr><td><code>sockfilter</code></td><td>C</td><td>socket filter program</td><td>load only: the socket creation and <code>SO_ATTACH_BPF</code> are commented out with "TODO: add socket api from wasi"</td></tr>
+        <tr><td><code>xdp</code></td><td>C</td><td>XDP pass program</td><td>interface-name attach target from <code>argv[1]</code></td></tr>
+        <tr><td><code>uprobe</code></td><td>C</td><td><code>SEC("uprobe/./target:uprobe_add")</code> and <code>uprobe_sub</code> on a small target program</td><td>user-space probes from Wasm</td></tr>
+        <tr><td><code>tcpconnlat-libbpf-rs</code></td><td>Rust</td><td>libbpf-tools tcpconnlat</td><td>a second Rust SDK example, polling a perf event array</td></tr>
+      </tbody>
+    </table>
+    <p>The sockfilter example points to a general limit: anything that needs a syscall outside the seven functions and
+      WASI cannot be done from the guest. Creating raw sockets, opening perf events by hand or calling
+      <code>setsockopt</code> would each need a new host function.</p>
+
+    <h2>Packaging and deployment: OCI, WasmEdge and Kubernetes</h2>
+    <p>Because a wasm-bpf application is one self-contained file, it can be distributed like any other artifact. The
+      repository shows three deployment styles.</p>
+    <div class="grid">
+      <div class="card"><h4>A runtime container</h4>
+        <p>The <code>Dockerfile</code> is <code>ubuntu:22.04</code> plus <code>libelf1</code> plus the Rust
+          <code>wasm-bpf</code> binary as the entry point. The module is mounted in:
+          <code>docker run --rm -it --privileged -v $(pwd):/examples ghcr.io/eunomia-bpf/wasm-bpf:latest
+          /examples/runqlat.wasm</code>. One generic image serves every tool; only the 50–100 KB module changes.</p></div>
+      <div class="card"><h4>OCI artifacts</h4>
+        <p>CI builds each example and pushes it with <code>ecli-rs push -m $(ls *.wasm)
+          ghcr.io/$REPO_OWNER/&lt;example&gt;:latest -a org.opencontainers.image.title=&lt;example&gt;</code>. ecli
+          (<a href="10-eunomia-bpf-ecc-ecli.html">10</a>) can pull an image reference and run it directly.</p></div>
+      <div class="card"><h4>Wasm containers</h4>
+        <p>The WasmEdge <code>wasm_bpf</code> plugin implements the same host functions inside WasmEdge. With a crun
+          built against WasmEdge, podman can run the module as a <code>--platform=wasi/wasm</code> container;
+          <code>docs/podman.md</code> walks through it and offers a prebuilt <code>ghcr.io/eunomia-bpf/wasm-podman</code>
+          image.</p></div>
+    </div>
+    <p>The OCI format is the standard Wasm artifact convention, not something wasm-bpf invented. ecli's push uses the
+      <code>bpf-oci</code> crate, which builds a manifest with a single layer of media type
+      <code>application/vnd.wasm.content.layer.v1+wasm</code> (the module bytes) and a config of type
+      <code>application/vnd.wasm.config.v1+json</code> containing <code>{}</code>; both constants come from the
+      <code>oci-distribution</code> crate. Any OCI registry (ghcr.io, Docker Hub, Harbor) can store it, and tools such as
+      <a href="https://github.com/oras-project/oras">ORAS</a> can copy it.</p>
+    <p>For Kubernetes, the pitch in the paper and the KubeCon talk is: instead of a privileged DaemonSet with one fat
+      image per tool, nodes run a Wasm-capable container runtime (crun or a containerd shim with WasmEdge and the eBPF
+      plugin), and eBPF tools become small Wasm OCI artifacts that the usual tooling can schedule, version and roll
+      back. The paper describes replacing the standard containerd shim with a WasmEdge shim. The repository contains the
+      podman/crun recipe, not Kubernetes manifests, so treat the Kubernetes integration as a direction rather than a
+      packaged feature. Two points apply however you deploy:</p>
+    <ul>
+      <li>The node-side runtime still needs eBPF privileges (<code>--privileged</code> in every example) and a kernel with
+        BTF for CO-RE. Wasm does not remove those requirements.</li>
+      <li>Embedding is a first-class mode. A host application written in Rust can link <code>wasm-bpf-rs</code> and run
+        plugins with <code>run_wasm_bpf_module_async</code>, redirect their stdout/stderr through
+        <code>Config</code>, register extra host functions with <code>register_host_function</code>, and pause or kill
+        them through the returned handle. ecli's task manager (<code>ecli/ecli-lib/src/runner/task_manager</code>) does
+        exactly this. The <code>c-wrapper</code> crate exposes
+        the same thing to C.</li>
+    </ul>
+
+    <h3>What the paper measured</h3>
+    <p>The arXiv preprint reports these numbers. I did not reproduce them; they come from the authors' setup (Intel Xeon
+      E5-2697v2, kernel 6.6).</p>
+    <table>
+      <thead><tr><th>Measurement (paper, Tables 2–4)</th><th>Wasm</th><th>Native / Docker</th></tr></thead>
+      <tbody>
+        <tr><td>Map access via syscall, average</td><td>1,885.26 ns</td><td>1,117.43 ns</td></tr>
+        <tr><td>Ring-buffer polling latency per event</td><td>3,186.83 ns</td><td>1,509.18 ns</td></tr>
+        <tr><td>Start-up to load-and-attach, bootstrap (units not stated in the table)</td><td>0.176</td><td>0.656 (Docker)</td></tr>
+        <tr><td>Size, bootstrap</td><td>72 K</td><td>1.3 M</td></tr>
+        <tr><td>Size, runqlat</td><td>92 K</td><td>1.3 M</td></tr>
+        <tr><td>Size, rust-bootstrap</td><td>1.7 M</td><td>5.0 M</td></tr>
+      </tbody>
+    </table>
+    <p>The sizes agree with what the orb shows: 72,984 bytes for a freshly built <code>bootstrap.wasm</code> and 110,081
+      bytes for the prebuilt <code>runqlat.wasm</code>. Rust guests are much larger (the prebuilt
+      <code>rust-bootstrap.wasm</code> is 2.1 MB) because they carry Rust's standard library and formatting code. The
+      per-operation overhead is roughly 1.7–2.1× for these micro-operations: noticeable for very high event rates, small
+      next to the cost of the work most tools do per event.</p>
+    <p>The paper also describes features that I could not find in the repository at the studied commit: a CO-RE pass
+      that rewrites <code>pt_regs</code> accesses for other architectures, automatic BTF download, and automatic fallback
+      to the userspace runtime bpftime (<a href="14-bpftime-architecture.html">14</a>) when kernel eBPF is unavailable. A
+      search of <code>runtime/</code> for <code>bpftime</code>, <code>pt_regs</code> and <code>btfhub</code> finds
+      nothing outside vendored headers. Treat them as part of the research design, possibly implemented elsewhere, not as
+      features of this repository.</p>
+
+    <h2>Security model: what the sandbox does and does not protect</h2>
+    <p>It is easy to read "Wasm sandbox" as "safe eBPF". The real picture has two parts.</p>
+    <div class="grid">
+      <div class="card"><h4>What Wasm gives you</h4>
+        <p>The guest's user-space code cannot touch host memory, open files, make network connections or call syscalls
+          except through WASI and the seven functions. Every pointer it passes is bounds-checked against its linear memory
+          before the host dereferences it. A crash in the guest is a trap, not a host segfault. Since #160/#163, attach
+          targets follow WASI's capability model: the operator decides which cgroup directories exist for the guest at
+          all.</p></div>
+      <div class="card"><h4>What it does not give you</h4>
+        <p>The guest chooses which eBPF object to load, and the host loads it with its own privileges. A malicious module
+          can load an LSM program that denies operations system-wide, a kprobe that reads kernel memory, or an XDP program
+          that drops traffic. The kernel verifier guarantees the programs are memory-safe and terminate; it does not judge
+          what they do (<a href="03-verifier.html">03</a>). Map access by raw fd, as noted above, is not scoped to the
+          guest's objects.</p></div>
+    </div>
+    <div class="callout danger"><span class="label">Rule of thumb</span>
+      <p>Running a wasm-bpf module is equivalent to granting it the eBPF privileges of the runtime process. The sandbox
+        protects the host from bugs and misbehaviour in the <em>user-space</em> half; it does not make an untrusted
+        <em>kernel</em> half safe. A runtime meant for third-party plugins would need policy on top: allow-lists of program
+        types and attach points, signed objects, or a review step. None of this exists in wasm-bpf today.</p>
+    </div>
+
+    <h2>Benefits and limitations</h2>
+    <h3>Benefits</h3>
+    <ul>
+      <li><strong>One artifact per tool.</strong> The <code>.wasm</code> file contains the kernel object and the control
+        plane and runs on any architecture the runtime supports. CO-RE handles kernel differences, Wasm handles CPU and
+        libc differences.</li>
+      <li><strong>Small and fast to deploy.</strong> 40–110 KB for C tools, compiled in well under a second, versus a
+        container image per tool.</li>
+      <li><strong>No serialisation layer.</strong> Map keys and values are read and written by the kernel directly in
+        guest memory; ring-buffer records cost one <code>memcpy</code>.</li>
+      <li><strong>Familiar programming model.</strong> C guests are near copies of libbpf-bootstrap code with the same
+        skeleton API; Rust and Go guests are possible.</li>
+      <li><strong>Embeddable.</strong> The Rust library gives an application a plugin system for eBPF tools with
+        pause/resume/terminate and captured output.</li>
+      <li><strong>Small, re-implementable ABI.</strong> Seven functions; there are already three independent
+        implementations (Wasmtime, WAMR, WasmEdge).</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>Narrow ABI.</strong> Four map commands; no batch operations, no <code>bpf_link</code> management, no
+        pinning, no per-program load, no access to <code>.bss</code>/<code>.data</code> globals, no arbitrary syscalls
+        (sockfilter's socket creation is a TODO). Attach targets are special-cased for two section types.</li>
+      <li><strong>Layout care.</strong> Shared structs must be written or generated for the 32-bit guest. The generator
+        path has drifted (the pinned bpftool's <code>format c -j</code> now prints JSON; btf2wit uses pre-1.0 WIT).</li>
+      <li><strong>Runtime differences.</strong> The Rust runtime appears to deliver at most one ring-buffer record per poll;
+        only the Rust runtime runs TinyGo modules; the Rust and Go SDK signatures for <code>wasm_bpf_map_operate</code>
+        disagree with the runtimes; the documented ABI in the README differs from the implemented one.</li>
+      <li><strong>No signals, no argp, limited WASI.</strong> Ported tools need small edits.</li>
+      <li><strong>Same privileges as native.</strong> The runtime needs eBPF capabilities and a BTF-enabled kernel, and
+        the sandbox does not constrain the kernel half.</li>
+      <li><strong>Release lag.</strong> The crates on crates.io date from 2023 (<code>wasm-bpf</code> 0.2.0,
+        <code>wasm-bpf-rs</code> 0.3.2), and the Rust runtime still uses Wasmtime 5. Issue #157 (June 2026) tracks
+        refreshing the package channels.</li>
+    </ul>
+    <h3>Project status</h3>
+    <p>After its main development burst in 2022–2023 (Rust runtime, SDK split, libbpf-rs-style Rust SDK, XDP and uprobe
+      support, OCI publishing), the repository was quiet from late 2023 to 2026, apart from documentation links. Work
+      resumed in 2026: a February–March batch of CI and lint fixes (including <code>strlcpy</code> conflicts with glibc
+      2.38 and Wasm skeleton generation), dependency bumps in July, and in August–September the fd-based attach work for
+      both runtimes and all three SDKs (#160, #163, SDK commits on 9 September 2026), followed by CI fixes that restored
+      TinyGo example builds. It is maintained, and recent work has gone into hardening the existing ABI rather than
+      adding features.</p>
+
+    <h2>Related work and where to go next</h2>
+    <ul>
+      <li><strong>eunomia-bpf, ecc and ecli</strong> (<a href="10-eunomia-bpf-ecc-ecli.html">10</a>): the sibling
+        project. ecc can package a BPF object plus JSON metadata so ecli runs it with no user-space code at all; ecli also
+        runs and distributes wasm-bpf modules. Choose ecc/ecli when the "user space" is just printing events, and wasm-bpf
+        when you need real logic.</li>
+      <li><strong>libbpf and skeletons</strong> (<a href="06-btf-core-libbpf.html">06</a>) and the starter templates
+        (<a href="11-starter-templates.html">11</a>): the native baseline that wasm-bpf mirrors.</li>
+      <li><strong>bpftime</strong> (<a href="14-bpftime-architecture.html">14</a>): the opposite move. bpftime runs the
+        <em>eBPF programs</em> in user space; wasm-bpf runs the <em>control plane</em> in Wasm. The wasm-bpf paper lists
+        bpftime as a fallback runtime.</li>
+      <li><strong>bpfman and Inspektor Gadget</strong>: Kubernetes-native approaches that the paper contrasts with
+        wasm-bpf. <a href="https://github.com/bpfman/bpfman">bpfman</a> is a daemon that loads and manages eBPF programs
+        on behalf of applications through an API; the paper groups it with Inspektor Gadget and bpfd as the "dedicated
+        BPF daemon over RPC" model, which adds a critical component that must be upgraded in step with the kernel
+        features it exposes. <a href="https://github.com/inspektor-gadget/inspektor-gadget">Inspektor Gadget</a> is a
+        framework of eBPF "gadgets" for Kubernetes and Linux hosts; this chapter did not examine its design.</li>
+      <li><strong>WALI</strong>, the WebAssembly Linux Interface (<a href="https://arxiv.org/abs/2312.03858">arXiv:2312.03858</a>):
+        a different answer to "Wasm needs more of the OS", exposing Linux syscalls almost directly to Wasm instead of a
+        small purpose-built ABI.</li>
+      <li><strong>WASI and the Component Model</strong>: WASI is moving from the "preview 1" function imports used here to
+        components described in WIT. A component-model version of the eBPF interface, as hinted at by btf2wit and WASI
+        issue #513, would give typed, language-neutral bindings and real resource handles instead of
+        <code>u64</code> integers. See the <a href="https://component-model.bytecodealliance.org/">Component Model
+        book</a>.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> In wasm-bpf, which component runs the eBPF bytecode of
+        <code>handle_exec</code>?</p>
+        <button class="opt">The Wasm engine (Wasmtime or WAMR), after translating eBPF to Wasm</button>
+        <button class="opt" data-right>The Linux kernel, after the host's libbpf loads it and the verifier accepts it</button>
+        <button class="opt">bpftime, always, because Wasm cannot make syscalls</button>
+        <div class="why">Only the user-space control plane is compiled to Wasm. The guest hands the embedded
+          <code>.bpf.o</code> bytes to <code>wasm_load_bpf_object</code>, and the host's libbpf loads them into the
+          kernel exactly as a native tool would.</div></div>
+      <div class="q"><p><strong>Q2.</strong> A guest calls <code>bpf_map_lookup_elem(fd, &amp;key, &amp;value)</code> from
+        <code>libbpf-wasm.h</code>. How does the value reach the guest's <code>value</code> variable?</p>
+        <button class="opt">The host serialises it to JSON and the SDK parses it</button>
+        <button class="opt">The host looks it up into a host buffer and calls back into the guest with a copy</button>
+        <button class="opt" data-right>The host bounds-checks the guest offsets against the map's key and value sizes, converts them to host pointers into linear memory, and the kernel's lookup writes the value there directly</button>
+        <div class="why"><code>wasm_bpf_map_operate</code> gets <code>key_size</code>/<code>value_size</code> from the
+          map info, checks that much guest memory is valid, and passes raw pointers into linear memory to
+          <code>bpf_map_lookup_elem_flags</code>.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does every C example link with <code>-Wl,--export-table</code>?</p>
+        <button class="opt">So the kernel can find the BPF programs inside the Wasm file</button>
+        <button class="opt" data-right>Because the ring-buffer callback is passed as a function-table index, and the host must be able to call entries of <code>__indirect_function_table</code></button>
+        <button class="opt">To make the <code>wasm_bpf</code> imports resolve at link time</button>
+        <div class="why">A C function pointer in Wasm is an index into the function table. The host calls the callback
+          with <code>wasm_runtime_call_indirect</code> (WAMR) or by looking up the table export (Wasmtime). Unresolved
+          imports are handled by <code>--allow-undefined</code>.</div></div>
+      <div class="q"><p><strong>Q4.</strong> How does <code>skel-&gt;rodata-&gt;min_duration_ns = …</code> in a Wasm
+        guest reach the kernel?</p>
+        <button class="opt">Through a dedicated host function that updates the <code>.rodata</code> map after load</button>
+        <button class="opt">The guest mmaps the kernel map</button>
+        <button class="opt" data-right>The Wasm skeleton points <code>rodata</code> at <code>.rodata</code>'s file offset inside the embedded ELF bytes, so the write patches the object before it is passed to <code>wasm_load_bpf_object</code></button>
+        <div class="why"><code>bpftool -w gen skeleton</code> records <code>s-&gt;rodata_offset</code> (1264 for the orb
+          build, matching <code>readelf</code>), and <code>bpf_object__open_skeleton</code> in <code>libbpf-wasm.h</code>
+          sets <code>*mmaped = s-&gt;data + s-&gt;rodata_offset</code>. <code>.bss</code> is not supported this way.</div></div>
+      <div class="q"><p><strong>Q5.</strong> What problem did <code>wasm_attach_bpf_program_fd</code> (2026) fix?</p>
+        <button class="opt">XDP programs could not be attached from Wasm</button>
+        <button class="opt" data-right>The guest could name any host path for the privileged runtime to open as a cgroup; now it can only pass a rights-free directory the operator preopened</button>
+        <button class="opt">Ring buffers could only be polled once</button>
+        <div class="why">Issue #48. With the string API, <code>sockops</code> attach opened whatever path the guest sent.
+          The fd API resolves only descriptors in the runtime's own preopen registry; XDP is explicitly rejected on this
+          path and keeps the interface-name string.</div></div>
+      <div class="q"><p><strong>Q6.</strong> A colleague says "it's in a Wasm sandbox, so a third-party wasm-bpf plugin
+        can't harm the host". What is the flaw?</p>
+        <button class="opt">Wasm is not memory-safe</button>
+        <button class="opt">The verifier is disabled for programs loaded from Wasm</button>
+        <button class="opt" data-right>The plugin chooses which eBPF programs the host loads with its own privileges; an LSM, kprobe or XDP program can affect the whole system even though it passes the verifier</button>
+        <div class="why">The sandbox isolates the user-space half. The kernel half runs with the runtime's eBPF
+          privileges, and the verifier checks safety, not intent.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>Yusheng Zheng, Tong Yu, Yiwei Yang, Andrew Quinn, <a href="https://arxiv.org/abs/2408.04856">"Wasm-bpf:
+        Streamlining eBPF Deployment in Cloud Environments with WebAssembly"</a>, arXiv:2408.04856 [cs.OS], August 2024
+        (preprint).</li>
+      <li>Michael Yuan and Yusheng Zheng, <a href="https://kccncna2023.sched.com/event/1R2uf">"eBPF + Wasm: Lightweight
+        Observability on Steroids"</a>, KubeCon + CloudNativeCon North America 2023, Chicago, 9 November 2023
+        (<a href="https://hosted-files.sched.co/kccncna2023/a3/eBPF%20%2B%20Wasm_%20Lightweight%20Observability%20on%20Steroids.pdf">slides</a>);
+        eunomia.dev write-up <a href="https://eunomia.dev/others/miscellaneous/wasm-bpf-kubecon">"Securing and
+        Simplifying eBPF Deployments with WebAssembly"</a>.</li>
+      <li><a href="https://github.com/eunomia-bpf/wasm-bpf">eunomia-bpf/wasm-bpf</a>, commit
+        <code>01f14194ca6966201ff34d72290be118ed2253a9</code> (files quoted: <code>README.md</code>,
+        <code>docs/build.md</code>, <code>docs/podman.md</code>, <code>Dockerfile</code>,
+        <code>runtime/wasm-bpf-rs/src/{runner.rs,bpf/load.rs,bpf/attach.rs,bpf/map_operate.rs,bpf/poll.rs}</code>,
+        <code>runtime/cpp/src/wasm-bpf.cpp</code>, <code>examples/bootstrap/{bootstrap.c,bootstrap.wasm.h}</code>,
+        <code>examples/rust-bootstrap/</code>, <code>examples/bootstrap-libbpf-rs/</code>,
+        <code>examples/go-execve/main.go</code>, <code>.github/workflows/publish-example-images.yml</code>); issue
+        <a href="https://github.com/eunomia-bpf/wasm-bpf/issues/48">#48</a>, pull requests
+        <a href="https://github.com/eunomia-bpf/wasm-bpf/pull/160">#160</a> and
+        <a href="https://github.com/eunomia-bpf/wasm-bpf/pull/163">#163</a>.</li>
+      <li>Guest SDKs: <a href="https://github.com/eunomia-bpf/wasm-bpf-guest-sdk-c">wasm-bpf-guest-sdk-c</a> @
+        <code>c8b1d8a</code>, <a href="https://github.com/eunomia-bpf/wasm-bpf-guest-sdk-rust">wasm-bpf-guest-sdk-rust</a>
+        @ <code>7d0b615</code>, <a href="https://github.com/eunomia-bpf/wasm-bpf-guest-sdk-go">wasm-bpf-guest-sdk-go</a> @
+        <code>27b5c51</code>.</li>
+      <li><a href="https://github.com/eunomia-bpf/bpftool">eunomia-bpf/bpftool</a> (Wasm skeleton generator), pinned commit
+        <code>a3bb93e</code>, and branch <code>wasm-bpftool</code> @ <code>252f067</code> (<code>src/btf.c</code>
+        <code>dump_btf_wasm</code>, <code>src/gen.c</code> <code>codegen_datasec_def_wasm</code>).</li>
+      <li><a href="https://github.com/eunomia-bpf/btf2wit">eunomia-bpf/btf2wit</a> and
+        <a href="https://github.com/eunomia-bpf/c-struct-bindgen">eunomia-bpf/c-struct-bindgen</a>.</li>
+      <li><a href="https://github.com/eunomia-bpf/eunomia-bpf">eunomia-bpf/eunomia-bpf</a> (ecli push/pull,
+        <code>ecli/client/src/main.rs</code>) and the <a href="https://github.com/eunomia-bpf/bpf-oci">bpf-oci</a> crate
+        0.1.0.</li>
+      <li>WasmEdge, <a href="https://github.com/WasmEdge/WasmEdge/tree/master/plugins/wasm_bpf"><code>plugins/wasm_bpf</code></a>.</li>
+      <li>Yusheng Zheng (yunwei37), <a href="https://github.com/WebAssembly/WASI/issues/513">"WASI proposal for eBPF related
+        API"</a>, WebAssembly/WASI issue #513, February 2023.</li>
+      <li><a href="https://github.com/WebAssembly/WASI">WebAssembly/WASI</a> and <a href="https://wasi.dev/">wasi.dev</a>;
+        <a href="https://github.com/WebAssembly/wasi-sdk">wasi-sdk</a>.</li>
+      <li><a href="https://github.com/WebAssembly/component-model">WebAssembly Component Model</a> repository,
+        <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/WIT.md">WIT specification</a>, and
+        the <a href="https://component-model.bytecodealliance.org/">Component Model book</a>.</li>
+      <li>WebAssembly Core Specification, <a href="https://webassembly.github.io/spec/">webassembly.github.io/spec</a>;
+        Andreas Haas et al., <a href="https://doi.org/10.1145/3062341.3062363">"Bringing the Web up to Speed with
+        WebAssembly"</a>, PLDI 2017.</li>
+      <li><a href="https://wasmtime.dev/">Wasmtime</a> and <a href="https://github.com/bytecodealliance/wasm-micro-runtime">WebAssembly
+        Micro Runtime (WAMR)</a>, Bytecode Alliance.</li>
+      <li>Arjun Ramesh, Tianshu Huang, Ben L. Titzer, Anthony Rowe, <a href="https://arxiv.org/abs/2312.03858">"Empowering
+        WebAssembly with Thin Kernel Interfaces"</a> (WALI; earlier titled "Stop Hiding the Sharp Knives: The WebAssembly
+        Linux Interface"), arXiv:2312.03858.</li>
+      <li>Yusheng Zheng et al., <a href="https://arxiv.org/abs/2311.07923">"bpftime: userspace eBPF Runtime for Uprobe,
+        Syscall and Kernel-User Interactions"</a>, arXiv:2311.07923.</li>
+      <li><a href="https://github.com/bpfman/bpfman">bpfman</a>, <a href="https://github.com/inspektor-gadget/inspektor-gadget">Inspektor
+        Gadget</a>, <a href="https://github.com/oras-project/oras">ORAS</a>,
+        <a href="https://github.com/opencontainers/image-spec">OCI image specification</a>.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-portability-and-co-re/">"BPF CO-RE (Compile Once – Run
+        Everywhere)"</a>, 2020.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="11-starter-templates.html"><small>Previous</small>11 · Starter templates</a>
+      <a class="next" href="13-bpf-compatible.html"><small>Next</small>13 · bpf-compatible</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -458,7 +458,7 @@ struct bpf_insn {
       filter (chapter <a href="07-networking-xdp-tc.html">07</a>). cgroup hooks (4.10) made it a container
       networking and policy tool. BTF (4.18) gave programs type information about the running kernel and later
       enabled CO-RE, "compile once, run everywhere" (chapter <a href="06-btf-core-libbpf.html">06</a>). The BPF
-      trampoline (5.5) made function entry and exit hooks nearly free. The BPF LSM (5.7) let programs make security
+      trampoline (5.5) made function entry and exit hooks much cheaper than kprobes. The BPF LSM (5.7) let programs make security
       decisions. <code>struct_ops</code> (5.6) let BPF implement kernel callback tables, first TCP congestion
       control and, with sched_ext in 6.12, whole CPU scheduling policies
       (<a href="https://kernelnewbies.org/Linux_6.12">kernelnewbies, Linux 6.12</a>). Chapter
@@ -714,6 +714,9 @@ $ cd libbpf-bootstrap/examples/c
 $ make minimal
 $ sudo ./minimal
 $ sudo cat /sys/kernel/debug/tracing/trace_pipe
+# Sample output below is quoted from the libbpf-bootstrap README. It was not
+# reproduced for this chapter: the kernel used here lacks the per-syscall
+# tracepoints (CONFIG_FTRACE_SYSCALLS), so sys_enter_write cannot be attached.
            &lt;...&gt;-3840345 [010] d... 3220701.101143: bpf_trace_printk: BPF triggered from PID 3840345.
            &lt;...&gt;-3840345 [010] d... 3220702.101265: bpf_trace_printk: BPF triggered from PID 3840345.</code></pre>
       </div>
@@ -722,7 +725,8 @@ $ sudo cat /sys/kernel/debug/tracing/trace_pipe
       such as DTrace and SystemTap" (<a href="https://ebpf.io/what-is-ebpf/">ebpf.io</a>), and bpftrace compiles each
       script to BPF bytecode with LLVM, loads it, attaches it and prints the maps when it exits. <code>BEGIN</code> is
       a special probe that fires once at start. In the second one-liner, <code>@[comm] = count()</code> is a BPF
-      <em>hash map</em> keyed by process name. The kernel-side program increments a counter on every system call, and
+      <em>hash map</em> keyed by process name (bpftrace creates it as a per-CPU hash, <code>percpu_hash</code> in
+      <code>bpftool map list</code>, and sums the CPUs when printing). The kernel-side program increments a counter on every system call, and
       bpftrace prints the map at exit. Nothing is copied to user space per event; only the final totals are. That is
       the same "filter and aggregate in place" idea as the 1993 paper. The commonly shown
       <code>tracepoint:syscalls:sys_enter_openat</code> example needs the per-syscall tracepoints
@@ -960,7 +964,7 @@ libbpf: prog 'bad': failed to load: -13</code></pre>
       <tr><td><code>tools/bpf/bpftool/</code></td><td>bpftool, in the kernel tree since 4.15.</td></tr>
       <tr><td><code>tools/testing/selftests/bpf/</code></td><td>Thousands of tests, the best collection of example programs, including verifier tests.</td></tr>
       <tr><td><code>samples/bpf/</code>, <code>samples/seccomp/</code></td><td>Older samples, including <code>dropper.c</code> above.</td></tr>
-      <tr><td><code>Documentation/bpf/</code></td><td>Source of <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>, including <code>instruction-set.rst</code>, from which RFC 9669 was generated.</td></tr>
+      <tr><td><code>Documentation/bpf/</code></td><td>Source of <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>, including <code>standardization/instruction-set.rst</code>, from which RFC 9669 was generated.</td></tr>
     </table>
 
     <h2>Benefits, limitations and related work</h2>
@@ -1059,9 +1063,9 @@ libbpf: prog 'bad': failed to load: -13</code></pre>
       <li>Linux kernel documentation. "BPF Design Q&amp;A." <a href="https://docs.kernel.org/bpf/bpf_design_QA.html">https://docs.kernel.org/bpf/bpf_design_QA.html</a></li>
       <li>Linux kernel documentation. "Documentation for /proc/sys/kernel/" (<code>unprivileged_bpf_disabled</code>). <a href="https://docs.kernel.org/admin-guide/sysctl/kernel.html">https://docs.kernel.org/admin-guide/sysctl/kernel.html</a></li>
       <li>Alexei Starovoitov (joint work with Daniel Borkmann). "net: filter: rework/optimize internal BPF interpreter's instruction set." Linux commit bd4cf0ed331a, 2014. <a href="https://github.com/torvalds/linux/commit/bd4cf0ed331a275e9bf5a49e6d0fd55dffc551b8">https://github.com/torvalds/linux/commit/bd4cf0ed331a275e9bf5a49e6d0fd55dffc551b8</a></li>
-      <li>"A JIT for packet filters." LWN.net, 2011. <a href="https://lwn.net/Articles/437981/">https://lwn.net/Articles/437981/</a></li>
-      <li>"Yet another new approach to seccomp." LWN.net, January 2012. <a href="https://lwn.net/Articles/475043/">https://lwn.net/Articles/475043/</a></li>
-      <li>"BPF: the universal in-kernel virtual machine." LWN.net, 2014. <a href="https://lwn.net/Articles/599755/">https://lwn.net/Articles/599755/</a></li>
+      <li>Jonathan Corbet. "A JIT for packet filters." LWN.net, April 12, 2011. <a href="https://lwn.net/Articles/437981/">https://lwn.net/Articles/437981/</a></li>
+      <li>Jonathan Corbet. "Yet another new approach to seccomp." LWN.net, January 11, 2012. <a href="https://lwn.net/Articles/475043/">https://lwn.net/Articles/475043/</a></li>
+      <li>Jonathan Corbet. "BPF: the universal in-kernel virtual machine." LWN.net, May 21, 2014. <a href="https://lwn.net/Articles/599755/">https://lwn.net/Articles/599755/</a></li>
       <li>Jonathan Corbet. "Extending extended BPF." LWN.net, July 2, 2014. <a href="https://lwn.net/Articles/603983/">https://lwn.net/Articles/603983/</a></li>
       <li>Jonathan Corbet. "The BPF system call API, version 14." LWN.net, September 24, 2014. <a href="https://lwn.net/Articles/612878/">https://lwn.net/Articles/612878/</a></li>
       <li>Matt Fleming. "A thorough introduction to eBPF." LWN.net, December 2, 2017. <a href="https://lwn.net/Articles/740157/">https://lwn.net/Articles/740157/</a></li>

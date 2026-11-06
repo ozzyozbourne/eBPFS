@@ -1,0 +1,1408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Starter templates for libbpf and libbpf-rs · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="11">
+<meta name="chapter-part" content="Part II · Learning and tooling">
+<meta name="chapter-summary" content="How eunomia-bpf's libbpf-starter-template (C) and libbpf-rs-starter-template (Rust) package a single libbpf-bootstrap-style app with submodules, vendored vmlinux.h, Docker, Nix and GitHub Actions, and how to turn one into your own project.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/libbpf-starter-template">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part II · Learning and tooling › 11 · Starter templates</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 11</div>
+      <h1>Starter templates for libbpf and libbpf-rs</h1>
+      <p class="lede">You have read how a libbpf program is compiled, embedded in a skeleton and loaded
+        (<a href="06-btf-core-libbpf.html">06</a>). Now you want your <em>own</em> repository: one tool, its own name, a
+        build that works on a fresh laptop and in CI, and a release binary at the end. What is the shortest correct path
+        from "nothing" to that, and what do eunomia-bpf's two starter templates actually give you?</p>
+      <div class="meta"><span>Prerequisites: <a href="06-btf-core-libbpf.html">06</a>, <a href="08-ecosystem.html">08</a></span><span>Repos: eunomia-bpf/libbpf-starter-template @ 6e572b6, libbpf-rs-starter-template @ 8927eea</span><span>~40 min</span></div>
+    </section>
+
+    <h2>Why this matters: the first hour of an eBPF project</h2>
+    <p>Writing the BPF program is rarely the hard part of starting an eBPF project. The hard part is everything around
+      it. A libbpf application in C needs at least five things to line up before the first line of output appears:</p>
+    <ul>
+      <li>a <strong>libbpf</strong> library of a known version, ideally linked statically so the binary does not depend on
+        whatever <code>libbpf.so</code> the target distribution ships;</li>
+      <li>a <strong>bpftool</strong> new enough to generate skeletons for the BPF features you use;</li>
+      <li>a <strong><code>vmlinux.h</code></strong> for each CPU architecture you build for, so the BPF code can name kernel
+        types (<a href="06-btf-core-libbpf.html">06</a> explains why this one header is enough when CO-RE is used);</li>
+      <li>a <strong>build</strong> that compiles the kernel half with <code>clang -target bpf</code>, turns the object into a
+        skeleton header, and only then compiles the user half against it;</li>
+      <li>a <strong>toolchain on the build machine</strong>: clang, llvm, libelf, zlib, make. On the target, only libelf and
+        zlib.</li>
+    </ul>
+    <p>The libbpf authors solved this once in <a href="https://github.com/libbpf/libbpf-bootstrap">libbpf-bootstrap</a>,
+      which chapter 06 dissected. But libbpf-bootstrap is a <em>collection of examples</em>: one Makefile builds about fifteen
+      demo apps (<code>minimal</code>, <code>bootstrap</code>, <code>kprobe</code>, <code>fentry</code>, <code>uprobe</code>,
+      <code>usdt</code>, <code>tc</code>, <code>lsm</code>, <code>profile</code> and more) from inside
+      <code>examples/c/</code>, with the submodules two directories up. It is not designed to be the root of somebody
+      else's product. If you want a repository that contains <em>only your tool</em>, you have to cut it out: copy one
+      example, copy the Makefile, fix the relative paths, delete the other apps, add the submodules to your own repo, and
+      then write CI from scratch.</p>
+    <p>eunomia-bpf's starter templates are that cut-out, done in advance and published as
+      <a href="https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-template-repository">GitHub
+      template repositories</a>. Each one contains exactly one example application, a build that works from the repository
+      root, a Dockerfile, a development container, a Nix flake, and two GitHub Actions workflows that build the binary on
+      every push, attach it to a GitHub release and push a container image. This chapter reads every file of the C and
+      Rust templates, builds and runs the C one on this curriculum's orb, and shows exactly what you need to change to make
+      the template yours.</p>
+
+    <div class="callout key"><span class="label">Key idea</span>
+      <p>A starter template is not a framework and adds no runtime code. It is a <strong>pre-arranged repository
+        layout</strong>: libbpf-bootstrap's build rules and one example app, moved to the root of a repository, with
+        dependencies pinned (submodules in C, Cargo versions in Rust) and packaging and CI already wired. Everything you
+        learned in chapter 06 applies unchanged; the template only decides where files live and what runs on
+        <code>git push</code>.</p>
+    </div>
+
+    <h2>What a GitHub template repository is</h2>
+    <p>"Template" here is a GitHub feature, not an eBPF concept. Any repository whose admin ticks <em>Template
+      repository</em> in its settings shows a <strong>Use this template</strong> button. Clicking it creates a new repository
+      in your account with the same files and directory structure. According to GitHub's documentation, the differences from
+      a fork are that the new repository starts with <strong>a single commit</strong> instead of the parent's full history,
+      it is not linked to the parent, and by default only the default branch is copied (an <em>Include all branches</em>
+      option copies the rest). The GitHub CLI does the same thing from a terminal:</p>
+    <pre><code class="language-bash"># Illustrative: create your own repo from the C template and clone it (flags from `gh repo create --help`, gh 2.99)
+$ gh repo create my-execsnoop --template eunomia-bpf/libbpf-starter-template --public --clone</code></pre>
+    <p>All three eunomia-bpf starter repositories have the template flag set (GitHub API field
+      <code>is_template: true</code>, checked 2026-11-06). Because the result is an unrelated repository, there is no
+      "update from upstream" button later: if the template fixes a bug after you started, you copy the fix by hand. Keep that
+      in mind when reading the maintenance section below.</p>
+
+    <div class="callout warn"><span class="label">Unverified: submodules</span>
+      <p>The C template depends on two git submodules. GitHub's template documentation does not say whether submodule links
+        (the <code>gitlink</code> entries in the index) are carried into the generated repository. After you clone your new
+        repository, run <code>git submodule status</code>. If it lists <code>libbpf</code> and <code>bpftool</code> with
+        commit IDs, you are fine. If it prints nothing while <code>.gitmodules</code> exists, re-create them with
+        <code>git submodule add https://github.com/libbpf/libbpf.git libbpf</code> (and the same for bpftool) and commit.
+        The template's own README assumes they survive and tells you to clone with <code>--recursive</code>.</p>
+    </div>
+
+    <h2>The template family</h2>
+    <p>The README of each template lists four siblings, one per language/framework. Two of them are this chapter's subject;
+      the other two are covered briefly here or elsewhere.</p>
+    <div class="grid">
+      <div class="card"><h4>libbpf-starter-template (C)</h4><p>libbpf + bpftool as submodules, a vendored per-architecture
+        <code>vmlinux.h</code> directory, and libbpf-bootstrap's <code>bootstrap</code> example (process exec/exit tracer
+        with a ring buffer). Built with <code>make</code>. Last commit 2026-09-16. 78 stars, 26 forks.</p></div>
+      <div class="card"><h4>libbpf-rs-starter-template (Rust)</h4><p>A Cargo crate using libbpf-rs and libbpf-cargo 0.20, with
+        the <code>runqslower</code> example (run-queue latency via <code>tp_btf</code>) and a single vendored
+        <code>vmlinux.h</code>. Built with <code>cargo build</code> through a <code>build.rs</code>. Last commit 2026-09-16.
+        30 stars, 1 fork.</p></div>
+      <div class="card"><h4>cilium-ebpf-starter-template (Go)</h4><p>cilium/ebpf v0.10.0 with <code>bpf2go</code> and a
+        kprobe + ring buffer example. <strong>Less active</strong>: last commit 2023-03-25. Summarised later in this
+        chapter.</p></div>
+      <div class="card"><h4>eunomia-template (C, eunomia-bpf)</h4><p>No hand-written loader at all: <code>ecc</code> compiles
+        the BPF code to a package and <code>ecli</code> runs it. A different model, covered in
+        <a href="10-eunomia-bpf-ecc-ecli.html">10 · eunomia-bpf, ecc and ecli</a>.</p></div>
+    </div>
+    <p>Star and fork counts are from the GitHub API on 2026-11-06 and will drift. The C template is the most used and the
+      most maintained of the group: it received a submodule refresh in July 2026 (<code>13a3549</code>, "updated submodules
+      and its dependencies") and a compile fix in 2025. The Rust template's last functional change was in August 2024
+      (<code>7553497</code> "fix compile and docker name"); later commits are a Dependabot bump and a CI action pin.</p>
+
+    <h2>libbpf-starter-template (C)</h2>
+    <h3>Directory map</h3>
+    <pre><code class="language-plaintext">libbpf-starter-template/                     (commit 6e572b6, 2026-09-16)
+├── Makefile                 build → make -C src; clean; install (apt-get the toolchain)
+├── src/
+│   ├── Makefile             the real build: trimmed copy of libbpf-bootstrap examples/c/Makefile
+│   ├── bootstrap.bpf.c      kernel side: two tracepoint programs, a hash map, a ring buffer
+│   ├── bootstrap.c          user side: argp CLI, skeleton open/load/attach, ring-buffer poll loop
+│   ├── bootstrap.h          struct event, shared by both sides
+│   └── .gitignore           /.output  /bootstrap
+├── libbpf/                  git submodule → libbpf/libbpf  @ dcaac95 (v1.8, 2026-05-28)
+├── bpftool/                 git submodule → libbpf/bpftool @ 48f7cc7 (v7.8.0, 2026-06-01; has its own libbpf submodule)
+├── vmlinux/                 vendored headers, tracked in this repo (not a submodule), 19 MB
+│   ├── vmlinux.h → x86/vmlinux.h
+│   ├── x86/      vmlinux.h → vmlinux_601.h;  vmlinux_68.h  vmlinux_71.h
+│   ├── arm64/    vmlinux.h, vmlinux_516.h, vmlinux_601.h
+│   ├── arm/      vmlinux.h, vmlinux_62.h
+│   └── riscv/    vmlinux.h, vmlinux_602.h
+├── dockerfile               runtime image: ubuntu:22.04 + libelf1, ENTRYPOINT /root/src/bootstrap
+├── dev.dockerfile           development image: clang, llvm, libelf-dev, zlib1g-dev, make, git …
+├── .devcontainer/devcontainer.json   build the dev image for VS Code / Codespaces
+├── flake.nix, flake.lock, .envrc     Nix dev shell; direnv loads it ("use flake")
+├── .github/workflows/
+│   ├── publish.yml          on push to master: make build, create release with src/bootstrap
+│   └── docker.yml           on push to master: make build, push image to ghcr.io/&lt;owner&gt;/&lt;repo&gt;
+├── README.md, LICENSE (MIT), .gitignore, .gitmodules</code></pre>
+    <p>The application lives in <code>src/</code> and follows libbpf-bootstrap's naming convention exactly:
+      <code>NAME.bpf.c</code> is compiled for the BPF target, <code>NAME.c</code> for the host, and <code>NAME.h</code> holds
+      the structures that cross the kernel/user boundary. Everything under <code>src/.output/</code> is generated.</p>
+    <p>Two choices differ from libbpf-bootstrap. First, the vmlinux headers are <strong>copied into the repository</strong>
+      instead of being a submodule pointing at <a href="https://github.com/libbpf/vmlinux.h">libbpf/vmlinux.h</a>. That makes
+      the template self-contained but heavy (19 MB of headers in every repository generated from it), and it means the
+      headers only change when someone commits new ones. Each architecture directory has a <code>vmlinux.h</code> symlink
+      that selects one version; for x86 that is <code>vmlinux_601.h</code>, a header generated from a 6.1 kernel, even
+      though 6.8 and 7.1 headers sit next to it. Second, there is no blazesym submodule, because the only example does not
+      symbolize stack traces.</p>
+
+    <div class="callout tip"><span class="label">Which header should you use?</span>
+      <p>With CO-RE the header's kernel version matters less than you might think: field offsets are relocated at load time
+        anyway. What the header decides is which types and fields <em>exist at compile time</em>. If your program uses a
+        type or a field added after 6.1, switch the symlink (<code>ln -sf vmlinux_71.h vmlinux/x86/vmlinux.h</code>) or
+        generate a header from your own kernel with <code>bpftool btf dump file /sys/kernel/btf/vmlinux format c</code>.
+        Then guard newer fields with <code>bpf_core_field_exists()</code> so older kernels still load the program.</p>
+    </div>
+
+    <h3>The build, end to end</h3>
+    <p>The top-level <code>Makefile</code> only forwards to <code>src/</code>:</p>
+    <pre data-file="libbpf-starter-template/Makefile"><code class="language-makefile">build:
+	make -C src
+
+clean:
+	make -C src clean
+
+install:
+	sudo apt update
+	sudo apt-get install -y --no-install-recommends \
+        libelf1 libelf-dev zlib1g-dev libssl-dev \
+        make clang llvm</code></pre>
+    <p><code>make install</code> is a convenience for Ubuntu/Debian; it installs the build toolchain, not your tool. The real
+      work is in <code>src/Makefile</code>. Its first lines fix every path relative to <code>src/</code> and pick the
+      architecture:</p>
+    <pre data-file="libbpf-starter-template/src/Makefile"><code class="language-makefile">OUTPUT := .output
+CLANG ?= clang
+LLVM_STRIP ?= llvm-strip
+LIBBPF_SRC := $(abspath ../libbpf/src)
+BPFTOOL_SRC := $(abspath ../bpftool/src)
+LIBBPF_OBJ := $(abspath $(OUTPUT)/libbpf.a)
+BPFTOOL_OUTPUT ?= $(abspath $(OUTPUT)/bpftool)
+BPFTOOL ?= $(BPFTOOL_OUTPUT)/bootstrap/bpftool
+ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
+			 | sed 's/aarch64/arm64/' \
+			 | sed 's/ppc64le/powerpc/' \
+			 | sed 's/mips.*/mips/' \
+			 | sed 's/arm.*/arm/' \
+			 | sed 's/riscv64/riscv/')
+VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
+# Use our own libbpf API headers and Linux UAPI headers distributed with
+# libbpf to avoid dependency on system-wide headers, which could be missing or
+# outdated
+INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
+CFLAGS := -g -Wall
+ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
+
+APPS = bootstrap
+/* ... CLANG_BPF_SYS_INCLUDES, quiet-output helpers, allow-override for CC/LD ... */</code></pre>
+    <p>Three things are worth noticing. <code>APPS</code> is the list of applications; adding a second tool is one word.
+      <code>ARCH</code> maps <code>uname -m</code> to the kernel's architecture names, which is also the directory name under
+      <code>vmlinux/</code>; the sed chain recognises powerpc and mips, but the template ships no headers for them, so on
+      those machines you must supply your own <code>vmlinux.h</code>. And <code>-I$(OUTPUT)</code> comes first: libbpf's
+      install step below copies the libbpf headers (<code>bpf/libbpf.h</code>, <code>bpf/bpf_helpers.h</code>, …) into
+      <code>.output/bpf/</code>, so both halves of the app compile against the submodule's headers, never the system's.</p>
+    <p>The rules then build four things in order:</p>
+    <pre data-file="libbpf-starter-template/src/Makefile"><code class="language-makefile"># Build libbpf
+$(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPUT)/libbpf
+	$(call msg,LIB,$@)
+	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1		      \
+		    OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@)		      \
+		    INCLUDEDIR= LIBDIR= UAPIDIR=			      \
+		    install
+
+# Build bpftool
+$(BPFTOOL): | $(BPFTOOL_OUTPUT)
+	$(call msg,BPFTOOL,$@)
+	$(Q)$(MAKE) ARCH= CROSS_COMPILE= OUTPUT=$(BPFTOOL_OUTPUT)/ -C $(BPFTOOL_SRC) bootstrap
+
+# Build BPF code
+$(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT)
+	$(call msg,BPF,$@)
+	$(Q)$(CLANG) -g -O2 -fno-stack-protector -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
+	$(Q)$(LLVM_STRIP) -g $@ # strip useless DWARF info
+
+# Generate BPF skeletons
+$(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
+	$(call msg,GEN-SKEL,$@)
+	$(Q)$(BPFTOOL) gen skeleton $&lt; &gt; $@
+
+# Build user-space code
+$(patsubst %,$(OUTPUT)/%.o,$(APPS)): %.o: %.skel.h
+
+$(OUTPUT)/%.o: %.c $(wildcard %.h) | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
+
+# Build application binary
+$(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@</code></pre>
+    <ol>
+      <li><strong>libbpf.a.</strong> The submodule's own Makefile builds only the static library
+        (<code>BUILD_STATIC_ONLY=1</code>) and installs it with its headers into <code>.output/</code>.</li>
+      <li><strong>bpftool.</strong> The <code>bootstrap</code> target builds a minimal bpftool, enough for
+        <code>gen skeleton</code> and <code>btf dump</code>, without optional libraries like libbfd or libcap. It is built
+        for the host (<code>ARCH= CROSS_COMPILE=</code>) even when cross-compiling the app, because it runs during the
+        build.</li>
+      <li><strong>The BPF object.</strong> <code>clang -target bpf</code> with <code>-g</code> (needed for BTF and CO-RE
+        records), then <code>llvm-strip -g</code> to remove DWARF, which the kernel never reads. The
+        <code>-fno-stack-protector</code> flag was added in 2025 (<code>5ba4410</code>, "fix: disable stack-protector for
+        eBPF parts to fix compile error"): some distributions' clang enables stack protection by default, and the BPF
+        target cannot use it.</li>
+      <li><strong>The skeleton and the binary.</strong> <code>bpftool gen skeleton</code> writes
+        <code>.output/bootstrap.skel.h</code>; the static pattern rule makes <code>bootstrap.o</code> depend on it; the link
+        step adds <code>libbpf.a</code>, <code>-lelf</code> and <code>-lz</code>.</li>
+    </ol>
+    <p>Compared with libbpf-bootstrap at commit <code>820a1bd</code> the rules are an older, simpler variant. libbpf-bootstrap
+      now compiles to a temporary <code>NAME.tmp.bpf.o</code> and runs <code>bpftool gen object</code> (BPF static linking)
+      to produce the final object, and both compilers write <code>-MMD -MP</code> dependency files. The template has neither.
+      The first difference costs nothing for a one-file program. The second one is visible, as the next section shows.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 420" role="img" aria-label="Build diagram of libbpf-starter-template: the libbpf submodule builds libbpf.a and its headers into src/.output; the bpftool submodule builds a bootstrap bpftool; bootstrap.bpf.c plus vmlinux/x86/vmlinux.h is compiled by clang -target bpf and stripped to bootstrap.bpf.o; bpftool gen skeleton writes bootstrap.skel.h; bootstrap.c is compiled with it and linked with libbpf.a, libelf and zlib into src/bootstrap; CI then uploads the binary to a GitHub release and builds a Docker image pushed to ghcr.io.">
+        <defs>
+          <marker id="a11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="b11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+          <marker id="c11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+        </defs>
+        <text x="16" y="22" fill="var(--muted)" font-size="12" font-family="sans-serif">REPOSITORY INPUTS</text>
+        <rect x="16" y="34" width="150" height="40" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="91" y="52" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">libbpf/</text>
+        <text x="91" y="67" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">submodule</text>
+        <rect x="16" y="84" width="150" height="40" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="91" y="102" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">bpftool/</text>
+        <text x="91" y="117" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">submodule</text>
+        <rect x="16" y="134" width="150" height="40" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="91" y="152" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">vmlinux/x86/</text>
+        <text x="91" y="167" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">vendored, → vmlinux_601.h</text>
+        <rect x="16" y="184" width="150" height="40" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="91" y="208" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">src/bootstrap.bpf.c</text>
+        <rect x="16" y="300" width="150" height="40" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="91" y="318" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">src/bootstrap.c</text>
+        <text x="91" y="333" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="monospace">+ bootstrap.h</text>
+
+        <rect x="210" y="34" width="170" height="40" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="295" y="52" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">make BUILD_STATIC_ONLY=1</text>
+        <text x="295" y="67" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">→ .output/libbpf.a + bpf/*.h</text>
+        <path d="M166,54 L208,54" stroke="var(--accent2)" stroke-width="2" marker-end="url(#b11)" fill="none"/>
+        <rect x="210" y="84" width="170" height="40" rx="7" fill="none" stroke="var(--muted)" stroke-width="2"/>
+        <text x="295" y="102" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">make bootstrap</text>
+        <text x="295" y="117" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">→ host bpftool v7.8.0</text>
+        <path d="M166,104 L208,104" stroke="var(--muted)" stroke-width="2" marker-end="url(#c11)" fill="none"/>
+
+        <rect x="210" y="164" width="170" height="56" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="295" y="184" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">clang -g -O2 -target bpf</text>
+        <text x="295" y="199" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">-fno-stack-protector</text>
+        <text x="295" y="213" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">then llvm-strip -g</text>
+        <path d="M166,204 L208,196" stroke="var(--accent)" stroke-width="2" marker-end="url(#a11)" fill="none"/>
+        <path d="M166,156 L208,180" stroke="var(--accent)" stroke-width="2" marker-end="url(#a11)" fill="none"/>
+        <path d="M295,74 C330,110 330,140 300,162" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a11)" fill="none"/>
+        <text x="342" y="140" fill="var(--muted)" font-size="10" font-family="sans-serif">headers</text>
+
+        <rect x="420" y="172" width="150" height="40" rx="7" fill="var(--bg3)" stroke="var(--border)"/>
+        <text x="495" y="190" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">.output/bootstrap.bpf.o</text>
+        <text x="495" y="205" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">36 KB: code, .BTF, .BTF.ext</text>
+        <path d="M380,192 L418,192" stroke="var(--accent)" stroke-width="2" marker-end="url(#a11)" fill="none"/>
+
+        <rect x="610" y="172" width="130" height="40" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="675" y="196" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">gen skeleton</text>
+        <path d="M570,192 L608,192" stroke="var(--accent)" stroke-width="2" marker-end="url(#a11)" fill="none"/>
+        <path d="M380,104 C620,104 675,120 675,170" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#c11)" fill="none"/>
+        <text x="560" y="98" fill="var(--muted)" font-size="10" font-family="sans-serif">runs bpftool</text>
+
+        <rect x="610" y="240" width="130" height="40" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="675" y="258" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">bootstrap.skel.h</text>
+        <text x="675" y="273" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">120 KB, embeds the .o</text>
+        <path d="M675,212 L675,238" stroke="var(--accent)" stroke-width="2" marker-end="url(#a11)" fill="none"/>
+
+        <rect x="210" y="300" width="170" height="40" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="295" y="318" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">cc -g -Wall -c</text>
+        <text x="295" y="333" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">includes the skeleton</text>
+        <path d="M166,320 L208,320" stroke="var(--accent2)" stroke-width="2" marker-end="url(#b11)" fill="none"/>
+        <path d="M610,262 L382,312" stroke="var(--accent)" stroke-width="2" marker-end="url(#a11)" fill="none"/>
+
+        <rect x="420" y="300" width="150" height="40" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="495" y="318" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">cc … libbpf.a</text>
+        <text x="495" y="333" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">-lelf -lz</text>
+        <path d="M380,320 L418,320" stroke="var(--accent2)" stroke-width="2" marker-end="url(#b11)" fill="none"/>
+        <path d="M380,54 C470,54 495,100 495,298" stroke="var(--accent2)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#b11)" fill="none"/>
+
+        <rect x="610" y="300" width="130" height="40" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="675" y="318" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">src/bootstrap</text>
+        <text x="675" y="333" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">1.6 MB, needs libelf, libz</text>
+        <path d="M570,320 L608,320" stroke="var(--accent2)" stroke-width="2" marker-end="url(#b11)" fill="none"/>
+
+        <text x="770" y="22" fill="var(--muted)" font-size="12" font-family="sans-serif">CI (push to master)</text>
+        <rect x="770" y="270" width="120" height="40" rx="7" fill="none" stroke="var(--border)"/>
+        <text x="830" y="288" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="sans-serif">publish.yml</text>
+        <text x="830" y="303" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">GitHub release asset</text>
+        <rect x="770" y="330" width="120" height="40" rx="7" fill="none" stroke="var(--border)"/>
+        <text x="830" y="348" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="sans-serif">docker.yml</text>
+        <text x="830" y="363" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">ghcr.io/owner/repo</text>
+        <path d="M740,314 L768,292" stroke="var(--muted)" stroke-width="2" marker-end="url(#c11)" fill="none"/>
+        <path d="M740,326 L768,346" stroke="var(--muted)" stroke-width="2" marker-end="url(#c11)" fill="none"/>
+        <text x="16" y="400" fill="var(--muted)" font-size="11" font-family="sans-serif">Orange: BPF target. Second colour: host target. Grey: build tools and CI. Sizes measured in the orb.</text>
+      </svg>
+      <figcaption>Figure 11.1 — What <code>make build</code> in libbpf-starter-template does, from submodules to the binary that
+        CI publishes. The libbpf submodule is in fact compiled twice: once for the app and once inside the bpftool bootstrap
+        build, which uses bpftool's own nested libbpf submodule.</figcaption>
+    </figure>
+
+    <h3>Building and running it in the orb</h3>
+    <p>This curriculum's orb runs Linux 6.1.189 on x86_64 with Debian clang 14.0.6, libelf-dev 0.188 and zlib1g-dev
+      installed. The template was cloned with its submodules and built with the README's command. The output, trimmed to the
+      lines the Makefile prints for each stage:</p>
+    <pre><code class="language-plaintext">$ git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/eunomia-bpf/libbpf-starter-template
+$ cd libbpf-starter-template
+$ time make build -j4
+make -C src
+make[1]: warning: jobserver unavailable: using -j1.  Add '+' to parent make rule.
+  LIB      libbpf.a
+  BPF      .output/bootstrap.bpf.o
+  BPFTOOL  bpftool/bootstrap/bpftool
+...                        libbfd: [ OFF ]
+...               clang-bpf-co-re: [ on  ]
+...                          llvm: [ on  ]
+...                        libcap: [ OFF ]
+  GEN-SKEL .output/bootstrap.skel.h
+  CC       .output/bootstrap.o
+  BINARY   bootstrap
+
+real	0m29.598s
+$ ldd src/bootstrap
+	linux-vdso.so.1
+	libelf.so.1 =&gt; /lib/x86_64-linux-gnu/libelf.so.1
+	libz.so.1 =&gt; /lib/x86_64-linux-gnu/libz.so.1
+	libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6</code></pre>
+    <p>A clean build took about 30 seconds, most of it compiling libbpf (twice). The jobserver warning is harmless but
+      tells you something: the top-level Makefile calls <code>make -C src</code> instead of <code>$(MAKE) -C src</code>, so
+      the inner make cannot share the outer <code>-j4</code> and runs serially. If you care about build time, run
+      <code>make -C src -j$(nproc)</code> directly. The binary has no dependency on a shared libbpf, which is the point of
+      linking it statically: you can copy it to another machine that has libelf and zlib.</p>
+    <p>Running it requires root (or <code>CAP_BPF</code> plus <code>CAP_PERFMON</code>). Both tracepoints attached on the
+      orb, and every process start and exit appeared:</p>
+    <pre><code class="language-plaintext">$ sudo src/bootstrap
+TIME     EVENT COMM             PID     PPID    FILENAME/EXIT CODE
+00:10:06 EXEC  id               30113   30112   /usr/bin/id
+00:10:06 EXIT  id               30113   30112   [0] (1ms)
+00:10:06 EXEC  sudo             30112   30111   /usr/bin/sudo
+00:10:06 EXEC  git              30115   1977    /opt/git/bin/git
+00:10:06 EXIT  git              30115   1977    [128] (1ms)
+00:10:06 EXEC  bash             30120   1977    /usr/bin/bash
+...
+$ sudo src/bootstrap -d 200          # only processes that lived at least 200 ms
+TIME     EVENT COMM             PID     PPID    FILENAME/EXIT CODE
+00:10:24 EXIT  head             30994   30851   [0] (289ms)
+00:10:24 EXIT  sleep            31021   30838   [0] (501ms)
+00:10:25 EXIT  sh               31022   30838   [0] (303ms)</code></pre>
+    <p>The orb's kernel has a restricted set of tracing hooks (it is a sandbox kernel), but the
+      <code>sched:sched_process_exec</code> and <code>sched:sched_process_exit</code> tracepoints this example uses are
+      present, and the program worked as described. The <code>-v</code> flag turns on libbpf's debug log, which shows CO-RE
+      doing its job even here:</p>
+    <pre><code class="language-plaintext">$ sudo src/bootstrap -v 2&gt;&amp;1 | grep -E 'BTF|relo #[01]:'
+libbpf: loaded kernel BTF from '/sys/kernel/btf/vmlinux'
+libbpf: CO-RE relocating [34] struct task_struct: found target candidate [187] struct task_struct in [vmlinux]
+libbpf: prog 'handle_exec': relo #0: &lt;byte_off&gt; [34] struct task_struct.real_parent (0:81 @ offset 1416)
+libbpf: prog 'handle_exec': relo #0: matching candidate #0 &lt;byte_off&gt; [187] struct task_struct.real_parent (0:82 @ offset 1400)
+libbpf: prog 'handle_exec': relo #0: patched insn #30 (ALU/ALU64) imm 1416 -&gt; 1400
+libbpf: prog 'handle_exec': relo #1: &lt;byte_off&gt; [34] struct task_struct.tgid (0:79 @ offset 1404)
+libbpf: prog 'handle_exec': relo #1: matching candidate #0 &lt;byte_off&gt; [187] struct task_struct.tgid (0:80 @ offset 1388)
+libbpf: prog 'handle_exec': relo #1: patched insn #37 (ALU/ALU64) imm 1404 -&gt; 1388</code></pre>
+    <p>This is a nice demonstration of why the "which vmlinux.h version?" question matters less than it seems. The template
+      compiles against a header generated from <em>a</em> 6.1 kernel, and the orb runs <em>a</em> 6.1 kernel, yet
+      <code>real_parent</code> sits at byte 1416 in the header and byte 1400 in the running kernel: <code>task_struct</code>
+      depends on the kernel configuration, not just on the version. libbpf found the field by name and patched the
+      instruction. Chapter 06 measured the same effect with libbpf-bootstrap's 6.18 header (1032 → 1400).</p>
+
+    <h3>The example program, kernel side</h3>
+    <p><code>src/bootstrap.bpf.c</code> is libbpf-bootstrap's <code>bootstrap</code> example with only whitespace changes
+      (checked with <code>diff</code> against libbpf-bootstrap <code>820a1bd</code>). It is a good choice for a template
+      because it exercises the pieces most real tools need: a hash map for state, a ring buffer for events, a read-only
+      global as a configuration knob, and CO-RE reads of kernel structures.</p>
+    <pre data-file="libbpf-starter-template/src/bootstrap.bpf.c"><code class="language-c">#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include "bootstrap.h"
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, pid_t);
+	__type(value, u64);
+} exec_start SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+
+const volatile unsigned long long min_duration_ns = 0;
+
+SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	struct task_struct *task;
+	unsigned fname_off;
+	struct event *e;
+	pid_t pid;
+	u64 ts;
+
+	/* remember time exec() was executed for this PID */
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&amp;exec_start, &amp;pid, &amp;ts, BPF_ANY);
+
+	/* don't emit exec events when minimum duration is specified */
+	if (min_duration_ns)
+		return 0;
+
+	/* reserve sample from BPF ringbuf */
+	e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	/* fill out the sample with data */
+	task = (struct task_struct *)bpf_get_current_task();
+
+	e-&gt;exit_event = false;
+	e-&gt;pid = pid;
+	e-&gt;ppid = BPF_CORE_READ(task, real_parent, tgid);
+	bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+
+	fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+	bpf_probe_read_str(&amp;e-&gt;filename, sizeof(e-&gt;filename), (void *)ctx + fname_off);
+
+	/* successfully submit it to user-space for post-processing */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+/* ... handle_exit: SEC("tp/sched/sched_process_exit"), ignores thread exits,
+       computes duration from exec_start, reads exit_code via BPF_CORE_READ ... */</code></pre>
+    <p>For a template user, the interesting lines are the ones you will replace. <code>SEC("tp/sched/...")</code> chooses
+      the hook (any section name libbpf understands works; see <a href="05-program-types-and-hooks.html">05</a>). The two
+      <code>.maps</code> definitions become fields of the skeleton's <code>maps</code> struct by name. The
+      <code>const volatile</code> global becomes <code>skel-&gt;rodata-&gt;min_duration_ns</code>. And
+      <code>struct event</code> comes from <code>bootstrap.h</code>, which user space includes too, so both sides agree on
+      the record layout. Chapter 04 covers maps and ring buffers in depth
+      (<a href="04-maps-helpers-kfuncs.html">04</a>); chapter 06 covers <code>BPF_CORE_READ</code> and read-only globals.</p>
+    <pre data-file="libbpf-starter-template/src/bootstrap.h"><code class="language-c">#define TASK_COMM_LEN 16
+#define MAX_FILENAME_LEN 127
+
+struct event {
+	int pid;
+	int ppid;
+	unsigned exit_code;
+	unsigned long long duration_ns;
+	char comm[TASK_COMM_LEN];
+	char filename[MAX_FILENAME_LEN];
+	bool exit_event;
+};</code></pre>
+
+    <h3>The example program, user side</h3>
+    <p><code>src/bootstrap.c</code> is the loader. Apart from argument parsing with glibc's <code>argp</code> and a
+      printing callback, it is the standard skeleton lifecycle: open, set read-only data, load, attach, poll, destroy.</p>
+    <pre data-file="libbpf-starter-template/src/bootstrap.c"><code class="language-c">#include &lt;bpf/libbpf.h&gt;
+#include "bootstrap.h"
+#include "bootstrap.skel.h"
+/* ... argp options -v and -d, libbpf_print_fn, sig_handler, handle_event ... */
+
+int main(int argc, char **argv)
+{
+	struct ring_buffer *rb = NULL;
+	struct bootstrap_bpf *skel;
+	int err;
+	/* ... argp_parse, libbpf_set_print(libbpf_print_fn), SIGINT/SIGTERM handlers ... */
+
+	/* Load and verify BPF application */
+	skel = bootstrap_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+		return 1;
+	}
+
+	/* Parameterize BPF code with minimum duration parameter */
+	skel-&gt;rodata-&gt;min_duration_ns = env.min_duration_ms * 1000000ULL;
+
+	/* Load &amp; verify BPF programs */
+	err = bootstrap_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		goto cleanup;
+	}
+
+	/* Attach tracepoints */
+	err = bootstrap_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF skeleton\n");
+		goto cleanup;
+	}
+
+	/* Set up ring buffer polling */
+	rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.rb), handle_event, NULL, NULL);
+	/* ... */
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		/* ... -EINTR on Ctrl-C ends the loop ... */
+	}
+
+cleanup:
+	/* Clean up */
+	ring_buffer__free(rb);
+	bootstrap_bpf__destroy(skel);
+
+	return err &lt; 0 ? -err : 0;
+}</code></pre>
+    <p>Every <code>bootstrap_bpf</code> name comes from the generated skeleton, and the skeleton's name comes from the
+      <em>object file name</em>: bpftool takes <code>bootstrap.bpf.o</code>, drops <code>.o</code>, and turns the remaining
+      dot into an underscore. This is the single most important fact when you rename the template. The skeleton generated in
+      the orb begins like this (generated output, not a file in the repository):</p>
+    <pre><code class="language-c">/* src/.output/bootstrap.skel.h, generated by bpftool v7.8.0 in the orb (trimmed) */
+/* THIS FILE IS AUTOGENERATED BY BPFTOOL! */
+#ifndef __BOOTSTRAP_BPF_SKEL_H__
+#define __BOOTSTRAP_BPF_SKEL_H__
+
+#include &lt;errno.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;bpf/libbpf.h&gt;
+
+struct bootstrap_bpf {
+	struct bpf_object_skeleton *skeleton;
+	struct bpf_object *obj;
+	struct {
+		struct bpf_map *exec_start;
+		struct bpf_map *rb;
+		struct bpf_map *rodata;
+	} maps;
+	struct {
+		struct bpf_program *handle_exec;
+		struct bpf_program *handle_exit;
+	} progs;
+	struct {
+		struct bpf_link *handle_exec;
+		struct bpf_link *handle_exit;
+	} links;
+	struct bootstrap_bpf__rodata {
+		unsigned long long min_duration_ns;
+	} *rodata;
+	/* ... C++ member declarations ... */
+};</code></pre>
+
+    <h3>A gap in the dependency rules</h3>
+    <p>The prerequisite lists contain <code>$(wildcard %.h)</code>. That looks like "depend on the matching header", but
+      <code>wildcard</code> runs when make <em>reads</em> the Makefile, before any pattern is matched. It searches for a file
+      literally named <code>%.h</code>, finds none, and expands to nothing. The effect, verified in the orb after a full
+      build:</p>
+    <pre><code class="language-plaintext">$ cd src
+$ touch bootstrap.h &amp;&amp; make -n          # prints nothing: no rebuild
+$ touch bootstrap.bpf.c &amp;&amp; make -n      # recompiles BPF object, skeleton, bootstrap.o, binary</code></pre>
+    <p>If you change <code>struct event</code> in the header and run <code>make</code>, neither side is recompiled, and the
+      old binary keeps using the old layout. Run <code>make clean</code> after editing shared headers, or port
+      libbpf-bootstrap's <code>-MMD -MP</code> dependency generation (it adds <code>-include $(wildcard
+      $(OUTPUT)/*.d)</code> at the end). This is a template you are meant to edit, so treat this as the first improvement to
+      make.</p>
+
+    <h2>Packaging and CI in the C template</h2>
+    <h3>Three ways to get a toolchain</h3>
+    <p>The template offers three development environments so that "install clang and libelf-dev" is never the blocker:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Dev container">
+        <p>VS Code's Dev Containers extension and GitHub Codespaces read <code>.devcontainer/devcontainer.json</code>, which
+          only says "build <code>dev.dockerfile</code> with the repository as context":</p>
+        <pre data-file="libbpf-starter-template/.devcontainer/devcontainer.json"><code class="language-json">{
+	"build": {
+		"context": "..",
+		"dockerfile": "../dev.dockerfile"
+	}
+}</code></pre>
+        <pre data-file="libbpf-starter-template/dev.dockerfile"><code class="language-dockerfile">FROM ubuntu:22.04
+
+WORKDIR /root/
+COPY . /root/
+
+RUN apt-get update -y &amp;&amp; \
+    apt-get install -y --no-install-recommends \
+      libelf1 libelf-dev zlib1g-dev libclang-13-dev libssl-dev \
+      make git clang llvm pkg-config build-essential &amp;&amp; \
+    apt-get install -y --no-install-recommends ca-certificates	&amp;&amp; \
+	  update-ca-certificates	&amp;&amp; \
+    apt-get clean &amp;&amp; \
+    rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["/bin/bash"]</code></pre>
+        <p>The container is fine for <em>building</em>. To <em>run</em> the tool inside it you need privileges to call
+          <code>bpf()</code>; the JSON sets no <code>runArgs</code> such as <code>--privileged</code>, so add them yourself
+          if you want to test inside the container. Whether a Codespace's kernel lets you load tracing programs at all is
+          not something the template documents; it was not tested here.</p>
+      </div>
+      <div class="tab-panel" data-label="Nix + direnv">
+        <p><code>.envrc</code> contains one line, <code>use flake</code>. With direnv installed, entering the directory loads
+          the flake's shell; <code>nix develop</code> does the same without direnv.</p>
+        <pre data-file="libbpf-starter-template/flake.nix"><code class="language-nix">        packages.default = pkgs.mkShell {
+          name = "libbpf-template";
+          nativeBuildInputs = with pkgs; [
+            clang
+            llvm
+            pkg-config
+            openssl
+          ];
+
+          packages = with pkgs; [
+            elfutils
+            zlib
+          ];
+
+          # See prior art in nixpkgs at:
+          # * https://github.com/NixOS/nixpkgs/issues/325910
+          # * https://github.com/NixOS/nixpkgs/pull/325587
+          hardeningDisable = [
+            "zerocallusedregs"
+          ];
+        };</code></pre>
+        <p>The <code>hardeningDisable</code> line was added in October 2025 (<code>a916454</code>, "Update nix flake and fix
+          nix build"). Nix's clang wrapper adds hardening flags to every compile; <code>-fzero-call-used-regs</code> is not
+          supported for the BPF target, so it must be switched off. This is the Nix counterpart of the
+          <code>-fno-stack-protector</code> fix in the Makefile.</p>
+      </div>
+      <div class="tab-panel" data-label="Plain apt">
+        <p>On Ubuntu or Debian, <code>make install</code> runs the apt command shown earlier. In this chapter's orb, the
+          packages were already present (clang 14, libelf-dev, zlib1g-dev) and nothing else was needed. Other distributions
+          need the equivalent packages: clang, llvm (for <code>llvm-strip</code>), libelf development files, zlib
+          development files and make.</p>
+      </div>
+    </div>
+
+    <h3>The runtime Docker image</h3>
+    <p>The file named <code>dockerfile</code> is the image users run, and it is tiny:</p>
+    <pre data-file="libbpf-starter-template/dockerfile"><code class="language-dockerfile">FROM ubuntu:22.04
+
+WORKDIR /root/
+COPY . /root/
+
+RUN apt-get update \
+    &amp;&amp; apt-get install -y --no-install-recommends libelf1 \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["/root/src/bootstrap"]</code></pre>
+    <p>It does not compile anything. It copies the whole build context, including an already-built
+      <code>src/bootstrap</code>, and installs only <code>libelf1</code>, because libbpf is linked in statically and zlib is
+      already in the base image. So <code>docker build</code> only works after <code>make build</code> on the host, which is
+      exactly the order CI uses. The image needs <code>--privileged</code> at run time to load BPF programs:</p>
+    <pre data-file="libbpf-starter-template/README.md"><code class="language-bash">$ sudo docker run --rm -it --privileged ghcr.io/eunomia-bpf/libbpf-template:latest</code></pre>
+    <p>Note the image name. The README still says <code>libbpf-template</code>, but since August 2024 (<code>fd14bb1</code>,
+      "fix: docker name should be repo name") the workflow pushes to <code>ghcr.io/${{ github.repository }}</code>, i.e.
+      <code>ghcr.io/eunomia-bpf/libbpf-starter-template</code> for the original and
+      <code>ghcr.io/&lt;you&gt;/&lt;your-repo&gt;</code> for your copy. Whether the old name still resolves could not be
+      checked from the orb (the package API requires a token scope it does not have).</p>
+
+    <h3>The two workflows</h3>
+    <p>Both workflows trigger on every push to <code>master</code> and skip themselves if the commit message contains
+      <code>[skip ci]</code> or <code>[ci skip]</code>. <code>publish.yml</code> turns each push into a GitHub release:</p>
+    <pre data-file="libbpf-starter-template/.github/workflows/publish.yml"><code class="language-yaml">name: Build and publish
+
+on:
+  push:
+    branches: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]') &amp;&amp; !contains(github.event.head_commit.message, '[ci skip]')"
+    # ...
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: 'recursive'
+
+    - name: Set latest release version
+      if:   github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/master'
+      id: set_version
+      uses: actions/github-script@v6
+      with:
+        result-encoding: string
+        script: |
+          /* ... list releases and tags ... */
+          if (releases.length === 0) { return "v0.0.1"; }
+          /* ... increase_v() bumps the last number of the latest release tag ... */
+          const tag = tags.find(tag =&gt; tag.commit.sha === context.sha);
+          return tag ? tag.name : increase_v(latest_release_tag)
+
+    - name: install deps
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+        libelf1 libelf-dev zlib1g-dev libclang-dev libssl-dev \
+        make git clang llvm pkg-config build-essential
+
+    - name: build package
+      run:  make build
+
+    - name: Publish
+      if:   github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/master'
+      uses: softprops/action-gh-release@v3
+      with:
+          files: |
+            src/bootstrap
+          prerelease: false
+          tag_name: ${{ steps.set_version.outputs.result }}
+          generate_release_notes: true</code></pre>
+    <p>The version logic is simple: the first release is <code>v0.0.1</code>; after that, if the pushed commit already has a
+      tag, that tag is used, otherwise the patch number of the latest release is incremented. Every push to
+      <code>master</code> therefore produces a release with <code>src/bootstrap</code> attached; the original repository is at
+      <code>v0.0.11</code> (July 2026). If you prefer releases only on tags, change the trigger. Two details to fix when you
+      adopt it: the <code>files:</code> path must name <em>your</em> binary, and the job has a
+      <code>strategy.matrix.target</code> of <code>x86_64-unknown-linux-gnu</code> that no step uses, so the template builds
+      only for the runner's architecture.</p>
+    <p><code>docker.yml</code> repeats checkout and <code>make build</code>, then uses <code>docker/build-push-action</code> to
+      build <code>dockerfile</code> for <code>linux/amd64</code> and push it to the GitHub Container Registry with the
+      workflow's own <code>GITHUB_TOKEN</code>. Its last step echoes <code>steps.docker_build.outputs.digest</code>, but no
+      step has the id <code>docker_build</code>, so it prints an empty line; it is cosmetic.</p>
+
+    <figure>
+      <svg viewBox="0 0 880 250" role="img" aria-label="CI flow: git push to master triggers two independent jobs on ubuntu-latest. publish.yml: checkout with submodules, compute version, apt install, make build, softprops action uploads src/bootstrap to a GitHub release vX.Y.Z. docker.yml: checkout, apt install, make build, docker build of dockerfile copying the binary, push to ghcr.io/owner/repo.">
+        <defs>
+          <marker id="d11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+        </defs>
+        <rect x="16" y="98" width="110" height="50" rx="8" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="71" y="120" text-anchor="middle" fill="var(--fg)" font-size="12" font-family="monospace">git push</text>
+        <text x="71" y="136" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">to master</text>
+        <path d="M126,112 L160,62" stroke="var(--accent)" stroke-width="2" marker-end="url(#d11)" fill="none"/>
+        <path d="M126,134 L160,184" stroke="var(--accent)" stroke-width="2" marker-end="url(#d11)" fill="none"/>
+        <text x="166" y="28" fill="var(--muted)" font-size="12" font-family="sans-serif">publish.yml</text>
+        <text x="166" y="238" fill="var(--muted)" font-size="12" font-family="sans-serif">docker.yml</text>
+        <g font-family="sans-serif" font-size="11">
+          <rect x="164" y="40" width="110" height="44" rx="6" fill="none" stroke="var(--border)"/>
+          <text x="219" y="58" text-anchor="middle" fill="var(--fg)">checkout</text>
+          <text x="219" y="73" text-anchor="middle" fill="var(--muted)" font-size="10">submodules: recursive</text>
+          <rect x="290" y="40" width="110" height="44" rx="6" fill="none" stroke="var(--border)"/>
+          <text x="345" y="58" text-anchor="middle" fill="var(--fg)">compute version</text>
+          <text x="345" y="73" text-anchor="middle" fill="var(--muted)" font-size="10">github-script</text>
+          <rect x="416" y="40" width="110" height="44" rx="6" fill="none" stroke="var(--border)"/>
+          <text x="471" y="58" text-anchor="middle" fill="var(--fg)">apt install</text>
+          <text x="471" y="73" text-anchor="middle" fill="var(--muted)" font-size="10">clang, libelf-dev …</text>
+          <rect x="542" y="40" width="110" height="44" rx="6" fill="none" stroke="var(--accent)" stroke-width="2"/>
+          <text x="597" y="67" text-anchor="middle" fill="var(--fg)" font-family="monospace">make build</text>
+          <rect x="668" y="40" width="196" height="44" rx="6" fill="var(--bg3)" stroke="var(--accent2)"/>
+          <text x="766" y="58" text-anchor="middle" fill="var(--fg)">GitHub release vX.Y.Z</text>
+          <text x="766" y="73" text-anchor="middle" fill="var(--muted)" font-size="10">asset: src/bootstrap</text>
+          <path d="M274,62 L288,62 M400,62 L414,62 M526,62 L540,62 M652,62 L666,62" stroke="var(--accent)" stroke-width="2" marker-end="url(#d11)" fill="none"/>
+
+          <rect x="164" y="162" width="110" height="44" rx="6" fill="none" stroke="var(--border)"/>
+          <text x="219" y="180" text-anchor="middle" fill="var(--fg)">checkout</text>
+          <text x="219" y="195" text-anchor="middle" fill="var(--muted)" font-size="10">submodules: recursive</text>
+          <rect x="290" y="162" width="110" height="44" rx="6" fill="none" stroke="var(--border)"/>
+          <text x="345" y="189" text-anchor="middle" fill="var(--fg)">apt install</text>
+          <rect x="416" y="162" width="110" height="44" rx="6" fill="none" stroke="var(--accent)" stroke-width="2"/>
+          <text x="471" y="189" text-anchor="middle" fill="var(--fg)" font-family="monospace">make build</text>
+          <rect x="542" y="162" width="110" height="44" rx="6" fill="none" stroke="var(--border)"/>
+          <text x="597" y="180" text-anchor="middle" fill="var(--fg)">docker build</text>
+          <text x="597" y="195" text-anchor="middle" fill="var(--muted)" font-size="10">COPY . (with binary)</text>
+          <rect x="668" y="162" width="196" height="44" rx="6" fill="var(--bg3)" stroke="var(--accent2)"/>
+          <text x="766" y="180" text-anchor="middle" fill="var(--fg)">ghcr.io/owner/repo</text>
+          <text x="766" y="195" text-anchor="middle" fill="var(--muted)" font-size="10">linux/amd64, GITHUB_TOKEN</text>
+          <path d="M274,184 L288,184 M400,184 L414,184 M526,184 L540,184 M652,184 L666,184" stroke="var(--accent)" stroke-width="2" marker-end="url(#d11)" fill="none"/>
+        </g>
+        <text x="166" y="128" fill="var(--muted)" font-size="11" font-family="sans-serif">Both jobs run on ubuntu-latest, independently; each builds the binary itself. Skipped if the message contains [skip ci].</text>
+      </svg>
+      <figcaption>Figure 11.2 — The two GitHub Actions workflows shared (with small differences) by the C and Rust
+        templates. Nothing runs the BPF program in CI: the jobs prove that it <em>compiles</em> and that the skeleton
+        generates, not that it loads or attaches.</figcaption>
+    </figure>
+
+    <div class="callout warn"><span class="label">CI proves compilation, not loading</span>
+      <p>The verifier only runs when the program is loaded into a kernel. A green build in these workflows says nothing about
+        whether the program passes the verifier on the runner's kernel or on yours. If you want that check, add a step that
+        runs the binary with <code>sudo</code> for a few seconds (GitHub's hosted Ubuntu runners allow passwordless sudo), or
+        use a VM-based kernel test harness. The template does neither.</p>
+    </div>
+
+    <h2>libbpf-rs-starter-template (Rust)</h2>
+    <p>The Rust template has the same packaging idea but a very different build: there are no submodules and no Makefile
+      logic. Cargo and a build script do everything. The example is not <code>bootstrap</code> but
+      <code>runqslower</code>, originally from the libbpf-rs repository (the crate's author field is still Daniel Xu, one of
+      the libbpf-rs authors), which reports tasks that waited on a CPU run queue for longer than a threshold.</p>
+    <h3>Directory map</h3>
+    <pre><code class="language-plaintext">libbpf-rs-starter-template/                  (commit 8927eea, 2026-09-16)
+├── Cargo.toml          package "runqslower"; libbpf-rs 0.20, libbpf-cargo 0.20 (build-dep), clap 3.1, time, plain, anyhow
+├── Cargo.lock          pins libbpf-rs 0.20.1, libbpf-cargo 0.20.1, libbpf-sys 1.4.3+v1.4.5
+├── build.rs            compiles src/bpf/runqslower.bpf.c and generates $OUT_DIR/runqslower.skel.rs
+├── Makefile            build: cargo build --release;  clean: rm -rf target
+├── src/
+│   ├── main.rs         clap CLI, skeleton open/load/attach, perf-buffer poll loop
+│   └── bpf/
+│       ├── runqslower.bpf.c   three tp_btf programs on sched_wakeup / _new / sched_switch
+│       ├── runqslower.h       struct event
+│       └── vmlinux.h          one x86 header, 2.6 MB, vendored
+├── dockerfile          runtime image: COPY target/release/runqslower, libelf1
+├── dockerfile-dev      dev image: clang, llvm, libelf-dev, zlib1g-dev, then rustup and make
+├── .devcontainer/devcontainer.json   build dockerfile-dev
+├── flake.nix, flake.lock, .envrc     Nix (fenix toolchain + naersk) builds and runs the crate
+├── .github/workflows/  publish.yml (release target/release/runqslower), docker.yml
+└── README.md, LICENSE (MIT), .gitignore</code></pre>
+
+    <h3>Cargo.toml and build.rs</h3>
+    <pre data-file="libbpf-rs-starter-template/Cargo.toml"><code class="language-toml">[package]
+name = "runqslower"
+version = "0.1.0"
+authors = ["Daniel Xu &lt;dxu@dxuuu.xyz&gt;"]
+license = "LGPL-2.1-only OR BSD-2-Clause"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+libbpf-rs = "0.20"
+libc = "0.2"
+plain = "0.2"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"]}
+clap = { version = "3.1", default-features = false, features = ["std", "derive"] }
+
+[build-dependencies]
+libbpf-cargo = "0.20"</code></pre>
+    <pre data-file="libbpf-rs-starter-template/build.rs"><code class="language-rust">use libbpf_cargo::SkeletonBuilder;
+use std::{env, path::PathBuf};
+
+const SRC: &amp;str = "src/bpf/runqslower.bpf.c";
+
+fn main() {
+    let mut out =
+        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"));
+    out.push("runqslower.skel.rs");
+    SkeletonBuilder::new()
+        .source(SRC)
+        .build_and_generate(&amp;out)
+        .unwrap();
+    println!("cargo:rerun-if-changed={SRC}");
+}</code></pre>
+    <p><code>build.rs</code> is the Rust counterpart of the whole BPF half of the C Makefile. When Cargo builds the crate it
+      first compiles and runs this script. <code>SkeletonBuilder</code> (from libbpf-cargo) invokes <code>clang</code> on
+      the BPF source, so clang must still be installed, and then generates a Rust skeleton module instead of a C header. The
+      skeleton lands in Cargo's per-build <code>OUT_DIR</code>, and <code>main.rs</code> pulls it in with
+      <code>include!</code>. The libbpf C library itself comes through the <code>libbpf-sys</code> crate (1.4.3, wrapping
+      libbpf 1.4.5 according to its version string), so the libbpf you get is whatever <code>Cargo.lock</code> pins, not a
+      submodule. The <code>vmlinux.h</code> in <code>src/bpf/</code> is found because it is next to the source file.</p>
+    <p>There is the same kind of dependency gap as in C: <code>rerun-if-changed</code> lists only the <code>.bpf.c</code>
+      file, so editing <code>runqslower.h</code> alone does not regenerate the skeleton. The upstream libbpf-rs example adds a
+      second <code>rerun-if-changed</code> line for the header.</p>
+    <figure>
+      <svg viewBox="0 0 860 220" role="img" aria-label="Rust template build: cargo build --release first runs build.rs; SkeletonBuilder runs clang -target bpf on src/bpf/runqslower.bpf.c with vmlinux.h and writes runqslower.skel.rs into OUT_DIR; rustc compiles main.rs, which includes the skeleton, and links libbpf-rs and libbpf-sys into target/release/runqslower.">
+        <defs>
+          <marker id="e11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          <marker id="f11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <rect x="16" y="20" width="150" height="44" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="91" y="38" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">src/bpf/</text>
+        <text x="91" y="54" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">runqslower.bpf.c</text>
+        <rect x="200" y="14" width="200" height="56" rx="7" fill="none" stroke="var(--accent)" stroke-width="2"/>
+        <text x="300" y="34" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">build.rs: SkeletonBuilder</text>
+        <text x="300" y="50" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">runs clang -target bpf,</text>
+        <text x="300" y="63" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">then generates Rust code</text>
+        <path d="M166,42 L198,42" stroke="var(--accent)" stroke-width="2" marker-end="url(#e11)" fill="none"/>
+        <rect x="434" y="20" width="190" height="44" rx="7" fill="var(--bg3)" stroke="var(--accent)"/>
+        <text x="529" y="38" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">$OUT_DIR/</text>
+        <text x="529" y="54" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">runqslower.skel.rs</text>
+        <path d="M400,42 L432,42" stroke="var(--accent)" stroke-width="2" marker-end="url(#e11)" fill="none"/>
+
+        <rect x="16" y="130" width="150" height="44" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="91" y="157" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">src/main.rs</text>
+        <rect x="200" y="124" width="200" height="56" rx="7" fill="none" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="300" y="146" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">rustc (cargo build --release)</text>
+        <text x="300" y="164" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="sans-serif">include!(…skel.rs)</text>
+        <path d="M166,152 L198,152" stroke="var(--accent2)" stroke-width="2" marker-end="url(#f11)" fill="none"/>
+        <path d="M529,64 L400,138" stroke="var(--accent)" stroke-width="2" marker-end="url(#e11)" fill="none"/>
+        <rect x="434" y="130" width="190" height="44" rx="7" fill="none" stroke="var(--border)"/>
+        <text x="529" y="148" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">libbpf-rs 0.20.1</text>
+        <text x="529" y="164" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="monospace">libbpf-sys 1.4.3 (libbpf C)</text>
+        <path d="M434,152 L402,152" stroke="var(--accent2)" stroke-width="2" marker-end="url(#f11)" fill="none"/>
+        <rect x="660" y="124" width="186" height="56" rx="7" fill="var(--bg3)" stroke="var(--accent2)"/>
+        <text x="753" y="148" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">target/release/</text>
+        <text x="753" y="164" text-anchor="middle" fill="var(--fg)" font-size="11" font-family="monospace">runqslower</text>
+        <path d="M400,176 C520,210 640,200 690,182" stroke="var(--accent2)" stroke-width="2" marker-end="url(#f11)" fill="none"/>
+        <text x="660" y="40" fill="var(--muted)" font-size="11" font-family="sans-serif">No submodules: libbpf</text>
+        <text x="660" y="56" text-anchor="start" fill="var(--muted)" font-size="11" font-family="sans-serif">comes from Cargo.lock;</text>
+        <text x="660" y="72" fill="var(--muted)" font-size="11" font-family="sans-serif">clang must be on PATH.</text>
+      </svg>
+      <figcaption>Figure 11.3 — The Rust template's build. <code>cargo</code> replaces both make and the submodules: the build
+        script does the BPF compile and skeleton generation, and crates supply libbpf.</figcaption>
+    </figure>
+
+    <h3>The BPF program: CO-RE with a type flavor</h3>
+    <pre data-file="libbpf-rs-starter-template/src/bpf/runqslower.bpf.c"><code class="language-c">#include "vmlinux.h"
+#include &lt;bpf/bpf_core_read.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include "runqslower.h"
+
+#define TASK_RUNNING	0
+
+const volatile __u64 min_us = 0;
+const volatile pid_t targ_pid = 0;
+const volatile pid_t targ_tgid = 0;
+
+// Dummy instance to get skeleton to generate definition for `struct event`
+struct event _event = {0};
+
+// Kernel 5.14 changed the state field to __state
+struct task_struct___pre_5_14 {
+	long int state;
+};
+/* ... maps: start (HASH, pid -&gt; u64 ts), events (PERF_EVENT_ARRAY) ... */
+/* ... trace_enqueue(); tp_btf/sched_wakeup and tp_btf/sched_wakeup_new record a timestamp ... */
+
+static inline long get_task_state(struct task_struct *t)
+{
+	if (bpf_core_field_exists(t-&gt;__state))
+		return t-&gt;__state;
+
+	return ((struct task_struct___pre_5_14*)t)-&gt;state;
+}
+
+SEC("tp_btf/sched_switch")
+int handle__sched_switch(u64 *ctx)
+{
+	/* TP_PROTO(bool preempt, struct task_struct *prev,
+	 *	    struct task_struct *next)
+	 */
+	struct task_struct *prev = (struct task_struct *)ctx[1];
+	struct task_struct *next = (struct task_struct *)ctx[2];
+	struct event event = {};
+	u64 *tsp, delta_us;
+	long state = get_task_state(prev);
+	u32 pid;
+
+	/* ivcsw: treat like an enqueue event and store timestamp */
+	if (state == TASK_RUNNING)
+		trace_enqueue(prev-&gt;tgid, prev-&gt;pid);
+
+	pid = next-&gt;pid;
+
+	/* fetch timestamp and calculate delta */
+	tsp = bpf_map_lookup_elem(&amp;start, &amp;pid);
+	if (!tsp)
+		return 0;   /* missed enqueue */
+
+	delta_us = (bpf_ktime_get_ns() - *tsp) / 1000;
+	if (min_us &amp;&amp; delta_us &lt;= min_us)
+		return 0;
+
+	event.pid = pid;
+	event.delta_us = delta_us;
+	bpf_probe_read_kernel_str(&amp;event.task, sizeof(event.task), next-&gt;comm);
+
+	/* output */
+	bpf_perf_event_output(ctx, &amp;events, BPF_F_CURRENT_CPU,
+			      &amp;event, sizeof(event));
+
+	bpf_map_delete_elem(&amp;start, &amp;pid);
+	return 0;
+}</code></pre>
+    <p>This example teaches more CO-RE than the C template's. The programs are <code>tp_btf</code> ("BTF-enabled raw
+      tracepoints"): their arguments are typed kernel pointers, so <code>next-&gt;pid</code> is a direct load the verifier
+      checks with BTF, with no <code>bpf_probe_read</code>. <code>get_task_state()</code> handles a real kernel change:
+      Linux 5.14 renamed <code>task_struct::state</code> to <code>__state</code>. The local type
+      <code>task_struct___pre_5_14</code> is a <em>flavor</em>; libbpf ignores the <code>___</code> suffix and matches it
+      against the kernel's <code>task_struct</code>. On a kernel that has <code>__state</code>,
+      <code>bpf_core_field_exists()</code> is patched to 1 and the other branch is removed as dead code (the mechanism is
+      explained in <a href="06-btf-core-libbpf.html">06</a>). The dummy global <code>_event</code> exists only so the event
+      type appears in the object's BTF, which makes libbpf-cargo generate a Rust struct for it.</p>
+    <p>One naming trap, inherited from upstream: <code>trace_enqueue(tgid, pid)</code> compares <code>targ_tgid</code> with
+      the kernel's <code>tgid</code> (process ID) and <code>targ_pid</code> with the kernel's <code>pid</code> (thread ID),
+      while <code>main.rs</code> fills <code>targ_pid</code> from the CLI argument <em>pid</em> and <code>targ_tgid</code>
+      from the argument <em>tid</em>. So the argument called "pid" filters on a thread and the one called "tid" filters on a
+      process. Fix the names when you adapt it.</p>
+
+    <h3>The user side and its age</h3>
+    <p>The template's <code>main.rs</code> targets the libbpf-rs 0.20 API. libbpf-rs has moved on: the repository's
+      workspace version was 0.27.2 when this chapter was written, and the 0.24.0 changelog says
+      "<em>Adjusted <code>SkelBuilder::open</code> method to require mutable reference to storage space for BPF
+      object</em>". The upstream version of the very same example shows what changed:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Template (libbpf-rs 0.20)">
+        <pre data-file="libbpf-rs-starter-template/src/main.rs"><code class="language-rust">mod runqslower {
+    include!(concat!(env!("OUT_DIR"), "/runqslower.skel.rs"));
+}
+
+use runqslower::*;
+/* ... clap Command { latency, pid, tid, verbose } ... */
+
+unsafe impl Plain for runqslower_bss_types::event {}
+
+fn bump_memlock_rlimit() -&gt; Result&lt;()&gt; {
+    let rlimit = libc::rlimit {
+        rlim_cur: 128 &lt;&lt; 20,
+        rlim_max: 128 &lt;&lt; 20,
+    };
+    /* ... setrlimit(RLIMIT_MEMLOCK) ... */
+}
+/* ... handle_event() copies bytes into runqslower_bss_types::event and prints ... */
+
+fn main() -&gt; Result&lt;()&gt; {
+    let opts = Command::parse();
+
+    let mut skel_builder = RunqslowerSkelBuilder::default();
+    if opts.verbose {
+        skel_builder.obj_builder.debug(true);
+    }
+
+    bump_memlock_rlimit()?;
+    let mut open_skel = skel_builder.open()?;
+
+    // Write arguments into prog
+    open_skel.rodata().min_us = opts.latency;
+    open_skel.rodata().targ_pid = opts.pid;
+    open_skel.rodata().targ_tgid = opts.tid;
+
+    // Begin tracing
+    let mut skel = open_skel.load()?;
+    skel.attach()?;
+    /* ... print header ... */
+
+    let perf = PerfBufferBuilder::new(skel.maps_mut().events())
+        .sample_cb(handle_event)
+        .lost_cb(handle_lost_events)
+        .build()?;
+
+    loop {
+        perf.poll(Duration::from_millis(100))?;
+    }
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Upstream libbpf-rs today">
+        <pre data-file="libbpf-rs/examples/runqslower/src/main.rs"><code class="language-rust">fn main() -&gt; Result&lt;()&gt; {
+    let opts = Command::parse();
+
+    let mut skel_builder = RunqslowerSkelBuilder::default();
+    if opts.verbose {
+        skel_builder.obj_builder.debug(true);
+    }
+
+    let mut open_object = MaybeUninit::uninit();
+    let mut open_skel = skel_builder.open(&amp;mut open_object)?;
+    let rodata = open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .expect("`rodata` is not memory mapped");
+
+    // Write arguments into prog
+    rodata.min_us = opts.latency;
+    rodata.targ_pid = opts.pid;
+    rodata.targ_tgid = opts.tid;
+
+    // Begin tracing
+    let mut skel = open_skel.load()?;
+    skel.attach()?;
+    /* ... print header ... */
+
+    let mut builder = RingBufferBuilder::new();
+    builder.add(&amp;skel.maps.events, handle_event)?;
+    let ringbuf = builder.build()?;
+
+    loop {
+        ringbuf.poll(Duration::from_millis(100))?;
+    }
+}</code></pre>
+        <p>Upstream also switched the BPF side from <code>PERF_EVENT_ARRAY</code> to a ring buffer, moved to clap 4, gets
+          <code>vmlinux.h</code> from the <code>vmlinux</code> crate (a git dependency on libbpf/vmlinux.h at
+          <code>991dd4b</code>) passed with <code>clang_args</code>, and writes the skeleton into <code>src/bpf/</code>
+          instead of <code>OUT_DIR</code>. Maps are accessed as fields (<code>skel.maps.events</code>) instead of methods.</p>
+      </div>
+    </div>
+    <p>Because <code>Cargo.toml</code> says <code>libbpf-rs = "0.20"</code> and <code>Cargo.lock</code> pins 0.20.1, the
+      template still builds exactly as written; Cargo will not jump to 0.24. The cost appears when you want a newer libbpf
+      feature or follow today's libbpf-rs documentation: the moment you bump the version, the skeleton API calls above stop
+      compiling and you rewrite <code>main</code> along the lines of the right-hand tab. The <code>bump_memlock_rlimit</code>
+      call is a leftover from kernels before 5.11, which charged BPF memory to <code>RLIMIT_MEMLOCK</code>; it is harmless on
+      newer kernels.</p>
+
+    <h3>What was verified for the Rust template</h3>
+    <p>The orb has no Rust toolchain (<code>cargo</code> and <code>rustc</code> are not installed), so the crate was
+      <strong>not built</strong> for this chapter. To still check the kernel half on the orb's 6.1 kernel,
+      <code>runqslower.bpf.c</code> and <code>runqslower.h</code> were compiled unchanged with the C template's Makefile and
+      loaded by a 20-line throwaway C loader (open, set <code>min_us = 1000</code>, load, attach, poll the perf buffer for
+      3 s). All three <code>tp_btf</code> programs loaded and attached, and 46 events over 1 ms were reported in the 3
+      seconds. Whether the libbpf-rs 0.20 user side builds with a current stable Rust compiler was not tested.</p>
+    <p>A small README inconsistency: it tells Ubuntu users to run <code>make install</code>, but the Rust template's Makefile
+      has only <code>build</code> and <code>clean</code>. Install the packages listed in <code>dockerfile-dev</code> instead
+      (<code>pkg-config build-essential zlib1g-dev clang llvm libelf1 libelf-dev</code>) plus a Rust toolchain from rustup.
+      Its Nix flake goes further than the C one: it uses fenix and naersk to <em>build the crate</em>, so
+      <code>nix run .#</code> builds and runs <code>runqslower</code>.</p>
+
+    <h2>The Go sibling: cilium-ebpf-starter-template</h2>
+    <p>For completeness: <a href="https://github.com/eunomia-bpf/cilium-ebpf-starter-template">cilium-ebpf-starter-template</a>
+      applies the same packaging (Dockerfile, dev container, flake, the same two workflows) to
+      <a href="https://github.com/cilium/ebpf">cilium/ebpf</a>, the pure-Go loader described in
+      <a href="08-ecosystem.html">08</a>. Go has no build script hook, so it uses <code>go generate</code> with cilium/ebpf's
+      <code>bpf2go</code> tool, which compiles the C file with clang and generates Go bindings plus an embedded object:</p>
+    <pre data-file="cilium-ebpf-starter-template/cmd/ringbuffer/main.go"><code class="language-go">// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS -type event bpf ringbuffer.c -- -I../headers
+
+func main() {
+	// Name of the kernel function to trace.
+	fn := "sys_execve"
+	/* ... rlimit.RemoveMemlock(), loadBpfObjects(&amp;objs, nil) ... */
+	kp, err := link.Kprobe(fn, objs.KprobeExecve, nil)
+	/* ... ringbuf.NewReader(objs.Events), read loop printing pid and comm ... */
+}</code></pre>
+    <p>The repository has not been touched since 25 March 2023. It pins cilium/ebpf v0.10.0 and Go 1.20, while cilium/ebpf's
+      latest release is v0.22.0. It does not vendor a <code>vmlinux.h</code>: the example uses a kprobe with
+      <code>struct pt_regs</code> and copies <code>bpf_helpers.h</code> into the source tree. It was not built for this
+      chapter. If you start a Go project today, use it only as a picture of the layout and take current code from
+      cilium/ebpf's own <code>examples/</code> directory.</p>
+
+    <h2>Comparing the templates with each other and with libbpf-bootstrap</h2>
+    <table>
+      <thead><tr><th></th><th>libbpf-starter-template (C)</th><th>libbpf-rs-starter-template (Rust)</th><th>libbpf-bootstrap (ch. 06)</th></tr></thead>
+      <tbody>
+        <tr><td>Purpose</td><td>Root of <em>your</em> repo, one app</td><td>Root of your repo, one crate</td><td>Example collection maintained by the libbpf authors</td></tr>
+        <tr><td>Example app</td><td><code>bootstrap</code> (exec/exit, ringbuf, tracepoints)</td><td><code>runqslower</code> (tp_btf, perf buffer, CO-RE flavor)</td><td>~15 C apps + Rust examples (<code>profile</code>, <code>tracecon</code>, <code>xdp</code>)</td></tr>
+        <tr><td>Build driver</td><td>make (<code>src/Makefile</code>)</td><td>cargo + <code>build.rs</code> (libbpf-cargo <code>SkeletonBuilder</code>)</td><td>make, also CMake and xmake</td></tr>
+        <tr><td>libbpf source</td><td>submodule @ <code>dcaac95</code> (1.8), static</td><td>crate libbpf-sys 1.4.3 (libbpf 1.4.5)</td><td>submodule, static</td></tr>
+        <tr><td>bpftool</td><td>submodule @ <code>48f7cc7</code> (v7.8.0), bootstrap build</td><td>not needed (libbpf-cargo generates the skeleton)</td><td>submodule, bootstrap build</td></tr>
+        <tr><td>vmlinux.h</td><td>vendored per arch: x86 (6.1/6.8/7.1, default 6.1), arm64, arm, riscv</td><td>one vendored x86 header</td><td>submodule libbpf/vmlinux.h, per arch</td></tr>
+        <tr><td>BPF object step</td><td><code>clang</code> + <code>llvm-strip -g</code></td><td>done by libbpf-cargo</td><td><code>clang</code> → <code>.tmp.bpf.o</code> → <code>bpftool gen object</code></td></tr>
+        <tr><td>Header dependencies</td><td>not tracked (see above)</td><td>only <code>.bpf.c</code> in <code>rerun-if-changed</code></td><td><code>-MMD -MP</code> dep files</td></tr>
+        <tr><td>Dev environment</td><td>dev container, Nix shell, <code>make install</code> (apt)</td><td>dev container, Nix build (fenix/naersk)</td><td>none provided (README lists apt packages)</td></tr>
+        <tr><td>CI / release</td><td>release per push + ghcr image</td><td>release per push + ghcr image (cached Rust)</td><td>CI builds examples, no product release</td></tr>
+        <tr><td>Freshness</td><td>submodules refreshed July 2026</td><td>libbpf-rs 0.20 API (upstream at 0.27)</td><td>active (commit Oct 2026)</td></tr>
+        <tr><td>License of template</td><td>MIT (example files keep their GPL/BSD/LGPL SPDX headers)</td><td>MIT (crate metadata LGPL-2.1/BSD-2)</td><td>BSD-3-Clause / per-file SPDX</td></tr>
+      </tbody>
+    </table>
+    <p>The practical reading: the C template is libbpf-bootstrap's C build, slightly older, rehomed and wrapped with
+      delivery tooling. If you need several BPF objects linked together, or exact incremental rebuilds, copy the newer rules
+      from libbpf-bootstrap into it. The Rust template is the smallest working libbpf-rs project, but it pins an API from
+      2023; if you will develop in Rust for a while, plan to update to a current libbpf-rs early, while the code is still
+      small. In both cases the files you would otherwise write yourself (CI, Dockerfiles, Nix) are the main value.</p>
+
+    <h2>Start your own project from the C template</h2>
+    <p>The steps below turn the C template into a tool called <code>execsnoop</code>. Steps 3–5 were executed in a scratch
+      copy in the orb: after them, <code>make</code> produced <code>execsnoop</code> and the skeleton defined
+      <code>struct execsnoop_bpf</code> and <code>execsnoop_bpf__open()</code>. A second app was then added with
+      <code>APPS = execsnoop runqslower</code> and also built. Steps 1, 2 and 6 involve GitHub and were not executed.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Create the repository</h4>
+        <p>Click <strong>Use this template → Create a new repository</strong> on
+          <a href="https://github.com/eunomia-bpf/libbpf-starter-template">the template page</a>, or run
+          <code>gh repo create my-execsnoop --template eunomia-bpf/libbpf-starter-template --public</code>. Your repository
+          starts with one commit. Keep the default branch name <code>master</code>, or edit the <code>branches:</code>
+          trigger in both workflows if you rename it.</p></div>
+      <div class="step"><h4>2. Clone with submodules and check them</h4>
+        <pre><code class="language-bash">git clone --recursive https://github.com/you/my-execsnoop.git
+cd my-execsnoop
+git submodule status          # expect lines for bpftool and libbpf
+# already cloned without --recursive?
+git submodule update --init --recursive</code></pre>
+        <p>If <code>git submodule status</code> is empty, re-add the two submodules as described in the warning near the
+          top of this chapter. Then install the toolchain (<code>make install</code> on Ubuntu, <code>nix develop</code>, or
+          open the dev container) and confirm that <code>make build &amp;&amp; sudo src/bootstrap</code> works before you change
+          anything.</p></div>
+      <div class="step"><h4>3. Rename the three source files</h4>
+        <pre><code class="language-bash">cd src
+git mv bootstrap.bpf.c execsnoop.bpf.c
+git mv bootstrap.c     execsnoop.c
+git mv bootstrap.h     execsnoop.h
+sed -i 's/^APPS = bootstrap/APPS = execsnoop/' Makefile</code></pre>
+        <p>The base name must be the same for all three: the pattern rules derive <code>execsnoop.bpf.o</code>,
+          <code>execsnoop.skel.h</code> and <code>execsnoop.o</code> from it, and <code>APPS</code> names the final
+          binary.</p></div>
+      <div class="step"><h4>4. Update the names the skeleton generates</h4>
+        <pre><code class="language-bash">sed -i 's/bootstrap\.h/execsnoop.h/; s/bootstrap\.skel\.h/execsnoop.skel.h/; s/bootstrap_bpf/execsnoop_bpf/g' \
+    execsnoop.c execsnoop.bpf.c</code></pre>
+        <p>bpftool names the skeleton after the object file, so <code>bootstrap_bpf__open()</code> becomes
+          <code>execsnoop_bpf__open()</code>, <code>struct bootstrap_bpf</code> becomes <code>struct execsnoop_bpf</code>,
+          and so on. Also update the <code>argp_program_version</code> and usage strings by hand.</p></div>
+      <div class="step"><h4>5. Build from clean and run</h4>
+        <pre><code class="language-bash">make clean &amp;&amp; make          # inside src/, or `make build` at the top
+sudo ./execsnoop -v 2&gt;&amp;1 | head</code></pre>
+        <p>Always build from clean after editing a shared header (the dependency gap described above). The
+          <code>-v</code> log shows CO-RE relocations and any verifier error.</p></div>
+      <div class="step"><h4>6. Update packaging and CI</h4>
+        <ul>
+          <li><code>src/.gitignore</code>: replace <code>/bootstrap</code> with <code>/execsnoop</code>.</li>
+          <li><code>dockerfile</code>: <code>ENTRYPOINT ["/root/src/execsnoop"]</code>.</li>
+          <li><code>.github/workflows/publish.yml</code>: <code>files: src/execsnoop</code>.</li>
+          <li><code>README.md</code>: the image is now <code>ghcr.io/you/my-execsnoop</code>.</li>
+          <li><code>flake.nix</code>: optionally rename the shell (<code>name = "libbpf-template"</code>).</li>
+        </ul>
+        <p>Push to <code>master</code>. The first run of <code>publish.yml</code> creates release <code>v0.0.1</code> if your
+          repository has no releases yet. If the release or image push fails with a permission error, check the repository's
+          Actions setting for the <code>GITHUB_TOKEN</code> (it needs write access to contents and packages); that setting
+          is outside the template.</p></div>
+      <div class="step"><h4>7. Replace the program</h4>
+        <p>Now change the logic: new <code>SEC()</code> hooks, new maps, a new <code>struct event</code>. Keep the pattern of
+          one header shared by both sides. To add a second tool, drop in <code>other.bpf.c</code>, <code>other.c</code> and
+          <code>other.h</code> and write <code>APPS = execsnoop other</code>. If you need kernel types newer than 6.1, point
+          the <code>vmlinux/x86/vmlinux.h</code> symlink at <code>vmlinux_71.h</code>, or at a header you dumped from your
+          own kernel.</p></div>
+    </div>
+    <p>For the Rust template the equivalent edits are: rename the package in <code>Cargo.toml</code>, rename
+      <code>src/bpf/runqslower.*</code>, change <code>SRC</code> and the output file name in <code>build.rs</code> (the
+      generated module is named after the file: <code>RunqslowerSkelBuilder</code> becomes
+      <code>YournameSkelBuilder</code>), update <code>mod runqslower</code> and the <code>runqslower_bss_types</code> path in
+      <code>main.rs</code>, then the binary path in <code>dockerfile</code> and <code>publish.yml</code>
+      (<code>target/release/&lt;name&gt;</code>). Note that the Rust <code>publish.yml</code> only publishes when
+      <code>github.repository_owner == 'eunomia-bpf'</code>: in your copy the release step is skipped until you change that
+      condition. These Rust steps were not executed in the orb.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefits</h4><p>Working build from minute one, with libbpf and bpftool pinned to known commits (C)
+        or crate versions (Rust), so the build does not depend on the distribution's libbpf. A statically linked result that
+        needs only libelf and zlib on the target. Delivery is already wired: a GitHub release and a container image on
+        every push. Three ways to get a toolchain (apt, dev container, Nix). The example programs are well-known
+        libbpf-bootstrap / libbpf-rs code, so tutorials (<a href="09-bpf-developer-tutorial.html">09</a>) and chapter 06
+        apply directly.</p></div>
+      <div class="card"><h4>Limitations</h4><p>Once generated, your repository no longer receives template fixes. The C
+        build lags libbpf-bootstrap (no <code>bpftool gen object</code>, no header dependency tracking) and vendors 19 MB of
+        headers, defaulting to a 6.1 x86 header. The Rust template pins the 2023 libbpf-rs 0.20 API. CI builds only
+        x86_64 and never loads the program, so verifier failures surface on your machine, not in CI. Small rough edges: the
+        README image name, the empty digest step, the Rust README's missing <code>make install</code>, the owner check in
+        the Rust release step. The Go sibling is unmaintained since 2023.</p></div>
+    </div>
+    <div class="callout tip"><span class="label">First improvements worth making</span>
+      <p>(1) Use <code>$(MAKE)</code> in the top Makefile so <code>-j</code> works. (2) Add <code>-MMD -MP</code> and
+        <code>-include $(wildcard $(OUTPUT)/*.d)</code> so header edits rebuild. (3) Add a CI step that runs the binary
+        under <code>sudo timeout 5</code> to catch verifier rejections. (4) Add an <code>arm64</code> runner or a
+        cross-compile job if you ship to ARM servers; the arm64 headers are already in <code>vmlinux/arm64/</code>.</p>
+    </div>
+
+    <h2>Related work and where to go next</h2>
+    <ul>
+      <li><strong>libbpf-bootstrap</strong> is the upstream of the C template and of the build pattern itself:
+        <a href="06-btf-core-libbpf.html">06 · BTF, CO-RE and libbpf</a> walks through its Makefile and the skeleton
+        lifecycle in detail.</li>
+      <li><strong>Loader libraries.</strong> libbpf-rs, cilium/ebpf and aya are compared in
+        <a href="08-ecosystem.html">08 · Ecosystem</a>. aya, unlike libbpf-rs, lets you write the BPF half in Rust too; its
+        project generator (<code>cargo generate</code> with aya-template) plays the same role as these templates for that
+        ecosystem.</li>
+      <li><strong>No loader at all.</strong> <a href="10-eunomia-bpf-ecc-ecli.html">10 · eunomia-bpf</a> and its
+        eunomia-template drop the user-space C file: <code>ecc</code> builds a package and <code>ecli</code> runs it.
+        <a href="12-wasm-bpf.html">12 · wasm-bpf</a> moves the user-space half into WebAssembly.</li>
+      <li><strong>Programs to put in your template.</strong> <a href="09-bpf-developer-tutorial.html">09 ·
+        bpf-developer-tutorial</a> has dozens of libbpf programs in the same <code>NAME.bpf.c</code> / <code>NAME.c</code>
+        layout; most drop into <code>src/</code> with an <code>APPS</code> entry.</li>
+      <li><strong>Old kernels.</strong> If your users run kernels without BTF, <a href="13-bpf-compatible.html">13 ·
+        bpf-compatible</a> adds BTFHub-based BTF to a libbpf build like this one.</li>
+      <li><strong>BCC's libbpf-tools</strong> (<a href="https://github.com/iovisor/bcc/tree/master/libbpf-tools">iovisor/bcc
+        libbpf-tools</a>) is a larger, production example of the same build style, with dozens of tools and multi-arch
+        vmlinux headers; read its Makefile when your project outgrows one app.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> On an x86_64 machine, which <code>vmlinux.h</code> does the C template compile
+        against by default?</p>
+        <button class="opt">The one generated at build time from <code>/sys/kernel/btf/vmlinux</code></button>
+        <button class="opt">A submodule pointing at libbpf/vmlinux.h</button>
+        <button class="opt" data-right><code>vmlinux/x86/vmlinux.h</code>, a symlink to the vendored
+          <code>vmlinux_601.h</code></button>
+        <button class="opt">The system's <code>/usr/include/linux</code> headers</button>
+        <div class="why"><code>ARCH</code> maps <code>x86_64</code> to <code>x86</code> and <code>VMLINUX :=
+          ../vmlinux/$(ARCH)/vmlinux.h</code>. The headers are committed in the template; the symlink picks the 6.1 one,
+          with 6.8 and 7.1 headers available next to it.</div></div>
+      <div class="q"><p><strong>Q2.</strong> You add a field to <code>struct event</code> in <code>src/bootstrap.h</code> and
+        run <code>make</code>. What happens?</p>
+        <button class="opt">Both the BPF object and the user binary are rebuilt</button>
+        <button class="opt">Only the BPF object is rebuilt</button>
+        <button class="opt" data-right>Nothing is rebuilt; <code>$(wildcard %.h)</code> expands to nothing, so you must
+          <code>make clean</code> (or add dependency files)</button>
+        <button class="opt">make fails with a missing-dependency error</button>
+        <div class="why">Verified in the orb: <code>touch bootstrap.h; make -n</code> prints nothing. <code>wildcard</code>
+          is evaluated when the Makefile is parsed and looks for a file literally named <code>%.h</code>.
+          libbpf-bootstrap avoids this with <code>-MMD -MP</code>.</div></div>
+      <div class="q"><p><strong>Q3.</strong> After renaming <code>bootstrap.bpf.c</code> to <code>execsnoop.bpf.c</code>,
+        which function opens the skeleton?</p>
+        <button class="opt"><code>bootstrap_bpf__open()</code>, the name is fixed in the template</button>
+        <button class="opt" data-right><code>execsnoop_bpf__open()</code>, because bpftool names the skeleton after the
+          object file <code>execsnoop.bpf.o</code></button>
+        <button class="opt"><code>bpf_object__open("execsnoop")</code></button>
+        <button class="opt"><code>execsnoop__open()</code>, the <code>.bpf</code> part is dropped</button>
+        <div class="why"><code>bpftool gen skeleton</code> strips <code>.o</code> and turns the remaining dot into an
+          underscore: <code>execsnoop.bpf</code> → <code>execsnoop_bpf</code>. That is why step 4 of the stepper replaces
+          <code>bootstrap_bpf</code> everywhere.</div></div>
+      <div class="q"><p><strong>Q4.</strong> The template's Rust code calls <code>skel_builder.open()?</code>. You change
+        <code>Cargo.toml</code> to <code>libbpf-rs = "0.27"</code>. What must you expect?</p>
+        <button class="opt">Nothing changes; libbpf-rs keeps its API stable</button>
+        <button class="opt">Only the BPF C code needs changes</button>
+        <button class="opt" data-right>The user-side code needs updating: since 0.24, <code>open()</code> takes a
+          <code>&amp;mut MaybeUninit</code> storage argument, and rodata and maps are accessed as fields</button>
+        <button class="opt">The template stops needing clang</button>
+        <div class="why">The libbpf-rs 0.24.0 changelog changed <code>SkelBuilder::open</code>, and the upstream example
+          uses <code>open_skel.maps.rodata_data</code> and <code>skel.maps.events</code>. libbpf-cargo still runs clang on
+          the BPF source.</div></div>
+      <div class="q"><p><strong>Q5.</strong> The template's x86 header and the orb's kernel are both "6.1", yet libbpf logged
+        <code>patched insn #30 ... imm 1416 -&gt; 1400</code>. Why?</p>
+        <button class="opt">The header is corrupted</button>
+        <button class="opt" data-right><code>task_struct</code>'s layout depends on kernel configuration, not only version;
+          CO-RE matched <code>real_parent</code> by name in the running kernel's BTF and fixed the offset</button>
+        <button class="opt">The verifier adjusts offsets of all memory loads</button>
+        <button class="opt">bpftool rewrote the offset while generating the skeleton</button>
+        <div class="why">Two kernels of the same version built with different Kconfig options have different
+          <code>task_struct</code> layouts. Relocation happens at load time in libbpf, after the skeleton was
+          generated.</div></div>
+      <div class="q"><p><strong>Q6.</strong> What does the green check mark from the template's <code>publish.yml</code>
+        prove?</p>
+        <button class="opt">The program passes the verifier on all supported kernels</button>
+        <button class="opt">The program was loaded and attached on the CI runner</button>
+        <button class="opt" data-right>The BPF object and the user binary compile and link on ubuntu-latest (x86_64), and a
+          release with the binary was created</button>
+        <button class="opt">The Docker image runs correctly</button>
+        <div class="why">The workflow runs <code>make build</code> and uploads <code>src/bootstrap</code>. Nothing executes
+          the binary, so verifier and attach problems are not caught; add a run step if you need that.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/libbpf-starter-template">eunomia-bpf/libbpf-starter-template</a>, commit
+        <code>6e572b6d53cede2158dce357d1d5ebb1346640ce</code> (2026-09-16). Files quoted: <code>Makefile</code>,
+        <code>src/Makefile</code>, <code>src/bootstrap.bpf.c</code>, <code>src/bootstrap.c</code>,
+        <code>src/bootstrap.h</code>, <code>dockerfile</code>, <code>dev.dockerfile</code>,
+        <code>.devcontainer/devcontainer.json</code>, <code>flake.nix</code>, <code>.github/workflows/publish.yml</code>,
+        <code>README.md</code>. Commits cited: <code>fd14bb1</code>, <code>5ba4410</code>, <code>a916454</code>,
+        <code>13a3549</code>.</li>
+      <li><a href="https://github.com/eunomia-bpf/libbpf-rs-starter-template">eunomia-bpf/libbpf-rs-starter-template</a>,
+        commit <code>8927eea171db99ee8ada902380b0bc38f13aed53</code> (2026-09-16). Files quoted: <code>Cargo.toml</code>,
+        <code>build.rs</code>, <code>src/main.rs</code>, <code>src/bpf/runqslower.bpf.c</code>.</li>
+      <li><a href="https://github.com/eunomia-bpf/cilium-ebpf-starter-template">eunomia-bpf/cilium-ebpf-starter-template</a>,
+        commit <code>ec9a4303e13ea136d44f11f80dc4ac770bf0c148</code> (2023-03-25).</li>
+      <li><a href="https://github.com/libbpf/libbpf-bootstrap">libbpf/libbpf-bootstrap</a>, commit
+        <code>820a1bd8b4f4cb4b78b442ae4eb3994738651f12</code> (2026-10-22), <code>examples/c/Makefile</code> and
+        <code>examples/c/bootstrap.*</code>; Andrii Nakryiko,
+        <a href="https://nakryiko.com/posts/libbpf-bootstrap/">"Building BPF applications with libbpf-bootstrap"</a>.</li>
+      <li><a href="https://github.com/libbpf/libbpf">libbpf/libbpf</a> (submodule commit <code>dcaac95</code>, v1.8) and
+        <a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a> (submodule commit <code>48f7cc7</code>, v7.8.0);
+        <a href="https://github.com/libbpf/bpftool/blob/main/docs/bpftool-gen.rst">bpftool-gen documentation</a>.</li>
+      <li><a href="https://github.com/libbpf/libbpf-rs">libbpf/libbpf-rs</a>, commit <code>9680ea7</code> (2026-11-04):
+        <code>examples/runqslower/</code> and <a href="https://github.com/libbpf/libbpf-rs/blob/master/libbpf-rs/CHANGELOG.md">libbpf-rs/CHANGELOG.md</a>
+        (0.24.0 entry on <code>SkelBuilder::open</code>); crate docs for
+        <a href="https://docs.rs/libbpf-cargo/">libbpf-cargo</a>.</li>
+      <li><a href="https://github.com/cilium/ebpf">cilium/ebpf</a> and
+        <a href="https://pkg.go.dev/github.com/cilium/ebpf/cmd/bpf2go">bpf2go documentation</a>.</li>
+      <li><a href="https://github.com/libbpf/vmlinux.h">libbpf/vmlinux.h</a>, pre-generated vmlinux headers.</li>
+      <li>GitHub Docs, <a href="https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-repository-from-a-template">"Creating
+        a repository from a template"</a> and <a href="https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-template-repository">"Creating
+        a template repository"</a>; GitHub CLI manual, <a href="https://cli.github.com/manual/gh_repo_create">gh repo
+        create</a>.</li>
+      <li><a href="https://containers.dev/">Development Containers specification</a> (<code>devcontainer.json</code>).</li>
+      <li>Linux kernel documentation, <a href="https://docs.kernel.org/bpf/btf.html">"BPF Type Format (BTF)"</a> and
+        <a href="https://docs.kernel.org/bpf/libbpf/libbpf_overview.html">"libbpf Overview"</a>.</li>
+      <li>Andrii Nakryiko, <a href="https://nakryiko.com/posts/bpf-core-reference-guide/">"BPF CO-RE reference guide"</a>
+        (type flavors and <code>bpf_core_field_exists</code>).</li>
+      <li>BCC, <a href="https://github.com/iovisor/bcc/tree/master/libbpf-tools">libbpf-tools</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="10-eunomia-bpf-ecc-ecli.html"><small>Previous</small>10 · eunomia-bpf: ecc and ecli</a>
+      <a class="next" href="12-wasm-bpf.html"><small>Next</small>12 · wasm-bpf: eBPF user space in WebAssembly</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,1441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · bpftime in practice · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="15">
+<meta name="chapter-part" content="Part III · Userspace eBPF runtimes">
+<meta name="chapter-summary" content="How to install and drive bpftime: the load/start/attach/trace CLI, running unmodified libbpf tools (malloc, opensnoop, bashreadline, sslsniff, bpftrace) in userspace, bpftimetool, kernel-user mixed mode, CUDA kernel probes, XDP and nginx integrations, the repo's own benchmark numbers, and the current limits.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpftime">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part III · Userspace eBPF runtimes › 15 · bpftime in practice</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 15</div>
+      <h1>bpftime in practice: running eBPF tools in userspace</h1>
+      <p class="lede">You have a libbpf tool, such as a malloc counter, opensnoop or sslsniff, and
+      you want it to run inside the traced process instead of trapping into the kernel on every
+      event. Maybe the machine has no root access, or the kernel is too old. This chapter shows
+      how to do that with bpftime: install it, use its CLI, run four real examples from start to
+      finish, inspect shared state, mix kernel and userspace eBPF, probe CUDA kernels, and read
+      the repository's own benchmark numbers honestly.</p>
+      <div class="meta"><span>Prerequisites: <a href="05-program-types-and-hooks.html">05</a>, <a href="06-btf-core-libbpf.html">06</a>, <a href="14-bpftime-architecture.html">14</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/bpftime">eunomia-bpf/bpftime</a> @ <code>25e250d6</code></span><span>~55 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>Kernel uprobes work by placing a breakpoint instruction in the traced binary. Every time
+    the probed function runs, the CPU traps into the kernel, the kernel runs your eBPF program,
+    and then it returns to userspace. That is two mode switches per event. For a function like
+    <code>malloc</code> or <code>SSL_read</code>, which can run millions of times a second, those
+    traps cost more than the eBPF program itself. Syscall tracepoints have a related problem:
+    they need root (or <code>CAP_BPF</code> plus <code>CAP_PERFMON</code>) and a kernel with the
+    right configuration.</p>
+    <p><strong>bpftime</strong> is a userspace eBPF runtime from the eunomia-bpf organisation. It
+    takes the same compiled eBPF object and the same libbpf loader you would use with the kernel,
+    and runs the program <em>inside the target process</em>. It hooks functions with binary
+    rewriting instead of traps, and it keeps maps in shared memory instead of kernel memory.
+    <a href="14-bpftime-architecture.html">Chapter 14</a> explains the design, the internals and
+    the OSDI '25 paper. This chapter is the hands-on part: which commands to type, which files to
+    look at, what output to expect, and where the sharp edges are.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>A bpftime session always has
+    two sides. The <strong>loader</strong> (your libbpf tool) runs with
+    <code>libbpftime-syscall-server.so</code> preloaded, so its <code>bpf()</code> and
+    <code>perf_event_open()</code> calls go into a shared-memory segment instead of the kernel.
+    The <strong>target</strong> runs with <code>libbpftime-agent.so</code>, either preloaded at
+    start or injected later. The agent reads that segment, JIT-compiles the programs and patches
+    the hooks. Neither side needs to be recompiled.</p></div>
+
+    <div class="callout warn"><span class="label">Status</span><p>The repository's own manual
+    (<code>usage.md</code>) still opens with: "It's at an early stage and may contain bugs on more
+    platforms and eBPF programs … It's not suitable for production use now." The GPU README says
+    "GPU support is still experimental." Treat everything in this chapter as a developer tool
+    unless you have tested it on your own workload.</p></div>
+
+    <h2>The two-process workflow</h2>
+    <p>Before any commands, here is what happens when you run the canonical example. You start a
+    libbpf program (the loader) under <code>bpftime load</code>, and a victim program under
+    <code>bpftime start</code>. Figure 15.1 shows the pieces and the data flow.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 470" role="img" aria-label="Two-process bpftime workflow: loader with syscall-server writes programs and maps into shared memory; target with agent reads them, attaches hooks and runs programs in-process.">
+        <style>
+          .box{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .ac{fill:none;stroke:var(--accent);stroke-width:2}
+          .ac2{fill:none;stroke:var(--accent2);stroke-width:2}
+          .t{fill:var(--fg);font:600 15px sans-serif}
+          .s{fill:var(--fg);font:12.5px monospace}
+          .m{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.6;fill:none;marker-end:url(#ah15a)}
+          .ar2{stroke:var(--accent2);stroke-width:1.6;fill:none;stroke-dasharray:6 4;marker-end:url(#ah15b)}
+        </style>
+        <defs>
+          <marker id="ah15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker>
+          <marker id="ah15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <!-- loader -->
+        <rect class="box" x="15" y="15" width="300" height="330" rx="10"/>
+        <text class="t" x="30" y="40">Terminal 1 · loader process</text>
+        <text class="s" x="30" y="62">$ bpftime load ./malloc</text>
+        <rect class="ac" x="30" y="78" width="270" height="70" rx="8"/>
+        <text class="s" x="42" y="100">malloc.c (libbpf skeleton)</text>
+        <text class="m" x="42" y="118">open → load → attach_uprobe</text>
+        <text class="m" x="42" y="136">then poll the hash map every 1 s</text>
+        <rect class="ac2" x="30" y="170" width="270" height="92" rx="8"/>
+        <text class="s" x="42" y="192">libbpftime-syscall-server.so</text>
+        <text class="m" x="42" y="210">LD_PRELOAD; intercepts bpf(),</text>
+        <text class="m" x="42" y="226">perf_event_open(), ioctl(), mmap()</text>
+        <text class="m" x="42" y="244">and answers them from shared memory</text>
+        <line class="ar" x1="165" y1="148" x2="165" y2="168"/>
+        <text class="m" x="30" y="290">The kernel never sees BPF_PROG_LOAD</text>
+        <text class="m" x="30" y="308">(unless BPFTIME_RUN_WITH_KERNEL=true).</text>
+        <text class="m" x="30" y="326">No root needed in userspace-only mode.</text>
+        <!-- shm -->
+        <rect class="box" x="345" y="95" width="270" height="250" rx="10"/>
+        <text class="t" x="360" y="120">Shared memory</text>
+        <text class="s" x="360" y="140">/dev/shm/bpftime_maps_shm</text>
+        <text class="m" x="360" y="160">boost::interprocess segment holding</text>
+        <text class="m" x="360" y="176">the handler table, indexed by "fd":</text>
+        <text class="s" x="372" y="202">fd 3  bpf_map_handler</text>
+        <text class="s" x="372" y="222">fd 4  bpf_prog_handler</text>
+        <text class="s" x="372" y="242">fd 5  bpf_perf_event_handler</text>
+        <text class="s" x="372" y="262">fd 6  bpf_link_handler</text>
+        <text class="m" x="360" y="290">map values live here too, so both</text>
+        <text class="m" x="360" y="306">processes read and write them directly</text>
+        <text class="m" x="360" y="330">inspect: bpftimetool export state.json</text>
+        <line class="ar" x1="300" y1="215" x2="343" y2="215"/>
+        <!-- target -->
+        <rect class="box" x="645" y="15" width="300" height="330" rx="10"/>
+        <text class="t" x="660" y="40">Terminal 2 · target process</text>
+        <text class="s" x="660" y="62">$ bpftime start ./victim</text>
+        <text class="m" x="660" y="78">or: sudo bpftime attach &lt;pid&gt;</text>
+        <rect class="ac2" x="660" y="92" width="270" height="92" rx="8"/>
+        <text class="s" x="672" y="114">libbpftime-agent.so</text>
+        <text class="m" x="672" y="132">reads handlers from shm, JIT-compiles</text>
+        <text class="m" x="672" y="148">(LLVM by default), creates attaches</text>
+        <text class="m" x="672" y="166">via Frida (uprobe) or zpoline-style (-s)</text>
+        <rect class="ac" x="660" y="206" width="270" height="74" rx="8"/>
+        <text class="s" x="672" y="228">victim.c: malloc(1024) loop</text>
+        <text class="m" x="672" y="246">malloc entry → trampoline → do_count()</text>
+        <text class="m" x="672" y="264">runs in this process, no kernel trap</text>
+        <line class="ar" x1="795" y1="184" x2="795" y2="204"/>
+        <line class="ar" x1="617" y1="160" x2="658" y2="140"/>
+        <line class="ar2" x1="658" y1="250" x2="617" y2="270"/>
+        <text class="m" x="660" y="306">map updates from do_count() land in shm;</text>
+        <text class="m" x="660" y="322">the loader's next lookup sees them</text>
+        <!-- kernel -->
+        <rect class="box" x="15" y="370" width="930" height="80" rx="10"/>
+        <text class="t" x="30" y="396">Kernel</text>
+        <text class="m" x="30" y="418">Userspace-only mode: no eBPF programs, maps or uprobes are created in the kernel. The kernel only sees ordinary</text>
+        <text class="m" x="30" y="436">mmap/shm_open/futex calls. Order matters: run load first, then start (the agent attaches what it finds at startup).</text>
+      </svg>
+      <figcaption>Figure 15.1 — The bpftime two-process workflow. The loader and the target never talk
+      directly. They share one named shared-memory segment (default name
+      <code>bpftime_maps_shm</code>, overridable with <code>BPFTIME_GLOBAL_SHM_NAME</code>).</figcaption>
+    </figure>
+
+    <p>The order matters, and the top-level README says so directly: "You should always run the
+    <code>load</code> first then run the <code>start</code> command, or the eBPF program will not
+    be attached." With <code>bpftime start</code>, the agent attaches what it finds when the
+    target starts. The newer <code>bpftime trace</code> command removes this restriction for
+    long-running targets: it polls for links that appear later (see
+    <a href="#the-bpftime-cli">the CLI section</a>).</p>
+
+    <h2>Installing bpftime</h2>
+    <p>There are three ways to get bpftime: the container image, a source build with the Makefile
+    wrapper, or a source build with CMake directly. Check the releases page before you look for a
+    tarball. As of 2026-11-06, the five most recent GitHub releases (v0.9.0 from 2026-08-14,
+    v0.2.0, v0.1.0, v0.0.3 and v0.0.2) have <em>no binary assets attached</em>. The release
+    workflow (<code>.github/workflows/docker.yml</code>) publishes a container image to
+    <code>ghcr.io/eunomia-bpf/bpftime</code>, tagged with the release version, and then creates
+    the GitHub release. In practice, the prebuilt option is the container.</p>
+
+    <h3>Option A: the container image</h3>
+    <p>From <code>installation.md</code>:</p>
+    <pre data-file="installation.md"><code class="language-bash"># run the container
+docker run -it --rm --name test_bpftime -v "$(pwd)":/workdir -w /workdir ghcr.io/eunomia-bpf/bpftime:latest /bin/bash
+# start another shell in the container (If needed)
+docker exec -it test_bpftime /bin/bash</code></pre>
+    <p>The <code>Dockerfile</code> builds on <code>ubuntu:24.04</code> with clang-16 and
+    llvm-16, configures with <code>-DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_BPFTIME_DAEMON=1</code>,
+    runs <code>make install</code>, and adds <code>/root/.bpftime/</code> to <code>PATH</code>.
+    The image therefore contains the CLI, the daemon and the preload libraries. The
+    <code>docker exec</code> line matters because the workflow needs two shells, one for the
+    loader and one for the target.</p>
+
+    <h3>Option B: build from source</h3>
+    <p>The dependency list and build commands below are copied from <code>installation.md</code>.
+    The docs were tested on Ubuntu 23.04 and recommend gcc ≥ 12 and clang ≥ 16:</p>
+    <pre data-file="installation.md"><code class="language-bash">sudo apt-get update &amp;&amp; sudo apt-get install \
+        libelf1 libelf-dev libssl-dev zlib1g-dev make cmake git libboost-all-dev \
+        binutils-dev libyaml-cpp-dev ca-certificates clang llvm pkg-config llvm-dev
+git submodule update --init --recursive
+
+make release JOBS=$(nproc) # Build and install the runtime
+export PATH=$PATH:~/.bpftime</code></pre>
+    <p>The <code>release</code> target in the <code>Makefile</code> is a thin wrapper:</p>
+    <pre data-file="Makefile"><code class="language-makefile">release: ## build the release version
+	cmake -Bbuild  -DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo \
+				   -DBUILD_BPFTIME_DAEMON=1
+	cmake --build build --config RelWithDebInfo --target install  -j$(JOBS)</code></pre>
+    <p>The build is a large C++ project. It pulls in LLVM for the JIT, Frida for function hooking,
+    Boost.Interprocess, libbpf and bpftool as submodules. Expect it to take a while and to use a
+    lot of memory. When it finishes, <code>~/.bpftime/</code> contains:</p>
+    <table>
+      <thead><tr><th>Installed file</th><th>Role (from <code>installation.md</code> / <code>tools/README.md</code>)</th></tr></thead>
+      <tbody>
+        <tr><td><code>bpftime</code></td><td>CLI that injects the agent or syscall server into programs</td></tr>
+        <tr><td><code>bpftimetool</code></td><td>Inspect and manage objects stored in shared memory</td></tr>
+        <tr><td><code>bpftime-vm</code> / <code>bpftime-aot</code></td><td>Compile eBPF to native code, or run the compiled program</td></tr>
+        <tr><td><code>bpftime_daemon</code></td><td>Kernel-assisted mode that redirects kernel uprobe programs to userspace without injecting the loader</td></tr>
+        <tr><td><code>libbpftime-syscall-server.so</code></td><td>Preloaded into the loader</td></tr>
+        <tr><td><code>libbpftime-agent.so</code>, <code>libbpftime-agent-transformer.so</code></td><td>Preloaded or injected into the target. The transformer adds syscall rewriting</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Build options you will actually touch</h3>
+    <p>All of these come from the option list in <code>installation.md</code>
+    (<code>cmake/StandardSettings.cmake</code> has the full set):</p>
+    <ul>
+      <li><code>BPFTIME_LLVM_JIT</code> (default ON): the LLVM JIT/AOT backend from
+      <a href="16-llvmbpf.html">llvmbpf</a>. <code>BPFTIME_UBPF_JIT</code> selects the uBPF backend.</li>
+      <li><code>ENABLE_EBPF_VERIFIER</code> (default OFF): link the PREVAIL userspace verifier.</li>
+      <li><code>BPFTIME_BUILD_WITH_LIBBPF</code> / <code>BPFTIME_BUILD_KERNEL_BPF</code>: turn these off
+      to build without kernel eBPF support, for example on macOS.</li>
+      <li><code>BPFTIME_ENABLE_CUDA_ATTACH</code> + <code>BPFTIME_CUDA_ROOT</code>: GPU support (see
+      <a href="#gpu-and-cuda-probes">below</a>).</li>
+      <li><code>BPFTIME_BUILD_STATIC_LIB</code>: produce <code>libbpftime.a</code> for embedding.</li>
+      <li><code>BPFTIME_ENABLE_MPK</code>, <code>BPFTIME_ENABLE_IOURING_EXT</code>: memory-protection
+      keys for the shared segment, and io_uring helper extensions.</li>
+    </ul>
+    <p>For a much smaller build that contains only the VM, with no runtime and no uprobes, use
+    <code>make build-vm</code> or <code>make build-llvm</code>.</p>
+
+    <h2>Where things live in the repo</h2>
+    <p><a href="14-bpftime-architecture.html">Chapter 14</a> has the full architecture map. These
+    are the directories a <em>user</em> visits:</p>
+    <div class="grid">
+      <div class="card"><h4><code>tools/cli/</code></h4><p>The <code>bpftime</code> command, in one file
+      (<code>main.cpp</code>, ~1,300 lines). It is the authority on subcommands and flags.</p></div>
+      <div class="card"><h4><code>tools/bpftimetool/</code></h4><p>Shared-memory inspector: export, import,
+      run and benchmark programs.</p></div>
+      <div class="card"><h4><code>runtime/syscall-server/</code>, <code>runtime/agent/</code></h4><p>The two
+      preload libraries. The syscall-server README documents <code>BPFTIME_RUN_WITH_KERNEL</code>.</p></div>
+      <div class="card"><h4><code>attach/</code></h4><p>Hook backends: <code>frida_uprobe_attach_impl</code>,
+      <code>syscall_trace_attach_impl</code>, <code>text_segment_transformer</code>,
+      <code>nv_attach_impl</code> (CUDA), <code>trap_uprobe_attach_impl</code> (riscv64).</p></div>
+      <div class="card"><h4><code>example/</code></h4><p>Runnable examples: <code>malloc</code>, <code>minimal</code>,
+      <code>tracing/*</code> (bcc libbpf-tools ports), <code>gpu/*</code>, <code>xdp-counter</code>,
+      <code>attach_implementation</code> (nginx), <code>hotpatch</code>, <code>error-inject</code>.</p></div>
+      <div class="card"><h4><code>daemon/</code></h4><p><code>bpftime_daemon</code>: uses a kernel eBPF
+      tracer to capture <code>bpf()</code> calls and redirect uprobes to userspace.</p></div>
+      <div class="card"><h4><code>benchmark/</code></h4><p>Micro-benchmarks (uprobe, syscall, MPK, GPU) and
+      application experiments (ssl-nginx, syscount-nginx, deepflow, fuse, redis).</p></div>
+      <div class="card"><h4><code>usage.md</code>, <code>installation.md</code></h4><p>The manual. The
+      environment variables are listed in <code>runtime/include/bpftime_config.hpp</code>.</p></div>
+    </div>
+
+    <h2 id="the-bpftime-cli">The bpftime CLI</h2>
+    <p>The tool's README gives a summary, but the argparse definitions in
+    <code>tools/cli/main.cpp</code> are what actually run. The excerpt below declares every
+    subcommand:</p>
+    <pre data-file="tools/cli/main.cpp"><code class="language-cpp">	argparse::ArgumentParser load_command("load");
+
+	load_command
+		.add_description(
+			"Start an application with bpftime-server injected")
+	/* ... */
+	load_command.add_argument("COMMAND")
+		.help("Command to run")
+		.nargs(argparse::nargs_pattern::at_least_one)
+		.remaining();
+	add_common_runtime_env_cli_options(load_command);
+	add_kernel_loader_cli_options(load_command);
+
+	argparse::ArgumentParser start_command("start");
+
+	start_command
+		.add_description(
+			"Start an application with bpftime-agent injected")
+	/* ... */
+	start_command.add_argument("-s", "--enable-syscall-trace")
+		.help("Whether to enable syscall trace")
+		.flag();
+	/* ... */
+	argparse::ArgumentParser attach_command("attach");
+
+	attach_command.add_description("Inject bpftime-agent to a certain pid")
+	/* ... */
+	attach_command.add_argument("-s", "--enable-syscall-trace")
+		.help("Whether to enable syscall trace")
+		.flag();
+	attach_command.add_argument("PID").scan&lt;'i', int&gt;();
+
+	argparse::ArgumentParser detach_command("detach");
+	detach_command.add_description("Detach all attached agents")
+	/* ... */
+	argparse::ArgumentParser trace_command("trace");
+	trace_command.add_description(
+		"Run a loader with bpftime-server injected, then attach bpftime-agent to a running process");
+	trace_command.add_argument("--pid")
+	/* ... */
+	trace_command.add_argument("--pidof")
+		.help("Resolve PID by /proc/&lt;pid&gt;/comm name (Linux only); must match exactly and be unique")
+	/* ... */
+	trace_command.add_argument("--auto-refresh-ms")
+		.help("Agent-side auto refresh interval (ms) for discovering late-loaded links")
+		.default_value(500)
+		.scan&lt;'i', int&gt;();</code></pre>
+
+    <p>The table below lists what each subcommand does, based on the code that handles it in
+    <code>main()</code>:</p>
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th><th>Equivalent by hand</th></tr></thead>
+      <tbody>
+        <tr><td><code>bpftime load CMD…</code></td><td>Fork and exec <code>CMD</code> with
+        <code>LD_PRELOAD=libbpftime-syscall-server.so</code>. Waits for it to exit.</td>
+        <td><code>LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so CMD</code></td></tr>
+        <tr><td><code>bpftime start CMD…</code></td><td>Exec <code>CMD</code> with the agent preloaded.</td>
+        <td><code>LD_PRELOAD=~/.bpftime/libbpftime-agent.so CMD</code></td></tr>
+        <tr><td><code>bpftime start -s CMD…</code></td><td>Preload the <em>transformer</em> and pass the
+        agent path in <code>AGENT_SO</code>. The transformer rewrites syscall instructions, then loads the agent.</td>
+        <td><code>AGENT_SO=…/libbpftime-agent.so LD_PRELOAD=…/libbpftime-agent-transformer.so CMD</code></td></tr>
+        <tr><td><code>bpftime attach [-s] PID</code></td><td>Inject the agent (or the transformer) into a
+        running process with Frida's injector, calling <code>bpftime_agent_main</code>.</td><td>none, needs ptrace rights</td></tr>
+        <tr><td><code>bpftime detach</code></td><td>For each PID in the shared "alive agent" set, send an
+        IPC <code>detach</code> request, then <code>SIGUSR1</code>.</td><td><code>kill -USR1 PID</code></td></tr>
+        <tr><td><code>bpftime trace --pid|--pidof … CMD…</code></td><td>Start the loader with the syscall server,
+        then attach the agent to a running PID. It first tries to refresh an agent that is already present over
+        an abstract unix socket <code>bpftime-agent-&lt;pid&gt;</code>, and falls back to Frida injection.
+        Polls for new links every <code>--auto-refresh-ms</code>. On Ctrl-C it detaches the agent before
+        stopping the loader.</td><td>none</td></tr>
+      </tbody>
+    </table>
+    <p>The global options are <code>-i/--install-location</code> (default <code>$HOME/.bpftime</code>)
+    and <code>-d/--dry-run</code>. The CLI looks for libraries in the build tree first
+    (<code>runtime/agent/</code>, <code>runtime/syscall-server/</code>,
+    <code>attach/text_segment_transformer/</code>) when the binary runs from a build directory.
+    Otherwise it uses the install location.</p>
+    <p>Only <code>load</code> takes the runtime options. Each one is a command-line form of an
+    environment variable:</p>
+    <pre data-file="tools/cli/main.cpp"><code class="language-cpp">static void
+add_common_runtime_env_cli_options(argparse::ArgumentParser &amp;command)
+{
+	command.add_argument("--no-jit")
+		.help("Same as BPFTIME_DISABLE_JIT, disable JIT and use interpreter")
+		.flag();
+	command.add_argument("--spdlog-level")
+	/* ... */
+	command.add_argument("--bpftime-log-output")
+	/* ... */
+	command.add_argument("--allow-external-maps")
+	/* ... */
+	command.add_argument("--fuzzy-backtracer")
+	/* ... */
+	command.add_argument("--memory-size")
+		.help("Same as BPFTIME_SHM_MEMORY_MB, set the shared memory size for bpftime maps in MB.")
+		.nargs(1)
+		.scan&lt;'i', int&gt;();
+}
+
+static void add_kernel_loader_cli_options(argparse::ArgumentParser &amp;command)
+{
+	command.add_argument("--run-with-kernel-verifier")
+		.help("Same as BPFTIME_RUN_WITH_KERNEL, load the eBPF application with the kernel eBPF loader and kernel verifier.")
+		.flag();
+	command.add_argument("--bpftime-not-load-pattern")
+	/* ... */
+}</code></pre>
+
+    <h3>Runtime configuration by environment</h3>
+    <p>The preload libraries read their configuration from environment variables, which are
+    parsed in <code>runtime/src/bpftime_config.cpp</code>. These are the ones that matter in
+    practice:</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>BPFTIME_DISABLE_JIT</code></td><td>Use the interpreter. JIT is on by default. Old builds used <code>BPFTIME_USE_JIT=true</code> to opt in.</td></tr>
+        <tr><td><code>BPFTIME_VM_NAME</code></td><td>Select the VM backend by name (the Dockerfile sets <code>llvm</code>).</td></tr>
+        <tr><td><code>SPDLOG_LEVEL</code></td><td><code>trace</code> … <code>off</code>.</td></tr>
+        <tr><td><code>BPFTIME_LOG_OUTPUT</code></td><td>Default is <code>~/.bpftime/runtime.log</code>, so the host's stdout stays clean. Set it to <code>console</code> or a file path.</td></tr>
+        <tr><td><code>BPFTIME_SHM_MEMORY_MB</code></td><td>Size of the shared segment, from 1 to 10240 MB.</td></tr>
+        <tr><td><code>BPFTIME_MAX_FD_COUNT</code></td><td>Size of the handler table (default 6144). It also lives in shared memory.</td></tr>
+        <tr><td><code>BPFTIME_HELPER_GROUPS</code></td><td>Comma list of <code>kernel</code>, <code>shm_map</code>, <code>ufunc</code>. If set, only the listed groups are enabled.</td></tr>
+        <tr><td><code>BPFTIME_VERIFIER_LEVEL</code></td><td><code>STRICT</code>, <code>WARNING</code> (default) or <code>NO_VERIFY</code>.</td></tr>
+        <tr><td><code>BPFTIME_RUN_WITH_KERNEL</code>, <code>BPFTIME_NOT_LOAD_PATTERN</code></td><td>Kernel-user mixed mode (see <a href="#kernel-user-mixed-mode">below</a>).</td></tr>
+        <tr><td><code>BPFTIME_ALLOW_EXTERNAL_MAPS</code></td><td>Accept map types bpftime does not implement, for example a custom XDP map handled by your own driver.</td></tr>
+        <tr><td><code>BPFTIME_FRIDA_FUZZY_BACKTRACER</code></td><td>Use Frida's fuzzy unwinder for user stacks. Helps with stripped binaries.</td></tr>
+        <tr><td><code>BPFTIME_GLOBAL_SHM_NAME</code></td><td>Name of the shared segment (default <code>bpftime_maps_shm</code>).</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="label">Verifier default</span><p>The comment on
+    <code>BPFTIME_VERIFIER_WARNING</code> in <code>runtime/include/bpftime_config.hpp</code> reads:
+    "Userspace verifier failure is treated as a warning (default). Program loading continues even
+    if verification fails." The PREVAIL verifier is also compiled in only when you build with
+    <code>ENABLE_EBPF_VERIFIER=YES</code>. If you depend on verification for safety, set
+    <code>BPFTIME_VERIFIER_LEVEL=STRICT</code>, or use the kernel verifier with
+    <code>BPFTIME_RUN_WITH_KERNEL=true</code>. <code>usage.md</code> itself recommends the kernel
+    verifier.</p></div>
+
+    <h2>Walkthrough 1: counting malloc with a uprobe</h2>
+    <p><code>example/malloc</code> is the canonical first run. It is an ordinary libbpf program
+    that counts <code>malloc</code> calls per PID. The same binary works unchanged against the
+    kernel.</p>
+    <pre data-file="example/malloc/malloc.bpf.c"><code class="language-c">#define BPF_NO_GLOBAL_DATA
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u32);
+	__type(value, u64);
+} libc_malloc_calls_total SEC(".maps");
+
+static int increment_map(void *map, void *key, u64 increment)
+{
+	u64 zero = 0, *count = bpf_map_lookup_elem(map, key);
+	if (!count) {
+		bpf_map_update_elem(map, key, &amp;zero, BPF_NOEXIST);
+		count = bpf_map_lookup_elem(map, key);
+		if (!count) {
+			return 0;
+		}
+	}
+	u64 res = *count + increment;
+	bpf_map_update_elem(map, key, &amp;res, BPF_EXIST);
+
+	return *count;
+}
+
+SEC("uprobe/libc.so.6:malloc")
+int do_count(struct pt_regs *ctx)
+{
+	u32 pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	bpf_printk("malloc called from pid %d\n", pid);
+
+	increment_map(&amp;libc_malloc_calls_total, &amp;pid, 1);
+
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+    <p>The loader is a standard libbpf skeleton program. There is nothing bpftime-specific in
+    it, and that is the point:</p>
+    <pre data-file="example/malloc/malloc.c"><code class="language-c">	/* Load and verify BPF application */
+	skel = malloc_bpf__open();
+	/* ... */
+	/* Load &amp; verify BPF programs */
+	err = malloc_bpf__load(skel);
+	/* ... */
+	LIBBPF_OPTS(bpf_uprobe_opts, attach_opts, .func_name = "malloc",
+		    .retprobe = false);
+	struct bpf_link *attach = bpf_program__attach_uprobe_opts(
+		skel-&gt;progs.do_count, -1, "libc.so.6", 0, &amp;attach_opts);
+	/* ... */
+	while (!exiting) {
+		sleep(1);
+		print_stat(skel);
+	}</code></pre>
+    <p><code>print_stat()</code> iterates over the map with <code>bpf_map_get_next_key</code>,
+    <code>bpf_map_lookup_elem</code> and <code>bpf_map_delete_elem</code>. Under bpftime, those
+    libbpf calls still go through the <code>bpf()</code> syscall wrapper. The syscall server
+    intercepts them and serves them from the shared map. The victim is a tight loop:</p>
+    <pre data-file="example/malloc/victim.c"><code class="language-c">int main(int argc, char *argv[]) {
+    while(1) {
+        void *p = malloc(1024);
+        printf("continue malloc...\n");
+        usleep(100 * 1000);
+        free(p);
+    }
+    return 0;
+}</code></pre>
+
+    <p>The stepper below walks through the whole session. Every command and every line of output
+    is copied from the top-level <code>README.md</code> / <code>usage.md</code>.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Build the example</h4>
+        <p>The example Makefile compiles <code>malloc.bpf.c</code> with clang, generates the
+        skeleton with bpftool, and links <code>malloc</code> and <code>victim</code>.</p>
+        <pre><code class="language-bash">make -C example/malloc # Build the eBPF program example
+export PATH=$PATH:~/.bpftime/</code></pre></div>
+      <div class="step"><h4>2. Start the loader under the syscall server</h4>
+        <p><code>bpftime load</code> preloads <code>libbpftime-syscall-server.so</code>. When libbpf
+        calls <code>BPF_MAP_CREATE</code>, <code>BPF_PROG_LOAD</code> and
+        <code>perf_event_open</code> for the uprobe, the calls create handlers in shared memory.
+        No kernel object is created.</p>
+        <pre><code class="language-bash">bpftime load ./example/malloc/malloc</code></pre></div>
+      <div class="step"><h4>3. Start the target with the agent</h4>
+        <p>In a second shell, start the victim. The agent finds the uprobe handler for
+        <code>libc.so.6:malloc</code>, JIT-compiles <code>do_count</code>, and installs a Frida
+        hook on <code>malloc</code>. The <code>bpf_printk</code> output appears in the victim's
+        own terminal:</p>
+        <pre><code class="language-console">$ bpftime start ./example/malloc/victim
+malloc called from pid 250215
+continue malloc...
+malloc called from pid 250215</code></pre></div>
+      <div class="step"><h4>4. Read the map from the loader</h4>
+        <p>Every second, the loader walks the hash map in shared memory and prints the counts it
+        finds:</p>
+        <pre><code class="language-console">$ bpftime load ./example/malloc/malloc
+...
+12:44:35 
+        pid=247299      malloc calls: 10
+        pid=247322      malloc calls: 10</code></pre></div>
+      <div class="step"><h4>5. Or attach to a process that is already running</h4>
+        <p>Start the victim without bpftime, then inject the agent. This uses Frida's injector, so
+        it needs ptrace permission over the target (usually root):</p>
+        <pre><code class="language-console">$ ./example/malloc/victim &amp; echo $! # The pid is 101771
+[1] 101771
+101771
+continue malloc...
+continue malloc...
+$ sudo bpftime attach 101771 # You may need to run make install in root
+Inject: "/root/.bpftime/libbpftime-agent.so"
+Successfully injected. ID: 1</code></pre></div>
+      <div class="step"><h4>6. Compare with the kernel</h4>
+        <p>Run the same binary without bpftime and it loads into the kernel as usual. It then
+        counts every <code>malloc</code> on the system, not only in processes that run the agent:</p>
+        <pre><code class="language-console">$ sudo example/malloc/malloc
+15:38:05
+        pid=30415       malloc calls: 1079
+        pid=30393       malloc calls: 203
+        pid=29882       malloc calls: 1076
+        pid=34809       malloc calls: 8</code></pre></div>
+    </div>
+
+    <div class="callout tip"><span class="label">Scope difference</span><p>A kernel uprobe on
+    <code>libc.so.6:malloc</code> fires in <em>every</em> process that maps that library. A
+    bpftime uprobe fires only in processes that run the agent. That difference is part of why it
+    is cheap, and it also changes what the output means. If you expected system-wide numbers, the
+    userspace run will look "missing". Step 6 shows the difference: the kernel run lists four
+    unrelated PIDs.</p></div>
+
+    <h2>Walkthrough 2: syscall tracing with opensnoop and <code>-s</code></h2>
+    <p>Syscall tracepoints are the second big event source. <code>example/tracing/opensnoop</code>
+    is a port of bcc's libbpf-tools <code>opensnoop</code>. The BPF side attaches to the standard
+    <code>syscalls/sys_enter_openat</code> / <code>sys_exit_openat</code> tracepoints and uses
+    the same context structs it would use in the kernel:</p>
+    <pre data-file="example/tracing/opensnoop/opensnoop.bpf.c"><code class="language-c">SEC("tracepoint/syscalls/sys_enter_openat")
+int tracepoint__syscalls__sys_enter_openat(struct trace_event_raw_sys_enter* ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	/* use kernel terminology here for tgid/pid: */
+	u32 tgid = id &gt;&gt; 32;
+	u32 pid = id;
+
+	/* store arg info for later lookup */
+	if (trace_allowed(tgid, pid)) {
+		struct args_t args = {};
+		args.fname = (const char *)ctx-&gt;args[1];
+		args.flags = (int)ctx-&gt;args[2];
+		bpf_map_update_elem(&amp;start, &amp;pid, &amp;args, 0);
+	}
+	return 0;
+}
+
+static __always_inline
+int trace_exit(struct trace_event_raw_sys_exit* ctx)
+{
+	struct event event = {};
+	struct args_t *ap;
+	uintptr_t stack[3];
+	int ret;
+	u32 pid = bpf_get_current_pid_tgid();
+
+	ap = bpf_map_lookup_elem(&amp;start, &amp;pid);
+	if (!ap)
+		return 0;	/* missed entry */
+	ret = ctx-&gt;ret;
+	/* ... */
+	bpf_get_current_comm(&amp;event.comm, sizeof(event.comm));
+	bpf_probe_read_user_str(&amp;event.fname, sizeof(event.fname), ap-&gt;fname);
+	/* ... */
+	bpf_get_stack(ctx, &amp;stack, sizeof(stack),
+		      BPF_F_USER_STACK);
+	/* ... */
+	/* emit event */
+	bpf_perf_event_output(ctx, &amp;events, BPF_F_CURRENT_CPU,
+			      &amp;event, sizeof(event));
+	/* ... */
+}</code></pre>
+    <p>Syscalls cannot be hooked with a function trampoline, because the <code>syscall</code>
+    instruction is not a function. The agent therefore needs the <em>text segment
+    transformer</em>. It rewrites syscall instructions in the executable segments before
+    <code>main</code> runs. The approach is inspired by zpoline and
+    <code>pmem/syscall_intercept</code>; <a href="14-bpftime-architecture.html">Chapter 14</a>
+    covers the mechanism. You enable it with <code>-s</code>. From <code>usage.md</code> (the
+    directory has since moved to <code>example/tracing/opensnoop</code>):</p>
+    <pre data-file="usage.md"><code class="language-console">$ sudo ~/.bpftime/bpftime load ./example/opensnoop/opensnoop
+[2023-10-09 04:36:33.891] [info] manager constructed
+[2023-10-09 04:36:33.892] [info] global_shm_open_type 0 for bpftime_maps_shm
+[2023-10-09 04:36:33][info][23999] Enabling helper groups ffi, kernel, shm_map by default
+PID    COMM              FD ERR PATH
+72101  victim             3   0 test.txt
+72101  victim             3   0 test.txt</code></pre>
+    <pre data-file="usage.md"><code class="language-console">$ sudo ~/.bpftime/bpftime start -s example/opensnoop/victim
+[2023-10-09 04:38:16.196] [info] Entering new main..
+[2023-10-09 04:38:16.197] [info] Using agent /root/.bpftime/libbpftime-agent.so
+[2023-10-09 04:38:16.198] [info] Page zero setted up..
+[2023-10-09 04:38:16.198] [info] Rewriting executable segments..
+[2023-10-09 04:38:19.260] [info] Loading dynamic library..
+...
+test.txt closed
+Opening test.txt
+test.txt opened, fd=3
+Closing test.txt...</code></pre>
+    <p>The log shows the order of events. The transformer takes over <code>main</code>
+    ("Entering new main"), maps a page at address zero (that page is the landing pad for
+    zpoline-style rewriting), rewrites the executable segments, and only then
+    <code>dlopen</code>s the agent named in <code>AGENT_SO</code>. Note the timestamps: rewriting
+    took about three seconds in that run, so startup cost is real. <code>example/README.md</code>
+    also notes that syscall tracepoints are "currently x86 only".</p>
+    <p>The victim is just a loop that opens and closes a file:</p>
+    <pre data-file="example/tracing/opensnoop/victim.cpp"><code class="language-cpp">int main()
+{
+	while (true) {
+		std::cout &lt;&lt; "Opening test.txt" &lt;&lt; std::endl;
+
+		int fd = open("test.txt", O_RDONLY | O_CREAT);
+		assert(fd != -1);
+
+		std::cout &lt;&lt; "test.txt opened, fd=" &lt;&lt; fd &lt;&lt; std::endl;
+		usleep(1000 * 300);
+		std::cout &lt;&lt; "Closing test.txt..." &lt;&lt; std::endl;
+		close(fd);
+		std::cout &lt;&lt; "test.txt closed" &lt;&lt; std::endl;
+	}
+	return 0;
+}</code></pre>
+    <p>The program uses a <code>PERF_EVENT_ARRAY</code> for output and calls
+    <code>bpf_get_stack(..., BPF_F_USER_STACK)</code>. Both are implemented in userspace: the
+    perf buffer is a shared-memory ring, and stacks are unwound by Frida. The loader's
+    <code>perf_buffer__poll</code> works because the syscall server also emulates the
+    <code>mmap</code> and <code>epoll</code> calls libbpf makes on the perf event fds. A recent fix
+    (#689, "return epoll readiness without duplicates") touched exactly that path.</p>
+
+    <h2>Walkthrough 3: bashreadline, sslsniff and bpftrace</h2>
+    <p>These three show that "unmodified" really means unmodified. Two are libbpf-tools ports
+    and the third is a stock <code>bpftrace</code>. The tabs below hold the relevant BPF source
+    for each example program in this chapter, so you can compare them side by side.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="bashreadline (uretprobe)">
+        <pre data-file="example/tracing/bashreadline/readline.bpf.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+} events SEC(".maps");
+
+SEC("uretprobe//bin/bash:readline")
+int BPF_KRETPROBE(printret, const void *ret)
+{
+	struct str_t data;
+	char comm[TASK_COMM_LEN];
+	u32 pid;
+
+	if (!ret)
+		return 0;
+
+	bpf_get_current_comm(&amp;comm, sizeof(comm));
+	if (comm[0] != 'b' || comm[1] != 'a' || comm[2] != 's' ||
+	    comm[3] != 'h' || comm[4] != 0)
+		return 0;
+
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	data.pid = pid;
+	bpf_probe_read_user_str(&amp;data.str, sizeof(data.str), ret);
+
+	bpf_perf_event_output(ctx, &amp;events, BPF_F_CURRENT_CPU, &amp;data,
+			      sizeof(data));
+
+	return 0;
+};</code></pre></div>
+      <div class="tab-panel" data-label="sslsniff (uprobe pair)">
+        <pre data-file="example/tracing/sslsniff/sslsniff.bpf.c"><code class="language-c">SEC("uprobe/do_handshake")
+int BPF_UPROBE(probe_SSL_rw_enter, void *ssl, void *buf, int num) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid &gt;&gt; 32;
+    u32 tid = pid_tgid;
+    u32 uid = bpf_get_current_uid_gid();
+    u64 ts = bpf_ktime_get_ns();
+
+    /* store arg info for later lookup */
+    bpf_map_update_elem(&amp;bufs, &amp;tid, &amp;buf, BPF_ANY);
+    bpf_map_update_elem(&amp;start_ns, &amp;tid, &amp;ts, BPF_ANY);
+    return 0;
+}</code></pre>
+        <p>The loader attaches one program to many library symbols (<code>example/tracing/sslsniff/sslsniff.c</code>):</p>
+        <pre data-file="example/tracing/sslsniff/sslsniff.c"><code class="language-c">	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_rw_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_write_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_read, probe_SSL_rw_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_read, probe_SSL_read_exit);</code></pre></div>
+      <div class="tab-panel" data-label="minimal uprobe">
+        <pre data-file="example/minimal/uprobe.bpf.c"><code class="language-c">#define BPF_NO_GLOBAL_DATA
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+
+SEC("uprobe/./victim:target_func")
+int do_uprobe_trace(struct pt_regs *ctx)
+{
+	bpf_printk("target_func called.\n");
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="uprobe-override">
+        <pre data-file="example/minimal/uprobe-override.bpf.c"><code class="language-c">#define BPF_NO_GLOBAL_DATA
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+
+SEC("uprobe")
+int do_uprobe_override_patch(struct pt_regs *ctx)
+{
+	bpf_printk("target_func called is overrided.\n");
+	bpf_override_return(ctx, 0);
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";</code></pre></div>
+      <div class="tab-panel" data-label="cuda-counter (GPU)">
+        <pre data-file="example/gpu/cuda-counter/cuda_probe.bpf.c"><code class="language-c">static const void (*ebpf_puts)(const char *) = (void *)501;
+static const u64 (*bpf_get_globaltimer)(void) = (void *)502;
+static const u64 (*bpf_get_block_idx)(u64 *x, u64 *y, u64 *z) = (void *)503;
+static const u64 (*bpf_get_block_dim)(u64 *x, u64 *y, u64 *z) = (void *)504;
+static const u64 (*bpf_get_thread_idx)(u64 *x, u64 *y, u64 *z) = (void *)505;
+
+SEC("kprobe/_Z9vectorAddPKfS0_Pf")
+int cuda__probe()
+{
+	u32 pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	u64 ts = bpf_get_globaltimer();
+	u64 x, y, z;
+	bpf_get_block_idx(&amp;x, &amp;y, &amp;z);
+	// Store entry timestamp
+	bpf_map_update_elem(&amp;start_ts, &amp;x, &amp;ts, BPF_ANY);
+	/* ... */
+	bpf_printk("Entered _Z9vectorAddPKfS0_Pf x=%lu, ts=%lu\n", x, ts);
+
+	return 0;
+}</code></pre></div>
+    </div>
+
+    <h3>bashreadline</h3>
+    <p>The program is a <code>uretprobe</code> on <code>/bin/bash:readline</code>. It copies the
+    returned string with <code>bpf_probe_read_user_str</code> and emits it through a perf event
+    array. Under bpftime you run the loader with <code>bpftime load</code> and start a shell with
+    <code>bpftime start /bin/bash</code>. Each command you type in that shell then shows up in the
+    loader. The comm check (<code>comm == "bash"</code>) works because the userspace
+    <code>bpf_get_current_comm</code> reads the calling thread's name.</p>
+
+    <h3>sslsniff: reading TLS plaintext</h3>
+    <p><code>sslsniff</code> is the most useful example in practice, and the one where userspace
+    execution makes the biggest difference. It hooks <code>SSL_read</code>/<code>SSL_write</code>
+    (and the GnuTLS and NSS equivalents) to capture plaintext before encryption and after
+    decryption. The repo's README shows it against <code>wget</code>: first the probe, then, in
+    another terminal, the traced program. The README wraps the library name across two lines;
+    it is joined here. The paths predate the move to <code>example/tracing/</code>.</p>
+    <pre data-file="example/tracing/sslsniff/README.md"><code class="language-bash">sudo LD_PRELOAD=build/runtime/syscall-server/libbpftime-syscall-server.so example/sslsniff/sslsniff</code></pre>
+    <pre data-file="example/tracing/sslsniff/README.md"><code class="language-bash">sudo LD_PRELOAD=build/runtime/agent/libbpftime-agent.so wget https://www.google.com</code></pre>
+    <p>The output is the decrypted HTML of the response, framed by <code>----- DATA -----</code>
+    markers and a line like <code>READ/RECV 0.127135326 wget 165620 1228</code>. In the
+    <code>benchmark/ssl-nginx</code> experiment, the same tool is run against nginx serving
+    HTTPS. That README's conclusion is that "kernel sslsniff can significantly reduce the
+    performance of nginx, lead to a 2x performance drop". The userspace version is the
+    comparison point.</p>
+
+    <h3>bpftrace in userspace</h3>
+    <p>bpftrace is a full eBPF front-end. It generates bytecode with LLVM, creates maps, and
+    attaches through <code>perf_event_open</code>. It can still be run under the syscall server.
+    From <code>example/tracing/bpftrace/README.md</code>:</p>
+    <pre data-file="example/tracing/bpftrace/README.md"><code class="language-console">$ sudo ~/.bpftime/bpftime load bpftrace -e 'uretprobe:/bin/bash:readline { printf("%-6d %s\n", pid, str(retval)); }'
+[2023-10-27 19:00:32][info][13368] bpftime-syscall-server started
+Attaching 1 probe...
+13615  
+13615  clear
+13615  clear
+13615  cat</code></pre>
+    <pre data-file="example/tracing/bpftrace/README.md"><code class="language-bash">sudo ~/.bpftime/bpftime start /bin/bash</code></pre>
+    <p>Syscall one-liners work the same way with <code>start -s</code>. The README was tested
+    against a specific bpftrace commit (<code>75aca47d</code>) and warns: "some scripts may not
+    work as expected due to the lack of helpers". The directory ships ready-made scripts
+    (<code>bashreadline.bt</code>, <code>execsnoop.bt</code>, <code>opensnoop.bt</code>,
+    <code>sslsnoop.bt</code>, <code>syscount.bt</code> and others). CI runs the bpftrace one-liner
+    tests in <code>.github/workflows/test-bpftrace.yml</code> (#666 added the rest of them in
+    2026-09).</p>
+
+    <h2>Changing behaviour: override and error injection</h2>
+    <p>Tracing only observes. bpftime also lets a uprobe program <em>replace</em> a function's
+    return value with <code>bpf_override_return</code>. In the kernel, this helper only works on
+    functions marked <code>ALLOW_ERROR_INJECTION</code>. In userspace, it works on any function
+    the agent can hook. Look at the <code>uprobe-override</code> tab above: the program prints a
+    line and forces <code>target_func</code> to return 0 without running its body. libbpf has no
+    attach API for this, so the example opens the perf event by hand with a bpftime-specific
+    type:</p>
+    <pre data-file="example/minimal/attach_override.h"><code class="language-c">#define BPF_TYPE_UPROBE_OVERRIDE 1008
+/* ... */
+static int perf_event_open_with_override(const char *name, uint64_t offset,
+					 int pid, size_t ref_ctr_off, int type)
+{
+	/* ... */
+	attr.size = attr_sz;
+	attr.type = type;
+	attr.config |= (__u64)ref_ctr_off &lt;&lt; PERF_UPROBE_REF_CTR_OFFSET_SHIFT;
+	attr.config1 = ptr_to_u64(name); /* kprobe_func or uprobe_path */
+	attr.config2 = offset; /* kprobe_addr or probe_offset */
+	/* ... */
+}</code></pre>
+    <p><code>1008</code> matches <code>ATTACH_UPROBE_OVERRIDE</code> in
+    <code>attach/frida_uprobe_attach_impl/include/frida_uprobe_attach_impl.hpp</code>, next to
+    <code>ATTACH_UPROBE = 6</code>, <code>ATTACH_URETPROBE = 7</code> and
+    <code>ATTACH_UREPLACE = 1009</code>. This is the one place where a bpftime program is
+    <em>not</em> portable to the kernel. <code>example/error-inject</code> applies the same idea
+    to syscalls, and <code>example/hotpatch/redis</code> and <code>hotpatch/vim</code> use it to
+    patch real applications.</p>
+
+    <h2>Inspecting shared state with bpftimetool</h2>
+    <p>Because every object lives in one shared-memory segment, you can dump it, edit it and load
+    it back. The subcommands come from <code>tools/bpftimetool/arguments.hpp</code>, which was
+    rewritten on argparse in the most recent commit (#719):</p>
+    <pre data-file="tools/bpftimetool/arguments.hpp"><code class="language-cpp">	argparse::ArgumentParser load{"load", "", argparse::default_arguments::help};
+	argparse::ArgumentParser export_cmd{"export", "", argparse::default_arguments::help};
+	argparse::ArgumentParser import_cmd{"import", "", argparse::default_arguments::help};
+	argparse::ArgumentParser remove{"remove", "", argparse::default_arguments::help};
+	argparse::ArgumentParser run{"run", "", argparse::default_arguments::help};
+	argparse::ArgumentParser cuda{"run-on-cuda", "", argparse::default_arguments::help};
+	/* ... */
+		run.add_argument("--repeat").action(integer("repeat", 1));
+		run.add_argument("--type").choices("JIT", "AOT", "INTERPRET");</code></pre>
+    <p>There is no <code>dump</code> subcommand. <code>export</code> is the dump. The typical
+    debugging loop, from <code>tools/bpftimetool/README.md</code>:</p>
+    <pre data-file="tools/bpftimetool/README.md"><code class="language-bash">bpftimetool export debug_state.json
+cat debug_state.json | jq '.handlers[] | select(.type=="bpf_prog_handler")'
+bpftimetool run 4 test_input.bin</code></pre>
+    <p>The same README covers benchmarking one program under different engines, and restoring a
+    saved state:</p>
+    <pre data-file="tools/bpftimetool/README.md"><code class="language-bash"># Compare execution modes
+bpftimetool run 4 input.bin repeat 1000 type JIT
+bpftimetool run 4 input.bin repeat 1000 type AOT
+bpftimetool run 4 input.bin repeat 1000 type INTERPRET</code></pre>
+    <pre data-file="tools/bpftimetool/README.md"><code class="language-bash"># Restore if needed
+bpftimetool remove
+bpftimetool import backup_20250930_120000.json</code></pre>
+    <p><code>remove</code> destroys all loaded programs, maps and state for every process using
+    bpftime. <code>AOT</code> requires that the program was compiled with
+    <code>bpftime-aot</code> first.</p>
+    <p>The exported JSON is a list of handlers keyed by fd. Each handler is a
+    <code>bpf_map_handler</code> (with <code>map_type</code>, sizes and flags), a
+    <code>bpf_prog_handler</code> (hex-encoded instructions plus <code>attach_fds</code>), a
+    <code>bpf_perf_event_handler</code> (for a uprobe: <code>_module_name</code> and
+    <code>offset</code>) or a <code>bpf_link_handler</code>. This gives you a workflow the kernel
+    does not: capture a session on one machine, then <code>import</code> it elsewhere and start
+    the target with the agent, with no loader at all. <code>bpftimetool load &lt;fd&gt;
+    &lt;JSON&gt;</code> inserts a single handler. Fix #682 made it accept the same JSON that
+    <code>import</code> reads. <code>remove</code> is the cleanup to use after a crash leaves a
+    stale <code>/dev/shm/bpftime_maps_shm</code> behind.</p>
+
+    <h2 id="kernel-user-mixed-mode">Kernel-user mixed mode</h2>
+    <p>"Userspace only" is one of three ways to run bpftime. The other two let userspace programs
+    cooperate with real kernel eBPF.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 360" role="img" aria-label="Three bpftime modes: userspace-only, run-with-kernel via syscall-server, and daemon mode.">
+        <style>
+          .bx{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .hi{fill:none;stroke:var(--accent);stroke-width:2}
+          .hi2{fill:none;stroke:var(--accent2);stroke-width:2}
+          .tt{fill:var(--fg);font:600 14px sans-serif}
+          .ss{fill:var(--fg);font:12px monospace}
+          .mm{fill:var(--muted);font:11.5px sans-serif}
+          .kl{stroke:var(--muted);stroke-width:1.2;stroke-dasharray:5 4}
+        </style>
+        <!-- col 1 -->
+        <rect class="bx" x="20" y="12" width="290" height="336" rx="10"/>
+        <text class="tt" x="34" y="36">1 · Userspace only (default)</text>
+        <rect class="hi2" x="34" y="50" width="262" height="60" rx="7"/>
+        <text class="ss" x="44" y="72">loader + syscall-server</text>
+        <text class="mm" x="44" y="92">maps, progs, links → shm</text>
+        <rect class="hi" x="34" y="124" width="262" height="60" rx="7"/>
+        <text class="ss" x="44" y="146">target + agent</text>
+        <text class="mm" x="44" y="166">runs uprobes / syscall hooks</text>
+        <text class="mm" x="34" y="208">verifier: PREVAIL if built in</text>
+        <text class="mm" x="34" y="276">kernel not used for eBPF;</text>
+        <text class="mm" x="34" y="294">no root, works on old kernels</text>
+        <!-- col 2 -->
+        <rect class="bx" x="335" y="12" width="290" height="336" rx="10"/>
+        <text class="tt" x="349" y="36">2 · BPFTIME_RUN_WITH_KERNEL</text>
+        <rect class="hi2" x="349" y="50" width="262" height="60" rx="7"/>
+        <text class="ss" x="359" y="72">loader + syscall-server</text>
+        <text class="mm" x="359" y="92">forwards MAP_CREATE / PROG_LOAD</text>
+        <rect class="hi" x="349" y="124" width="262" height="60" rx="7"/>
+        <text class="ss" x="359" y="146">target + agent</text>
+        <text class="mm" x="359" y="166">runs progs, uses kernel maps</text>
+        <text class="mm" x="349" y="208">map type + 1000 = KERNEL_USER_*</text>
+        <line class="kl" x1="349" y1="234" x2="611" y2="234"/>
+        <text class="mm" x="349" y="250">in the kernel:</text>
+        <rect class="hi2" x="349" y="258" width="262" height="76" rx="7"/>
+        <text class="ss" x="359" y="280">kernel maps + kernel verifier</text>
+        <text class="mm" x="359" y="300">shared with kprobes, XDP, tc …</text>
+        <text class="mm" x="359" y="318">BPFTIME_NOT_LOAD_PATTERN skips some</text>
+        <!-- col 3 -->
+        <rect class="bx" x="650" y="12" width="290" height="336" rx="10"/>
+        <text class="tt" x="664" y="36">3 · bpftime_daemon</text>
+        <rect class="hi2" x="664" y="50" width="262" height="60" rx="7"/>
+        <text class="ss" x="674" y="72">plain loader (no preload)</text>
+        <text class="mm" x="674" y="92">sudo example/malloc/malloc</text>
+        <rect class="hi" x="664" y="124" width="262" height="60" rx="7"/>
+        <text class="ss" x="674" y="146">target + agent</text>
+        <text class="mm" x="674" y="166">uprobes run here, not in kernel</text>
+        <text class="mm" x="664" y="208">daemon writes captured progs to shm</text>
+        <line class="kl" x1="664" y1="234" x2="926" y2="234"/>
+        <text class="mm" x="664" y="250">in the kernel:</text>
+        <rect class="hi2" x="664" y="258" width="262" height="76" rx="7"/>
+        <text class="ss" x="674" y="280">bpf_tracer.bpf.c (kernel eBPF)</text>
+        <text class="mm" x="674" y="300">traces bpf(), perf_event_open(),</text>
+        <text class="mm" x="674" y="318">ioctl(); redirects uprobes</text>
+      </svg>
+      <figcaption>Figure 15.2 — The three ways to run bpftime. Mode 2 keeps the loader in
+      preload but sends maps and verification to the kernel. Mode 3 does not touch the loader at
+      all. A kernel eBPF tracer captures its <code>bpf()</code> calls instead.</figcaption>
+    </figure>
+
+    <h3>Mode 2: run with the kernel</h3>
+    <p>With <code>BPFTIME_RUN_WITH_KERNEL=true</code>, the syscall server forwards
+    <code>BPF_MAP_CREATE</code> to the real <code>bpf()</code> syscall. It then records a bpftime
+    handler whose type is the kernel type plus <code>KERNEL_USER_MAP_OFFSET</code> (1000):</p>
+    <pre data-file="runtime/syscall-server/syscall_context.cpp"><code class="language-cpp">	case BPF_MAP_CREATE: {
+		if (run_with_kernel) {
+			uint32_t translated_map_type =
+				bpftime_translate_shared_map_type_to_kernel_map_type(
+					attr-&gt;map_type);
+			/* ... */
+			int fd = orig_syscall_fn(__NR_bpf, (long)cmd,
+						 (long)(uintptr_t)&amp;new_attr,
+						 (long)size);
+			/* ... */
+			if (translated_map_type == attr-&gt;map_type) {
+				// Marks a kernel-user shared map, the
+				// corresponding bpftime map type should be
+				// added by KERNEL_USER_MAP_OFFSET
+				bpftime_map_type =
+					attr-&gt;map_type + KERNEL_USER_MAP_OFFSET;
+
+			} else {
+				// Marks a kernel-gpu shared map, the
+				// corresponding bpftime map type should be the
+				// map type before translating
+				bpftime_map_type = attr-&gt;map_type;
+			}
+			return create_kernel_bpf_map(fd, bpftime_map_type);
+		}</code></pre>
+    <p>The agent's program then reads and writes the <em>kernel's</em> map. A kprobe or an XDP
+    program in the kernel and a uprobe in userspace can share a hash map. Programs are also
+    loaded into the kernel, so the kernel verifier checks them, but the agent still runs them in
+    userspace. Programs the kernel would reject (userspace-only helpers such as ufuncs) can be
+    excluded by name with a regex. From <code>usage.md</code>:</p>
+    <pre data-file="usage.md"><code class="language-bash">BPFTIME_NOT_LOAD_PATTERN=start_.* BPFTIME_RUN_WITH_KERNEL=true LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so example/malloc/malloc</code></pre>
+    <p>The kernel-user map types handled in <code>runtime/src/handler/map_handler.cpp</code> are
+    <code>KERNEL_USER_HASH</code>, <code>KERNEL_USER_ARRAY</code>,
+    <code>KERNEL_USER_PERCPU_ARRAY</code> and <code>KERNEL_USER_PERF_EVENT_ARRAY</code>. The
+    manual's requirement is that the kernel version "should be higher enough to support mmap eBPF
+    map".</p>
+
+    <h3>Mode 3: the daemon</h3>
+    <p><code>bpftime_daemon</code> goes one step further. You do not preload anything into the
+    loader. The daemon loads its own kernel eBPF program (<code>daemon/kernel/bpf_tracer.bpf.c</code>)
+    that traces <code>bpf()</code>, <code>perf_event_open()</code> and <code>ioctl()</code>
+    system-wide. When a tool loads a uprobe program, the daemon copies its instructions into
+    shared memory and changes the load and attach path so the kernel uprobe never fires.
+    From <code>daemon/README.md</code>:</p>
+    <pre data-file="daemon/README.md"><code class="language-console">$ sudo SPDLOG_LEVEL=Debug build/daemon/bpftime_daemon
+[2023-10-24 11:07:13.143] [info] Global shm constructed. shm_open_type 0 for bpftime_maps_shm
+
+$ sudo example/malloc/malloc
+libbpf: loading object 'malloc_bpf' from buffer
+11:08:11 
+11:08:12 
+
+$ sudo SPDLOG_LEVEL=Debug ~/.bpftime/bpftime start example/malloc/victim
+malloc called from pid 12314
+continue malloc...</code></pre>
+    <p>The loader prints empty timestamps at first. The README explains that this is "because we
+    modify the load and attach process of bpf and perf event with eBPF in the kernel". Counts
+    appear once a victim with the agent starts calling <code>malloc</code>. The daemon's flags
+    (from the <code>argp_option</code> table in <code>daemon/user/main.cpp</code>) are
+    <code>-p/--pid</code>, <code>-u/--uid</code>, <code>-o/--open</code>, <code>-v/--verbose</code>
+    and <code>-w/--whitelist-uprobe</code>. The daemon needs root and a kernel that can run
+    bpftime's own tracer. It is the option to use when you cannot change how an existing agent
+    such as an observability collector is launched. <code>example/otel-ebpf-profiler</code> (#623)
+    is a compatibility smoke test for exactly that "daemon mirror" case.</p>
+
+    <h2>Supported maps and helpers</h2>
+    <p>The authoritative list is the <code>switch</code> over <code>bpf_map_type</code> in
+    <code>runtime/src/handler/map_handler.cpp</code>, together with the helper groups in
+    <code>runtime/src/bpf_helper.cpp</code>. The tables below were read from those files at
+    <code>25e250d6</code>.</p>
+    <table>
+      <thead><tr><th>Category</th><th>Map types handled</th></tr></thead>
+      <tbody>
+        <tr><td>Userspace (shared memory)</td><td><code>HASH</code>, <code>ARRAY</code>, <code>PERCPU_HASH</code>,
+        <code>PERCPU_ARRAY</code>, <code>LRU_HASH</code>, <code>LPM_TRIE</code>, <code>BLOOM_FILTER</code>,
+        <code>QUEUE</code>, <code>STACK</code>, <code>RINGBUF</code>, <code>PERF_EVENT_ARRAY</code>,
+        <code>STACK_TRACE</code>, <code>PROG_ARRAY</code> (tail calls), <code>ARRAY_OF_MAPS</code></td></tr>
+        <tr><td>Kernel-user (offset 1000)</td><td><code>KERNEL_USER_HASH</code>, <code>KERNEL_USER_ARRAY</code>,
+        <code>KERNEL_USER_PERCPU_ARRAY</code>, <code>KERNEL_USER_PERF_EVENT_ARRAY</code></td></tr>
+        <tr><td>GPU (offset 1500, CUDA builds)</td><td><code>GPU_HASH_MAP</code>, <code>PERGPUTD_ARRAY_MAP</code>
+        (per-thread), <code>GPU_ARRAY_MAP</code>, <code>GPU_KERNEL_SHARED_ARRAY_MAP</code>,
+        <code>GPU_RINGBUF_MAP</code>, <code>PERGPUTD_ARRAY_HOST_MAP</code>, <code>GPU_ARRAY_HOST_MAP</code></td></tr>
+      </tbody>
+    </table>
+    <p>Anything outside this list (for example <code>SOCKMAP</code>, <code>DEVMAP</code>,
+    <code>XSKMAP</code>, <code>TASK_STORAGE</code>) fails to load unless you set
+    <code>BPFTIME_ALLOW_EXTERNAL_MAPS</code>, in which case your own code has to provide it.
+    <code>example/bpf_features</code> has demos for bloom filters, <code>get_stackid</code>, LPM
+    tries, queues/stacks and tail calls.</p>
+    <table>
+      <thead><tr><th>Helper group (<code>BPFTIME_HELPER_GROUPS</code> token)</th><th>Helpers registered</th></tr></thead>
+      <tbody>
+        <tr><td><code>kernel</code></td><td><code>bpf_probe_read</code>, <code>_kernel</code>, <code>_user</code>, <code>_str</code>, <code>_user_str</code>;
+        <code>bpf_probe_write_user</code>; <code>bpf_ktime_get_ns</code>, <code>_boot_ns</code>, <code>_coarse_ns</code>;
+        <code>bpf_trace_printk</code>; <code>bpf_get_prandom_u32</code>; <code>bpf_get_smp_processor_id</code>;
+        <code>bpf_get_current_pid_tgid</code>, <code>_uid_gid</code>, <code>_comm</code>; <code>bpf_override_return</code>;
+        <code>bpf_set_retval</code>; <code>bpf_strncmp</code>; <code>bpf_get_stack</code>, <code>bpf_get_stackid</code>;
+        <code>bpf_ringbuf_reserve</code>/<code>submit</code>/<code>discard</code>/<code>output</code>;
+        <code>bpf_perf_event_output</code>; <code>bpf_tail_call</code>; <code>bpf_get_attach_cookie</code>;
+        <code>bpf_get_func_ip</code>; <code>bpf_csum_diff</code>; <code>bpf_xdp_adjust_head</code>/<code>_tail</code></td></tr>
+        <tr><td><code>shm_map</code></td><td><code>bpf_map_lookup_elem</code>, <code>update</code>, <code>delete</code>, <code>push</code>, <code>pop</code>, <code>peek</code></td></tr>
+        <tr><td><code>ufunc</code></td><td><code>__ebpf_call_find_ufunc_id</code>, <code>__ebpf_call_ufunc_dispatcher</code>: call registered native functions from eBPF</td></tr>
+      </tbody>
+    </table>
+    <p>Attach backends add their own helpers. The CUDA backend adds helpers 501–511, for example.
+    Missing helpers are worth noticing: there is no <code>bpf_get_current_cgroup_id</code>, no
+    <code>bpf_get_current_task</code>, no <code>bpf_send_signal</code> and no spin locks in the
+    groups above. The README states the general rule: "It does not support direct access to
+    kernel data structures or functions like <code>task_struct</code>." An open PR (#705,
+    "reject unregistered helper calls at load time") suggests that today an unknown helper is not
+    always caught at load time. Test your program rather than assuming it will be rejected.</p>
+
+    <h2 id="gpu-and-cuda-probes">GPU and CUDA probes</h2>
+    <p>The most active area of bpftime is GPU support, which came from the eGPU research
+    prototype. The <a href="https://github.com/eunomia-bpf/eGPU">eunomia-bpf/eGPU</a> repository
+    now says it has been "merged into bpftime and will be maintained there". The GPU README in
+    <code>example/gpu/README.md</code> describes it as running eBPF programs "within GPU kernels
+    on NVIDIA and AMD GPUs". <a href="20-gpu-ext.html">Chapter 20</a> covers the related
+    <code>gpu_ext</code> work on UVM and scheduling, and <a href="16-llvmbpf.html">Chapter 16</a>
+    covers the eBPF→PTX compiler. This section covers using it.</p>
+
+    <figure>
+      <svg viewBox="0 0 960 300" role="img" aria-label="CUDA attach pipeline: agent hooks CUDA registration, extracts PTX, compiles eBPF to PTX, patches and recompiles, kernel runs with probes; maps in shared or GPU memory.">
+        <style>
+          .g1{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .g2{fill:none;stroke:var(--accent);stroke-width:2}
+          .gt{fill:var(--fg);font:600 13.5px sans-serif}
+          .gs{fill:var(--fg);font:11.5px monospace}
+          .gm{fill:var(--muted);font:11.5px sans-serif}
+          .ga{stroke:var(--fg);stroke-width:1.6;fill:none;marker-end:url(#ah15c)}
+        </style>
+        <defs><marker id="ah15c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--fg)"/></marker></defs>
+        <rect class="g1" x="10" y="20" width="170" height="120" rx="9"/>
+        <text class="gt" x="22" y="44">1 · Hook CUDA API</text>
+        <text class="gs" x="22" y="66">__cudaRegisterFatBinary</text>
+        <text class="gs" x="22" y="84">__cudaRegisterFunction</text>
+        <text class="gs" x="22" y="102">cudaLaunchKernel</text>
+        <text class="gm" x="22" y="124">Frida hooks in the agent</text>
+        <line class="ga" x1="180" y1="80" x2="200" y2="80"/>
+        <rect class="g1" x="202" y="20" width="170" height="120" rx="9"/>
+        <text class="gt" x="214" y="44">2 · Extract PTX</text>
+        <text class="gm" x="214" y="66">from the fat binary</text>
+        <text class="gm" x="214" y="84">(late attach: bpftime trace</text>
+        <text class="gm" x="214" y="102">runs cuobjdump --extract-ptx</text>
+        <text class="gm" x="214" y="120">all before injecting)</text>
+        <line class="ga" x1="372" y1="80" x2="392" y2="80"/>
+        <rect class="g1" x="394" y="20" width="170" height="120" rx="9"/>
+        <text class="gt" x="406" y="44">3 · eBPF → PTX</text>
+        <text class="gm" x="406" y="66">LLVM (llvmbpf) lowers the</text>
+        <text class="gm" x="406" y="84">kprobe/kretprobe program;</text>
+        <text class="gm" x="406" y="102">helpers via a trampoline</text>
+        <text class="gm" x="406" y="120">(default_trampoline.cu)</text>
+        <line class="ga" x1="564" y1="80" x2="584" y2="80"/>
+        <rect class="g1" x="586" y="20" width="170" height="120" rx="9"/>
+        <text class="gt" x="598" y="44">4 · Patch + rebuild</text>
+        <text class="gm" x="598" y="66">insert at entry / exit /</text>
+        <text class="gm" x="598" y="84">memory ops; register</text>
+        <text class="gm" x="598" y="102">guards; recompile the PTX</text>
+        <text class="gm" x="598" y="120">and hand it to the driver</text>
+        <line class="ga" x1="756" y1="80" x2="776" y2="80"/>
+        <rect class="g2" x="778" y="20" width="170" height="120" rx="9"/>
+        <text class="gt" x="790" y="44">5 · Kernel runs</text>
+        <text class="gm" x="790" y="66">each GPU thread runs</text>
+        <text class="gm" x="790" y="84">the probe; per-thread</text>
+        <text class="gm" x="790" y="102">results in GPU maps or</text>
+        <text class="gm" x="790" y="120">host maps via shm</text>
+        <rect class="g1" x="10" y="170" width="938" height="112" rx="9"/>
+        <text class="gt" x="22" y="194">Data paths</text>
+        <text class="gm" x="22" y="216">CPU maps (HASH, ARRAY …) work from GPU code, but each access is a GPU→host call through pinned shared memory guarded by a spinlock: slow.</text>
+        <text class="gm" x="22" y="236">GPU maps (GPU_ARRAY_MAP, PERGPUTD_ARRAY_MAP, GPU_RINGBUF_MAP …) live in device memory (CUDA IPC) and take the fast path.</text>
+        <text class="gm" x="22" y="256">The loader reads them from the host; optional GDRCopy (BPFTIME_ENABLE_GDRCOPY) speeds up host-side reads.</text>
+      </svg>
+      <figcaption>Figure 15.3 — The CUDA attach pipeline in <code>attach/nv_attach_impl/</code>,
+      summarised from its README and <code>example/gpu/README.md</code>.</figcaption>
+    </figure>
+
+    <h3>Walkthrough 4: cuda-counter</h3>
+    <p>The program is shown in the "cuda-counter" tab above. Two details are new. First, the
+    section names reuse <code>kprobe/</code> and <code>kretprobe/</code> with a <em>mangled CUDA
+    kernel name</em> (<code>_Z9vectorAddPKfS0_Pf</code> is <code>vectorAdd(const float*, const
+    float*, float*)</code>). The GPU README admits "<code>kprobe</code> / <code>kretprobe</code>
+    here is a bad name, we just use it as a placeholder". These map to
+    <code>ATTACH_CUDA_PROBE = 8</code> and <code>ATTACH_CUDA_RETPROBE = 9</code> in
+    <code>attach/nv_attach_impl/nv_attach_impl.hpp</code>. Second, GPU-only helpers are declared
+    by number, the same way the earliest kernel helpers were. 501 is <code>ebpf_puts</code>, 502
+    <code>bpf_get_globaltimer</code>, 503–505 block index, block dimension and thread index, 506
+    <code>bpf_gpu_membar</code>. The <code>threadscheduling</code> example adds 509–511 for SM,
+    warp and lane IDs.</p>
+    <p>Building needs a CUDA toolkit. From <code>example/gpu/cuda-counter/README.md</code>:</p>
+    <pre data-file="example/gpu/cuda-counter/README.md"><code class="language-bash">cmake -Bbuild -DBPFTIME_ENABLE_CUDA_ATTACH=1 -DBPFTIME_CUDA_ROOT=/usr/local/cuda .
+cmake --build build -j$(nproc)
+make -C example/gpu/cuda-counter</code></pre>
+    <p>Then start the loader in one terminal and the CUDA application in another:</p>
+    <pre data-file="example/gpu/cuda-counter/README.md"><code class="language-bash">BPFTIME_LOG_OUTPUT=console LD_PRELOAD=build/runtime/syscall-server/libbpftime-syscall-server.so \
+  example/gpu/cuda-counter/cuda_probe</code></pre>
+    <pre data-file="example/gpu/cuda-counter/README.md"><code class="language-bash">BPFTIME_LOG_OUTPUT=console LD_PRELOAD=build/runtime/agent/libbpftime-agent.so \
+  example/gpu/cuda-counter/vec_add</code></pre>
+    <p>The expected output, as documented in the same README:</p>
+    <pre data-file="example/gpu/cuda-counter/README.md"><code class="language-text">Entered _Z9vectorAddPKfS0_Pf x=0, ts=1749147474550023136
+Exited (with tsp) _Z9vectorAddPKfS0_Pf x=0 duration=6437888 tsp=1749147474550023136ns
+C[0] = 0 (expected 0)
+C[1] = 0 (expected 3)</code></pre>
+    <p>It is the same two-process shape as Figure 15.1. The only difference is that the agent's
+    attach backend is <code>nv_attach_impl</code>, which rewrites PTX instead of x86 code.</p>
+
+    <h3>Late attach to a running CUDA process</h3>
+    <p>Preload means restarting the GPU job, which is often not acceptable for a long training
+    run. <code>bpftime trace</code> was added for this case. From
+    <code>example/gpu/threadscheduling_dynamic_hook/README.md</code>:</p>
+    <pre data-file="example/gpu/threadscheduling_dynamic_hook/README.md"><code class="language-bash">example/gpu/threadscheduling_dynamic_hook/vec_add 4 64</code></pre>
+    <p>Terminal 1 starts the target with no preload, as above. Terminal 2 starts probing later:</p>
+    <pre data-file="example/gpu/threadscheduling_dynamic_hook/README.md"><code class="language-bash">sudo BPFTIME_LOG_OUTPUT=console ./build/tools/cli/bpftime trace --pidof vec_add --auto-refresh-ms 500 \
+  example/gpu/threadscheduling_dynamic_hook/threadscheduling</code></pre>
+    <p>The <code>trace</code> branch in <code>tools/cli/main.cpp</code> does the following:</p>
+    <ol>
+      <li>Resolves <code>--pidof</code> through <code>/proc/*/comm</code>. The name must match exactly one process.</li>
+      <li>If run as root, reads the target's uid/gid and plans to start the loader as that user. It
+      relaxes ownership of <code>/dev/shm/bpftime_maps_shm</code> so the target can open it.</li>
+      <li>Runs <code>cuobjdump --extract-ptx all</code> on the target executable into a private temp directory
+      (<code>BPFTIME_CUOBJDUMP</code> or <code>BPFTIME_CUDA_ROOT</code> help it find the tool).</li>
+      <li>Spawns the loader with the syscall server.</li>
+      <li>Asks an agent that is already present to refresh over IPC, or injects one with Frida using the argument
+      <code>loader_pid=…;force_reinit=1;auto_refresh_ms=500;cuda_late_ptx_dir=…</code>.</li>
+      <li>On Ctrl-C: sends <code>detach</code> to the agent first, then stops the loader, "to avoid CUDA IPC
+      allocations being torn down while the target still uses them".</li>
+    </ol>
+    <p>The README lists the practical constraints. Injection needs ptrace rights, so Yama
+    <code>ptrace_scope=1</code> blocks it unless the target opts in with
+    <code>BPFTIME_ALLOW_PTRACE=1</code>. Use <code>BPFTIME_CUDA_DEVICE</code> for a non-zero GPU.
+    The <code>_dynamic_hook</code> variant passes <code>N</code> as a kernel argument instead of
+    <code>__constant__</code> "to avoid relying on constant/global mirroring during late attach".
+    The fix for that mirroring (#695) landed in 2026-10.</p>
+    <p>The example directory also includes real-framework smoke tests: <code>pytorch-test</code>,
+    <code>llama-cpp-test</code>, <code>faiss-test</code>, <code>cutlass</code>, <code>cudagraph</code>.
+    It also has <code>directly_run_on_gpu</code> (run an eBPF program as a GPU kernel, together
+    with <code>bpftimetool run-on-cuda</code>) and an experimental <code>rocm-counter</code> for
+    AMD. Commit #647 (2026-08) added NVIDIA GB300 (<code>sm_103</code>) and CUDA 13 support.</p>
+
+    <h2>Userspace XDP, DPDK and the nginx module</h2>
+    <h3>XDP programs in userspace</h3>
+    <p><code>example/xdp-counter</code> loads an ordinary XDP program into the userspace runtime
+    and attaches it with a <code>bpf_link</code> to a veth device. From its README:</p>
+    <pre data-file="example/xdp-counter/README.md"><code class="language-bash">sudo ip link add veth0 type veth peer name veth1
+LD_PRELOAD=build/runtime/syscall-server/libbpftime-syscall-server.so example/xdp-counter/xdp-counter example/xdp-counter/.output/xdp-counter.bpf.o veth1 example/xdp-counter/base.btf</code></pre>
+    <p><code>base.btf</code> supplies BTF for relocating against the userspace <code>xdp_md</code>
+    defined in <code>runtime/extension/userspace_xdp.h</code>. bpftime does not receive packets
+    itself. A driver program has to feed them through DPDK or AF_XDP. That driver lived in
+    <a href="https://github.com/eunomia-bpf/XDP-eBPF-in-DPDK">eunomia-bpf/XDP-eBPF-in-DPDK</a>,
+    which is now <strong>archived</strong> (last push 2024-09). The README also notes that "Currently
+    bpftime only support attach XDP program with <code>bpf_link</code>". The research version of
+    this work is the uXDP paper (eBPF '25 workshop). Its abstract reports throughput gains "up to
+    3.3× over in-kernel execution" and a 40% improvement for Katran. Those numbers come from the
+    paper, not from this repository's benchmark directory.</p>
+
+    <h3>bpftime as an nginx module</h3>
+    <p><code>example/attach_implementation</code> shows how to embed bpftime in an application
+    that you control, with a custom attach type. It has three parts. An nginx module
+    (<code>nginx_plugin</code>) calls into an adaptor library (<code>nginx_plugin_adaptor</code>)
+    that registers a new attach implementation. A <code>controller</code> loads a request-filter
+    eBPF program into shared memory and prints accepted and rejected URLs from a ring buffer. The
+    filter accepts only paths with a given prefix and rejects the rest with 403. Build and run,
+    from its README:</p>
+    <pre data-file="example/attach_implementation/README.md"><code class="language-bash">cmake -DBPFTIME_LLVM_JIT=0 -DCMAKE_BUILD_TYPE:STRING=Release -DBUILD_ATTACH_IMPL_EXAMPLE=YES -B build -S .
+cmake --build build --config Release --target attach_impl_example_nginx -j$(nproc)</code></pre>
+    <p>In terminal A, at the repository root, run the controller with the prefix to accept
+    (<code>/aaaa</code>). In terminal B, inside <code>example/attach_implementation</code>,
+    start nginx and send requests. The commands are quoted from the README's prose:</p>
+    <pre data-file="example/attach_implementation/README.md"><code class="language-bash">build/example/attach_implementation/controller/attach_impl_example_controller /aaaa
+nginx_plugin_output/nginx -p $(pwd) -c ./nginx.conf
+curl http://127.0.0.1:9023/aaab
+curl http://127.0.0.1:9023/aaaab</code></pre>
+    <p>The older standalone <a href="https://github.com/eunomia-bpf/Nginx-eBPF-module">Nginx-eBPF-module</a>
+    repo has not been pushed since 2024-01. The in-tree example is the maintained one: CI runs it
+    in <code>test-nginx-attach.yml</code>. For the lowest-level form of embedding, the new
+    <code>example/runtime_library</code> (#700) creates a map, an embedded program, a custom
+    event handler and a link through the C++ API. It uses no libbpf, no LD_PRELOAD and no Frida,
+    and runs without root.</p>
+
+    <h2>What the benchmarks in the repo say</h2>
+    <p>The project's headline claim is "up to a <code>10x</code> speedup in Uprobe overhead
+    compared to kernel uprobe and uretprobe" (<code>README.md</code>). The numbers below are the
+    measured results that the repository itself contains, with the files they come from. They
+    were measured by the authors on their own hardware. They are not independent results, and
+    they were not reproduced for this chapter.</p>
+
+    <h3>Uprobe and memory micro-benchmarks</h3>
+    <p><code>benchmark/uprobe/example_results.md</code> (generated 2025-04-30, Linux 6.11, Intel
+    Core Ultra 7 258V, 4 cores). The file says "Times shown in nanoseconds (ns) - lower is
+    better":</p>
+    <table>
+      <thead><tr><th>Operation</th><th>Kernel (avg ns)</th><th>bpftime (avg ns)</th><th>Ratio</th></tr></thead>
+      <tbody>
+        <tr><td><code>__bench_uprobe</code></td><td>2561.57</td><td>190.02</td><td>13.48× faster</td></tr>
+        <tr><td><code>__bench_uretprobe</code></td><td>3019.45</td><td>187.10</td><td>16.14× faster</td></tr>
+        <tr><td><code>__bench_uprobe_uretprobe</code></td><td>3119.28</td><td>191.63</td><td>16.28× faster</td></tr>
+        <tr><td><code>__bench_read</code> (probe_read)</td><td>25865.43</td><td>1653.45</td><td>faster</td></tr>
+        <tr><td><code>__bench_write</code> (probe_write_user)</td><td>26478.92</td><td>1542.49</td><td>faster</td></tr>
+        <tr><td><code>__bench_hash_map_update</code></td><td>53376.22</td><td>23992.67</td><td>faster</td></tr>
+        <tr><td><code>__bench_hash_map_lookup</code></td><td>12375.69</td><td>22152.81</td><td><strong>slower</strong></td></tr>
+        <tr><td><code>__bench_per_cpu_hash_map_update</code></td><td>35580.60</td><td>76526.24</td><td><strong>slower</strong></td></tr>
+        <tr><td><code>__bench_per_cpu_array_map_lookup</code></td><td>3170.42</td><td>7018.47</td><td><strong>slower</strong></td></tr>
+      </tbody>
+    </table>
+    <p>The same table appears in <code>benchmark/README.md</code>. The pattern is clear: hook
+    overhead and user-memory access are much cheaper in userspace, but several map operations,
+    per-CPU maps especially, are slower in shared memory than in the kernel. Whether your tool
+    gets faster depends on how much of its time goes to traps and how much to maps.</p>
+
+    <h3>Syscall tracing</h3>
+    <p><code>benchmark/syscall/example_results.md</code> (2025-04-30, Linux 6.11, mean of 10 runs):
+    native <strong>404.44 ns</strong>, kernel tracepoint <strong>438.92 ns</strong>, userspace
+    bpftime <strong>484.65 ns</strong>. The older 2023 numbers in
+    <code>benchmark/syscall/README.md</code> (i7-11800H, kernel 6.2) are baseline 213.62 ns,
+    userspace 446.20 ns and kernel tracepoint 365.45 ns. In both runs, syscall tracing under
+    bpftime was <em>slower</em> than a kernel tracepoint. Its value is that it works without
+    kernel eBPF and can be limited to a single process, not that it is faster.</p>
+
+    <h3>GPU probes vs NVBit</h3>
+    <p><code>benchmark/gpu/README.md</code>, vector-add kernel, 10,000 iterations:</p>
+    <table>
+      <thead><tr><th>Device</th><th>Baseline</th><th>bpftime</th><th>NVBit</th></tr></thead>
+      <tbody>
+        <tr><td>NVIDIA P40</td><td>51.8 μs</td><td>81.1 μs (1.56×)</td><td>174.4 μs (3.37×)</td></tr>
+        <tr><td>NVIDIA RTX 5090</td><td>4.1 μs</td><td>8.2 μs (2.0×)</td><td>55.8 μs (13.6×)</td></tr>
+      </tbody>
+    </table>
+    <p>A probe on a tiny kernel still doubles its runtime on the RTX 5090. The advantage is
+    relative to NVBit, not an absolute "near zero" cost.</p>
+
+    <h3>nginx extension overhead</h3>
+    <p><code>example/attach_implementation/benchmark/example_benchmark_results.json</code>
+    (2025-05-12; wrk, 30 s, 64 connections, 8 threads, 20 iterations), requests per second:
+    no module 4536.86, baseline C module 4559.84, <strong>bpftime 4461.00</strong>, Wasm 4008.00,
+    LuaJIT 3982.76, RLBox 4148.58, ERIM 4024.11. Overhead against no module: bpftime 1.67%, Wasm
+    11.66%, LuaJIT 12.21%, RLBox 8.56%, ERIM 11.30%. The same file reports a standard deviation of
+    roughly 1000 rps for most configurations, so the gaps between the close results are within
+    the noise of that run.</p>
+    <p>To reproduce: <code>pip install -r benchmark/requirements.txt</code>, then
+    <code>make benchmark</code> and <code>make run-all-benchmark</code>. The README asks for at
+    least 4 cores and 16 GB of RAM on x86_64. <code>.github/workflows/benchmarks.yml</code> runs
+    the micro-benchmarks in CI. Execution-engine comparisons have moved to
+    <a href="https://github.com/eunomia-bpf/bpf-benchmark">bpf-benchmark</a>
+    (<a href="19-bpf-benchmark.html">Chapter 19</a>).</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefit: same tools</h4><p>The libbpf skeleton, bpftrace and bcc-style tools run
+      unchanged. The same binary still works on the kernel.</p></div>
+      <div class="card"><h4>Benefit: cheap hooks</h4><p>Function hooks and user-memory reads avoid the trap. The
+      repo's own uprobe numbers show 13–16× lower overhead.</p></div>
+      <div class="card"><h4>Benefit: no kernel eBPF needed</h4><p>Userspace-only mode needs no
+      <code>CAP_BPF</code>, works on old kernels, and builds on non-Linux targets with libbpf disabled.</p></div>
+      <div class="card"><h4>Benefit: new hook types</h4><p>CUDA kernels, nginx request phases, function
+      override and replacement: places the kernel cannot reach.</p></div>
+    </div>
+    <p>And the limitations, each tied to something in the repo:</p>
+    <ul>
+      <li><strong>Only processes running the agent are traced.</strong> There is no system-wide view
+      unless every process is started under bpftime or the daemon redirects probes.</li>
+      <li><strong>No kernel context.</strong> No <code>task_struct</code>, no kprobes and no cgroup ID
+      helper in userspace-only mode. Kernel events need mixed mode, with real kernel programs
+      sharing maps.</li>
+      <li><strong>Weaker safety by default.</strong> The verifier level defaults to <code>WARNING</code>,
+      and PREVAIL is off unless you build it in. eBPF code also runs in the target's address space:
+      the agent is a guest in someone else's process. The repo's <code>AGENTS.md</code> now writes
+      down a "host-process contract" (no <code>exit</code>, no writes to the host's stdio, chain
+      signal handlers). It exists because earlier versions broke these rules (#632, #634, #640).</li>
+      <li><strong>Map performance.</strong> Some map operations are slower than in the kernel (see the table
+      above). Shared memory has a fixed size (<code>BPFTIME_SHM_MEMORY_MB</code>), and
+      perf-buffer allocation fails with <code>ENOMEM</code> when it runs out.</li>
+      <li><strong>Platform scope.</strong> Syscall tracing is x86-only. Frida covers the function hooks on
+      x86-64 and arm64. riscv64 got a trap-based backend in 2026-09 (#665). macOS and QNX ports
+      are open PRs (#545, #661).</li>
+      <li><strong>Startup and attach costs.</strong> Rewriting text segments for <code>-s</code> took about 3 s in
+      the <code>usage.md</code> log. CUDA attach recompiles PTX. Late attach needs ptrace rights.</li>
+      <li><strong>Ordering.</strong> With <code>start</code>, the loader must already be running. Use
+      <code>trace</code> or <code>attach</code> for the other order.</li>
+      <li><strong>Maturity.</strong> The documentation calls it "not suitable for production use now",
+      and many of the last 50 commits fix correctness bugs (hash map collisions, ringbuf
+      wraparound, fd bounds).</li>
+    </ul>
+
+    <details><summary>Troubleshooting checklist</summary>
+      <ul>
+        <li><em>Nothing happens in the target.</em> Was the loader started first? Check
+        <code>~/.bpftime/runtime.log</code>, or rerun with <code>BPFTIME_LOG_OUTPUT=console SPDLOG_LEVEL=debug</code>.</li>
+        <li><em>"Global shm not found" from bpftimetool.</em> No loader is running, so nothing has created the segment yet.</li>
+        <li><em>Stale state after a crash.</em> <code>bpftimetool remove</code>, then start again.</li>
+        <li><em>Permission errors on <code>/dev/shm/bpftime_maps_shm</code>.</em> The loader and the target run as different users. <code>bpftime trace</code> fixes this by running the loader as the target's uid.</li>
+        <li><em>"unsupported map type".</em> Check the map table above, or use <code>--allow-external-maps</code> if you supply the map yourself.</li>
+        <li><em>Stripped binary, empty stacks.</em> <code>bpftime load --fuzzy-backtracer …</code>.</li>
+        <li><em>Injection fails.</em> Check <code>/proc/sys/kernel/yama/ptrace_scope</code> and run as root.</li>
+      </ul>
+    </details>
+
+    <h2>What is actively being worked on</h2>
+    <p>The 50 most recent commits on <code>master</code> (2026-08-01 to 2026-11-03, fetched with
+    <code>gh api repos/eunomia-bpf/bpftime/commits?per_page=50</code>) and the open PRs fall into
+    a few themes:</p>
+    <ul>
+      <li><strong>Hardening the preload contract.</strong> Fail-open preload boundaries (#640), keeping logs
+      off the host's stdio (#632, #694), containing syscall callback exceptions (#628), no-fault
+      probe memory copies (#642), and an open PR for signal-handler-based protected
+      <code>probe_read/write</code> (#702).</li>
+      <li><strong>Correctness of maps and buffers.</strong> Hash lookup after colliding deletes (#650), fixed-hash
+      iteration (#658), array-of-maps null dereference (#659), ringbuf records crossing the tail
+      (#706, open #698), handler fd bounds checks (#671, #672).</li>
+      <li><strong>Linux compatibility details.</strong> <code>get_stack</code> semantics and build-ID flag (#663,
+      #631), cached pid/tid after <code>fork</code> (#685), <code>clone</code>/<code>clone3</code> under syscall
+      tracing (#649), epoll readiness (#689), real uid/gid in the identity helper (#691).</li>
+      <li><strong>GPU.</strong> GB300/CUDA 13 (#647), CUDA <code>__constant__</code>/<code>__device__</code> global
+      mirroring (#695), watcher shutdown ordering (#620). Open: host-side CUDA API uprobe tracing
+      (#720), conservative GPU SIMT verification (#624), scoping patched modules to active
+      contexts (#627), skipping PTX compilation for missing kernels (#619).</li>
+      <li><strong>New architectures and backends.</strong> Trap-based uprobes for riscv64 with a native CI
+      harness (#665, #674), QNX 8.0 aarch64 (open #661), an experimental macOS build (open #545).</li>
+      <li><strong>Tooling and embedding.</strong> argparse for bpftimetool (#719), the runtime-library lifecycle
+      example (#700), daemon fixes (#662, #651, #687, #586), and the OTel profiler mirror test (#623).</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>uBPF</strong> and <strong>rbpf</strong> are userspace eBPF VMs without maps, loaders or hooks. bpftime can use uBPF as a backend.
+      <a href="16-llvmbpf.html">llvmbpf</a> is the bpftime VM as a standalone library.</li>
+      <li><strong>Frida</strong> provides the uprobe implementation. <strong>zpoline</strong> (ATC '23) and
+      <strong>syscall_intercept</strong> inspired the syscall rewriting.</li>
+      <li><strong>NVBit</strong>, CUPTI and Nsight are the GPU instrumentation baselines in the GPU README. The
+      eGPU paper (HCDS '25) is the research origin of the CUDA backend.</li>
+      <li><strong>DPDK's built-in BPF</strong> (librte_bpf, based on uBPF) is what the XDP README compares against.
+      bpftime adds maps and control-plane loading.</li>
+      <li><strong>Wasm, LuaJIT, RLBox, ERIM</strong> are the extension mechanisms compared in the nginx benchmark and in the
+      OSDI '25 paper (<a href="14-bpftime-architecture.html">Chapter 14</a>).
+      <a href="12-wasm-bpf.html">Chapter 12</a> covers the opposite direction: eBPF loaders compiled to Wasm.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> You run <code>bpftime start ./victim</code> first and then
+        <code>bpftime load ./malloc</code>. Nothing is counted. Why?</p>
+        <button class="opt">The kernel verifier rejected the program</button>
+        <button class="opt" data-right>The agent attaches what it finds in shared memory at startup, and the loader had not created anything yet</button>
+        <button class="opt">bpftime cannot hook libc functions</button>
+        <div class="why">The README says to run <code>load</code> first. Use <code>bpftime trace</code>, whose
+        <code>--auto-refresh-ms</code> option discovers late-loaded links, or re-attach.</div></div>
+      <div class="q"><p><strong>Q2.</strong> What does <code>bpftime start -s</code> change compared with plain <code>start</code>?</p>
+        <button class="opt">It runs the program under the kernel verifier</button>
+        <button class="opt">It enables the LLVM JIT</button>
+        <button class="opt" data-right>It preloads libbpftime-agent-transformer.so, which rewrites syscall instructions and then loads the agent from AGENT_SO</button>
+        <div class="why">See the <code>start</code> branch in <code>tools/cli/main.cpp</code> and the
+        "Rewriting executable segments.." log line in <code>usage.md</code>.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Which subcommand of bpftimetool writes all programs, maps and perf events to a file?</p>
+        <button class="opt">dump</button>
+        <button class="opt" data-right>export</button>
+        <button class="opt">save</button>
+        <div class="why"><code>bpftimetool export &lt;filename&gt;</code> writes JSON handlers.
+        <code>import</code> reads them back. There is no <code>dump</code> subcommand.</div></div>
+      <div class="q"><p><strong>Q4.</strong> According to <code>benchmark/syscall/example_results.md</code>, how does userspace
+        syscall tracing compare with a kernel tracepoint?</p>
+        <button class="opt">About 10× faster</button>
+        <button class="opt" data-right>Slower: 484.65 ns vs 438.92 ns per call</button>
+        <button class="opt">Identical</button>
+        <div class="why">The 10× figure applies to uprobes. For syscalls, bpftime's advantages are portability
+        and scope, not speed.</div></div>
+      <div class="q"><p><strong>Q5.</strong> With <code>BPFTIME_RUN_WITH_KERNEL=true</code>, where does a hash map created by the loader live?</p>
+        <button class="opt">Only in <code>/dev/shm/bpftime_maps_shm</code></button>
+        <button class="opt" data-right>In the kernel. bpftime records it as a KERNEL_USER map (type + 1000) and the agent accesses the kernel map</button>
+        <button class="opt">In GPU memory</button>
+        <div class="why">See <code>BPF_MAP_CREATE</code> in <code>runtime/syscall-server/syscall_context.cpp</code>.
+        This is what lets kernel kprobes and userspace uprobes share data.</div></div>
+      <div class="q"><p><strong>Q6.</strong> In <code>cuda_probe.bpf.c</code>, what does <code>SEC("kretprobe/_Z9vectorAddPKfS0_Pf")</code> attach to?</p>
+        <button class="opt">A kernel function called vectorAdd</button>
+        <button class="opt">The host-side cudaLaunchKernel call</button>
+        <button class="opt" data-right>The exit of the CUDA device kernel vectorAdd, injected into its PTX (ATTACH_CUDA_RETPROBE)</button>
+        <div class="why">The section prefix is reused as a placeholder (the GPU README says so). The CUDA
+        backend inserts the eBPF code, translated to PTX, before the kernel returns.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/bpftime">eunomia-bpf/bpftime</a>, studied at commit
+      <a href="https://github.com/eunomia-bpf/bpftime/tree/25e250d651ad1d2a2608bbbaeaf7b9ee90cca401"><code>25e250d6</code></a> (2026-11-03).
+      Files cited: <code>README.md</code>, <code>usage.md</code>, <code>installation.md</code>, <code>tools/cli/main.cpp</code>,
+      <code>tools/bpftimetool/</code>, <code>runtime/src/bpftime_config.cpp</code>, <code>runtime/src/handler/map_handler.cpp</code>,
+      <code>runtime/src/bpf_helper.cpp</code>, <code>runtime/syscall-server/</code>, <code>daemon/</code>, <code>example/</code>, <code>benchmark/</code>.</li>
+      <li>bpftime manual and docs: <a href="https://eunomia.dev/bpftime/">eunomia.dev/bpftime</a>.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn. "Extending Applications Safely and Efficiently."
+      19th USENIX Symposium on Operating Systems Design and Implementation (OSDI '25), 2025.
+      <a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">usenix.org</a></li>
+      <li>Y. Zheng et al. "bpftime: userspace eBPF Runtime for Uprobe, Syscall and Kernel-User Interactions." arXiv:2311.07923, 2023.
+      <a href="https://arxiv.org/abs/2311.07923">arxiv.org/abs/2311.07923</a></li>
+      <li>Y. Yang, T. Yu, Y. Zheng, A. Quinn. "eGPU: Extending eBPF Programmability and Observability to GPUs."
+      4th Workshop on Heterogeneous Composable and Disaggregated Systems (HCDS '25), 2025.
+      <a href="https://dl.acm.org/doi/10.1145/3723851.3726984">doi:10.1145/3723851.3726984</a>; original repo
+      <a href="https://github.com/eunomia-bpf/eGPU">eunomia-bpf/eGPU</a> (merged into bpftime).</li>
+      <li>Y. Zheng, P. Gavriil, M. Kogias. "uXDP: Frictionless XDP Deployments in Userspace."
+      3rd Workshop on eBPF and Kernel Extensions (eBPF '25, co-located with SIGCOMM), 2025.
+      <a href="https://dl.acm.org/doi/10.1145/3748355.3748360">doi:10.1145/3748355.3748360</a></li>
+      <li>K. Yasukata et al. "zpoline: a system call hook mechanism based on binary rewriting." USENIX ATC '23, 2023.
+      <a href="https://www.usenix.org/conference/atc23/presentation/yasukata">usenix.org</a></li>
+      <li>Linux Plumbers Conference 2023 talk on bpftime:
+      <a href="https://lpc.events/event/17/contributions/1639/">lpc.events/event/17/contributions/1639</a></li>
+      <li><a href="https://github.com/eunomia-bpf/XDP-eBPF-in-DPDK">eunomia-bpf/XDP-eBPF-in-DPDK</a> (archived) and
+      <a href="https://github.com/eunomia-bpf/Nginx-eBPF-module">eunomia-bpf/Nginx-eBPF-module</a>.</li>
+      <li>bcc libbpf-tools (origin of opensnoop, bashreadline, sslsniff):
+      <a href="https://github.com/iovisor/bcc/tree/master/libbpf-tools">github.com/iovisor/bcc/tree/master/libbpf-tools</a></li>
+      <li>Frida: <a href="https://github.com/frida/frida-gum">frida-gum</a>; PREVAIL verifier:
+      <a href="https://github.com/vbpf/ebpf-verifier">vbpf/ebpf-verifier</a>.</li>
+      <li>Container image: <a href="https://github.com/eunomia-bpf/bpftime/pkgs/container/bpftime">ghcr.io/eunomia-bpf/bpftime</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="14-bpftime-architecture.html"><small>Previous</small>14 · bpftime architecture</a>
+      <a class="next" href="16-llvmbpf.html"><small>Next</small>16 · llvmbpf</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

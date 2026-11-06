@@ -1,0 +1,1760 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · bpftime architecture · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="14">
+<meta name="chapter-part" content="Part III · Userspace eBPF runtimes">
+<meta name="chapter-summary" content="How bpftime runs unmodified eBPF tools in userspace: the LD_PRELOAD syscall server, shared-memory maps, the injected agent, inline-hook uprobes, zpoline-style syscall hooks, the VM and verifier options, kernel interop, and the OSDI '25 EIM paper.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpftime">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part III · Userspace eBPF runtimes › 14 · bpftime architecture</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 14</div>
+      <h1>bpftime architecture: eBPF without the kernel round trip</h1>
+      <p class="lede">A kernel uprobe traps into the kernel on every hit. bpftime takes an
+      unmodified libbpf tool, intercepts its <code>bpf()</code> calls, keeps its programs and
+      maps in shared memory, and patches the target process so the probe jumps straight into
+      JIT-compiled eBPF in user mode. This chapter explains how each of those pieces works,
+      using the source code, and what the OSDI '25 paper adds on top: the Extension Interface
+      Model.</p>
+      <div class="meta"><span>Prerequisites: <a href="04-maps-helpers-kfuncs.html">04</a>, <a href="05-program-types-and-hooks.html">05</a> (uprobes), <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/bpftime">eunomia-bpf/bpftime</a> at <code>25e250d6</code></span><span>~55 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p><a href="05-program-types-and-hooks.html">Chapter 05</a> showed what a uprobe costs.
+    The kernel writes an <code>int3</code> over the first byte of the probed instruction.
+    Every call of the function raises a breakpoint exception, switches to kernel mode, runs
+    the BPF program, emulates or single-steps the displaced instruction, and returns to user
+    mode. That is acceptable for <code>readline()</code>. It is expensive for
+    <code>malloc()</code>, <code>SSL_read()</code> or a per-request handler in a busy
+    server, because most of the time goes into the mode switches, not into the BPF
+    program.</p>
+
+    <p>The obvious fix is to run the probe in the traced process itself, the way a
+    dynamic-instrumentation tool such as Frida or Pin does. The difficult part is keeping
+    the eBPF model intact: programs written in restricted C, compiled by clang, loaded by
+    libbpf, checked by a verifier, sharing maps with a control-plane process and even with
+    kernel eBPF programs. bpftime is the eunomia-bpf project that does this. Its stated goal
+    in the README is to be "a userspace runtime framework [that] includes everything to run
+    eBPF in userspace: loader, verifier, helpers, maps, ufunc and multiple events". The
+    project's OSDI '25 paper generalises the idea from tracing to <em>application
+    extensions</em> and proposes a model for granting them least privilege.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>bpftime puts its
+    compatibility layer at the system-call boundary that every eBPF tool already uses. The loader's
+    <code>bpf()</code> and <code>perf_event_open()</code> calls are intercepted and turned
+    into objects in a POSIX shared-memory segment. An agent library inside the target process
+    reads that segment, JIT-compiles the programs, and attaches them with binary rewriting:
+    an inline hook for function probes and a zpoline-style rewrite of <code>syscall</code>
+    instructions for syscall tracepoints. Neither the eBPF program nor the libbpf loader needs
+    any change.</p></div>
+
+    <p>This chapter covers the design and the code. <a href="15-bpftime-in-practice.html">Chapter
+    15</a> covers day-to-day use: the example tools, attach modes, and GPU support.
+    <a href="16-llvmbpf.html">Chapter 16</a> covers the LLVM-based VM that bpftime uses by
+    default.</p>
+
+    <h2>What bpftime is</h2>
+    <p>bpftime is a C++20 code base (MIT licensed) that produces a handful of shared libraries
+    and tools. The ones that matter for the architecture are:</p>
+
+    <div class="grid">
+      <div class="card"><h4>libbpftime-syscall-server.so</h4><p>Preloaded into the
+      <em>loader</em> (the libbpf, bcc or bpftrace process). It overrides <code>syscall()</code>,
+      <code>mmap()</code>, <code>ioctl()</code>, <code>epoll_*</code>, <code>open()</code> and a
+      few more, and implements the eBPF syscall interface on top of shared memory.</p></div>
+      <div class="card"><h4>libbpftime-agent.so</h4><p>Loaded into the <em>target</em>
+      process, either by <code>LD_PRELOAD</code> at start or by Frida's injector into a running
+      process. It contains the attach backends, the helpers and the VM.</p></div>
+      <div class="card"><h4>Shared memory segment</h4><p>A Boost.Interprocess
+      <code>managed_shared_memory</code> named <code>bpftime_maps_shm</code>. It holds the
+      handler table (progs, maps, perf events, links), the map data and the runtime
+      config.</p></div>
+      <div class="card"><h4>libbpftime-agent-transformer.so</h4><p>The syscall-hook bootstrap.
+      It rewrites every <code>syscall</code> instruction in the target and then loads the agent
+      into a fresh link-map namespace.</p></div>
+      <div class="card"><h4>bpftime, bpftimetool</h4><p>The CLI (<code>load</code>,
+      <code>start</code>, <code>attach</code>, <code>detach</code>, <code>trace</code>) and a
+      tool that exports, imports and runs the shared-memory state as JSON.</p></div>
+      <div class="card"><h4>bpftime_daemon</h4><p>Optional. A kernel eBPF program plus a
+      user-space driver that watches real <code>bpf()</code> calls system-wide and mirrors
+      uprobe programs into bpftime, so they run in user space after the kernel verifier has
+      checked them.</p></div>
+    </div>
+
+    <p>The paper describes the same split in its own terms: a <em>loader</em> that is "a thin
+    interposition layer between eBPF applications and the kernel", a <em>runtime</em> that
+    "executes extensions in the same process as the original application", and maps with
+    "three sharing modes: local process (nonshared), shared across multiple processes, and
+    shared across processes and the kernel".</p>
+
+    <h2>The architecture at a glance</h2>
+
+    <figure>
+      <svg viewBox="0 0 900 540" role="img" aria-label="bpftime architecture: loader process with syscall server, shared memory segment, target process with agent, and the kernel below">
+        <style>
+          .z{fill:var(--bg3);stroke:var(--border)}
+          .a{fill:none;stroke:var(--accent);stroke-width:2}
+          .b{fill:none;stroke:var(--accent2);stroke-width:2}
+          .m{fill:none;stroke:var(--muted);stroke-width:1.5}
+          .w{fill:var(--fg);font:13px sans-serif}
+          .h{fill:var(--fg);font:bold 14px sans-serif}
+          .c{fill:var(--fg);font:12px monospace}
+          .g{fill:var(--muted);font:12px sans-serif}
+          .p{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah141)}
+          .d{stroke:var(--muted);stroke-width:1.5;fill:none;stroke-dasharray:5 4;marker-end:url(#ah141)}
+        </style>
+        <defs><marker id="ah141" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <rect class="z" x="10" y="10" width="880" height="370" rx="8"/>
+        <text class="h" x="22" y="32">user space</text>
+        <!-- loader -->
+        <rect class="a" x="30" y="50" width="260" height="310" rx="8"/>
+        <text class="h" x="42" y="72">Loader process</text>
+        <text class="g" x="42" y="90">e.g. ./malloc, bpftrace, opensnoop</text>
+        <rect class="m" x="45" y="102" width="230" height="56" rx="5"/>
+        <text class="w" x="55" y="122">libbpf / bcc / bpftrace</text>
+        <text class="c" x="55" y="142">syscall(__NR_bpf, ...)</text>
+        <rect class="a" x="45" y="178" width="230" height="110" rx="5"/>
+        <text class="w" x="55" y="198">libbpftime-syscall-server.so</text>
+        <text class="g" x="55" y="216">LD_PRELOAD: syscall, mmap, ioctl,</text>
+        <text class="g" x="55" y="232">epoll_*, open, fopen, close ...</text>
+        <text class="c" x="55" y="252">handle_sysbpf()</text>
+        <text class="c" x="55" y="270">handle_perfevent()</text>
+        <rect class="m" x="45" y="300" width="230" height="44" rx="5"/>
+        <text class="w" x="55" y="318">PREVAIL verifier</text>
+        <text class="g" x="55" y="335">optional, build-time flag</text>
+        <path class="p" d="M160,158 V176"/>
+        <!-- shm -->
+        <rect class="b" x="320" y="70" width="250" height="270" rx="8"/>
+        <text class="h" x="332" y="92">Shared memory</text>
+        <text class="c" x="332" y="110">/dev/shm/bpftime_maps_shm</text>
+        <text class="g" x="332" y="128">boost::interprocess segment</text>
+        <rect class="m" x="335" y="140" width="220" height="110" rx="5"/>
+        <text class="w" x="345" y="160">handler_manager [fd]</text>
+        <text class="c" x="345" y="180">3: bpf_map_handler</text>
+        <text class="c" x="345" y="198">4: bpf_prog_handler</text>
+        <text class="c" x="345" y="216">5: bpf_perf_event_handler</text>
+        <text class="c" x="345" y="234">6: bpf_link_handler</text>
+        <text class="w" x="345" y="275">map data, runtime_config,</text>
+        <text class="w" x="345" y="293">alive pid sets, epoch seqlock</text>
+        <path class="p" d="M275,232 H333"/>
+        <text class="g" x="282" y="225">create</text>
+        <!-- target -->
+        <rect class="a" x="600" y="50" width="270" height="310" rx="8"/>
+        <text class="h" x="612" y="72">Target process</text>
+        <text class="g" x="612" y="90">e.g. ./victim, nginx, redis</text>
+        <rect class="m" x="615" y="102" width="240" height="48" rx="5"/>
+        <text class="w" x="625" y="122">host code: malloc(), syscall</text>
+        <text class="g" x="625" y="140">patched by inline hook / zpoline</text>
+        <rect class="a" x="615" y="162" width="240" height="182" rx="5"/>
+        <text class="w" x="625" y="182">libbpftime-agent.so</text>
+        <text class="c" x="625" y="202">bpf_attach_ctx</text>
+        <text class="g" x="625" y="222">attach impls: frida uprobe,</text>
+        <text class="g" x="625" y="238">syscall trace, CUDA (opt.)</text>
+        <text class="c" x="625" y="262">bpftime_prog + VM</text>
+        <text class="g" x="625" y="280">llvm JIT (default) or ubpf</text>
+        <text class="g" x="625" y="300">helpers, ufuncs</text>
+        <text class="g" x="625" y="318">open_only on the segment</text>
+        <path class="p" d="M613,240 H572"/>
+        <text class="g" x="578" y="232">read</text>
+        <path class="p" d="M735,160 V152"/>
+        <!-- kernel -->
+        <rect class="z" x="10" y="395" width="880" height="135" rx="8"/>
+        <text class="h" x="22" y="417">kernel (optional)</text>
+        <rect class="m" x="40" y="430" width="230" height="80" rx="5"/>
+        <text class="w" x="50" y="452">real bpf(): kernel verifier,</text>
+        <text class="w" x="50" y="470">kernel maps</text>
+        <text class="g" x="50" y="490">BPFTIME_RUN_WITH_KERNEL</text>
+        <rect class="m" x="330" y="430" width="250" height="80" rx="5"/>
+        <text class="w" x="340" y="452">kernel-user maps</text>
+        <text class="g" x="340" y="470">type + KERNEL_USER_MAP_OFFSET</text>
+        <text class="g" x="340" y="490">mmap or bpf_map_*_elem()</text>
+        <rect class="m" x="620" y="430" width="250" height="80" rx="5"/>
+        <text class="w" x="630" y="452">bpftime_daemon tracer</text>
+        <text class="g" x="630" y="470">tracepoints on sys_enter_bpf,</text>
+        <text class="g" x="630" y="490">perf_event_open, ioctl, close</text>
+        <path class="d" d="M160,344 V428"/>
+        <path class="d" d="M445,340 V428"/>
+        <path class="d" d="M735,428 L560,342"/>
+      </svg>
+      <figcaption>Figure 14.1 — The main parts of bpftime. Solid arrows are the default
+      userspace-only path: the loader writes objects into shared memory, and the agent in the
+      target reads them and patches the host code. Dashed arrows are the optional kernel paths:
+      loading through the real kernel verifier, maps backed by kernel maps, and the daemon that
+      mirrors kernel-loaded uprobe programs.</figcaption>
+    </figure>
+
+    <p>The loader and the target are separate processes, which is deliberate. In kernel eBPF the
+    control plane (the libbpf program that loads, attaches and reads maps) talks to the kernel,
+    and the kernel runs the program in whatever process hits the hook. bpftime keeps that shape
+    and replaces the kernel with a shared-memory segment. The loader still "creates a map" and
+    gets back a file descriptor. The target still "runs the program when the hook fires". The
+    two sides do not need to run at the same time: you can <code>load</code> first and
+    <code>start</code> or <code>attach</code> later, and the README notes that "You should
+    always run the <code>load</code> first then run the <code>start</code> command, or the eBPF
+    program will not be attached".</p>
+
+    <h2>How the code is organised</h2>
+    <p>At commit <code>25e250d6</code> (3 November 2026) the repository has about 1,000 files
+    outside submodules. The architecture is spread over these directories:</p>
+
+    <table>
+      <thead><tr><th>Directory</th><th>What lives there</th><th>Key files</th></tr></thead>
+      <tbody>
+        <tr><td><code>runtime/syscall-server/</code></td><td>The <code>LD_PRELOAD</code> loader shim: bpf() and perf_event_open() emulation, mocked sysfs files</td><td><code>syscall_server_main.cpp</code>, <code>syscall_context.cpp</code>, <code>syscall_server_utils.cpp</code></td></tr>
+        <tr><td><code>runtime/agent/</code></td><td>The library that runs inside the target; entry points for preload and injection</td><td><code>agent.cpp</code></td></tr>
+        <tr><td><code>runtime/src/</code></td><td>Shared-memory layer, handlers, programs, helpers, ufuncs, attach context</td><td><code>bpftime_shm_internal.cpp</code>, <code>handler/handler_manager.hpp</code>, <code>bpftime_prog.cpp</code>, <code>bpf_helper.cpp</code>, <code>attach/bpf_attach_ctx.cpp</code></td></tr>
+        <tr><td><code>runtime/src/bpf_map/</code></td><td>Map implementations: <code>userspace/</code> (hash, array, per-CPU, LRU, LPM trie, ringbuf, perf array, prog array, stack trace...), <code>shared/</code> (kernel-user), <code>gpu*/</code></td><td><code>userspace/var_hash_map.hpp</code>, <code>shared/hash_map_kernel_user.cpp</code></td></tr>
+        <tr><td><code>attach/base_attach_impl/</code></td><td>The interface every event source implements</td><td><code>base_attach_impl.hpp</code></td></tr>
+        <tr><td><code>attach/frida_uprobe_attach_impl/</code></td><td>uprobe, uretprobe, override and replace via frida-gum's Interceptor (x86-64, arm64)</td><td><code>src/frida_internal_attach_entry.cpp</code></td></tr>
+        <tr><td><code>attach/trap_uprobe_attach_impl/</code></td><td>A breakpoint + <code>SIGTRAP</code> uprobe backend, built only on riscv64</td><td><code>README.md</code>, <code>src/trap_uprobe_attach_impl.cpp</code></td></tr>
+        <tr><td><code>attach/text_segment_transformer/</code></td><td>zpoline-style rewriting of <code>syscall</code> instructions</td><td><code>text_segment_transformer.cpp</code>, <code>agent-transformer.cpp</code></td></tr>
+        <tr><td><code>attach/syscall_trace_attach_impl/</code></td><td>Dispatches intercepted syscalls to <code>sys_enter_*</code> / <code>sys_exit_*</code> programs</td><td><code>src/</code>, <code>README.md</code></td></tr>
+        <tr><td><code>attach/nv_attach_impl/</code></td><td>CUDA/PTX attach (see <a href="15-bpftime-in-practice.html">chapter 15</a>)</td><td><code>nv_attach_impl.cpp</code></td></tr>
+        <tr><td><code>vm/</code></td><td>VM C API, backend interface, ubpf and LLVM backends (<code>vm/llvm-jit</code> is the <a href="16-llvmbpf.html">llvmbpf</a> submodule)</td><td><code>vm-core/include/ebpf-vm.h</code>, <code>compat/include/bpftime_vm_compat.hpp</code></td></tr>
+        <tr><td><code>bpftime-verifier/</code></td><td>Wrapper around PREVAIL (<code>vbpf/ebpf-verifier</code> submodule)</td><td><code>src/bpftime-verifier.cpp</code>, <code>src/platform-impl.cpp</code></td></tr>
+        <tr><td><code>daemon/</code></td><td>Kernel tracer program and user driver for the run-alongside-kernel mode</td><td><code>kernel/bpf_tracer.bpf.c</code>, <code>user/bpftime_driver.cpp</code></td></tr>
+        <tr><td><code>tools/cli/</code>, <code>tools/bpftimetool/</code>, <code>tools/aot/</code></td><td>The <code>bpftime</code> CLI, the shm inspector, and the AOT compiler front end</td><td><code>cli/main.cpp</code></td></tr>
+        <tr><td><code>example/</code>, <code>benchmark/</code></td><td>libbpf examples (malloc, opensnoop, sslsniff...), benchmarks</td><td><code>example/malloc/malloc.bpf.c</code></td></tr>
+      </tbody>
+    </table>
+
+    <p>The repository's <code>AGENTS.md</code> also records a design rule that shapes much of
+    the agent's code. It calls it the "Injected Agent Host-Process Contract": code loaded into a
+    third-party process "must remain a guest of that process". It must not exit, must not touch
+    the host's stdio unless asked, and must chain signal handlers it replaces.</p>
+
+    <h2>The loader: intercepting bpf() with LD_PRELOAD</h2>
+
+    <h3>Why a preloaded library sees libbpf's system calls</h3>
+    <p>libbpf does not issue the <code>syscall</code> instruction itself. It calls glibc's
+    <code>syscall()</code> wrapper with <code>__NR_bpf</code>. When a shared library listed in
+    <code>LD_PRELOAD</code> defines a symbol named <code>syscall</code>, the dynamic linker
+    resolves libbpf's reference to that definition first, so every eBPF system call of the
+    loader goes through bpftime. The preloaded library finds the real function with
+    <code>dlsym(RTLD_NEXT, "syscall")</code>. Here is the dispatcher, trimmed:</p>
+
+    <pre data-file="bpftime/runtime/syscall-server/syscall_server_main.cpp"><code class="language-cpp">extern "C" long syscall(long sysno, ...)
+{
+	// glibc directly reads the arguments without considering
+	// the underlying argument number. So did us
+	va_list args;
+	va_start(args, sysno);
+	long arg1 = va_arg(args, long);
+	/* ... arg2 .. arg6 ... */
+	va_end(args);
+	if (!initialize_ctx())
+		return fallback_syscall(sysno, arg1, arg2, arg3, arg4, arg5,
+					arg6);
+	auto call_original = [&amp;]() {
+		return context-&gt;orig_syscall_fn(sysno, arg1, arg2, arg3, arg4,
+						arg5, arg6);
+	};
+	if (sysno == __NR_bpf) {
+		/* ... */
+		int cmd = (int)arg1;
+		auto attr = (union bpf_attr *)(uintptr_t)arg2;
+		auto size = (size_t)arg3;
+		return handle_exceptions(
+			[&amp;]() {
+				return context-&gt;handle_sysbpf(cmd, attr, size);
+			},
+			call_original);
+	} else if (sysno == __NR_perf_event_open) {
+		/* ... */
+		return handle_exceptions(
+			[&amp;]() {
+				return context-&gt;handle_perfevent(
+					(perf_event_attr *)(uintptr_t)arg1,
+					(pid_t)arg2, (int)arg3, (int)arg4,
+					(unsigned long)arg5);
+			},
+			call_original);
+	} /* ... dup3, memfd_create ... */
+	return call_original();
+}</code></pre>
+
+    <p>Note <code>handle_exceptions(..., call_original)</code>: if the emulation throws (for
+    example a Boost <code>bad_alloc</code> because the segment is full) the shim falls back to
+    the real system call instead of crashing the loader. The same file overrides
+    <code>mmap</code>, <code>munmap</code>, <code>ioctl</code>, <code>epoll_create1</code>,
+    <code>epoll_ctl</code>, <code>epoll_wait</code>, <code>close</code>, <code>open</code>,
+    <code>openat</code>, <code>read</code> and the <code>fopen</code> family. libbpf uses each
+    of these somewhere in the load path. It <code>mmap</code>s ring buffers and array maps,
+    calls <code>ioctl(PERF_EVENT_IOC_ENABLE)</code> on probe fds, waits on ring buffers with
+    epoll, and reads sysfs files to learn the uprobe PMU type.</p>
+
+    <p>The context constructor resolves all the original functions and then calls
+    <code>unsetenv("LD_PRELOAD")</code>, with the comment "To avoid polluting other child
+    processes". A loader that forks helper programs does not pass the shim on to them.</p>
+
+    <h3>What each bpf() command becomes</h3>
+    <p><code>syscall_context::handle_sysbpf()</code> is a <code>switch</code> over the
+    <code>bpf_cmd</code>. Map commands go to <code>bpftime_maps_create</code>,
+    <code>bpftime_map_lookup_elem</code> and so on. <code>BPF_LINK_CREATE</code> and
+    <code>BPF_PROG_ATTACH</code> record links. <code>BPF_MAP_FREEZE</code> is accepted and
+    ignored ("we didn't implement this"). Unknown commands are passed to the real kernel.
+    Program load is the interesting case:</p>
+
+    <pre data-file="bpftime/runtime/syscall-server/syscall_context.cpp"><code class="language-cpp">	case BPF_PROG_LOAD:
+		// Load a program?
+		{
+			/* ... */
+			if (run_with_kernel) {
+				return create_kernel_bpf_prog_in_userspace(
+					cmd, attr, size);
+			}
+			// tracepoint -&gt; BPF_PROG_TYPE_TRACEPOINT
+			// uprobe/uretprobe -&gt; BPF_PROG_TYPE_SOCKET_FILTER
+			std::optional&lt;std::string&gt; simple_section_name;
+			if (attr-&gt;prog_type == BPF_PROG_TYPE_TRACEPOINT) {
+				simple_section_name = "tracepoint";
+			} else if (attr-&gt;prog_type ==
+				   BPF_PROG_TYPE_SOCKET_FILTER) {
+				simple_section_name = "uprobe";
+			}
+#ifdef ENABLE_BPFTIME_VERIFIER
+			auto verifier_mode =
+				bpftime_get_runtime_config().verifier_mode;
+			// Only do verification for tracepoint/uprobe/uretprobe
+			if (simple_section_name.has_value() &amp;&amp;
+			    verifier_mode != BPFTIME_NO_VERIFY) {
+				auto result = verifier::verify_ebpf_program(
+					(uint64_t *)(uintptr_t)attr-&gt;insns,
+					(size_t)attr-&gt;insn_cnt,
+					simple_section_name.value());
+				/* ... STRICT: errno = EINVAL; return -1;
+				       WARNING: log and continue ... */
+			}
+#endif
+			int id = bpftime_progs_create(
+				-1 /* let the shm alloc fd for us */,
+				(ebpf_inst *)(uintptr_t)attr-&gt;insns,
+				(size_t)attr-&gt;insn_cnt, attr-&gt;prog_name,
+				attr-&gt;prog_type);
+			return id;
+		}</code></pre>
+
+    <p>The program is stored as raw eBPF instructions in the shared-memory handler table, and the
+    returned "fd" is just the index of its slot. Nothing is compiled yet. Compilation happens
+    later, in the target, because the JIT output has to live in the target's address space. The
+    verifier part is covered in its own section below.</p>
+
+    <h3>perf_event_open() and the files bpftime pretends exist</h3>
+    <p>libbpf attaches a uprobe in two steps. It calls <code>perf_event_open()</code> with
+    <code>attr.type</code> set to the dynamic PMU type of the uprobe event source,
+    <code>config1</code> pointing at the binary path and <code>config2</code> holding the file
+    offset. Then it links the program to the returned fd. libbpf learns the PMU type by reading
+    <code>/sys/bus/event_source/devices/uprobe/type</code>. bpftime intercepts that too.
+    <code>handle_perfevent()</code> compares <code>attr-&gt;type</code> with
+    <code>determine_uprobe_perf_type()</code> and calls
+    <code>bpftime_uprobe_create(pid, name, offset, retprobe, ref_ctr_off)</code>. If the sysfs
+    file does not exist, for example on a kernel without uprobes or in a container, the
+    overridden <code>open</code>/<code>fopen</code> serve a mocked file containing
+    <code>MOCKED_UPROBE_TYPE_VALUE</code> (9). That is one reason bpftime can run unmodified
+    libbpf tools on systems where kernel eBPF is unavailable.</p>
+
+    <p>The same function handles tracepoints (<code>PERF_TYPE_TRACEPOINT</code> becomes
+    <code>bpftime_tracepoint_create</code>, which is how <code>sys_enter_openat</code> programs
+    are registered), software perf events (used for perf-buffer output), kprobes (recorded but
+    only meaningful with the GPU and kernel modes) and two bpftime-specific types,
+    <code>BPF_TYPE_UREPLACE</code> and <code>BPF_TYPE_UPROBE_OVERRIDE</code>, which replace a
+    function or filter its return value.</p>
+
+    <h2>Shared memory: the handler table and the maps</h2>
+
+    <h3>One segment, named objects</h3>
+    <p>Everything the loader creates goes into one Boost.Interprocess
+    <code>managed_shared_memory</code> segment. The segment is a file in
+    <code>/dev/shm</code> that each process maps. Boost provides a heap allocator inside it
+    (<code>segment_manager</code>), offset-based pointers that work at different mapping
+    addresses, and named object lookup. The default name is <code>bpftime_maps_shm</code>
+    (override with <code>BPFTIME_GLOBAL_SHM_NAME</code>) and the default size is 50 MB
+    (<code>BPFTIME_SHM_MEMORY_MB</code>). The server creates it, and the agent opens it and
+    looks up the same named objects:</p>
+
+    <pre data-file="bpftime/runtime/src/bpftime_shm_internal.cpp"><code class="language-cpp">bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
+	: open_type(type)
+{
+	// Get the config from env because the shared memory is not initialized
+	auto config = construct_runtime_config_from_env();
+	size_t memory_size = config.shm_memory_size;
+	size_t max_fd_count = config.max_fd_count;
+	if (type == shm_open_type::SHM_OPEN_ONLY) {
+		SPDLOG_DEBUG("start: bpftime_shm for client setup");
+		// open the shm
+		segment = boost::interprocess::managed_shared_memory(
+			boost::interprocess::open_only, shm_name);
+		manager = segment.find&lt;bpftime::handler_manager&gt;(
+					 bpftime::DEFAULT_GLOBAL_HANDLER_NAME)
+				  .first;
+		/* ... syscall_installed_pids, runtime_config, injected_pids,
+		       alive_syscall_server_pids, pid_set_lock, epoch_state ... */
+	} else if (type == shm_open_type::SHM_CREATE_OR_OPEN ||
+		   type == shm_open_type::SHM_CREATE_ONLY) {
+		if (type == shm_open_type::SHM_CREATE_ONLY) {
+			segment = boost::interprocess::managed_shared_memory(
+				boost::interprocess::create_only, shm_name,
+				memory_size &lt;&lt; 20);
+		} else {
+			segment = boost::interprocess::managed_shared_memory(
+				boost::interprocess::open_or_create, shm_name,
+				memory_size &lt;&lt; 20);
+		}
+		manager = segment.find_or_construct&lt;bpftime::handler_manager&gt;(
+			bpftime::DEFAULT_GLOBAL_HANDLER_NAME)(segment,
+							      max_fd_count);
+		/* ... */
+	} /* ... SHM_REMOVE_AND_CREATE (daemon), SHM_NO_CREATE (tests) ... */
+}</code></pre>
+
+    <p>The central object is the <code>handler_manager</code>: a shared-memory vector of
+    <code>std::variant</code>s, one slot per fake file descriptor (6,144 slots by default,
+    <code>BPFTIME_MAX_FD_COUNT</code>):</p>
+
+    <pre data-file="bpftime/runtime/src/handler/handler_manager.hpp"><code class="language-cpp">constexpr const char *DEFAULT_GLOBAL_SHM_NAME = "bpftime_maps_shm";
+constexpr const char *DEFAULT_GLOBAL_HANDLER_NAME = "bpftime_handler";
+/* ... */
+using handler_variant =
+	std::variant&lt;unused_handler, bpf_map_handler, bpf_link_handler,
+		     bpf_prog_handler, bpf_perf_event_handler, epoll_handler,
+		     memfd_handler&gt;;
+
+using handler_variant_allocator =
+	allocator&lt;handler_variant, managed_shared_memory::segment_manager&gt;;
+
+using handler_variant_vector =
+	boost::interprocess::vector&lt;handler_variant, handler_variant_allocator&gt;;
+
+// handler manager for keep bpf maps and progs fds
+// This struct will be put on shared memory
+class handler_manager {
+    public:
+	/* ... */
+	int set_handler_at_empty_slot(handler_variant &amp;&amp;handler,
+				      managed_shared_memory &amp;memory);
+	/* ... */
+    private:
+	handler_variant_vector handlers;
+};</code></pre>
+
+    <p>This table is the hand-off point between the two processes. A <code>bpf_prog_handler</code>
+    holds the instruction vector and name. A <code>bpf_perf_event_handler</code> holds "uprobe
+    on <code>libc.so.6</code> at offset X for pid P". A <code>bpf_link_handler</code> says "prog
+    4 is attached to perf event 5, with this cookie". The agent never receives a message from
+    the loader. It scans this table.</p>
+
+    <p>The fds that bpftime hands to the loader are not real kernel fds. The
+    overridden <code>close()</code>, <code>mmap()</code>, <code>ioctl()</code> and
+    <code>epoll_ctl()</code> check whether an fd number belongs to a bpftime handler before
+    deciding whether to emulate the call or pass it through. The calls pass <code>-1 /* let the
+    shm alloc fd for us */</code>, and the handler manager picks an empty slot. How these
+    numbers are kept from colliding with real descriptors that the loader opens later is not
+    covered here; I did not trace that path completely.</p>
+
+    <h3>Map implementations</h3>
+    <p>Map values live inside the segment, so a loader reading a map does not need a system call:
+    <code>bpf(BPF_MAP_LOOKUP_ELEM)</code> becomes a function call on shared memory. The
+    userspace hash map, for example, is a Boost <code>unordered_map</code> whose allocator
+    draws from the segment:</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Userspace hash map (shm)">
+        <pre data-file="bpftime/runtime/src/bpf_map/userspace/var_hash_map.hpp"><code class="language-cpp">// implementation of hash map
+class var_size_hash_map_impl {
+	using bi_map_value_ty = std::pair&lt;const bytes_vec, bytes_vec&gt;;
+	using bi_map_allocator =
+		allocator&lt;bi_map_value_ty,
+			  managed_shared_memory::segment_manager&gt;;
+	using shm_hash_map =
+		boost::unordered_map&lt;bytes_vec, bytes_vec, bytes_vec_hasher,
+				     std::equal_to&lt;bytes_vec&gt;, bi_map_allocator&gt;;
+	shm_hash_map map_impl;
+	uint32_t _key_size;
+	uint32_t _value_size;
+	uint32_t _max_entries;
+	uint32_t flags;
+	/* ... */
+    public:
+	const static bool should_lock = true;
+	/* ... elem_lookup, elem_update, elem_delete, map_get_next_key ... */
+};</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Kernel-user hash map">
+        <pre data-file="bpftime/runtime/src/bpf_map/shared/hash_map_kernel_user.cpp"><code class="language-cpp">void *hash_map_kernel_user_impl::elem_lookup(const void *key)
+{
+	SPDLOG_TRACE("Peform elem lookup of hash map");
+	if (map_fd &lt; 0) {
+		init_map_fd();
+	}
+	// Allocate as a local variable to make
+	//  it thread safe, since we use sharable lock
+	int res = bpf_map_lookup_elem(map_fd, key, value_vec.data());
+	if (res &lt; 0) {
+		return nullptr;
+	}
+	return value_vec.data();
+}</code></pre>
+      </div>
+    </div>
+
+    <p>The <code>should_lock</code> flag tells the generic <code>bpf_map_handler</code> to wrap
+    each operation in a spinlock guard (<code>bpftime_lock_guard</code> around
+    <code>pthread_spin_lock</code>). That lock is one reason the paper's microbenchmark finds
+    <code>hash_map_lookup</code> slower in bpftime than in the kernel (22.0 ns against 9.8 ns,
+    see the evaluation section). The kernel's hash map lookup is RCU-protected and takes no lock.
+    The comparison of the two designs is my reading; the paper does not explain that row.</p>
+
+    <p>The "kernel-user" variants in <code>bpf_map/shared/</code> are the third sharing mode in
+    the paper. The data lives in a real kernel map. A bpftime program in the target accesses it
+    with <code>bpf_map_lookup_elem()</code> from libbpf (a real syscall) for hash maps, or by
+    <code>mmap</code>ing the kernel array for array maps. Their type numbers are the kernel's
+    plus <code>KERNEL_USER_MAP_OFFSET</code> (1000) in <code>bpftime_shm.hpp</code>, e.g.
+    <code>BPF_MAP_TYPE_KERNEL_USER_HASH = 1001</code>.</p>
+
+    <h3>Sessions</h3>
+    <p>A long-lived target can outlive many loader runs. The segment therefore carries a small
+    seqlock, <code>bpftime_global_epoch_state</code>: odd values mean "server is resetting
+    handlers", even values identify a stable session. On startup the syscall server calls
+    <code>begin_new_session()</code>, and when the agent sees the epoch change it destroys its
+    old attachments and rebinds. The segment also records alive agent and server PIDs so the last
+    process out can remove it.</p>
+
+    <h2>The agent: getting code into the target</h2>
+
+    <h3>Two ways in</h3>
+    <p>The agent library is <code>libbpftime-agent.so</code>. It has two entry points, one per
+    way of getting into a process.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Start: LD_PRELOAD">
+        <pre data-file="bpftime/runtime/agent/agent.cpp"><code class="language-cpp">extern "C" int bpftime_hooked_main(int argc, char **argv, char **envp)
+{
+	int stay_resident = 0;
+	injected_with_frida = false;
+	bpftime_agent_main("", &amp;stay_resident);
+	int ret = orig_main_func(argc, argv, envp);
+	return ret;
+}
+
+extern "C" int __libc_start_main(int (*main)(int, char **, char **), int argc,
+				 char **argv,
+				 int (*init)(int, char **, char **),
+				 void (*fini)(void), void (*rtld_fini)(void),
+				 void *stack_end)
+{
+	orig_main_func = main;
+	using this_func_t = decltype(&amp;__libc_start_main);
+	this_func_t orig = (this_func_t)dlsym(RTLD_NEXT, "__libc_start_main");
+
+	return orig(bpftime_hooked_main, argc, argv, init, fini, rtld_fini,
+		    stack_end);
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="Attach: Frida injector">
+        <pre data-file="bpftime/tools/cli/main.cpp"><code class="language-cpp">static int inject_by_frida(int pid, const char *inject_path, const char *arg)
+{
+	spdlog::info("Injecting to {}", pid);
+	frida_init();
+	auto injector = frida_injector_new();
+	GError *err = nullptr;
+	auto id = frida_injector_inject_library_file_sync(injector, pid,
+							  inject_path,
+							  "bpftime_agent_main",
+							  arg, nullptr, &amp;err);
+	if (err) {
+		spdlog::error("Failed to inject: {}", err-&gt;message);
+		/* ... */
+		return 1;
+	}
+	spdlog::info("Successfully injected. ID: {}", id);
+	/* ... */
+}</code></pre>
+      </div>
+    </div>
+
+    <p><code>bpftime start ./prog</code> forks and execs the program with
+    <code>LD_PRELOAD</code> set to the agent. The agent's <code>__libc_start_main</code> wins
+    symbol resolution, swaps <code>main</code> for <code>bpftime_hooked_main</code>, and so runs
+    its initialisation before the program's own <code>main</code>. <code>bpftime attach PID</code>
+    uses frida-core's injector instead. On Linux the injector attaches to the running process with
+    <code>ptrace</code>, makes it load the library, and calls the named entry point
+    <code>bpftime_agent_main</code> with a data string. The paper describes the same step: "The
+    rewriter uses ptrace to pause the host application and load the bpftime user runtime ...
+    which allows the system to support use-cases that extend live applications." The repo's
+    <code>usage.md</code> likewise says the CLI "can work with <code>ptrace</code> to inject the
+    runtime shared library into a running target process". Injection therefore needs ptrace
+    permission over the target: the same user plus a permissive Yama
+    <code>ptrace_scope</code>, or root. That is why the README writes <code>sudo bpftime attach</code>.</p>
+
+    <h3>What the agent does when it starts</h3>
+    <p><code>bpftime_agent_main</code> is defensive, because it runs inside someone else's
+    process. It detects a copy of the agent that is already loaded and forwards the request to it
+    over a Unix socket. It retries opening the segment, since the loader may still be creating
+    it. It records its PID, registers the attach backends and builds the attach context.
+    Trimmed:</p>
+
+    <pre data-file="bpftime/runtime/agent/agent.cpp"><code class="language-cpp">			// SHM can race with the loader process; retry a bit to avoid
+			// flakiness in "spawn loader then inject agent" workflows.
+			for (int attempt = 0; attempt &lt; 60; attempt++) {
+				try {
+					/* ... */
+					bpftime_initialize_global_shm(
+						shm_open_type::SHM_OPEN_ONLY);
+					shm_ok = true;
+					break;
+				} catch (const std::exception &amp;ex) {
+					/* ... sleep 50 ms ... */
+				}
+			}
+			/* ... */
+			ctx_holder.init();
+#if __linux__ &amp;&amp; BPFTIME_BUILD_WITH_LIBBPF
+			// Register syscall trace impl
+			auto syscall_trace_impl =
+				std::make_unique&lt;syscall_trace_attach_impl&gt;();
+			syscall_trace_impl-&gt;set_original_syscall_function(
+				orig_hooker);
+			/* ... */
+			ctx_holder.ctx.register_attach_impl(
+				{ ATTACH_SYSCALL_TRACE },
+				std::move(syscall_trace_impl), /* ... */);
+#endif
+			// Register uprobe attach impl
+#if BPFTIME_HAVE_TRAP_UPROBE_ATTACH
+			/* ... riscv64: trap::trap_attach_impl ... */
+#elif BPFTIME_HAVE_FRIDA_ATTACH
+			ctx_holder.ctx.register_attach_impl(
+				{ ATTACH_UPROBE, ATTACH_URETPROBE,
+				  ATTACH_UPROBE_OVERRIDE, ATTACH_UREPLACE },
+				std::make_unique&lt;attach::frida_attach_impl&gt;(
+					runtime_config.enable_frida_fuzzy_backtracer),
+				/* ... private-data factory ... */);
+#endif
+			/* ... CUDA attach impl if BPFTIME_ENABLE_CUDA_ATTACH ... */
+			int res = ctx_holder.ctx
+					  .init_attach_ctx_from_handlers(
+						  runtime_config);</code></pre>
+
+    <p>An <em>attach implementation</em> is any class that implements the small interface in
+    <code>attach/base_attach_impl/base_attach_impl.hpp</code>. This interface is what makes
+    bpftime a framework rather than only a uprobe tool: a new event source needs only to
+    implement it.</p>
+
+    <pre data-file="bpftime/attach/base_attach_impl/base_attach_impl.hpp"><code class="language-cpp">// A wrapper function for an entry function of an ebpf program
+using ebpf_run_callback = std::function&lt;int(void *memory, size_t memory_size,
+					    uint64_t *return_value)&gt;;
+/* ... */
+// The base of all attach implementations
+class base_attach_impl {
+    public:
+	// Detach a certain attach entry by a local attach id
+	virtual int detach_by_id(int id) = 0;
+
+	// Create an attach entry with an ebpf callback. To avoid messing up the
+	// code base, we don't use bpftime_prog here, instead, we require a
+	// callback accept the same argument as bpftime_prog::run The callback
+	// would be called if the attach entry is triggered. The specific attach
+	// impl will be responsible for preparing arguments to the ebpf program.
+	virtual int create_attach_with_ebpf_callback(
+		ebpf_run_callback &amp;&amp;cb, const attach_private_data &amp;private_data,
+		int attach_type) = 0;
+	/* ... register_custom_helpers, call_attach_specific_function ... */
+};</code></pre>
+
+    <h3>From handlers to live hooks</h3>
+    <p><code>bpf_attach_ctx::init_attach_ctx_from_handlers()</code> walks every allocated slot of
+    the handler table. A program handler becomes a <code>bpftime_prog</code>: a VM instance with
+    the helpers registered. A perf-event handler becomes "attach private data" (for a uprobe,
+    the module and offset). A link handler joins the two: it looks up the attach
+    implementation registered for that perf event's type and hands it a closure that runs the
+    program:</p>
+
+    <pre data-file="bpftime/runtime/src/attach/bpf_attach_ctx.cpp"><code class="language-cpp">		auto cookie = handler.attach_cookie;
+		/* ... trap backend: prog-&gt;prepare_for_signal_execution() ... */
+		attach_id = attach_impl-&gt;create_attach_with_ebpf_callback(
+			[=](void *mem, size_t mem_size, uint64_t *ret) -&gt; int {
+				if (auto *ctx = attach::current_signal_callback)
+					ctx-&gt;cookie = cookie;
+				else
+					current_thread_bpf_cookie = cookie;
+				int err = prog-&gt;bpftime_prog_exec(
+					(void *)mem, mem_size, ret);
+				return err;
+			},
+			*priv_data, attach_type);
+	}
+	if (attach_id &lt; 0) {
+		// Since the agent might be attach to a unrelated
+		// process Using LD_PRELOAD, it's not an error here.
+		SPDLOG_DEBUG("Unable to instantiate bpf link handler {}: {}",
+			     id, attach_id);
+		return attach_id;
+	}</code></pre>
+
+    <p>The final comment shows a consequence of the design. The handler table is global, so every
+    agent sees every link. An agent in a process that has no <code>libc.so.6:malloc</code>
+    simply fails to attach that link, and that is not an error. Note also what the uprobe's
+    private data contains: <code>instantiate_perf_event_handler_at()</code> builds it from the
+    string <code>module:offset</code> only. In my reading, the PID that libbpf passed to
+    <code>perf_event_open()</code> is stored in the handler but not used here, so any agent
+    whose process maps that module attaches. Which process runs an agent is decided by
+    <code>start</code> and <code>attach</code>.</p>
+
+    <h2>Loading and attaching to a running process, end to end</h2>
+
+    <figure>
+      <svg viewBox="0 0 900 620" role="img" aria-label="Sequence diagram of bpftime load followed by bpftime attach to a running process">
+        <style>
+          .ln{stroke:var(--border);stroke-width:1.5;stroke-dasharray:4 4}
+          .hd{fill:var(--bg3);stroke:var(--accent);stroke-width:1.5}
+          .t{fill:var(--fg);font:bold 13px sans-serif}
+          .s{fill:var(--fg);font:12px sans-serif}
+          .mo{fill:var(--fg);font:11.5px monospace}
+          .mu{fill:var(--muted);font:11.5px sans-serif}
+          .ar{stroke:var(--fg);stroke-width:1.4;fill:none;marker-end:url(#ah142)}
+          .ar2{stroke:var(--accent2);stroke-width:1.6;fill:none;marker-end:url(#ah142)}
+          .act{fill:var(--bg3);stroke:var(--accent2);stroke-width:1}
+        </style>
+        <defs><marker id="ah142" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <rect class="hd" x="20" y="10" width="130" height="36" rx="5"/><text class="t" x="34" y="33">bpftime CLI</text>
+        <rect class="hd" x="190" y="10" width="170" height="36" rx="5"/><text class="t" x="200" y="33">loader + syscall-srv</text>
+        <rect class="hd" x="400" y="10" width="130" height="36" rx="5"/><text class="t" x="410" y="33">shared memory</text>
+        <rect class="hd" x="570" y="10" width="160" height="36" rx="5"/><text class="t" x="582" y="33">target + agent</text>
+        <rect class="hd" x="770" y="10" width="110" height="36" rx="5"/><text class="t" x="800" y="33">kernel</text>
+        <line class="ln" x1="85" y1="46" x2="85" y2="610"/>
+        <line class="ln" x1="275" y1="46" x2="275" y2="610"/>
+        <line class="ln" x1="465" y1="46" x2="465" y2="610"/>
+        <line class="ln" x1="650" y1="46" x2="650" y2="610"/>
+        <line class="ln" x1="825" y1="46" x2="825" y2="610"/>
+        <path class="ar" d="M85,72 H273"/><text class="mo" x="92" y="66">load ./malloc (LD_PRELOAD=server)</text>
+        <path class="ar" d="M275,104 H463"/><text class="mo" x="282" y="98">bpf(MAP_CREATE) → slot 3</text>
+        <path class="ar" d="M275,136 H463"/><text class="mo" x="282" y="130">bpf(PROG_LOAD) → slot 4</text>
+        <text class="mu" x="282" y="150">(PREVAIL if built in)</text>
+        <path class="ar" d="M275,176 H463"/><text class="mo" x="282" y="170">perf_event_open(uprobe) → 5</text>
+        <path class="ar" d="M275,208 H463"/><text class="mo" x="282" y="202">bpf(LINK_CREATE 4→5) → 6</text>
+        <path class="ar" d="M85,252 H823"/><text class="mo" x="92" y="246">attach PID: frida injector, ptrace(ATTACH)</text>
+        <path class="ar" d="M823,284 H652"/><text class="mo" x="660" y="278">dlopen agent .so</text>
+        <rect class="act" x="644" y="292" width="12" height="190"/>
+        <text class="mo" x="664" y="306">bpftime_agent_main()</text>
+        <path class="ar" d="M644,330 H467"/><text class="mo" x="478" y="324">open_only(segment)</text>
+        <path class="ar" d="M644,362 H467"/><text class="mo" x="478" y="356">scan handlers 3..6</text>
+        <text class="mo" x="664" y="392">JIT prog 4 (llvm)</text>
+        <text class="mo" x="664" y="414">gum_interceptor_attach</text>
+        <text class="mo" x="664" y="432">(malloc prologue → jmp)</text>
+        <path class="ar" d="M650,470 H823"/><text class="mo" x="664" y="462">ptrace(DETACH), resume</text>
+        <path class="ar2" d="M656,520 H467"/><text class="mo" x="478" y="514">malloc hit: JIT code updates map</text>
+        <text class="mu" x="664" y="540">no kernel entry on the hit path</text>
+        <path class="ar2" d="M275,580 H463"/><text class="mo" x="282" y="574">bpf(MAP_GET_NEXT_KEY/LOOKUP)</text>
+        <text class="mu" x="282" y="598">served from shm, print counts</text>
+      </svg>
+      <figcaption>Figure 14.2 — <code>bpftime load</code> followed by <code>bpftime attach</code>
+      to a running process. The loader and the agent never talk to each other directly; the
+      handler table in shared memory is the hand-off. The kernel lane shows only ptrace and the
+      library load that frida-core drives. The exact ptrace sequence is Frida's and is drawn
+      schematically.</figcaption>
+    </figure>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Start the loader under the syscall server</h4><p><code>bpftime
+      load ./example/malloc/malloc</code> forks and execs the tool with
+      <code>LD_PRELOAD=libbpftime-syscall-server.so</code>. The first intercepted call runs
+      <code>start_up()</code>: it creates the segment (or opens an existing one), starts a new
+      session epoch, configures the verifier's helper list and sets <code>BPFTIME_USED=1</code>.</p></div>
+      <div class="step"><h4>2. libbpf loads the object as usual</h4><p>The skeleton creates the
+      <code>libc_malloc_calls_total</code> hash map, loads <code>do_count</code>, resolves
+      <code>libc.so.6:malloc</code> to a file offset, and calls <code>perf_event_open()</code>
+      and <code>BPF_LINK_CREATE</code>. Each call returns a slot index from the handler table.
+      libbpf cannot tell that no kernel was involved.</p></div>
+      <div class="step"><h4>3. Inject the agent</h4><p><code>sudo bpftime attach 101771</code>
+      calls <code>frida_injector_inject_library_file_sync(..., "bpftime_agent_main", ...)</code>.
+      frida-core stops the target with ptrace, makes it load <code>libbpftime-agent.so</code>,
+      and calls the entry point on a thread in the target. The README shows the output
+      <code>Successfully injected. ID: 1</code>.</p></div>
+      <div class="step"><h4>4. Instantiate the handlers</h4><p>The agent opens the segment with
+      <code>open_only</code>, and <code>init_attach_ctx_from_handlers()</code> builds a
+      <code>bpftime_prog</code> for slot 4 (creating the VM named by <code>BPFTIME_VM_NAME</code>,
+      default <code>llvm</code>), private data for slot 5, and for link 6 calls
+      <code>frida_attach_impl::create_attach_with_ebpf_callback()</code>.</p></div>
+      <div class="step"><h4>5. Patch the function</h4><p>frida-gum's Interceptor rewrites the
+      first instructions of <code>malloc</code> with a branch to a generated trampoline and
+      relocates the displaced instructions. From now on every <code>malloc</code> call runs the
+      eBPF program in user mode.</p></div>
+      <div class="step"><h4>6. Read results without a kernel</h4><p>The loader's polling loop
+      calls <code>bpf_map_get_next_key</code> and <code>bpf_map_lookup_elem</code>. The shim
+      serves them straight from the shared hash map, and the loader prints
+      <code>pid=... malloc calls: 10</code>.</p></div>
+    </div>
+
+    <p>The paper reports what step 3 costs: "We write an extension that monitors malloc in libc,
+    load it into a running process, and observe a 48ms load latency. For comparison, we load the
+    same extension using LD_PRELOAD, and observe a 30ms load latency." That is a one-time cost
+    per attach. A newer <code>bpftime trace</code> subcommand at this commit combines both steps: it
+    spawns the loader, then injects or refreshes the agent over its IPC socket, passing
+    <code>loader_pid=...;force_reinit=1;auto_refresh_ms=500</code> so the agent picks up links
+    the loader creates later.</p>
+
+    <h2>Binary rewriting for uprobes: inline hooks instead of traps</h2>
+
+    <figure>
+      <svg viewBox="0 0 900 430" role="img" aria-label="Kernel uprobe trap path versus bpftime inline hook path">
+        <style>
+          .z{fill:var(--bg3);stroke:var(--border)}
+          .k{fill:none;stroke:var(--accent);stroke-width:2}
+          .u{fill:none;stroke:var(--accent2);stroke-width:2}
+          .w{fill:var(--fg);font:13px sans-serif}
+          .h{fill:var(--fg);font:bold 14px sans-serif}
+          .c{fill:var(--fg);font:12px monospace}
+          .g{fill:var(--muted);font:12px sans-serif}
+          .p{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah143)}
+        </style>
+        <defs><marker id="ah143" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <!-- left -->
+        <text class="h" x="20" y="24">Kernel uprobe (chapter 05)</text>
+        <rect class="z" x="10" y="36" width="430" height="150" rx="8"/><text class="g" x="20" y="54">user mode</text>
+        <rect class="z" x="10" y="200" width="430" height="170" rx="8"/><text class="g" x="20" y="218">kernel mode</text>
+        <rect class="k" x="30" y="66" width="150" height="56" rx="5"/><text class="c" x="40" y="88">malloc:</text><text class="c" x="40" y="108">int3 (0xcc)</text>
+        <rect class="k" x="270" y="66" width="150" height="56" rx="5"/><text class="c" x="280" y="88">malloc+N:</text><text class="c" x="280" y="108">continue</text>
+        <rect class="k" x="30" y="236" width="120" height="60" rx="5"/><text class="w" x="40" y="258">#BP trap,</text><text class="g" x="40" y="278">save pt_regs</text>
+        <rect class="k" x="165" y="236" width="120" height="60" rx="5"/><text class="w" x="175" y="258">handle_swbp</text><text class="g" x="175" y="278">run BPF prog</text>
+        <rect class="k" x="300" y="236" width="125" height="60" rx="5"/><text class="w" x="310" y="258">emulate or</text><text class="g" x="310" y="278">single-step XOL</text>
+        <path class="p" d="M125,122 L125,234"/><path class="p" d="M150,266 H163"/><path class="p" d="M285,266 H298"/><path class="p" d="M362,234 L345,124"/>
+        <text class="g" x="30" y="330">≥ 1 user→kernel→user round trip per hit</text>
+        <text class="g" x="30" y="350">eBPF: 2561.57 ns uprobe, 3019.45 ns uretprobe</text>
+        <!-- right -->
+        <text class="h" x="470" y="24">bpftime inline hook</text>
+        <rect class="z" x="460" y="36" width="430" height="334" rx="8"/><text class="g" x="470" y="54">user mode only</text>
+        <rect class="u" x="480" y="66" width="170" height="56" rx="5"/><text class="c" x="490" y="88">malloc:</text><text class="c" x="490" y="108">jmp trampoline</text>
+        <rect class="u" x="700" y="66" width="170" height="70" rx="5"/><text class="w" x="710" y="88">trampoline</text><text class="g" x="710" y="106">save CPU context,</text><text class="g" x="710" y="122">call listener</text>
+        <rect class="u" x="700" y="160" width="170" height="70" rx="5"/><text class="w" x="710" y="182">on_enter</text><text class="g" x="710" y="200">GumCpuContext →</text><text class="g" x="710" y="216">pt_regs</text>
+        <rect class="u" x="480" y="160" width="170" height="70" rx="5"/><text class="w" x="490" y="182">JIT-compiled eBPF</text><text class="g" x="490" y="200">helpers, maps in shm</text><text class="g" x="490" y="216">(llvm or ubpf)</text>
+        <rect class="u" x="480" y="256" width="170" height="56" rx="5"/><text class="w" x="490" y="278">relocated prologue</text><text class="g" x="490" y="296">displaced instructions</text>
+        <rect class="u" x="700" y="256" width="170" height="56" rx="5"/><text class="c" x="710" y="278">malloc+N:</text><text class="c" x="710" y="298">continue</text>
+        <path class="p" d="M650,94 H698"/><path class="p" d="M785,136 V158"/><path class="p" d="M700,195 H652"/><path class="p" d="M565,230 V254"/><path class="p" d="M650,284 H698"/>
+        <text class="g" x="480" y="340">bpftime: 190.02 ns uprobe, 187.10 ns uretprobe</text>
+        <text class="g" x="480" y="358">(OSDI '25 Table 3, server A)</text>
+        <text class="g" x="20" y="400">Numbers: OSDI '25 paper, Table 3, "Microbenchmark comparison of bpftime and eBPF". Single machine; read as a ratio.</text>
+      </svg>
+      <figcaption>Figure 14.3 — A kernel uprobe hit versus a bpftime uprobe hit. The kernel
+      replaces one byte with <code>int3</code> and does all the work after a trap. bpftime
+      replaces the function's first instructions with a jump to a trampoline in the same address
+      space, so the program runs as an ordinary function call. The trampoline layout is
+      frida-gum's and is drawn schematically.</figcaption>
+    </figure>
+
+    <p>An inline hook is old dynamic-instrumentation technique. To hook function
+    <code>f</code>, overwrite its first few instructions with a jump to a trampoline. The
+    trampoline saves the registers, calls your handler, then executes copies of the overwritten
+    instructions (relocated, because PC-relative operands change meaning at a new address) and
+    jumps back to <code>f</code> after the patched bytes. The paper describes bpftime's version
+    in exactly these terms: "it replaces the instructions that were originally at the hook point
+    with a call into a preamble for the point's associated eBPF function and places the
+    overwritten instructions at the end of its preamble."</p>
+
+    <p>bpftime does not implement its own x86-64 instruction relocator. On x86-64 and arm64 it
+    uses frida-gum's <code>GumInterceptor</code>. An entry probe is a "probe listener" and a
+    return probe is a "call listener" with only an <code>on_leave</code> callback:</p>
+
+    <pre data-file="bpftime/attach/frida_uprobe_attach_impl/src/frida_internal_attach_entry.cpp"><code class="language-cpp">void frida_internal_attach_entry::ensure_listener(int attach_type)
+{
+	if (attach_type != ATTACH_UPROBE &amp;&amp; attach_type != ATTACH_URETPROBE)
+		return;
+	auto **slot = attach_type == ATTACH_UPROBE ? &amp;uprobe_listener :
+						     &amp;uretprobe_listener;
+	if (*slot != nullptr)
+		return;
+	*slot = attach_type == ATTACH_UPROBE ?
+			gum_make_probe_listener(uprobe_listener_on_enter, this,
+						nullptr) :
+			gum_make_call_listener(nullptr, uprobe_listener_on_leave,
+					       this, nullptr);
+	/* ... */
+	gum_interceptor_begin_transaction(interceptor);
+	if (int err = gum_interceptor_attach(interceptor, function, *slot,
+					     nullptr);
+	    err &lt; 0) {
+		/* ... "Frida may reject very short functions or unsupported
+		       signatures; try compiling the target with -O0, adding
+		       __attribute__((noinline)), or attaching to a larger wrapper." */
+	}
+	gum_interceptor_end_transaction(interceptor);
+}
+/* ... */
+static void uprobe_listener_on_enter(GumInvocationContext *ctx,
+				     gpointer user_data)
+{
+	auto *hook_entry = static_cast&lt;frida_internal_attach_entry *&gt;(user_data);
+	bpftime::pt_regs regs;
+	convert_gum_cpu_context_to_pt_regs(*ctx-&gt;cpu_context, regs);
+	current_thread_gum_cpu_context = ctx-&gt;cpu_context;
+	hook_entry-&gt;iterate_uprobe_callbacks(regs);
+	current_thread_gum_cpu_context.reset();
+}</code></pre>
+
+    <p>Three details matter here:</p>
+    <ul>
+      <li><strong>The program still receives a <code>struct pt_regs *</code>.</strong>
+      <code>convert_gum_cpu_context_to_pt_regs</code> builds a kernel-layout <code>pt_regs</code>
+      from Frida's saved CPU context. That is why <code>BPF_KPROBE(do_count, ...)</code> and
+      <code>PT_REGS_PARM1(ctx)</code> work unchanged: the context the eBPF code reads has the same
+      layout in both runtimes.</li>
+      <li><strong>Short functions are a real limitation.</strong> The patch needs room for a
+      branch. The error message in the source suggests <code>-O0</code>, <code>noinline</code>, or
+      hooking a larger wrapper. A kernel uprobe needs only one byte, so it can probe any
+      instruction.</li>
+      <li><strong>Override and replace go beyond kernel uprobes.</strong> For
+      <code>ATTACH_UPROBE_OVERRIDE</code> and <code>ATTACH_UREPLACE</code> bpftime calls
+      <code>gum_interceptor_replace()</code>. The replacement handler runs the program, and if the
+      program called <code>bpf_override_return</code> (through <code>bpftime_override_return</code>),
+      it returns that value without running the original function. This is how bpftime does
+      error injection and hot patching in user space. The kernel's
+      <code>bpf_override_return</code> works only on kprobes of functions on the error-injection
+      allowlist.</li>
+    </ul>
+
+    <p>Return probes still rewrite the return address, like kernel uretprobes. The trap backend's
+    README notes that "unwinding through the probed function (C++ exceptions,
+    <code>backtrace()</code> from inside it) sees the trampoline instead of the caller. This is
+    the same limitation the frida backend and kernel uretprobes have."</p>
+
+    <h3>The cost of an inline hook</h3>
+    <p>The paper splits the uprobe cost into parts. "The average latency of calling the extension
+    function with the trampoline is 190ns, without the trampoline but with the extension entry is
+    106ns, and without both is 1.35ns." In other words, the trampoline "adds an additional 84ns
+    for every executed extension", while an unused hook site costs nothing because no patch exists
+    until an extension is loaded. The paper calls these <em>concealed extension entries</em>.
+    Compare the kernel row of the same table, 2561.57 ns per uprobe. By my arithmetic that is
+    about 13.5× the bpftime figure, consistent with the README's "up to 10x" claim and the
+    arXiv abstract's "10x speed enhancement".</p>
+
+    <details>
+      <summary>Not on x86 or arm: the RISC-V trap backend</summary>
+      <p>frida-gum has no RISC-V port, so <code>cmake/StandardSettings.cmake</code> forces
+      <code>BPFTIME_ENABLE_TRAP_UPROBE=ON</code> and <code>BPFTIME_ENABLE_FRIDA=OFF</code> when the
+      processor matches <code>^riscv</code>. <code>attach/trap_uprobe_attach_impl</code> then does
+      in user space what the kernel does: it writes <code>ebreak</code>/<code>c.ebreak</code>,
+      catches <code>SIGTRAP</code>, builds <code>pt_regs</code> from the <code>ucontext_t</code>,
+      and executes the displaced instruction out of line or emulates it. Because the program then
+      runs inside a signal handler, the runtime only admits helpers audited as async-signal-safe
+      and JIT-compiles eagerly (<code>prepare_for_signal_execution()</code> in
+      <code>bpftime_prog.cpp</code>). Its README reports ~5.7 µs per uprobe hit on an SG2042
+      host, because there are "two signal deliveries per hit". That is slower than kernel uprobes
+      on the x86 machine in the same table, which used different hardware. The table shows that an
+      inline hook, not merely "running in user space", is what makes bpftime's uprobes fast.</p>
+    </details>
+
+    <h2>Binary rewriting for syscalls: a zpoline in the target</h2>
+    <p>A syscall tracepoint (<code>tracepoint/syscalls/sys_enter_openat</code>) cannot be
+    implemented by hooking one function. A program may issue <code>syscall</code> from libc, from
+    a static binary, from a Go runtime, or from inline assembly. bpftime's answer is the
+    zpoline technique (Yasukata et al., USENIX ATC '23). It rewrites <em>every</em>
+    <code>syscall</code> instruction in the process.</p>
+
+    <figure>
+      <svg viewBox="0 0 900 360" role="img" aria-label="zpoline rewriting: syscall replaced by call star rax, landing in a nop sled at page zero that jumps to the hook">
+        <style>
+          .z{fill:var(--bg3);stroke:var(--border)}
+          .k{fill:none;stroke:var(--accent);stroke-width:2}
+          .u{fill:none;stroke:var(--accent2);stroke-width:2}
+          .w{fill:var(--fg);font:13px sans-serif}
+          .h{fill:var(--fg);font:bold 14px sans-serif}
+          .c{fill:var(--fg);font:12px monospace}
+          .g{fill:var(--muted);font:12px sans-serif}
+          .p{stroke:var(--fg);stroke-width:1.5;fill:none;marker-end:url(#ah144)}
+        </style>
+        <defs><marker id="ah144" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--fg)"/></marker></defs>
+        <text class="h" x="20" y="24">before</text>
+        <rect class="k" x="20" y="36" width="230" height="64" rx="5"/>
+        <text class="c" x="30" y="58">mov $257, %eax  # openat</text>
+        <text class="c" x="30" y="80">0f 05   syscall</text>
+        <text class="h" x="20" y="130">after rewrite_segment()</text>
+        <rect class="u" x="20" y="142" width="230" height="64" rx="5"/>
+        <text class="c" x="30" y="164">mov $257, %eax</text>
+        <text class="c" x="30" y="186">ff d0   call *%rax</text>
+        <rect class="z" x="300" y="36" width="250" height="250" rx="6"/>
+        <text class="h" x="312" y="58">page 0 (PROT_EXEC only)</text>
+        <text class="c" x="312" y="84">0x000: nop</text>
+        <text class="c" x="312" y="104">0x001: nop</text>
+        <text class="c" x="312" y="124">  ...  (512 nops)</text>
+        <text class="c" x="312" y="144">0x101: nop  ← %rax=257</text>
+        <text class="c" x="312" y="164">  ...</text>
+        <text class="c" x="312" y="190">0x200: push %rax</text>
+        <text class="c" x="312" y="210">       movabs $hook,%rax</text>
+        <text class="c" x="312" y="230">       jmp *%rax</text>
+        <text class="g" x="312" y="268">NULL reads/writes still fault</text>
+        <rect class="u" x="600" y="36" width="280" height="250" rx="6"/>
+        <text class="h" x="612" y="58">syscall_hooker_asm</text>
+        <text class="g" x="612" y="80">pop saved %rax (syscall nr)</text>
+        <text class="g" x="612" y="98">rt_sigreturn, clone, clone3:</text>
+        <text class="g" x="612" y="114">  untraced fast path</text>
+        <text class="g" x="612" y="134">syscall ABI → C ABI</text>
+        <text class="c" x="612" y="156">syscall_hooker_cxx()</text>
+        <text class="c" x="612" y="176">→ agent syscall_callback()</text>
+        <text class="c" x="612" y="196">→ dispatch_syscall()</text>
+        <text class="g" x="612" y="216">sys_enter progs, real syscall,</text>
+        <text class="g" x="612" y="232">sys_exit progs</text>
+        <text class="g" x="612" y="256">ret → after the call *%rax</text>
+        <path class="p" d="M250,186 L298,144"/>
+        <path class="p" d="M550,210 L598,160"/>
+        <text class="g" x="20" y="320">Two-byte instruction replaced by a two-byte instruction: no relocation, no trap.</text>
+        <text class="g" x="20" y="340">%rax holds the syscall number, so the call lands somewhere in the nop sled and slides to the jump.</text>
+      </svg>
+      <figcaption>Figure 14.4 — zpoline-style syscall hooking as implemented in
+      <code>attach/text_segment_transformer</code>. Syscall numbers are below 512, so
+      <code>call *%rax</code> always lands in the nop sled on page 0.</figcaption>
+    </figure>
+
+    <p>The trick is that <code>syscall</code> (<code>0f 05</code>) and <code>call *%rax</code>
+    (<code>ff d0</code>) are both two bytes long, and at a syscall site <code>%rax</code> always
+    holds the syscall number. If page 0 is mapped and filled with <code>nop</code>s, the call
+    lands at address <em>N</em>, slides down the sled, and reaches a jump into the hook. The
+    paper: "Since sysenter is smaller than a trampoline, the system uses zpoline, which uses the
+    zero page to accommodate two-byte call instructions." Here is the code, trimmed:</p>
+
+    <pre data-file="bpftime/attach/text_segment_transformer/text_segment_transformer.cpp"><code class="language-cpp">static inline void rewrite_segment(uint8_t *code, size_t len, int perm)
+{
+	// Set the pages to be writable
+	if (int err = mprotect(code, len, PROT_READ | PROT_WRITE | PROT_EXEC);
+	    err &lt; 0) { /* ... */ }
+	csh cs_handle;
+	cs_err ret;
+	ret = cs_open(CS_ARCH_X86, CS_MODE_64, &amp;cs_handle);
+	/* ... */
+	while (curr_addr &lt; (uintptr_t)code + len) {
+		auto ok = cs_disasm_iter(cs_handle, &amp;curr_code, &amp;size,
+					 &amp;curr_addr, &amp;curr_insn);
+		if (!ok) {
+			break;
+		}
+		auto insn_name =
+			std::string(cs_insn_name(cs_handle, curr_insn.id));
+		if (insn_name == "syscall" || insn_name == "sysenter") {
+			if (curr_insn.address != (uintptr_t)&amp;syscall_addr) {
+				uint8_t *curr_pos =
+					(uint8_t *)(uintptr_t)curr_insn.address;
+				curr_pos[0] = 0xff;
+				curr_pos[1] = 0xd0;
+			}
+		}
+	}
+	cs_close(&amp;cs_handle);
+	if (int err = mprotect(code, len, perm); err &lt; 0) { /* ... */ }
+}
+/* ... */
+void setup_syscall_tracer()
+{
+	// Setup page mappings
+	if (auto mmap_addr =
+		    mmap(0x0, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+	    mmap_addr == MAP_FAILED) { /* ... */ }
+	// Setup jumpings
+	for (int i = 0; i &lt; NR_syscalls; i++) {
+		// 0x90; nop
+		*((char *)(uintptr_t)(i)) = 0x90;
+	}
+	/* ... push %rax; movabs $syscall_hooker_asm, %rax; jmp *%rax ... */
+	// Set the page to execute-only. Keep normal behavior of
+	// dereferencing null-pointers
+	if (int err = mprotect(0, 0x1000, PROT_EXEC); err &lt; 0) { /* ... */ }
+	/* ... parse /proc/self/maps, skip [stack], [vsyscall] and page 0,
+	       rewrite_segment() every executable mapping ... */
+}</code></pre>
+
+    <p>Several design consequences follow from this code:</p>
+    <ul>
+      <li><strong>The rewrite is a linear sweep.</strong> Capstone disassembles each executable
+      mapping from its first byte and stops at the first undecodable byte. Data embedded in
+      <code>.text</code>, or a misaligned decode, can make it miss real <code>syscall</code>s or,
+      in principle, patch bytes that only look like one. zpoline has the same property.</li>
+      <li><strong>Page 0 must be mappable.</strong> zpoline's README tells users to run
+      <code>echo 0 &gt; /proc/sys/vm/mmap_min_addr</code>. bpftime makes the same
+      <code>MAP_FIXED</code> mmap at address 0, so it has the same requirement unless the process
+      may map low addresses anyway. Page 0 is then set to execute-only, so ordinary NULL loads and
+      stores still fault.</li>
+      <li><strong>The hook cannot hook itself.</strong> The transformer skips its own
+      <code>syscall_addr</code> instruction, which is used to issue the real syscall. More subtly,
+      <code>agent-transformer.cpp</code> loads the full agent only <em>after</em> rewriting, with
+      <code>dlmopen(LM_ID_NEWLM, agent_so, RTLD_NOW | RTLD_LOCAL)</code>. A new link-map
+      namespace gets its own copy of libc. That copy was not present during the rewrite, so the
+      agent's own logging and allocation make plain system calls and do not recurse into the hook.
+      The dlmopen is in the source; the explanation of why it is used is mine.</li>
+      <li><strong>It is x86-64 only.</strong> The assembly trampoline exists for
+      <code>__x86_64__</code>; the <code>__aarch64__</code> branch reads
+      <code>// TODO: implement syscall trace trampoline</code>.</li>
+      <li><strong>clone is special.</strong> The assembly sends <code>clone</code> and
+      <code>clone3</code> down an untraced path, because the child starts on a fresh stack with no
+      return address for the hook's <code>ret</code>. It seeds the child stack so the child still
+      resumes after the rewritten instruction.</li>
+    </ul>
+
+    <pre data-file="bpftime/attach/text_segment_transformer/agent-transformer.cpp"><code class="language-cpp">	SPDLOG_DEBUG("Using agent {}", agent_so);
+	cs_arch_register_x86();
+	bpftime::setup_syscall_tracer();
+	SPDLOG_DEBUG("Loading dynamic library..");
+	auto next_handle = dlmopen(LM_ID_NEWLM, agent_so, RTLD_NOW | RTLD_LOCAL);
+	/* ... */
+	auto entry_func = (void (*)(syscall_hooker_func_t *))dlsym(
+		next_handle, "_bpftime__setup_syscall_trace_callback");
+	/* ... */
+	syscall_hooker_func_t orig_syscall_hooker_func =
+		bpftime::get_call_hook();
+	entry_func(&amp;orig_syscall_hooker_func);
+	bpftime::set_call_hook(orig_syscall_hooker_func);</code></pre>
+
+    <p>The agent's <code>_bpftime__setup_syscall_trace_callback</code> stores the original hook
+    pointer, puts its own <code>syscall_callback</code> in its place, and runs
+    <code>bpftime_agent_main</code>. From then on each rewritten syscall calls
+    <code>syscall_trace_attach_impl::dispatch_syscall()</code>, which runs the
+    <code>sys_enter</code> programs, performs the real syscall through the saved function, and
+    runs the <code>sys_exit</code> programs. On the CLI this is the <code>-s</code> flag:
+    <code>bpftime start -s ./victim</code> preloads the transformer with
+    <code>AGENT_SO</code> pointing at the agent, and <code>bpftime attach -s PID</code> injects the
+    transformer with the agent path as Frida's data argument. The usage manual shows the effect:
+    <code>Page zero setted up..</code> followed by <code>Rewriting executable segments..</code>.</p>
+
+    <p>Unlike the uprobe case, this hook is not faster than the kernel. Table 3 of the paper
+    lists "Syscall Tracepoint" at 151 ns for eBPF and 232 ns for bpftime: "about 1.5x slower".
+    The kernel tracepoint is a branch inside a syscall that is already in the kernel. bpftime adds
+    a user-space detour in front of a syscall that still has to enter the kernel. That
+    explanation is mine; the paper only gives the numbers. The gain lies elsewhere. Only the
+    rewritten process pays for the hook. With kernel <code>syscount</code>, the paper says
+    the overhead falls "on every process, even those that are not monitored", and bpftime
+    "offers configurations that prevent monitoring overhead from affecting unmonitored
+    processes, a feature eBPF cannot provide."</p>
+
+    <h2>The VM layer: ubpf or llvmbpf</h2>
+    <p>The attach backends never call a specific VM. <code>bpftime_prog</code> creates one through
+    a small C API that selects a backend by name:</p>
+
+    <pre data-file="bpftime/vm/vm-core/include/ebpf-vm.h"><code class="language-c">struct ebpf_vm;
+
+typedef uint64_t (*ebpf_jit_fn)(void *mem, size_t mem_len);
+
+struct ebpf_vm *ebpf_create(const char *vm_name);
+
+void ebpf_destroy(struct ebpf_vm *vm);
+/* ... */
+int ebpf_register(struct ebpf_vm *vm, unsigned int index, const char *name,
+		  void *fn);
+
+int ebpf_load(struct ebpf_vm *vm, const void *code, uint32_t code_len,
+	      char **errmsg);
+/* ... */
+int ebpf_exec(const struct ebpf_vm *vm, void *mem, size_t mem_len,
+	      uint64_t *bpf_return_value);
+
+ebpf_jit_fn ebpf_compile(struct ebpf_vm *vm, char **errmsg);</code></pre>
+
+    <p>Behind it, <code>vm/compat/include/bpftime_vm_compat.hpp</code> defines a virtual class
+    <code>bpftime_vm_impl</code> (<code>load_code</code>, <code>exec</code>,
+    <code>compile</code>, <code>register_external_function</code>, <code>set_lddw_helpers</code>
+    for map relocations). Two backends register themselves by name from static constructors:
+    <code>"llvm"</code> in <code>compat/llvm-vm/compat_llvm.cpp</code>, which wraps
+    <a href="16-llvmbpf.html">llvmbpf</a>, and <code>"ubpf"</code> in
+    <code>compat/ubpf-vm/compat_ubpf.cpp</code>, which wraps iovisor's uBPF. The default is
+    <code>llvm</code>, or <code>ubpf</code> when bpftime is built without LLVM. Override it with
+    <code>BPFTIME_VM_NAME</code>. <code>installation.md</code> recommends LLVM "since the ubpf
+    intepreter is no longer maintained". Execution itself is short:</p>
+
+    <pre data-file="bpftime/runtime/src/bpftime_prog.cpp"><code class="language-cpp">int bpftime_prog::bpftime_prog_exec(void *memory, size_t memory_size,
+				    uint64_t *return_val) const
+{
+	/* ... signal (trap backend) path: only a prepared JIT function ... */
+	uint64_t val = 0;
+	int res = 0;
+	// set share memory read and write able
+	bpftime_protect_disable();
+	/* ... */
+	if (jitted) {
+		val = fn(memory, memory_size);
+	} else {
+		res = ebpf_exec(vm, memory, memory_size, &amp;val);
+		/* ... */
+	}
+	*return_val = current_thread_tail_call_ret.value_or(val);
+	current_thread_tail_call_ret.reset();
+	// set share memory read only
+	bpftime_protect_enable();
+	return res;
+}</code></pre>
+
+    <p>The paper compares the engine with other userspace eBPF VMs. Over eight microbenchmarks,
+    "bpftime accelerates average benchmark latency by a factor of 1.53 and 1.72 compared to ubpf
+    and rbpf, respectively". On the bpf-conformance suite, "bpftime fails only one test ...
+    whereas ubpf and rbpf fail 22 and 23, respectively."</p>
+
+    <p><code>bpftime_protect_disable()</code> and <code>bpftime_protect_enable()</code> are the
+    hooks for Intel MPK. With <code>-DBPFTIME_ENABLE_MPK=ON</code> (off by default), the segment
+    is tagged with a protection key at startup (<code>pkey_alloc(0, PKEY_DISABLE_WRITE)</code>,
+    then <code>pkey_mprotect</code> over the whole segment), and <code>pkey_set</code> lifts write
+    protection only while a program runs. Host code that scribbles on map memory outside an
+    extension then faults. This is the isolation property in the paper, but the code differs in
+    detail from the paper's description, which loads the key "directly into the extension" and
+    makes extension pages non-readable. At this commit the MPK code protects the shared segment.
+    I did not find code that also protects the JIT output.</p>
+
+    <h2>Verification: three ways to trust a program</h2>
+    <p>Kernel eBPF is safe because the in-kernel verifier (<a href="03-verifier.html">chapter
+    03</a>) proves properties of every program before it runs. bpftime offers three
+    options, and the choice matters more than in the kernel, because a bad program now runs
+    inside your application.</p>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="Userspace: PREVAIL">
+        <p>The <code>bpftime-verifier/</code> wrapper drives PREVAIL (the
+        <code>vbpf/ebpf-verifier</code> abstract interpreter from Gershuni et al., PLDI 2019) with
+        a bpftime "platform": the set of helpers enabled by the helper groups, prototypes for
+        bpftime-only helpers (<code>set_non_kernel_helpers</code>), and map descriptors.</p>
+        <pre data-file="bpftime/bpftime-verifier/src/bpftime-verifier.cpp"><code class="language-cpp">std::optional&lt;std::string&gt; verify_ebpf_program(const uint64_t *raw_inst,
+					       size_t num_inst,
+					       const std::string &amp;section_name)
+{
+	raw_program prog;
+	prog.filename = "BPFTIME_VERIFIER";
+	prog.section = section_name;
+	/* ... copy instructions ... */
+	prog.info = {
+		.platform = &amp;bpftime_platform_spec,
+		.map_descriptors = get_all_map_descriptors(),
+		.type = bpftime_platform_spec.get_program_type(section_name,
+							       ""),
+	};
+	/* ... */
+	auto unmarshal_result = unmarshal(prog, notes);
+	/* ... */
+	auto result = ebpf_verify_program(message_stream, inst_seq, prog.info,
+					  &amp;verifier_options, &amp;stats);
+	if (result) {
+		return {};
+	} else {
+		return verifier_message;
+	}
+}</code></pre>
+        <p>Two caveats are visible in the build files. First, it is opt-in at build time:
+        <code>ENABLE_EBPF_VERIFIER</code> "Default to <code>OFF</code>" (installation.md).
+        Second, when it is built in, the default <code>BPFTIME_VERIFIER_LEVEL</code> is
+        <code>WARNING</code>, so a failing program is logged and still loaded. Set
+        <code>STRICT</code> to reject it. A third point, from reading the code without running it:
+        the check in <code>handle_sysbpf</code> keys on <code>prog_type</code>
+        (<code>TRACEPOINT</code> or <code>SOCKET_FILTER</code>), while libbpf loads
+        <code>SEC("uprobe")</code> programs as <code>BPF_PROG_TYPE_KPROBE</code>. If that holds,
+        uprobe programs skip PREVAIL on this path. Treat this as unverified.</p>
+      </div>
+      <div class="tab-panel" data-label="Kernel verifier: RUN_WITH_KERNEL">
+        <p>With <code>BPFTIME_RUN_WITH_KERNEL=true</code> the syscall server lets the real kernel
+        verify the program and keeps a copy for user space:</p>
+        <pre data-file="bpftime/runtime/syscall-server/syscall_context.cpp"><code class="language-cpp">	} else {
+		res = orig_syscall_fn(__NR_bpf, (long)cmd,
+				      (long)(uintptr_t)attr, (long)size);
+	}
+	if (res &lt; 0) {
+		SPDLOG_ERROR("Failed to load program `{}`", attr-&gt;prog_name);
+		return res;
+	}
+	int id = res;
+	std::vector&lt;ebpf_inst&gt; insns;
+	/* ... copy attr-&gt;insns ... */
+	for (size_t i = 0; i &lt; attr-&gt;insn_cnt; i++) {
+		/* ... */
+		case EBPF_OP_LDDW:
+			if (inst.src_reg == 1 || inst.src_reg == 2) {
+				/* ... get_bpf_obj_info_by_fd(inst.imm, &amp;info, ...) ... */
+				insns[i].imm = info.id;
+			}
+			break;
+		/* ... */
+	}
+	id = bpftime_progs_create(id /* let the shm alloc fd for us */,
+				  insns.data(), (size_t)attr-&gt;insn_cnt,
+				  attr-&gt;prog_name, attr-&gt;prog_type);</code></pre>
+        <p>Map fds in <code>LDDW</code> instructions are rewritten to kernel map IDs, because
+        the target process does not share the loader's fd table. Maps are created as real kernel
+        maps and registered in shm as kernel-user maps. <code>BPFTIME_NOT_LOAD_PATTERN</code>
+        is an escape hatch for programs the kernel would reject (for example ones that call
+        bpftime-only helpers). For matching names it loads a trivial <code>r0 = 0; exit</code>
+        into the kernel instead, which bypasses verification for that program.
+        <code>usage.md</code> recommends this mode: "it is recommended to use the kernel's eBPF
+        verifier to ensure program safety."</p>
+      </div>
+      <div class="tab-panel" data-label="Daemon: mirror kernel programs">
+        <p>The daemon needs no <code>LD_PRELOAD</code> on the loader at all. Its kernel half
+        (<code>daemon/kernel/bpf_tracer.bpf.c</code>) attaches to the
+        <code>sys_enter_bpf</code>, <code>sys_enter_perf_event_open</code>,
+        <code>ioctl</code>, <code>close</code> and exec/exit tracepoints. When a tool creates a
+        uprobe perf event, the tracer edits the request in the caller's memory, so the kernel
+        does not place the probe on the real target:</p>
+        <pre data-file="bpftime/daemon/kernel/bpf_tracer.bpf.c"><code class="language-c">	if (new_attr_pointer-&gt;type == uprobe_perf_type) {
+		// found uprobe
+		if (enable_replace_uprobe) {
+			if (can_hook_uprobe_at(
+				    new_attr_pointer-&gt;probe_offset)) {
+				u64 old_offset = new_attr_pointer-&gt;probe_offset;
+				new_attr_pointer-&gt;probe_offset = 0;
+				/* ... read old path ... */
+				bpf_probe_write_user(
+					(void *)new_attr_pointer-&gt;uprobe_path,
+					&amp;new_uprobe_path, (size_t)size);
+				bpf_probe_write_user(attr, new_attr_pointer,
+						     sizeof(*new_attr_pointer));
+				// This probe creation request should be
+				// executed in userspace
+				return 1;
+			} /* ... */</code></pre>
+        <p>On syscall exit the tracer restores the caller's buffers and sends the event to the
+        user-space driver over a ring buffer. The driver (<code>daemon/user/bpftime_driver.cpp</code>)
+        fetches the already verified program by ID, reads its <code>xlated_prog_insns</code>,
+        relocates them, and creates the program, maps and links in a segment it created with
+        <code>SHM_REMOVE_AND_CREATE</code>. Agents in target processes then run the program in
+        user space. The kernel verifier has checked it, since only verified programs get an
+        ID. The design relies on <code>bpf_probe_write_user</code>, which the kernel marks with a
+        warning in the log. It also changes what the loader's syscall really did, which is clever
+        but fragile.</p>
+      </div>
+    </div>
+
+    <h2>Kernel–userspace interop</h2>
+    <p>bpftime does not try to replace kernel eBPF. It aims to work with it. Interop works at three
+    levels:</p>
+    <ul>
+      <li><strong>Same programs.</strong> The same <code>malloc</code> object file runs under
+      <code>sudo example/malloc/malloc</code> in the kernel and under <code>bpftime load</code> in
+      user space. The README shows both outputs. The <code>pt_regs</code> context and the helper
+      numbering are kept compatible for this reason.</li>
+      <li><strong>Shared maps.</strong> Kernel-user maps let a kprobe in the kernel and a uprobe
+      in user space use one hash map. The paper's FUSE use case relies on this: a user-space
+      metadata cache whose consistency is maintained "using a kprobe extension on unlink in the
+      kernel". DeepFlow "adds support for using process-kernel shared maps". The kernel-user perf
+      event array (<code>bpf_map/shared/perf_event_array_kernel_user.hpp</code>) takes a
+      roundabout route. According to its header comment, user-space programs write into a BPF
+      user ring buffer, and a small kernel program "attached to an intervally triggered event
+      (e.g a timer perf event)" copies the data into the real kernel perf event array, where an
+      ordinary consumer reads it.</li>
+      <li><strong>Kernel as verifier and loader.</strong> The run-with-kernel mode and the
+      daemon both use the kernel for what it does well, verification and map management, and keep
+      the hot path in user space.</li>
+    </ul>
+    <p>What does <em>not</em> carry over: kernel data structures. The README says plainly that
+    bpftime "does not support direct access to kernel data structures or functions like
+    <code>task_struct</code>", and some helpers and kfuncs do not exist in user space.
+    <code>bpf_get_current_pid_tgid()</code> works because the agent runs in the traced process.
+    <code>bpf_get_current_task()</code> has no meaning there.</p>
+
+    <h2>The OSDI '25 paper: the Extension Interface Model</h2>
+
+    <h3>Two papers, one system</h3>
+    <p>The project has two papers. The first is the arXiv preprint "bpftime: userspace eBPF
+    Runtime for Uprobe, Syscall and Kernel-User Interactions" (arXiv:2311.07923, November
+    2023, by Yusheng Zheng, Tong Yu, Yiwei Yang, Yanpeng Hu, Xiaozheng Lai and Andrew Quinn).
+    It describes the runtime in roughly the terms used so far in this chapter: binary rewriting
+    for uprobes and syscalls, "interprocess eBPF Maps within shared memory", toolchain
+    compatibility, and a uprobe that is "10x" faster than the kernel's. The second is the peer-reviewed
+    paper: "Extending Applications Safely and Efficiently" by Yusheng Zheng (UC Santa Cruz),
+    Tong Yu (eunomia-bpf Community), Yiwei Yang (UC Santa Cruz), Yanpeng Hu (ShanghaiTech),
+    Xiaozheng Lai (SCUT), Dan Williams (Virginia Tech) and Andi Quinn (UC Santa Cruz), in the
+    19th USENIX Symposium on Operating Systems Design and Implementation (OSDI '25), Boston,
+    July 2025, pages 557–574. The OSDI paper reframes bpftime from "faster uprobes" to "a safe
+    extension framework for applications".</p>
+
+    <h3>The problem the paper poses</h3>
+    <p>Applications are extended all the time: Nginx and Apache modules, Lua in Redis and
+    OpenResty, browser add-ons, and tracing tools. The paper argues that every extension
+    framework faces a trade-off between <em>interconnectedness</em> ("the ability to observe or
+    modify the host application's state and to execute functions defined by the host") and
+    <em>safety</em> ("an extension failure cannot harm the health of the host application and
+    the underlying system"). It adds two more requirements: <em>isolation</em> (the host cannot
+    corrupt the extension, which matters for security extensions) and <em>efficiency</em>
+    (near-native speed). Table 1 motivates the need with real incidents: a Lua livelock that took
+    down Bilibili's Nginx, CVE-2021-44790 in Apache's Lua module, and CVE-2024-31449 in Redis's
+    Lua scripting.</p>
+
+    <p>The paper defines four roles. <em>Application developers</em> and <em>extension
+    developers</em> are "trusted but fallible". The <em>extension manager</em>, the person who
+    configures a deployment, is "both trusted and infallible". <em>Users</em> are untrusted and
+    may send malicious inputs. The threat model also assumes that the application's control flow
+    cannot be hijacked, "essentially equivalent to control flow integrity", since an attacker who
+    controls control flow could skip the extension entirely.</p>
+
+    <h3>EIM concepts</h3>
+    <p>The <strong>Extension Interface Model</strong> describes what an extension may do as a set
+    of <em>resources</em>, and grants access to them as <em>capabilities</em>. In the paper's
+    words: "EIM's key idea is to represent the extension features that might be necessary for
+    interconnectedness or restricted for safety as a resource ... EIM models the ability to use a
+    resource as a capability." A specification has two halves, written by different people:</p>
+
+    <table>
+      <thead><tr><th>Concept</th><th>Written by</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>State capability</td><td>application developer (development time)</td><td>Permission to <code>read(var)</code> or <code>write(var)</code> a host global</td></tr>
+        <tr><td>Function capability</td><td>application developer</td><td>Permission to call a host function, with its prototype and <em>constraints</em>: pre- and post-conditions such as <code>rtn &gt; 0</code></td></tr>
+        <tr><td>Extension entry</td><td>application developer</td><td>A host function that an extension may attach to, with its prototype</td></tr>
+        <tr><td>Resource capability</td><td>(built in)</td><td>A bound on hardware resources; EIM defines <code>instructions</code> and <code>memory</code></td></tr>
+        <tr><td>Extension class</td><td>extension manager (deployment time)</td><td>For one extension entry, the set of capabilities an extension loaded there may use</td></tr>
+      </tbody>
+    </table>
+
+    <p>The paper's running example is an Nginx observability deployment. The following is quoted
+    from the paper's Figures 2 and 3. It is <strong>not code from the bpftime repository</strong>
+    and not a format that bpftime parses at this commit:</p>
+
+    <pre><code class="language-plaintext">/* Illustrative: EIM specification from the OSDI '25 paper, Figures 2 and 3 */
+State_Capability(
+  name = "readPid",
+  operation = read(ngx_pid))
+
+Function_Capability(
+  name = "nginxTime",
+  prototype = (void) -&gt; time_t,
+  constraints = {rtn &gt; 0})
+
+Extension_Entry(
+  name = "processBegin"
+  extension_entry = "ngx_http_process_request",
+  prototype = (Request *r) -&gt; int))
+
+Extension_Class(
+  name = "observeProcessBegin",
+  extension_entry = "processBegin",
+  allowed = {instructions&lt;inf, nginxTime, readPid, read(r)})
+Extension_Class(
+  name = "updateResponse",
+  extension_entry = "updateResponseContent"
+  allowed = {instructions&lt;inf, read(r), write(r)})</code></pre>
+
+    <p>The point is least privilege per hook. An observability extension at
+    <code>processBegin</code> can read the request and the PID and call one time function. A
+    response-rewriting extension at another entry can write the request but sees nothing else.
+    The same entry can carry different classes in different deployments, without changing
+    Nginx.</p>
+
+    <h3>How the paper says bpftime enforces EIM</h3>
+    <p>The paper maps each part of EIM onto a piece of the system described in this chapter:</p>
+    <ul>
+      <li><strong>Development-time spec</strong> through source annotations "based upon eBPF's
+      kfunc annotations". bpftime also adds generic entries automatically: uprobe and uretprobe
+      entries "for every host-defined function", and sysenter and sysexit entries for syscalls.</li>
+      <li><strong>Deployment-time spec</strong> through "a YAML configuration language", with two
+      built-in class families: <em>observability</em> (read arguments, bounded instructions, a
+      subset of helpers) and <em>customizability</em> (also write arguments, more helpers).</li>
+      <li><strong>Verification as the enforcement mechanism.</strong> The loader checks the
+      program's signature against its class. It then turns the class into eBPF verifier input.
+      Host types come from DWARF converted to BTF. Each function capability becomes "a mock new
+      eBPF kfunc". Constraints become assertions inserted before the call. Read-only state
+      becomes <code>const</code> in the prototype, and resource bounds become verifier
+      clauses. Because the check is static, "without any runtime overhead".</li>
+      <li><strong>Isolation</strong> by ERIM-style MPK. The paper acknowledges the system "is
+      currently susceptible to the syscall-based attacks on ERIM" and "only supports isolation
+      on Intel x86".</li>
+      <li><strong>Concealed extension entries</strong> by the binary rewriter covered above. The
+      paper notes "the current implementation only supports a single extension per entry
+      point".</li>
+    </ul>
+    <p>The paper's trusted computing base is "the kernel eBPF verifier, the binary rewriter, the
+    operating system, and hardware-supported intra-process memory protections".</p>
+
+    <div class="callout warn"><span class="label">Paper versus repository</span><p>At commit
+    <code>25e250d6</code> I found no EIM YAML parser, no <code>Extension_Class</code> or
+    capability annotations, and no DWARF-to-BTF constraint generator in the bpftime tree. A
+    search for "EIM", "Extension_Class" and YAML handling in the non-third-party sources returned
+    nothing beyond <code>CITATION.cff</code>. The shipping repo implements the runtime half:
+    interposition, shared maps, rewriting, VMs, optional PREVAIL, optional MPK on the shared
+    segment, and kernel-verifier modes. Where the EIM tooling used for the paper lives is not
+    something I could verify. Read the paper's EIM sections as design and evaluation, not as
+    documentation for <code>bpftime load</code>.</p></div>
+
+    <h3>Evaluation claims</h3>
+    <p>The evaluation uses two servers: "Server A is a dual-socket Intel Xeon Gold 5418Y Processor
+    (24 cores, 2.00 GHz, 45 MB LLC) with 256 GB DDR5 memory. Server B is a dual-socket Intel Xeon
+    E5-2697-v2 processor (48 cores, 2.7 Ghz, 30 MB LLC) with 256 GB DDR3 memory." The headline
+    results, as stated in the paper:</p>
+
+    <table>
+      <thead><tr><th>Use case</th><th>Claim (quoted or paraphrased closely from the paper)</th></tr></thead>
+      <tbody>
+        <tr><td>Nginx extension (security + tracing modules, wrk 8 threads, 64 connections)</td><td>bpftime "introduces 2% overhead compared to native Nginx". Lua and WebAssembly "incur 11% and 12%", ERIM and RLBox "impose 11% and 9%". Summarised as "up to 5× lower than state-of-the-art alternatives".</td></tr>
+        <tr><td>DeepFlow microservice profiling</td><td>With eBPF, "throughput drops by up to 54%". bpftime "improves the throughput of profiling microservices by a factor of 1.5 compared to eBPF". The port changed "10 out of the 5,000 lines of eBPF code".</td></tr>
+        <tr><td>sslsniff (bcc) on Nginx</td><td>eBPF sslsniff reduces throughput "by up to 28.06%", bpftime's worst case is 7.41%. Overall "reduces the overhead of SSL traffic monitoring by a factor of 3.79".</td></tr>
+        <tr><td>FUSE metadata cache</td><td>"accelerates operations by orders of magnitude", e.g. LoggedFS <code>openat</code> 17.0 s native vs 0.074 s with bpftime.</td></tr>
+        <tr><td>Redis durability</td><td>A configuration that "loses orders of magnitude less data in a crash while decreasing throughput by only about 10%". The Redis change was "about 20 lines of code".</td></tr>
+        <tr><td>syscount</td><td>Overhead confined to the monitored process. Kernel eBPF imposes it "on every process, even those that are not monitored".</td></tr>
+        <tr><td>Compatibility</td><td>"17 BCC and bpftrace tools on bpftime without code changes".</td></tr>
+      </tbody>
+    </table>
+
+    <p>The microbenchmarks in Table 3 (server A) are the numbers most relevant to the
+    architecture:</p>
+
+    <table>
+      <thead><tr><th>Operation</th><th>eBPF (ns)</th><th>bpftime (ns)</th><th>Where the difference comes from (this chapter)</th></tr></thead>
+      <tbody>
+        <tr><td>Uprobe</td><td>2561.57</td><td>190.02</td><td>inline hook vs trap</td></tr>
+        <tr><td>Uretprobe</td><td>3019.45</td><td>187.10</td><td>return trampoline in user space</td></tr>
+        <tr><td>Syscall tracepoint</td><td>151</td><td>232</td><td>zpoline detour in front of a real syscall</td></tr>
+        <tr><td>User memory read</td><td>23.3</td><td>1.5</td><td>same address space; no <code>copy_from_user</code></td></tr>
+        <tr><td>User memory write</td><td>23.9</td><td>1.4</td><td>same address space</td></tr>
+        <tr><td>hash_map_update</td><td>50.8</td><td>23.8</td><td>shm map, no syscall</td></tr>
+        <tr><td>hash_map_delete</td><td>19.5</td><td>10.1</td><td>shm map</td></tr>
+        <tr><td>hash_map_lookup</td><td>9.8</td><td>22.0</td><td>bpftime slower (spinlock, see maps section)</td></tr>
+      </tbody>
+    </table>
+
+    <p>The paper attributes the helper speed-ups to the fact that "bpftime's extension compiler can
+    inline calls and does not require the address space of kernel eBPF". It also reports turning
+    MPK isolation on and off "and did not observe a measurable difference in average extension
+    execution".</p>
+
+    <div class="callout tip"><span class="label">Reading the numbers</span><p>All of these
+    numbers come from the authors' machines and builds, measured on the paper's version of the
+    code. Two details of the current tree affect comparisons. The memory-read rows were
+    presumably measured with a plain <code>memcpy</code>. At this commit
+    <code>ENABLE_PROBE_READ_CHECK</code> and <code>ENABLE_PROBE_WRITE_CHECK</code> default to
+    <code>ON</code>, and they route <code>bpf_probe_read*</code> and
+    <code>bpf_probe_write_user</code> through <code>process_vm_readv</code>/<code>writev</code>,
+    which are system calls. Also, the kernel's uprobe path has become cheaper since the paper (see
+    the 6.11 and 6.18 changes in <a href="05-program-types-and-hooks.html">chapter 05</a>).
+    The <code>bpf-benchmark</code> repo (<a href="19-bpf-benchmark.html">chapter 19</a>) is
+    where the project keeps its current benchmarks.</p></div>
+
+    <h2>Building and using it</h2>
+    <p>The build is CMake. The Makefile targets wrap it. From <code>installation.md</code> and the
+    <code>Makefile</code> at this commit:</p>
+
+    <pre data-file="bpftime/installation.md"><code class="language-bash">sudo apt-get update &amp;&amp; sudo apt-get install \
+        libelf1 libelf-dev libssl-dev zlib1g-dev make cmake git libboost-all-dev \
+        binutils-dev libyaml-cpp-dev ca-certificates clang llvm pkg-config llvm-dev
+git submodule update --init --recursive
+make release JOBS=$(nproc) # Build and install the runtime
+/* ... */
+cmake -Bbuild -DCMAKE_BUILD_TYPE=Release -DBPFTIME_ENABLE_LTO=NO -DBPFTIME_LLVM_JIT=YES
+cmake --build build --config RelWithDebInfo --target install
+/* ... */
+cmake -DBPFTIME_LLVM_JIT=NO -DENABLE_EBPF_VERIFIER=YES -DCMAKE_BUILD_TYPE=Release -B build
+cmake --build build --config Release --target install</code></pre>
+    <p>The first <code>cmake</code> pair builds with the LLVM JIT backend (LLVM 15 or newer).
+    The second builds the userspace PREVAIL verifier in, which is off by default.</p>
+
+    <p>It is a large C++ build (LLVM, Boost, Frida). I did not build it for this chapter. The
+    commands that exercise the architecture described here, from the README and
+    <code>usage.md</code>:</p>
+
+    <pre><code class="language-bash">make -C example/malloc                 # build the libbpf example
+export PATH=$PATH:~/.bpftime/
+bpftime load ./example/malloc/malloc   # loader under the syscall server
+bpftime start ./example/malloc/victim  # target with the agent preloaded
+sudo bpftime attach 101771             # or: inject into a running PID
+bpftime start -s example/opensnoop/victim   # syscall tracing via the transformer
+
+# The same thing without the CLI:
+LD_PRELOAD=build/runtime/syscall-server/libbpftime-syscall-server.so example/malloc/malloc
+LD_PRELOAD=build/runtime/agent/libbpftime-agent.so example/malloc/victim
+
+# Kernel verifier and kernel maps:
+BPFTIME_RUN_WITH_KERNEL=true LD_PRELOAD=~/.bpftime/libbpftime-syscall-server.so example/malloc/malloc</code></pre>
+
+    <p>The eBPF side of the example is an ordinary libbpf program. Nothing in it mentions
+    bpftime:</p>
+
+    <pre data-file="bpftime/example/malloc/malloc.bpf.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u32);
+	__type(value, u64);
+} libc_malloc_calls_total SEC(".maps");
+/* ... increment_map() ... */
+SEC("uprobe/libc.so.6:malloc")
+int do_count(struct pt_regs *ctx)
+{
+	u32 pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+
+	bpf_printk("malloc called from pid %d\n", pid);
+
+	increment_map(&amp;libc_malloc_calls_total, &amp;pid, 1);
+
+	return 0;
+}</code></pre>
+
+    <p>Useful runtime knobs, all read in <code>runtime/src/bpftime_config.cpp</code>:
+    <code>BPFTIME_VM_NAME</code>, <code>BPFTIME_DISABLE_JIT</code>,
+    <code>BPFTIME_SHM_MEMORY_MB</code>, <code>BPFTIME_MAX_FD_COUNT</code>,
+    <code>BPFTIME_VERIFIER_LEVEL</code> (<code>STRICT</code>/<code>WARNING</code>/<code>NO_VERIFY</code>),
+    <code>BPFTIME_LOG_OUTPUT</code> (default <code>~/.bpftime/runtime.log</code>),
+    <code>BPFTIME_ALLOW_EXTERNAL_MAPS</code> and <code>BPFTIME_HELPER_GROUPS</code>.
+    <code>bpftimetool export state.json</code> dumps the handler table, which is the quickest way
+    to see what the loader produced. <a href="15-bpftime-in-practice.html">Chapter 15</a> goes
+    through the examples and attach modes in detail.</p>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Fast probes</h4><p>Uprobes and uretprobes run as function calls in
+      the target (190 ns vs 2561 ns in the paper). Reading user memory and maps needs no mode
+      switch.</p></div>
+      <div class="card"><h4>Unmodified toolchain</h4><p>clang, libbpf, CO-RE, bcc and bpftrace
+      work through syscall interposition. The same object runs in the kernel or in bpftime.</p></div>
+      <div class="card"><h4>No kernel eBPF needed</h4><p>Userspace-only mode runs where the kernel
+      lacks eBPF or where the user is not root. The sysfs files libbpf needs are mocked.</p></div>
+      <div class="card"><h4>More than tracing</h4><p>Override and replace attaches, syscall
+      filtering, ufuncs and new attach backends make it an extension framework, not just a
+      faster uprobe.</p></div>
+      <div class="card"><h4>Per-process cost</h4><p>Only processes running the agent pay for
+      hooks. A kernel syscall tracepoint taxes every process.</p></div>
+      <div class="card"><h4>Kernel interop</h4><p>Kernel-user maps, kernel verification and the
+      daemon let user-space and kernel programs cooperate.</p></div>
+    </div>
+
+    <p>The limitations are mostly the reverse side of the same choices:</p>
+    <ul>
+      <li><strong>The program shares the host's fate.</strong> A kernel uprobe that misbehaves is
+      stopped by the kernel. A bpftime program runs on the host's thread, in its address space.
+      Safety depends entirely on verification. That verification is optional (PREVAIL is off by
+      default and in <code>WARNING</code> mode when on) unless you use the kernel-verifier modes.
+      Isolation (MPK) is also off by default and x86-only.</li>
+      <li><strong>Injection needs ptrace rights</strong>, and the rewrite modifies code pages of
+      a live process. Hardened environments (restricted <code>ptrace_scope</code>, seccomp
+      filters, W^X policies) can block it.</li>
+      <li><strong>Inline hooks need room.</strong> Very short functions, or functions whose first
+      instructions are branch targets, may not be hookable. A kernel uprobe can probe any
+      instruction.</li>
+      <li><strong>Syscall hooks have the zpoline caveats</strong>: page 0 must be mappable,
+      x86-64 only, a linear-sweep disassembly of all executable mappings, and a slower per-call
+      path than a kernel tracepoint.</li>
+      <li><strong>Visibility is per process.</strong> bpftime sees only processes that run the
+      agent. A system-wide tool such as "trace <code>malloc</code> in every process" needs the
+      daemon, an agent injected everywhere, or kernel uprobes.</li>
+      <li><strong>No kernel context.</strong> There is no <code>task_struct</code>, kernel stacks
+      or kfuncs, and some helpers are missing.</li>
+      <li><strong>Loader limits.</strong> Interposition relies on the dynamic linker. That last
+      point is my inference, not tested: a loader statically linked against libc, or one that
+      issues <code>bpf()</code> with an inline <code>syscall</code> instruction (some Go
+      libraries do), would bypass <code>LD_PRELOAD</code>. The daemon mode exists for such
+      cases.</li>
+      <li><strong>Maturity.</strong> <code>usage.md</code> opens with "It's at an early stage and
+      may contain bugs on more platforms and eBPF programs ... It's not suitable for production
+      use now."</li>
+    </ul>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><strong>Userspace eBPF VMs.</strong> <a href="https://github.com/iovisor/ubpf">uBPF</a>
+      (C, interpreter and x86-64/arm64 JIT) and <a href="https://github.com/qmonnet/rbpf">rbpf</a>
+      (Rust) run eBPF bytecode but provide no loader compatibility, maps or attach mechanism. bpftime
+      uses uBPF as one backend. <a href="16-llvmbpf.html">llvmbpf</a> is the eunomia-bpf LLVM VM
+      split out of bpftime. Microsoft's eBPF for Windows (see <a href="08-ecosystem.html">chapter
+      08</a>) also combines PREVAIL with uBPF, but in a kernel.</li>
+      <li><strong>Making kernel probes cheaper.</strong> The kernel's own answer is the uretprobe
+      syscall (6.11) and the optimised uprobe on <code>nop5</code> (6.18), covered in
+      <a href="05-program-types-and-hooks.html">chapter 05</a>. Jia et al., "Fast (Trapless)
+      Kernel Probes Everywhere" (USENIX ATC '24) does the same for kprobes. The OSDI paper says
+      its concealed entries are "inspired by" that work.</li>
+      <li><strong>Binary rewriting.</strong> <a href="https://github.com/frida/frida-gum">frida-gum</a>
+      provides the function interceptor. <a href="https://www.capstone-engine.org/">Capstone</a>
+      provides disassembly. zpoline (USENIX ATC '23) and
+      <a href="https://github.com/pmem/syscall_intercept">pmem/syscall_intercept</a> inspired the
+      syscall hook (README). Pin, DynamoRIO and Valgrind are heavier full DBI frameworks.</li>
+      <li><strong>Extension isolation.</strong> ERIM (USENIX Security '19) and libmpk introduced
+      MPK-based in-process isolation. RLBox (USENIX Security '20) sandboxes libraries with SFI or
+      Wasm. Native Client, WebAssembly and Lua runtimes are the alternatives the paper compares
+      with. KFlex (SOSP '24) is the kernel-side model for separating verification of the
+      interface from runtime isolation.</li>
+      <li><strong>Verifiers.</strong> PREVAIL (Gershuni et al., PLDI '19) is the userspace
+      verifier. <a href="18-ebpf-correctness-verifier.html">Chapter 18</a> covers eunomia-bpf's
+      work on validating eBPF transformations with Z3 and PREVAIL.</li>
+      <li><strong>Other eunomia-bpf runtimes.</strong> <a href="12-wasm-bpf.html">wasm-bpf</a>
+      runs the <em>control plane</em> in WebAssembly while programs stay in the kernel; bpftime
+      moves the <em>programs</em> to user space. GPU extensions built on bpftime's
+      <code>nv_attach_impl</code> are in <a href="20-gpu-ext.html">chapter 20</a>.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> An unmodified libbpf loader runs under
+      <code>LD_PRELOAD=libbpftime-syscall-server.so</code>. How do its <code>bpf()</code> calls
+      reach bpftime?</p>
+        <button class="opt">bpftime installs a seccomp filter that traps <code>__NR_bpf</code></button>
+        <button class="opt" data-right>libbpf calls glibc's <code>syscall()</code>; the preloaded library defines <code>syscall</code>, so the dynamic linker binds libbpf to it, and it dispatches <code>__NR_bpf</code> to <code>handle_sysbpf()</code></button>
+        <button class="opt">The kernel forwards bpf() to the bpftime daemon over a ring buffer</button>
+        <div class="why">Symbol interposition: the first definition of <code>syscall</code> in
+        load order wins. The real one is found with <code>dlsym(RTLD_NEXT, ...)</code>. The
+        daemon mode is a different mechanism, and it needs no preload on the loader.</div></div>
+      <div class="q"><p><strong>Q2.</strong> The loader and the target are different processes.
+      How does the agent in the target learn which programs to attach?</p>
+        <button class="opt">The loader sends them over a Unix socket when the agent connects</button>
+        <button class="opt">The agent re-reads the loader's ELF object file</button>
+        <button class="opt" data-right>It opens the <code>bpftime_maps_shm</code> segment and scans the <code>handler_manager</code> table for program, perf-event and link handlers</button>
+        <div class="why"><code>init_attach_ctx_from_handlers()</code> walks every allocated slot.
+        The loader's "fds" are slot indices in that shared table. An epoch seqlock tells the agent
+        when a new session replaced the handlers.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does bpftime's syscall hook map page 0 and fill
+      it with <code>nop</code>s?</p>
+        <button class="opt">To catch NULL-pointer dereferences in the target</button>
+        <button class="opt" data-right>Each 2-byte <code>syscall</code> becomes a 2-byte <code>call *%rax</code>; <code>%rax</code> holds the syscall number, so the call lands in the sled on page 0 and slides to a jump into the hook</button>
+        <button class="opt">Because frida-gum needs a trampoline at a fixed address</button>
+        <div class="why">This is zpoline. The replacement fits in the original two bytes, so no
+        instruction relocation is needed. Page 0 is then made execute-only, so NULL loads and
+        stores still fault.</div></div>
+      <div class="q"><p><strong>Q4.</strong> According to Table 3 of the OSDI '25 paper, which
+      operation is <em>slower</em> in bpftime than in kernel eBPF?</p>
+        <button class="opt">Uprobe</button>
+        <button class="opt">User memory read</button>
+        <button class="opt" data-right>Syscall tracepoint (232 ns vs 151 ns), and hash map lookup (22.0 vs 9.8 ns)</button>
+        <div class="why">Uprobes win because the trap disappears. A syscall tracepoint in the
+        kernel is already on the syscall path, while bpftime adds a user-space detour before the
+        real syscall. The paper reports the syscall row as "about 1.5x slower".</div></div>
+      <div class="q"><p><strong>Q5.</strong> In EIM, who decides which capabilities an extension
+      at <code>ngx_http_process_request</code> may use in a given deployment?</p>
+        <button class="opt">The application developer, through annotations in Nginx</button>
+        <button class="opt" data-right>The extension manager, by writing a deployment-time <em>extension class</em> for that extension entry</button>
+        <button class="opt">The kernel verifier, from the program type</button>
+        <div class="why">The application developer enumerates what is <em>possible</em> (state
+        and function capabilities, extension entries). The extension manager picks what is
+        <em>allowed</em> per entry, per deployment. bpftime enforces this by verification.</div></div>
+      <div class="q"><p><strong>Q6.</strong> With <code>BPFTIME_RUN_WITH_KERNEL=true</code>, what
+      happens on <code>BPF_PROG_LOAD</code>?</p>
+        <button class="opt">The program runs in the kernel instead of in user space</button>
+        <button class="opt" data-right>The real kernel loads and verifies it; bpftime then stores a copy in shm with map fds in <code>LDDW</code> rewritten to kernel map IDs, and the agent runs that copy in user space</button>
+        <button class="opt">PREVAIL runs in strict mode</button>
+        <div class="why">See <code>create_kernel_bpf_prog_in_userspace()</code>. The kernel is
+        used as verifier and map store, and the hot path stays in user space. Fd numbers are
+        process-local, so map IDs are used instead.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/bpftime">eunomia-bpf/bpftime</a> at commit <a href="https://github.com/eunomia-bpf/bpftime/tree/25e250d651ad1d2a2608bbbaeaf7b9ee90cca401"><code>25e250d6</code></a> (2026-11-03): <code>README.md</code>, <code>usage.md</code>, <code>installation.md</code>, <code>AGENTS.md</code>, and the source files cited above.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn, <a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">"Extending Applications Safely and Efficiently"</a>, 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI '25), Boston, MA, July 2025, pp. 557–574 (<a href="https://www.usenix.org/system/files/osdi25-zheng-yusheng.pdf">PDF</a>).</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, A. Quinn, <a href="https://arxiv.org/abs/2311.07923">"bpftime: userspace eBPF Runtime for Uprobe, Syscall and Kernel-User Interactions"</a>, arXiv:2311.07923 [cs.OS], 2023 (v2, Dec 2023).</li>
+      <li>Y. Zheng, <a href="https://lpc.events/event/17/contributions/1639/">"bpftime: Fast uprobes with user space BPF runtime"</a>, Linux Plumbers Conference 2023, eBPF track.</li>
+      <li><a href="https://eunomia.dev/bpftime/">bpftime documentation</a>, eunomia.dev.</li>
+      <li>K. Yasukata, H. Tazaki, P.-L. Aublin, K. Ishiguro, <a href="https://www.usenix.org/conference/atc23/presentation/yasukata">"zpoline: a system call hook mechanism based on binary rewriting"</a>, USENIX ATC '23, 2023, pp. 293–300; code at <a href="https://github.com/yasukata/zpoline">yasukata/zpoline</a>.</li>
+      <li><a href="https://github.com/frida/frida-gum">frida/frida-gum</a> (Interceptor) and <a href="https://www.capstone-engine.org/">Capstone disassembly framework</a>.</li>
+      <li><a href="https://www.boost.org/doc/libs/release/doc/html/interprocess.html">Boost.Interprocess</a> documentation (managed_shared_memory, allocators, offset pointers).</li>
+      <li>E. Gershuni et al., <a href="https://doi.org/10.1145/3314221.3314590">"Simple and Precise Static Analysis of Untrusted Linux Kernel Extensions"</a>, PLDI 2019 (PREVAIL); code at <a href="https://github.com/vbpf/ebpf-verifier">vbpf/ebpf-verifier</a>.</li>
+      <li><a href="https://github.com/iovisor/ubpf">iovisor/ubpf</a>, <a href="https://github.com/qmonnet/rbpf">qmonnet/rbpf</a>, <a href="https://github.com/eunomia-bpf/llvmbpf">eunomia-bpf/llvmbpf</a>; <a href="https://github.com/Alan-Jowett/bpf_conformance">Alan-Jowett/bpf_conformance</a>.</li>
+      <li>A. Vahldiek-Oberwagner et al., <a href="https://www.usenix.org/conference/usenixsecurity19/presentation/vahldiek-oberwagner">"ERIM: Secure, Efficient In-process Isolation with Protection Keys (MPK)"</a>, USENIX Security '19, 2019; <a href="https://man7.org/linux/man-pages/man7/pkeys.7.html">pkeys(7)</a>.</li>
+      <li>S. Narayan et al., <a href="https://www.usenix.org/conference/usenixsecurity20/presentation/narayan">"Retrofitting Fine Grain Isolation in the Firefox Renderer"</a> (RLBox), USENIX Security '20, 2020.</li>
+      <li>J. Jia, M. V. Le, S. Ahmed, D. Williams, H. Jamjoom, T. Xu, <a href="https://www.usenix.org/conference/atc24/presentation/jia">"Fast (Trapless) Kernel Probes Everywhere"</a>, USENIX ATC '24, 2024.</li>
+      <li><a href="https://github.com/pmem/syscall_intercept">pmem/syscall_intercept</a>; <a href="https://man7.org/linux/man-pages/man8/ld.so.8.html">ld.so(8)</a> (<code>LD_PRELOAD</code>); <a href="https://man7.org/linux/man-pages/man3/dlmopen.3.html">dlmopen(3)</a>.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="13-bpf-compatible.html"><small>Previous</small>13 · bpf-compatible</a>
+      <a class="next" href="15-bpftime-in-practice.html"><small>Next</small>15 · bpftime in practice</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

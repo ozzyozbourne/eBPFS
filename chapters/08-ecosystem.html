@@ -225,7 +225,7 @@ const volatile bool filter_cg = false;
 const volatile bool ignore_failed = true;
 const volatile uid_t targ_uid = INVALID_UID;
 const volatile int max_args = DEFAULT_MAXARGS;
-/* ... cgroup_map ... */
+/* ... empty_event, cgroup_map ... */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 10240);
@@ -238,7 +238,7 @@ struct {
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u32));
 } events SEC(".maps");
-
+/* ... valid_uid() ... */
 static __always_inline int enter_exec(const char *filename, const char **args)
 {
 	/* ... uid / cgroup filters ... */
@@ -259,6 +259,13 @@ static __always_inline int enter_exec(const char *filename, const char **args)
 	/* ... copy filename and up to max_args arguments ... */
 	return 0;
 }
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int tracepoint__syscalls__sys_enter_execve(struct syscall_trace_enter* ctx)
+{
+	return enter_exec((const char*)ctx-&gt;args[0], (const char **)(ctx-&gt;args[1]));
+}
+/* ... sys_enter_execveat, and exit_exec() on sys_exit_execve[at] ... */
 
 SEC("tracepoint/syscalls/sys_enter_execve")
 int tracepoint__syscalls__sys_enter_execve(struct syscall_trace_enter* ctx)
@@ -346,7 +353,7 @@ func main() {
 		log.Fatalf("loading objects: %v", err)
 	}
 	defer objs.Close()
-
+	/* ... */
 	kp, err := link.Kprobe(fn, objs.KprobeExecve, nil)
 	if err != nil {
 		log.Fatalf("opening kprobe: %s", err)
@@ -368,6 +375,8 @@ func main() {
         <p>aya writes <em>both</em> halves in Rust. The kernel half is a <code>#![no_std]</code> crate compiled by rustc's BPF target and linked by <code>bpf-linker</code>. The user half uses the aya crate, which issues syscalls through <code>libc</code> alone, with no libbpf and no BCC. This is the tracepoint example from the Aya book:</p>
         <pre data-file="aya-rs/book/examples/tracepoint/tracepoint-ebpf/src/main.rs"><code class="language-rust">#![no_std]
 #![no_main]
+// TODO(https://github.com/rust-lang/rust/issues/139984): remove.
+#![feature(cstr_display)]
 
 use aya_ebpf::{
     EbpfContext,
@@ -642,7 +651,7 @@ sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
     <p>A few large projects show what eBPF is used for in production. Each is summarized from its own README or documentation. Use them as references for your own design, or adopt them instead of writing your own.</p>
 
     <h3>Networking: Cilium and Hubble</h3>
-    <p><a href="https://github.com/cilium/cilium">Cilium</a> is a Kubernetes CNI (container network interface) built on eBPF from the start. It replaces iptables-based service routing and network policy with programs on tc/TCX and XDP hooks and socket hooks (<a href="07-networking-xdp-tc.html">07</a>), with per-identity state in maps. It was created by Isovalent, entered the CNCF as an incubating project in October 2021, and graduated on 11 October 2023. Its user space is Go, and the cilium/ebpf library above came out of this project. <a href="https://github.com/cilium/hubble">Hubble</a> is the observability layer on top of Cilium: per the README, a "fully distributed networking and security observability platform" that answers which services talk to each other, which HTTP calls or Kafka topics are involved, and why connections fail. Hubble reads the flow events Cilium's datapath already produces, so it adds visibility without adding another datapath.</p>
+    <p><a href="https://github.com/cilium/cilium">Cilium</a> is a Kubernetes CNI (container network interface) built on eBPF from the start. It replaces iptables-based service routing and network policy with programs on tc/TCX and XDP hooks and socket hooks (<a href="07-networking-xdp-tc.html">07</a>), with per-identity state in maps. It was created by Isovalent, entered the CNCF as an incubating project in October 2021, and graduated on 11 October 2023. Its user space is Go. The cilium/ebpf library above lives in the Cilium GitHub organization; it was co-written by Cilium and Cloudflare developers, and Cilium 1.7 was the first release to use it. <a href="https://github.com/cilium/hubble">Hubble</a> is the observability layer on top of Cilium: per the README, a "fully distributed networking and security observability platform" that answers which services talk to each other, which HTTP calls or Kafka topics are involved, and why connections fail. Hubble reads the flow events Cilium's datapath already produces, so it adds visibility without adding another datapath.</p>
 
     <h3>Security: Tetragon, Falco, Tracee</h3>
     <p><a href="https://github.com/cilium/tetragon">Tetragon</a> (also in the Cilium family) provides "eBPF-based Security Observability and Runtime Enforcement". By default it emits <code>process_exec</code>/<code>process_exit</code> events (a production-grade version of the exec tracer above), and its tracing policies can hook kprobes, tracepoints and LSM hooks. Its <a href="https://tetragon.io/docs/concepts/enforcement/">enforcement documentation</a> describes two actions, overriding a function's return value and sending a signal such as <code>SIGKILL</code>, both taken in the kernel "inline with the operation itself" rather than after a user-space round trip. It understands Kubernetes identities (namespaces, pods), so policies target workloads instead of PIDs.</p>
@@ -811,8 +820,8 @@ sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
       <div class="q"><p><strong>Q6.</strong> You must ship an exec-monitoring agent in Go to thousands of hosts with mixed kernels that have BTF. What is the most natural choice?</p>
         <button class="opt">BCC Python embedded in the Go agent</button>
         <button class="opt">bpftrace scripts called from Go</button>
-        <button class="opt" data-right>cilium/ebpf with bpf2go and CO-RE (as Tetragon does)</button>
-        <div class="why">There is no compiler on the hosts, a single Go binary, and CO-RE handles kernel differences. This is the pattern Cilium and Tetragon use.</div></div>
+        <button class="opt" data-right>cilium/ebpf with bpf2go and CO-RE</button>
+        <div class="why">There is no compiler on the hosts, a single Go binary, and CO-RE handles kernel differences. Tetragon follows the same pattern (a Go agent that loads BPF objects compiled ahead of time with cilium/ebpf), although it builds its objects with its own Makefile rather than bpf2go.</div></div>
     </div>
 
     <h2>References</h2>
@@ -824,7 +833,7 @@ sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
       <li>libbpf-rs — <a href="https://github.com/libbpf/libbpf-rs/tree/9680ea7054dc92e42248ca29c8ba1ed468a2b59d/examples/runqslower">examples/runqslower</a> (commit 9680ea7).</li>
       <li>libbpf — <a href="https://github.com/libbpf/libbpf">github.com/libbpf/libbpf</a>; <a href="https://github.com/libbpf/libbpf-bootstrap">libbpf-bootstrap</a>; A. Nakryiko, <a href="https://facebookmicrosites.github.io/bpf/blog/2020/02/19/bpf-portability-and-co-re.html">BPF Portability and CO-RE</a> (2020).</li>
       <li>eunomia-bpf — <a href="https://github.com/eunomia-bpf/eunomia-bpf/tree/a5408a8c3614bd4e008c1f999bb4ee9738e2fc41/examples/bpftools/bootstrap">examples/bpftools/bootstrap</a>, <a href="https://github.com/eunomia-bpf/eunomia-bpf">README</a> (commit a5408a8); <a href="https://eunomia.dev/">eunomia.dev</a>.</li>
-      <li>Cilium — <a href="https://github.com/cilium/cilium">github.com/cilium/cilium</a>; CNCF, <a href="https://www.cncf.io/announcements/2023/10/11/cloud-native-computing-foundation-announces-cilium-graduation">Cilium graduation announcement</a> (2023). Hubble — <a href="https://github.com/cilium/hubble">github.com/cilium/hubble</a>. Tetragon — <a href="https://github.com/cilium/tetragon">github.com/cilium/tetragon</a>.</li>
+      <li>Cilium — <a href="https://github.com/cilium/cilium">github.com/cilium/cilium</a>; CNCF, <a href="https://www.cncf.io/announcements/2023/10/11/cloud-native-computing-foundation-announces-cilium-graduation">Cilium graduation announcement</a> (2023). Cilium blog, <a href="https://cilium.io/blog/2020/02/18/cilium-17/">"Cilium 1.7"</a> (2020; first release using the pure-Go eBPF library co-written with Cloudflare). Hubble — <a href="https://github.com/cilium/hubble">github.com/cilium/hubble</a>. Tetragon — <a href="https://github.com/cilium/tetragon">github.com/cilium/tetragon</a>.</li>
       <li>Falco — <a href="https://github.com/falcosecurity/falco">falcosecurity/falco</a>, <a href="https://github.com/falcosecurity/libs">falcosecurity/libs</a>; CNCF, <a href="https://www.cncf.io/announcements/2024/02/29/cloud-native-computing-foundation-announces-falco-graduation">Falco graduation announcement</a> (2024).</li>
       <li>Tracee — <a href="https://github.com/aquasecurity/tracee">aquasecurity/tracee</a>. Pixie — <a href="https://github.com/pixie-io/pixie">pixie-io/pixie</a>. Parca Agent — <a href="https://github.com/parca-dev/parca-agent">parca-dev/parca-agent</a>. Katran — <a href="https://github.com/facebookincubator/katran">facebookincubator/katran</a>.</li>
       <li>bpftool — <a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a>; BPF selftests — <a href="https://github.com/torvalds/linux/tree/master/tools/testing/selftests/bpf">tools/testing/selftests/bpf</a>; kernel docs — <a href="https://docs.kernel.org/bpf/">docs.kernel.org/bpf</a>.</li>
@@ -835,9 +844,9 @@ sudo ./ecli run eunomia-bpf/examples/bpftools/bootstrap/package.json -h
       <li>D. Thaler (ed.). <em>BPF Instruction Set Architecture (ISA)</em>. RFC 9669, 2024. <a href="https://www.rfc-editor.org/rfc/rfc9669.html">rfc-editor.org/rfc/rfc9669</a>.</li>
       <li>Linux Foundation. <a href="https://www.linuxfoundation.org/press/press-release/facebook-google-isovalent-microsoft-and-netflix-launch-ebpf-foundation-as-part-of-the-linux-foundation">Facebook, Google, Isovalent, Microsoft and Netflix Launch eBPF Foundation</a>, 12 Aug 2021; <a href="https://ebpf.foundation/">ebpf.foundation</a>; <a href="https://ebpf.io/">ebpf.io</a>.</li>
       <li>Y. Zheng, Y. Hu, T. Yu, A. Quinn. <em>AgentSight: System-Level Observability for AI Agents Using eBPF</em>. PACMI '25 (4th Workshop on Practical Adoption Challenges of ML for Systems). <a href="https://doi.org/10.1145/3766882.3767169">doi:10.1145/3766882.3767169</a>; <a href="https://arxiv.org/abs/2508.02736">arXiv:2508.02736</a>.</li>
-      <li>Y. Zheng et al. <em>gpu_ext: Extensible OS Policies for GPUs via eBPF</em>. <a href="https://arxiv.org/abs/2512.12615">arXiv:2512.12615</a>.</li>
-      <li><em>AgentCgroup: Understanding and Controlling OS Resources of AI Agents</em>. <a href="https://arxiv.org/abs/2602.09345">arXiv:2602.09345</a>.</li>
-      <li><em>ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses</em>. <a href="https://arxiv.org/abs/2606.25189">arXiv:2606.25189</a>.</li>
+      <li>Y. Zheng et al. <em>gpu_ext: Extensible OS Policies for GPUs via eBPF</em>. arXiv preprint, 2025. <a href="https://arxiv.org/abs/2512.12615">arXiv:2512.12615</a>.</li>
+      <li>Y. Zheng, J. Fan, Q. Fu, Y. Yang, W. Zhang, A. Quinn. <em>AgentCgroup: Understanding and Controlling OS Resources of AI Agents</em>. arXiv preprint, 2026. <a href="https://arxiv.org/abs/2602.09345">arXiv:2602.09345</a>.</li>
+      <li>Y. Zheng, T. Wu, Q. Fu, T. Yu, W. Mao, T. Ma, D. Williams, W. Wang, A. Quinn. <em>ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses</em>. arXiv preprint, 2026. <a href="https://arxiv.org/abs/2606.25189">arXiv:2606.25189</a>.</li>
       <li>eunomia-bpf project READMEs (read 2026-11-05): <a href="https://github.com/eunomia-bpf/wasm-bpf">wasm-bpf</a>, <a href="https://github.com/eunomia-bpf/bpfix">bpfix</a>, <a href="https://github.com/eunomia-bpf/ebpf-correctness-verifier">ebpf-correctness-verifier</a>, <a href="https://github.com/eunomia-bpf/bpf-benchmark">bpf-benchmark</a>, <a href="https://github.com/eunomia-bpf/gpu_ext">gpu_ext</a>, <a href="https://github.com/eunomia-bpf/nccl-eBPF">nccl-eBPF</a>, <a href="https://github.com/eunomia-bpf/xpu-perf">xpu-perf</a>, <a href="https://github.com/eunomia-bpf/agentsight">agentsight</a>, <a href="https://github.com/eunomia-bpf/ActPlane">ActPlane</a>, <a href="https://github.com/eunomia-bpf/agentcgroup">agentcgroup</a>, <a href="https://github.com/eunomia-bpf/namei_ext">namei_ext</a>, <a href="https://github.com/eunomia-bpf/qwen3-ebpf">qwen3-ebpf</a>, <a href="https://github.com/eunomia-bpf/libbpf-starter-template">libbpf-starter-template</a>, <a href="https://github.com/eunomia-bpf/libbpf-rs-starter-template">libbpf-rs-starter-template</a>, <a href="https://github.com/eunomia-bpf/eunomia-template">eunomia-template</a>.</li>
     </ol>
 

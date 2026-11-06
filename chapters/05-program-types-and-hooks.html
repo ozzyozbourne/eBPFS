@@ -143,7 +143,7 @@
         <text class="t" x="353" y="274">Security (decide)</text>
         <text class="s" x="353" y="298">lsm/&lt;hook&gt;  ·  lsm.s/&lt;hook&gt;</text>
         <text class="s" x="353" y="316">lsm_cgroup/&lt;hook&gt;</text>
-        <text class="m" x="353" y="336">return 0 or -errno at ~250 LSM hooks:</text>
+        <text class="m" x="353" y="336">return 0 or -errno at ~280 LSM hooks:</text>
         <text class="m" x="353" y="352">exec, open, mmap, connect, bpf()…</text>
         <text class="m" x="353" y="370">(seccomp stays classic BPF)</text>
         <rect class="act" x="340" y="392" width="300" height="138"/>
@@ -205,7 +205,7 @@
         <tr><td>Tracepoint</td><td><code>tp/cat/name</code>, <code>tracepoint/cat/name</code></td><td>pointer to the tracepoint's record format</td><td>fields in <code>/sys/kernel/tracing/events/…/format</code></td><td>nothing</td><td>low–medium (record is built first)</td><td>4.7</td></tr>
         <tr><td>Raw tracepoint</td><td><code>raw_tp/name</code>, <code>raw_tp.w/name</code></td><td><code>struct bpf_raw_tracepoint_args *</code> (raw u64 args)</td><td>raw args; pointers via probe_read</td><td>writable variant: a buffer the tracepoint exposes</td><td>low</td><td>4.17 (writable 5.2)</td></tr>
         <tr><td>BTF tracepoint</td><td><code>tp_btf/name</code></td><td>typed args (<code>BPF_PROG</code>)</td><td>direct typed dereference</td><td>nothing</td><td>low</td><td>5.5</td></tr>
-        <tr><td>uprobe / uretprobe</td><td><code>uprobe/path:fn[+off]</code>, <code>uretprobe/…</code>, <code>.s</code>, <code>.multi</code>, <code>.session</code></td><td><code>struct pt_regs *</code> (user registers)</td><td>user memory via <code>bpf_probe_read_user</code></td><td>nothing (<code>bpf_probe_write_user</code> exists but taints the kernel log)</td><td><strong>high</strong>: trap into the kernel on every hit</td><td>4.3 (multi 6.6, session 6.13)</td></tr>
+        <tr><td>uprobe / uretprobe</td><td><code>uprobe/path:fn[+off]</code>, <code>uretprobe/…</code>, <code>.s</code>, <code>.multi</code>, <code>.session</code></td><td><code>struct pt_regs *</code> (user registers)</td><td>user memory via <code>bpf_probe_read_user</code></td><td>nothing (<code>bpf_probe_write_user</code> exists, but needs <code>CAP_SYS_ADMIN</code> and is disabled under kernel lockdown)</td><td><strong>high</strong>: trap into the kernel on every hit</td><td>4.3 (multi 6.6, session 6.13)</td></tr>
         <tr><td>USDT</td><td><code>usdt/path:provider:name</code></td><td><code>struct pt_regs *</code> + libbpf arg spec</td><td>probe args via <code>bpf_usdt_arg()</code> / <code>BPF_USDT</code></td><td>nothing</td><td>same as uprobe; zero when not attached</td><td>uprobe-based</td></tr>
         <tr><td>perf_event</td><td><code>perf_event</code></td><td><code>struct bpf_perf_event_data *</code></td><td>regs at sample, period, addr; stacks</td><td>nothing</td><td>proportional to sample rate</td><td>4.9</td></tr>
         <tr><td>BPF LSM</td><td><code>lsm/hook</code>, <code>lsm.s/hook</code>, <code>lsm_cgroup/hook</code></td><td>typed hook args + previous ret</td><td>hook args (inode, file, cred, socket…)</td><td>access decision: 0 or <code>-EPERM</code>…</td><td>low (trampoline)</td><td>5.7 (cgroup 6.0)</td></tr>
@@ -365,7 +365,9 @@ int BPF_PROG(do_unlinkat_exit, int dfd, struct filename *name, long ret)
     designed to be safe: <code>check_attach_modify_return()</code> in
     <code>kernel/bpf/verifier.c</code> accepts functions on the error-injection list
     (<code>ALLOW_ERROR_INJECTION</code>) and functions whose name starts with
-    <code>security_</code>. The kernel selftest shows the ordering fentry → fmod_ret →
+    <code>security_</code>. (On kernels built without
+    <code>CONFIG_FUNCTION_ERROR_INJECTION</code>, the error-injection list is replaced by
+    the architecture's syscall entry functions, such as <code>__x64_sys_*</code>.) The kernel selftest shows the ordering fentry → fmod_ret →
     fexit:</p>
     <pre data-file="linux/tools/testing/selftests/bpf/progs/modify_return.c"><code class="language-c">__u64 fmod_ret_result = 0;
 SEC("fmod_ret/bpf_modify_return_test")
@@ -771,7 +773,7 @@ int BPF_KRETPROBE(printret, const void *ret)
         <tr><td>syscall-count (one cheap syscall per iteration)</td><td>12.107</td><td>83</td></tr>
         <tr><td>uprobe-nop (int3 uprobe on a nop)</td><td>3.246</td><td>308</td></tr>
         <tr><td>uprobe-nop5 (proposed syscall-based path)</td><td>6.751</td><td>148</td></tr>
-        <tr><td>uretprobe-nop</td><td>1.740</td><td>575</td></tr>
+        <tr><td>uretprobe-nop (int3 entry + return through the 6.11 uretprobe syscall)</td><td>1.740</td><td>575</td></tr>
       </tbody>
     </table>
     <p>The nanosecond column is just 1/throughput, computed here. It includes loop and
@@ -831,8 +833,11 @@ int BPF_USDT(usdt_auto_attach, void *arg1, int arg2, void *arg3)
     <p><strong>How it works.</strong> LSM programs attach through the BPF trampoline, like
     fentry, and get the hook's typed arguments plus a final <code>ret</code> argument holding
     the verdict of earlier BPF LSM programs on that hook. Returning 0 allows the operation,
-    and a negative errno denies it. A BPF program cannot override a denial from another
-    LSM, which is why the examples pass a non-zero <code>ret</code> straight through.
+    and a negative errno denies it. The examples pass a non-zero <code>ret</code> straight
+    through so that they never turn an earlier BPF program's denial into an allow. A denial
+    by another LSM such as SELinux cannot be overridden at all: the LSM framework
+    (<code>call_int_hook()</code> in <code>security/security.c</code>) stops at the first
+    module that returns a non-default value.
     Sleepable <code>lsm.s/</code> programs may call helpers such as
     <code>bpf_d_path()</code> or <code>bpf_ima_inode_hash()</code> that can fault. Since 6.0,
     <code>lsm_cgroup/</code> (<code>BPF_LSM_CGROUP</code>) attaches a hook to a cgroup
@@ -1315,6 +1320,31 @@ int get_tasks(struct bpf_iter__task *ctx)
     verdicts (pass, drop, redirect, transmit). They have enough of their own machinery to need
     their own chapter: <a href="07-networking-xdp-tc.html">chapter 07</a>.</p>
 
+    <h2>Finding hook points on a running kernel</h2>
+    <p>Before writing a <code>SEC()</code> name you need a target that exists on <em>this</em>
+    kernel. These standard commands answer that (commands only; output depends on the
+    machine). Each one corresponds to a hook family above:</p>
+    <pre><code class="language-bash"># Illustrative: standard commands, not from a repo
+# Tracepoints and the record layout a tp/ program receives
+sudo ls /sys/kernel/tracing/events/sched/
+sudo cat /sys/kernel/tracing/events/syscalls/sys_enter_openat/format
+# Functions ftrace can trace (kprobe via ftrace, fentry/fexit also need BTF)
+sudo grep -w do_unlinkat /sys/kernel/tracing/available_filter_functions
+sudo cat /sys/kernel/debug/kprobes/blacklist | head     # functions kprobes refuse
+# The BTF prototype that fentry/fexit/LSM programs are typed against
+bpftool btf dump file /sys/kernel/btf/vmlinux format raw | grep "FUNC 'do_unlinkat'"
+# bpftrace lists probes and, with -v, their arguments
+sudo bpftrace -l 'tracepoint:sched:*'
+sudo bpftrace -lv 'fentry:tcp_reset'      # older bpftrace releases spell this kfunc:
+# USDT probes compiled into a binary (.note.stapsdt)
+readelf -n /usr/lib/x86_64-linux-gnu/libc.so.6 | grep -A3 stapsdt
+# Which program types this kernel supports
+sudo bpftool feature probe kernel | grep program_type</code></pre>
+    <p>If <code>available_filter_functions</code> does not list a function, fentry cannot
+    attach to it. If it was inlined, no hook can target it by name; if it is only
+    <code>notrace</code>, a breakpoint kprobe may still work. The libbpf <code>SEC()</code> table, <code>bpftool feature probe</code> and
+    these lists together tell you which hook is actually usable before you compile anything.</p>
+
     <h2>Choosing a hook</h2>
     <p>Choosing well matters more than micro-optimising the program afterwards. A practical
     order of preference:</p>
@@ -1361,7 +1391,7 @@ int get_tasks(struct bpf_iter__task *ctx)
     </div>
 
     <h2>Try it: build and run the examples</h2>
-    <p>libbpf-bootstrap needs its submodules. These commands come from its README:</p>
+    <p>libbpf-bootstrap needs its submodules. These commands are adapted from its README (which builds one example at a time, e.g. <code>make minimal</code>):</p>
     <pre><code class="language-bash">git clone --recurse-submodules https://github.com/libbpf/libbpf-bootstrap
 cd libbpf-bootstrap/examples/c
 make minimal kprobe fentry uprobe usdt profile task_iter

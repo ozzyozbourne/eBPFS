@@ -1,0 +1,1434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · llvmbpf: an LLVM JIT/AOT Compiler for eBPF · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="16">
+<meta name="chapter-part" content="Part III · Userspace eBPF runtimes">
+<meta name="chapter-summary" content="How llvmbpf lifts eBPF bytecode to LLVM IR instruction by instruction, JIT-compiles it with ORC, AOT-compiles it to native ELF objects, emits PTX and SPIR-V for GPUs, and serves as bpftime's default VM backend.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/llvmbpf">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part III · Userspace eBPF runtimes › 16 · llvmbpf</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 16</div>
+      <h1>llvmbpf: an LLVM JIT/AOT Compiler for eBPF</h1>
+      <p class="lede">The kernel's eBPF JITs are small, fast, single-purpose code generators that live inside
+      Linux. What if you want to run the same bytecode in an ordinary process, on a different CPU, ahead of
+      time, or on a GPU? llvmbpf answers that by translating each eBPF instruction into LLVM IR and handing
+      the result to LLVM. From one lifter you get an in-process JIT, a native ELF object, NVIDIA PTX and SPIR-V.
+      This chapter reads that lifter line by line, runs it, and shows where bpftime plugs it in.</p>
+      <div class="meta"><span>Prerequisites: <a href="02-ebpf-isa-and-vm.html">Chapter 02</a> (ISA and JIT), <a href="04-maps-helpers-kfuncs.html">Chapter 04</a> (maps and helpers), <a href="14-bpftime-architecture.html">Chapter 14</a></span><span>Repo: <a href="https://github.com/eunomia-bpf/llvmbpf">eunomia-bpf/llvmbpf</a> @ <code>7e384db</code></span><span>~50 min</span></div>
+    </section>
+
+    <h2>Why this matters</h2>
+    <p>An eBPF program is a list of 8-byte instructions for a small virtual machine. It has eleven 64-bit registers,
+    a 512-byte stack and a calling convention that matches x86-64 and arm64 on purpose
+    (<a href="02-ebpf-isa-and-vm.html#the-register-file">Chapter 02</a>). In the kernel, after the verifier
+    accepts a program, an architecture-specific JIT such as <code>arch/x86/net/bpf_jit_comp.c</code> turns it
+    into machine code. That JIT is a large <code>switch</code> over opcodes with a fixed register map. It emits
+    one or a few native instructions per eBPF instruction
+    (<a href="02-ebpf-isa-and-vm.html#the-x86-64-jit">Chapter 02, "The x86-64 JIT"</a>).</p>
+
+    <p>Userspace runtimes need the same thing outside the kernel. bpftime (<a href="14-bpftime-architecture.html">Chapter 14</a>)
+    runs uprobe, syscall-tracepoint and XDP-style programs inside the target process. Every probe hit runs
+    the program, so execution speed matters. The established userspace VMs, <a href="https://github.com/iovisor/ubpf">uBPF</a> (C) and
+    <a href="https://github.com/qmonnet/rbpf">rbpf</a> (Rust), each ship an interpreter and a hand-written JIT
+    for one or two architectures. Their JITs use the kernel's style: a direct, per-instruction translation.
+    That design is simple and compiles quickly. It cannot do the things an optimising compiler does: keep
+    stack slots in registers, fold constants across instructions, recognise loops, inline a helper, or
+    target an instruction set nobody wrote a backend for.</p>
+
+    <p>llvmbpf takes the opposite route. It does not write any machine code itself. It <em>lifts</em> eBPF bytecode
+    into LLVM IR, runs LLVM's standard <code>-O3</code> pipeline, and lets LLVM's backends do the rest. Once the
+    program is LLVM IR, other outputs cost little extra. The same module can be JIT-compiled with ORC,
+    written out as a relocatable ELF object, or lowered to PTX or SPIR-V for a GPU.</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>llvmbpf is a <strong>compiler front end for eBPF bytecode</strong>
+    whose back end is all of LLVM. It is deliberately <em>only</em> the VM: the README says it "does not include maps
+    implement, helpers, verifiers, or loaders". Safety and the runtime environment come from whoever embeds it.
+    In practice that is usually bpftime, which uses llvmbpf as its default VM.</p></div>
+
+    <h2>What llvmbpf is, and what it is not</h2>
+    <p>The repository describes itself as a "high-performance, multi-architecture JIT/AOT compiler and virtual machine
+    (VM) based on LLVM". It began as the <code>vm/llvm-jit</code> directory of bpftime; the first commit in the
+    standalone repository (10 August 2024) is literally "Init project from bpftime". Today it is a separate repo
+    again pulled back into bpftime as a git submodule. Its capabilities, according to the README and confirmed in the code:</p>
+    <ul>
+      <li>a C++ library, <code>bpftime::llvmbpf_vm</code>, that loads raw eBPF bytecode, JIT-compiles it and runs it;</li>
+      <li>AOT compilation of eBPF bytecode into a native relocatable ELF object exporting <code>bpf_main</code>,
+      which can be linked into a C program or loaded back into the VM;</li>
+      <li>emission of the lifted LLVM IR itself (<code>-emit-llvm</code>), for inspection or further optimisation;</li>
+      <li>hooks for helpers (by index) and for the five <code>LDDW</code> pseudo-instruction variants that
+      reference maps and globals;</li>
+      <li>PTX generation for NVIDIA GPUs and SPIR-V generation for other GPUs;</li>
+      <li>a small CLI, <code>bpftime-vm</code>, with <code>build</code> and <code>run</code> subcommands.</li>
+    </ul>
+    <p>What it does not do matters as much. There is no verifier. <code>load_code()</code> only checks that the length is a
+    multiple of 8. There is no interpreter: <code>exec()</code> compiles on first use. No map types and no helpers are built in.
+    There is also no memory-bounds checking in the generated code. A load from <code>r1 + 4096</code> becomes a plain LLVM
+    <code>load</code> from that address. Running unverified bytecode with llvmbpf therefore means running unverified
+    native code inside your process.</p>
+
+    <figure>
+      <svg viewBox="0 0 800 360" role="img" aria-label="Pipeline: eBPF bytecode is lifted by generateModule into LLVM IR, optimised, then sent to four backends: ORC LLJIT producing a function pointer, the host TargetMachine producing an ELF object, NVPTX producing PTX text, and SPIR-V producing a binary">
+        <defs>
+          <marker id="p16-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <g font-size="13" fill="var(--fg)">
+          <rect x="10" y="40" width="130" height="70" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="75" y="64" text-anchor="middle">eBPF bytecode</text>
+          <text x="75" y="82" text-anchor="middle" fill="var(--muted)" font-size="11">load_code(insns, len)</text>
+          <text x="75" y="98" text-anchor="middle" fill="var(--muted)" font-size="11">or libbpf: bpf.o</text>
+
+          <rect x="175" y="30" width="170" height="90" rx="6" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="260" y="54" text-anchor="middle">lifter</text>
+          <text x="260" y="72" text-anchor="middle" fill="var(--muted)" font-size="11">generateModule()</text>
+          <text x="260" y="88" text-anchor="middle" fill="var(--muted)" font-size="11">src/compiler.cpp</text>
+          <text x="260" y="104" text-anchor="middle" fill="var(--muted)" font-size="11">one switch case per opcode</text>
+
+          <rect x="380" y="30" width="150" height="90" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="455" y="54" text-anchor="middle">LLVM IR module</text>
+          <text x="455" y="72" text-anchor="middle" fill="var(--muted)" font-size="11">define i64 @bpf_main(</text>
+          <text x="455" y="88" text-anchor="middle" fill="var(--muted)" font-size="11">ptr %mem, i64 %len)</text>
+          <text x="455" y="104" text-anchor="middle" fill="var(--muted)" font-size="11">then -O3 pipeline</text>
+        </g>
+        <g stroke="var(--accent2)" stroke-width="2" fill="none">
+          <line x1="140" y1="75" x2="173" y2="75" marker-end="url(#p16-arrow)"/>
+          <line x1="345" y1="75" x2="378" y2="75" marker-end="url(#p16-arrow)"/>
+          <path d="M530,60 H560 V40 H588" marker-end="url(#p16-arrow)"/>
+          <path d="M530,75 H570 V125 H588" marker-end="url(#p16-arrow)"/>
+          <path d="M530,90 H550 V210 H588" marker-end="url(#p16-arrow)"/>
+          <path d="M530,105 H540 V295 H588" marker-end="url(#p16-arrow)"/>
+        </g>
+        <g font-size="12" fill="var(--fg)">
+          <rect x="590" y="12" width="200" height="62" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="690" y="32" text-anchor="middle">JIT: ORC LLJIT</text>
+          <text x="690" y="49" text-anchor="middle" fill="var(--muted)" font-size="11">compile() → function pointer</text>
+          <text x="690" y="64" text-anchor="middle" fill="var(--muted)" font-size="11">uint64_t (*)(void*, size_t)</text>
+
+          <rect x="590" y="94" width="200" height="62" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="690" y="114" text-anchor="middle">AOT: host TargetMachine</text>
+          <text x="690" y="131" text-anchor="middle" fill="var(--muted)" font-size="11">do_aot_compile() → ELF .o</text>
+          <text x="690" y="146" text-anchor="middle" fill="var(--muted)" font-size="11">link with C, or load_aot_object()</text>
+
+          <rect x="590" y="179" width="200" height="62" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="690" y="199" text-anchor="middle">NVPTX</text>
+          <text x="690" y="216" text-anchor="middle" fill="var(--muted)" font-size="11">generate_ptx("sm_60") → PTX</text>
+          <text x="690" y="231" text-anchor="middle" fill="var(--muted)" font-size="11">then ptxas / CUDA driver</text>
+
+          <rect x="590" y="264" width="200" height="62" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="690" y="284" text-anchor="middle">SPIR-V</text>
+          <text x="690" y="301" text-anchor="middle" fill="var(--muted)" font-size="11">generate_spirv() → binary</text>
+          <text x="690" y="316" text-anchor="middle" fill="var(--muted)" font-size="11">OpenCL / Vulkan</text>
+        </g>
+        <g font-size="11" fill="var(--muted)">
+          <text x="175" y="160">Inputs the embedder supplies:</text>
+          <text x="175" y="178">• helpers: register_external_function(idx, name, fn)</text>
+          <text x="175" y="196">• maps: set_lddw_helpers(map_by_fd, …, map_val, …)</text>
+          <text x="175" y="214">• no verifier, no maps, no loader inside llvmbpf</text>
+          <text x="175" y="250">Same lifter for all four outputs; GPU mode</text>
+          <text x="175" y="268">changes the function signature (returns void,</text>
+          <text x="175" y="286">pointer in address space 1) and the stack type.</text>
+        </g>
+      </svg>
+      <figcaption>Figure 16.1 — One lifter, four back ends. Everything to the right of the IR module is stock LLVM.</figcaption>
+    </figure>
+
+    <h2>Where the code lives</h2>
+    <p>The repository is small. At the studied commit (<code>7e384db</code>, 25 October 2026) the core library is about
+    3,900 lines of C++, and half of that is one function.</p>
+    <table>
+      <thead><tr><th>Path</th><th>Lines</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>include/llvmbpf.hpp</code></td><td>170</td><td>Public API: class <code>bpftime::llvmbpf_vm</code>, <code>precompiled_ebpf_function</code>, <code>array_map_descriptor</code>, <code>btf_line_info_entry</code></td></tr>
+        <tr><td><code>src/vm.cpp</code></td><td>359</td><td>API implementation; owns the instruction vector, helper table and lazily JITed function pointer</td></tr>
+        <tr><td><code>src/compiler.cpp</code></td><td>1,756</td><td><code>llvm_bpf_jit_context::generateModule()</code>: the eBPF → LLVM IR lifter</td></tr>
+        <tr><td><code>src/compiler_utils.{hpp,cpp}</code></td><td>118 + 403</td><td>Small emitters: ALU operand loading, loads/stores, conditional jumps, helper calls, atomics</td></tr>
+        <tr><td><code>src/llvm_jit_context.{hpp,cpp}</code></td><td>78 + 1,107</td><td>Optimisation pipeline, ORC LLJIT setup, symbol binding, AOT object emission, PTX and SPIR-V target machines, array-map inlining</td></tr>
+        <tr><td><code>src/ebpf_inst.h</code></td><td>256</td><td>Instruction struct and opcode constants, taken from uBPF (its header still reads "Copyright (c) 2015 Big Switch Networks")</td></tr>
+        <tr><td><code>cli/main.cpp</code></td><td>414</td><td><code>bpftime-vm build|run</code>; opens <code>.bpf.o</code> files with libbpf and parses <code>.BTF.ext</code> line info</td></tr>
+        <tr><td><code>example/</code></td><td></td><td><code>basic.cpp</code>, <code>maps.cpp</code>, <code>standalone/</code>, <code>inline/</code>, <code>load-llvm-ir/</code>, <code>ptx/</code>, <code>spirv/</code>, <code>array_map_inline_bench.cpp</code></td></tr>
+        <tr><td><code>test/</code></td><td></td><td>Catch2 unit tests, a <a href="https://github.com/Alan-Jowett/bpf_conformance">bpf_conformance</a> plugin, and a pytest framework plus 132 <code>.data</code> cases inherited from uBPF</td></tr>
+        <tr><td><code>.github/workflows/</code></td><td></td><td>unit-test, test-vm, test-aot-cli, bpf_conformance, test-spirv-opencl, codeql</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Lifting eBPF to LLVM IR</h2>
+    <p>Everything interesting happens in <code>generateModule()</code>. It receives the list of helper symbols
+    and <code>LDDW</code> helpers that exist, plus flags saying whether map addresses may be baked in at compile
+    time and whether the target is a GPU. It returns a <code>ThreadSafeModule</code> containing one function, by default
+    named <code>bpf_main</code>. The function has four phases. It declares external symbols, finds basic-block
+    boundaries, builds a frame that models the eBPF machine, and then walks the instructions.</p>
+
+    <h3>Modelling the machine in IR</h3>
+    <p>LLVM IR has unlimited virtual registers in SSA form, but eBPF registers are mutable. The lifter takes the
+    standard compiler-front-end shortcut. Each eBPF register becomes a stack slot (<code>alloca</code>), and every
+    instruction loads its operands from those slots and stores its result back. LLVM's SROA and mem2reg passes later
+    promote the slots to SSA values, so the slots cost nothing after optimisation. The eBPF stack is another
+    <code>alloca</code>, and <code>r10</code> is initialised to point at its top:</p>
+
+    <pre data-file="src/compiler.cpp"><code class="language-cpp">	// Stack used to save return address and saved registers
+	Value *callStack, *callItemCnt;
+	{
+		BasicBlock *setupBlock =
+			BasicBlock::Create(*context, "setupBlock", bpf_func);
+		allBlocks.push_back(setupBlock);
+		IRBuilder&lt;&gt; builder(setupBlock);
+		// Create registers
+
+		for (int i = 0; i &lt;= 10; i++) {
+			regs.push_back(builder.CreateAlloca(
+				builder.getInt64Ty(), nullptr,
+				"r" + std::to_string(i)));
+		}
+		/* ... kernel-compatible and GPU variants elided ... */
+		} else {
+			stackBegin = builder.CreateAlloca(
+				builder.getInt64Ty(),
+				builder.getInt32(STACK_SIZE *
+							 MAX_LOCAL_FUNC_DEPTH +
+						 10),
+				"stackBegin");
+		}
+		/* ... */
+		// Write stack pointer into r10
+		builder.CreateStore(stackEnd, regs[10]);
+		/* ... callStack = alloca ptr x (CALL_STACK_SIZE * 5) ... */
+		if (main_func_with_arguments) {
+			// Get args of uint64_t bpf_main(uint64_t, uint64_t)
+			llvm::Argument *mem = bpf_func-&gt;getArg(0);
+			// Write memory address into r1
+			builder.CreateStore(mem, regs[1]);
+			if (!kernel_compatible_mode) {
+				llvm::Argument *mem_len = bpf_func-&gt;getArg(1);
+				// Write memory len into r2
+				builder.CreateStore(mem_len, regs[2]);
+			}
+		}
+	}</code></pre>
+
+    <p>The constants are defined at the top of the file. <code>STACK_SIZE = (EBPF_STACK_SIZE + 7) / 8</code> is 64
+    (eight-byte slots in 512 bytes), <code>MAX_LOCAL_FUNC_DEPTH</code> is 32 and <code>CALL_STACK_SIZE</code> is 64. The stack
+    is therefore <code>alloca i64, i32 2058</code>, a little over 16 KiB, enough for 32 frames of 512 bytes. You can see these
+    numbers in the real IR below. The second argument, the memory length, goes into <code>r2</code>, a uBPF convention:
+    programs get <code>(ctx, ctx_len)</code> rather than the kernel's single context pointer.</p>
+
+    <figure>
+      <svg viewBox="0 0 800 330" role="img" aria-label="Layout of the generated bpf_main function: setupBlock with register allocas, stack, call stack; one bb_inst block per eBPF basic block; exitBlock returning r0; localFuncReturnBlock that pops the call stack and does an indirect branch back">
+        <defs>
+          <marker id="p16-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <rect x="10" y="10" width="780" height="310" rx="8" fill="none" stroke="var(--border)"/>
+        <text x="24" y="32" font-size="13" fill="var(--fg)">define i64 @bpf_main(ptr %0, i64 %1)</text>
+        <g font-size="12" fill="var(--fg)">
+          <rect x="24" y="46" width="230" height="150" rx="6" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="36" y="66">setupBlock</text>
+          <text x="36" y="86" fill="var(--muted)" font-size="11">%r0 … %r10 = alloca i64</text>
+          <text x="36" y="103" fill="var(--muted)" font-size="11">%stackBegin = alloca i64, 2058</text>
+          <text x="36" y="120" fill="var(--muted)" font-size="11">store stackBegin+2048 → %r10</text>
+          <text x="36" y="137" fill="var(--muted)" font-size="11">%callStack = alloca ptr, 320</text>
+          <text x="36" y="154" fill="var(--muted)" font-size="11">%callItemCnt = 0</text>
+          <text x="36" y="171" fill="var(--muted)" font-size="11">store %0 → %r1, %1 → %r2</text>
+          <text x="36" y="188" fill="var(--muted)" font-size="11">br bb_inst_0</text>
+
+          <rect x="300" y="46" width="200" height="40" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="400" y="71" text-anchor="middle">bb_inst_0</text>
+          <rect x="300" y="100" width="200" height="40" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="400" y="125" text-anchor="middle">bb_inst_6  (loop head)</text>
+          <rect x="300" y="154" width="200" height="40" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="400" y="179" text-anchor="middle">bb_inst_15 … bb_inst_26</text>
+          <rect x="300" y="208" width="200" height="40" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="400" y="225" text-anchor="middle">bb_inst_30</text>
+          <text x="400" y="240" text-anchor="middle" fill="var(--muted)" font-size="11">EXIT: callItemCnt == 0 ?</text>
+
+          <rect x="560" y="205" width="210" height="46" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="665" y="225" text-anchor="middle">exitBlock</text>
+          <text x="665" y="241" text-anchor="middle" fill="var(--muted)" font-size="11">ret i64 (load %r0)</text>
+
+          <rect x="560" y="262" width="210" height="52" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="665" y="279" text-anchor="middle">localFuncReturnBlock</text>
+          <text x="665" y="294" text-anchor="middle" fill="var(--muted)" font-size="11">pop ret addr, r6–r9; r10 += 64</text>
+          <text x="665" y="308" text-anchor="middle" fill="var(--muted)" font-size="11">indirectbr ret addr</text>
+        </g>
+        <g stroke="var(--accent2)" stroke-width="2" fill="none">
+          <line x1="254" y1="66" x2="298" y2="66" marker-end="url(#p16-arrow2)"/>
+          <line x1="400" y1="86" x2="400" y2="98" marker-end="url(#p16-arrow2)"/>
+          <line x1="400" y1="140" x2="400" y2="152" marker-end="url(#p16-arrow2)"/>
+          <path d="M300,174 H280 V120 H298" marker-end="url(#p16-arrow2)"/>
+          <path d="M300,112 H270 V228 H298" marker-end="url(#p16-arrow2)"/>
+          <line x1="500" y1="228" x2="558" y2="228" marker-end="url(#p16-arrow2)"/>
+          <path d="M400,248 V288 H558" marker-end="url(#p16-arrow2)"/>
+        </g>
+        <text x="24" y="232" font-size="11" fill="var(--muted)">Block names are eBPF program counters:</text>
+        <text x="24" y="248" font-size="11" fill="var(--muted)">bb_inst_6 starts at instruction 6.</text>
+        <text x="24" y="276" font-size="11" fill="var(--muted)">Back edge 29 → 6 becomes br %bb_inst_6;</text>
+        <text x="24" y="292" font-size="11" fill="var(--muted)">LLVM later recognises it as a loop.</text>
+      </svg>
+      <figcaption>Figure 16.2 — Shape of the function <code>generateModule()</code> builds, using the block names from the
+      worked example below. The call stack and <code>localFuncReturnBlock</code> exist only to support BPF-to-BPF calls.</figcaption>
+    </figure>
+
+    <h3>Finding basic blocks</h3>
+    <p>Before emitting anything, the lifter needs to know where control can enter. A block starts at instruction 0, after any jump
+    (the fall-through), and at every jump target. That is one linear scan:</p>
+    <pre data-file="src/compiler.cpp"><code class="language-cpp">	std::vector&lt;bool&gt; blockBegin(insts.size(), false);
+	// Split the blocks
+	blockBegin[0] = true;
+	for (uint16_t i = 0; i &lt; insts.size(); i++) {
+		auto curr = insts[i];
+		SPDLOG_TRACE("check pc {} opcode={} ", i,
+			     (uint16_t)curr.opcode);
+		if (i &gt; 0 &amp;&amp; is_jmp(insts[i - 1])) {
+			blockBegin[i] = true;
+			SPDLOG_TRACE("mark {} block begin", i);
+		}
+		if (is_imm_jmp(curr)) {
+			SPDLOG_TRACE("mark {} block begin", i + curr.imm + 1);
+			blockBegin[i + curr.imm + 1] = true;
+		} else if (is_jmp(curr) &amp;&amp;
+			   i + curr.offset + 1 &lt; blockBegin.size()) {
+			SPDLOG_TRACE("mark {} block begin",
+				     i + curr.offset + 1);
+			blockBegin[i + curr.offset + 1] = true;
+		}
+	}</code></pre>
+    <p>For each marked index it then creates an LLVM <code>BasicBlock</code> named <code>bb_inst_&lt;pc&gt;</code> and stores it in
+    a <code>std::map&lt;uint16_t, BasicBlock*&gt;</code>. Jump targets are looked up in that map, and a jump to an index
+    that is not a block start returns an error ("is going to jump to an illegal position"). This is the closest thing
+    to validation in the lifter. Note the <code>uint16_t</code> program counter: programs are limited to 65,535 instructions,
+    and a comment in the source calls this "a pre-existing limitation of this codebase".</p>
+
+    <h3>The translation loop</h3>
+    <p>The heart of the lifter is a <code>for</code> loop over the program counter with a <code>switch</code> on the opcode.
+    It looks a lot like the kernel's <code>do_jit()</code>. The difference is that each case calls <code>IRBuilder</code> rather than
+    emitting bytes:</p>
+    <pre data-file="src/compiler.cpp"><code class="language-cpp">	// Iterate over instructions
+	BasicBlock *currBB = instBlocks[0];
+	IRBuilder&lt;&gt; builder(currBB);
+	for (uint16_t pc = 0; pc &lt; codegen_end_pc; pc++) {
+		auto inst = insts[pc];
+		if (blockBegin[pc]) {
+			if (auto itr = instBlocks.find(pc);
+			    itr != instBlocks.end()) {
+				currBB = itr-&gt;second;
+			} else {
+				return llvm::make_error&lt;llvm::StringError&gt;(
+					"pc=" + std::to_string(pc) +
+						" was marked block begin, but no BasicBlock* found",
+					llvm::inconvertibleErrorCode());
+			}
+		}
+		builder.SetInsertPoint(currBB);
+		/* ... optional DILocation from BTF line info ... */
+		// Precheck for registers
+		if (inst.dst &gt; 10 || inst.src &gt; 10) {
+			return llvm::make_error&lt;llvm::StringError&gt;(
+				"Illegal src reg/dst reg at pc " +
+					std::to_string(pc),
+				llvm::inconvertibleErrorCode());
+		}
+		switch (inst.opcode) {
+			// ALU
+		case EBPF_OP_ADD64_IMM:
+		case EBPF_OP_ADD_IMM:
+		case EBPF_OP_ADD64_REG:
+		case EBPF_OP_ADD_REG: {
+			emitALUWithDstAndSrc(
+				inst, builder, &amp;regs[0],
+				[&amp;](Value *dst_val, Value *src_val) {
+					return builder.CreateAdd(dst_val,
+								 src_val);
+				});
+
+			break;
+		}
+		/* ... SUB, MUL, DIV, OR, AND, LSH, RSH, NEG, MOD, XOR, MOV, ARSH,
+		       LE/BE/BSWAP, ST/STX, LDX/LDXS, LDDW, JA, CALL, EXIT,
+		       sixteen conditional jumps, atomics ... */
+		default:
+			return llvm::make_error&lt;llvm::StringError&gt;(
+				"Unsupported or illegal opcode: " +
+					std::to_string(inst.opcode) +
+					" at pc " + std::to_string(pc),
+				llvm::inconvertibleErrorCode());
+		}
+	}
+
+	// Add br for all blocks
+	for (size_t i = 0; i &lt; allBlocks.size() - 1; i++) {
+		auto &amp;currBlk = allBlocks[i];
+		// LLVM 24 getTerminator() requires a well-formed block. During
+		// construction, inspect the last instruction without that assumption.
+		if (currBlk-&gt;empty() || !currBlk-&gt;back().isTerminator()) {
+			builder.SetInsertPoint(allBlocks[i]);
+			builder.CreateBr(allBlocks[i + 1]);
+		}
+	}</code></pre>
+    <p>Notice how one case covers four opcodes: the 32- and 64-bit forms, with an immediate or register source.
+    The opcode byte encodes these as independent bits (class in the low three bits, source in bit 3;
+    <a href="02-ebpf-isa-and-vm.html#instruction-encoding">Chapter 02, "Instruction encoding"</a>). The helper decodes the bits again
+    when it fetches operands. The final loop adds a fall-through <code>br</code> to any block that does not end in
+    a terminator, because LLVM requires every block to end in one. Afterwards <code>verifyModule()</code> runs (except for GPU
+    targets), so malformed IR is rejected before it reaches a backend.</p>
+
+    <h3>ALU instructions: width is the only subtlety</h3>
+    <p>The ALU helpers in <code>compiler_utils.cpp</code> encode the eBPF rule that 32-bit operations zero the upper half
+    of the destination. Operands are loaded as <code>i32</code> (via <code>trunc</code>) or <code>i64</code> depending on the
+    class, and 32-bit results are zero-extended before being stored:</p>
+    <pre data-file="src/compiler_utils.cpp"><code class="language-cpp">void emitStoreALUResult(const ebpf_inst &amp;inst, llvm::Value **regs,
+			llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value *result)
+{
+	if ((inst.opcode &amp; 0x07) == EBPF_CLS_ALU64) {
+		builder.CreateStore(result, regs[inst.dst]);
+	} else {
+		// For 32-bit ALU operations, clear the
+		// upper 32bits of the 64-bit register
+		builder.CreateStore(builder.CreateZExt(result,
+						       builder.getInt64Ty()),
+				    regs[inst.dst]);
+	}
+}
+/* ... */
+void emitALUWithDstAndSrc(
+	const ebpf_inst &amp;inst, llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
+	std::function&lt;llvm::Value *(llvm::Value *, llvm::Value *)&gt; func)
+{
+	using namespace llvm;
+	Value *dst_val = emitLoadALUDest(inst, &amp;regs[0], builder, false);
+	Value *src_val = emitLoadALUSource(inst, &amp;regs[0], builder);
+	Value *result = func(dst_val, src_val);
+	emitStoreALUResult(inst, regs, builder, result);
+}</code></pre>
+    <p>The interesting cases are the ones where eBPF semantics differ from LLVM's. In LLVM, <code>udiv</code> by zero is
+    undefined behaviour. In eBPF, division by zero yields 0 and modulo by zero leaves the destination unchanged. So the DIV
+    case wraps the division in <code>select(src == 0, 0, dst / src)</code>. For signed division (the v4 <code>sdiv</code>,
+    flagged by <code>offset == 1</code>) it also handles <code>INT_MIN / -1</code>. Shifts are masked with <code>urem src, 64</code> (or 32),
+    because a shift by the full width or more is also undefined in LLVM. None of these guards is optional. Without them, LLVM's
+    optimiser would be entitled to assume the bad case never happens and miscompile the program.</p>
+
+    <h3>Memory: loads and stores without checks</h3>
+    <p>Loads and stores are one <code>getelementptr i8</code> plus a <code>load</code> or <code>store</code> of the right width:</p>
+    <pre data-file="src/compiler_utils.cpp"><code class="language-cpp">llvm::Value *emitLDXLoadingAddr(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
+				const ebpf_inst &amp;inst)
+{
+	// [rX + OFFSET]
+	return builder.CreateGEP(builder.getInt8Ty(),
+				 builder.CreateLoad(builder.getPtrTy(),
+						    regs[inst.src]),
+				 { builder.getInt64(inst.offset) });
+}
+/* ... */
+void emitLoadX(llvm::IRBuilder&lt;&gt; &amp;builder, llvm::Value **regs,
+	       const ebpf_inst &amp;inst, llvm::IntegerType *srcTy,
+	       bool sign_extend)
+{
+	using namespace llvm;
+	Value *addr = emitLDXLoadingAddr(builder, &amp;regs[0], inst);
+	Value *result = builder.CreateLoad(srcTy, addr);
+	emitLDXStoringResult(builder, &amp;regs[0], inst, result, sign_extend);
+}</code></pre>
+    <p>That is the whole memory model: the register value <em>is</em> a host pointer. Nothing checks it against the context
+    buffer, the stack, or a map. This is the same choice the kernel JIT makes, but the kernel can make it because the verifier
+    has already proved every access safe (<a href="03-verifier.html">Chapter 03</a>). In userspace that proof has to come from
+    somewhere else. bpftime has a userspace verifier for this (<a href="14-bpftime-architecture.html">Chapter 14</a>). Note its default,
+    though: in <code>runtime/include/bpftime_config.hpp</code> the mode <code>BPFTIME_VERIFIER_WARNING</code> is marked "(default)", with the comment
+    "Program loading continues even if verification fails". Strict rejection needs <code>BPFTIME_VERIFIER_LEVEL=STRICT</code> (<code>runtime/src/bpftime_config.cpp</code>).</p>
+
+    <div class="callout warn"><span class="label">Warning</span><p>Because loads become plain IR loads, LLVM also applies its
+    normal assumptions to them: no data races on non-atomic accesses, natural alignment as declared (<code>align 4</code> in the output
+    below), and so on. An eBPF program that the kernel would accept but that relies on unaligned access, or on another thread
+    changing memory between two loads, can behave differently after <code>-O3</code>. Commit <code>256540e</code>
+    ("Fix atomic operation alignment causing uprobe failures", February 2026) is an example of such alignment issues surfacing in practice.</p></div>
+
+    <h3>Jumps, exit and BPF-to-BPF calls</h3>
+    <p>Conditional jumps are a comparison and a <code>CondBr</code> to two blocks found by program counter. <code>JSET</code> becomes
+    <code>(dst &amp; src) != 0</code>. <code>JMP32</code> variants compare <code>i32</code> loads. <code>EXIT</code> is where the lifter's design
+    shows. eBPF has local function calls (<code>call</code> with <code>src_reg = 1</code>;
+    <a href="02-ebpf-isa-and-vm.html#bpf-to-bpf-calls">Chapter 02</a>), but the lifter emits a <em>single</em> LLVM function.
+    Subprograms are not split out. Instead it implements calls by hand:</p>
+    <ul>
+      <li>A local call pushes five words onto the IR-level <code>callStack</code>: the return address as an LLVM
+      <code>blockaddress</code> of the block after the call, plus <code>r6</code>–<code>r9</code>. It moves <code>r10</code> down,
+      then branches to the callee's block.</li>
+      <li><code>EXIT</code> checks <code>callItemCnt</code>. At depth zero it branches to <code>exitBlock</code>, which returns <code>r0</code>.
+      Otherwise it branches to <code>localFuncReturnBlock</code>, which pops the saved registers and does an <code>indirectbr</code>
+      to the saved return block.</li>
+    </ul>
+    <pre data-file="src/compiler.cpp"><code class="language-cpp">		case EBPF_OP_EXIT: {
+			if (kernel_compatible_mode) {
+				builder.CreateBr(exitBlk);
+			} else {
+				builder.CreateCondBr(
+					builder.CreateICmpEQ(
+						builder.CreateLoad(
+							builder.getInt64Ty(),
+							callItemCnt),
+						builder.getInt64(0)),
+					exitBlk, localRetBlk);
+			}
+			break;
+		}</code></pre>
+    <p>This keeps everything in one function, which helps the optimiser: LLVM sees the whole program and can
+    propagate constants across "calls". The cost is an <code>indirectbr</code>, which limits some optimisations, and a hand-rolled
+    frame discipline that has to be exactly right.</p>
+
+    <div class="callout danger"><span class="label">Observed bug</span><p>On a local call the lifter executes
+    <code>r10 = r10 - STACK_SIZE</code>, and <code>localFuncReturnBlock</code> adds it back. <code>STACK_SIZE</code> is 64, the number of
+    8-byte <em>slots</em> in 512 bytes, but it is applied to <code>r10</code> as a <em>byte</em> offset. So a callee's frame starts only
+    64 bytes below the caller's, not 512. I tested this at commit <code>7e384db</code> with an eight-instruction hand-assembled program
+    (illustrative, not from the repo). The caller stores 7 at <code>r10-128</code> and calls a subprogram that stores 99 at its own
+    <code>r10-64</code>. Back in the caller, <code>r10-128</code> is read. The JIT returned <strong>99</strong>; spec semantics (each frame owns
+    its own stack) give 7. Moving the callee's store to <code>r10-520</code> returned 7, as expected. The repository's
+    <code>call_local</code> conformance test does not use deep stack slots, so it does not catch this. Kernel-compatible mode is not affected,
+    because it lowers local calls to external symbols (see below).</p></div>
+
+    <h3>Helper calls</h3>
+    <p>A helper call (<code>call imm</code> with <code>src_reg = 0</code>) becomes a call to an external function named
+    <code>_bpf_helper_ext_%04d</code>, so helper 1 is <code>_bpf_helper_ext_0001</code>. Every helper has the same LLVM type,
+    <code>i64 (i64, i64, i64, i64, i64)</code>, and receives <code>r1</code>–<code>r5</code>. This matches the eBPF calling convention exactly,
+    so no argument shuffling is needed:</p>
+    <pre data-file="src/compiler_utils.cpp"><code class="language-cpp">	auto funcNameToCall = ext_func_sym(inst.imm);
+	auto itr = extFunc.find(funcNameToCall);
+	/* ... kernel-compatible mode may declare it on the fly ... */
+	if (itr != extFunc.end()) {
+		SPDLOG_DEBUG("Emitting ext func call to {} name {} at pc {}",
+			     inst.imm, funcNameToCall, pc);
+		auto callInst = builder.CreateCall(
+			helperFuncTy, itr-&gt;second,
+			{
+				builder.CreateLoad(builder.getInt64Ty(),
+						   regs[1]),
+				builder.CreateLoad(builder.getInt64Ty(),
+						   regs[2]),
+				builder.CreateLoad(builder.getInt64Ty(),
+						   regs[3]),
+				builder.CreateLoad(builder.getInt64Ty(),
+						   regs[4]),
+				builder.CreateLoad(builder.getInt64Ty(),
+						   regs[5]),
+
+			});
+		/* ... */
+		if (!(kernel_compatible_mode &amp;&amp; inst.imm == 12)) {
+			builder.CreateStore(callInst, regs[0]);
+		}
+
+		// The userspace llvmbpf runtime does not implement real kernel tail
+		// calls, so keep the historical "exit after helper 12" behavior there.
+		if (inst.imm == 12 &amp;&amp; !kernel_compatible_mode) {
+			builder.CreateBr(exitBlk);
+		}
+		return 0;
+	} else {
+		return llvm::make_error&lt;llvm::StringError&gt;(
+			"Ext func not found: " + funcNameToCall,
+			llvm::inconvertibleErrorCode());
+	}</code></pre>
+    <p>Two things follow. First, a helper must be registered <em>before</em> compilation, otherwise lifting fails with
+    "Ext func not found". One of the unit tests checks exactly this error. Second, helper 12 is
+    <code>bpf_tail_call</code> in the kernel's numbering, and here it is approximated as "call the helper, then exit". The embedder's
+    helper does the tail call by running the next program itself. bpftime keeps a thread-local <code>current_thread_tail_call_ret</code>
+    for this purpose. The symbol names are the binding contract: when you link an AOT object into a C program, you provide
+    functions with exactly these names, as the standalone example below does.</p>
+
+    <h3>LDDW: how maps get in</h3>
+    <p>The 16-byte <code>lddw</code> instruction (<a href="02-ebpf-isa-and-vm.html#the-wide-instruction-lddw">Chapter 02</a>) loads
+    a 64-bit immediate. Its <code>src_reg</code> field selects how the immediate is interpreted, and that is how maps and global
+    variables are referenced (<a href="04-maps-helpers-kfuncs.html">Chapter 04</a>). llvmbpf maps each variant to one of five
+    callbacks that the embedder passes to <code>set_lddw_helpers()</code>:</p>
+    <table>
+      <thead><tr><th><code>src_reg</code></th><th>Meaning (RFC 9669)</th><th>llvmbpf callback</th><th>When it runs</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>plain 64-bit immediate</td><td>none</td><td>constant stored</td></tr>
+        <tr><td>1</td><td>map by fd</td><td><code>map_by_fd(imm)</code></td><td>at compile time; default returns <code>imm</code></td></tr>
+        <tr><td>2</td><td>map value by fd + offset</td><td><code>map_by_fd</code> then <code>map_val(map) + imm2</code></td><td>compile time (JIT) or a runtime call to <code>__lddw_helper_map_val</code> (AOT)</td></tr>
+        <tr><td>3</td><td>variable address</td><td><code>var_addr(imm)</code></td><td>compile time; required</td></tr>
+        <tr><td>4</td><td>code address</td><td><code>code_addr(imm)</code></td><td>compile time; required</td></tr>
+        <tr><td>5</td><td>map by index</td><td><code>map_by_idx(imm)</code></td><td>compile time; default returns <code>imm</code></td></tr>
+        <tr><td>6</td><td>map value by index + offset</td><td><code>map_by_idx</code> then <code>map_val</code></td><td>as for 2</td></tr>
+      </tbody>
+    </table>
+    <p>The JIT/AOT split for <code>src_reg = 2</code> is the important design point:</p>
+    <pre data-file="src/compiler.cpp"><code class="language-cpp">				if (patch_map_val_at_compile_time) {
+					SPDLOG_DEBUG(
+						"map_val is required to be evaluated at compile time");
+					/* ... error if vm.map_val is null ... */
+					builder.CreateStore(
+						builder.getInt64(
+							vm.map_val(mapPtr) +
+							nextinst.imm),
+						regs[inst.dst]);
+				} else {
+					SPDLOG_DEBUG(
+						"map_val is required to be evaluated at runtime, emitting calling instructions");
+					if (auto itrMapVal = lddwHelper.find(
+						    LDDW_HELPER_MAP_VAL);
+					    itrMapVal != lddwHelper.end()) {
+						auto retMapVal = builder.CreateCall(
+							lddwHelperWithUint64,
+							itrMapVal-&gt;second,
+							{ builder.getInt64(
+								mapPtr) });
+						auto finalRet = builder.CreateAdd(
+							retMapVal,
+							builder.getInt64(
+								nextinst.imm));
+						builder.CreateStore(
+							finalRet,
+							regs[inst.dst]);
+					/* ... */</code></pre>
+    <p>When JIT-compiling, the process that compiles is the process that runs, so the address of a map's value area can be
+    baked into the code as a constant. LLVM can then fold <code>cntrs_array[0]++</code> into a single increment of an absolute
+    address. An AOT object, though, may be linked into a different binary or loaded in a different process, so the address is
+    not known yet. The lifter instead emits a call to an external <code>__lddw_helper_map_val</code> that the final program must
+    define. You will see this function in the standalone example.</p>
+
+    <h2>Worked example: a loop from bytecode to x86-64</h2>
+    <p>The repository ships a tiny compiled program, <code>.github/assets/sum.bpf.o</code>, used by the AOT CI job. Its C source is not in
+    the repo. From the disassembly it is equivalent to the following (reconstructed, illustrative):</p>
+    <pre><code class="language-c">/* Illustrative reconstruction, not from the repo */
+int test(int *a)
+{
+	int sum = 0;
+	for (int i = 1; i &lt;= a[0]; i++)
+		sum += a[i];
+	return sum;
+}</code></pre>
+    <p>It was compiled without optimisation, so every variable lives on the stack: the pointer at <code>r10-8</code>, the sum at
+    <code>r10-12</code> and <code>i</code> at <code>r10-16</code>. That makes it a good test of how much LLVM can recover. All outputs below
+    were produced in this orb with LLVM 15.0.6 on x86-64, using the <code>bpftime-vm</code> CLI built from commit <code>7e384db</code>.</p>
+
+    <div class="stepper">
+      <div class="step"><h4>1. Decode and split</h4><p>32 instructions. Block starts are 0, 6 (target of the back edge at 29 and of
+      <code>goto +0</code> at 5), 14 (after the conditional jump at 13), 15, 26 and 30 (target of <code>if r1 s&gt; r2 goto +16</code>). Each becomes
+      <code>bb_inst_N</code>. The <code>goto +0</code> instructions come from unoptimised clang output and turn into empty blocks.</p></div>
+      <div class="step"><h4>2. Build the frame</h4><p><code>setupBlock</code> allocates <code>%r0</code>…<code>%r10</code>, the 2,058-slot stack and the
+      call stack, stores <code>stackBegin + 2048</code> into <code>%r10</code>, and stores the two arguments into <code>%r1</code> and <code>%r2</code>.</p></div>
+      <div class="step"><h4>3. Lift each instruction</h4><p><code>*(u64 *)(r10 - 8) = r1</code> becomes load <code>%r1</code>, load <code>%r10</code> as a
+      pointer, <code>getelementptr i8 … -8</code>, <code>store i64</code>. <code>r1 &lt;&lt;= 32; r1 s&gt;&gt;= 32</code> (sign extension in eBPF v1)
+      becomes <code>shl</code> then <code>ashr</code>. <code>if r1 s&gt; r2 goto +16</code> becomes <code>icmp sgt</code> plus <code>br i1</code>. The raw IR is about
+      150 lines, plus 1,000 helper declarations (the CLI pre-registers helpers 0–999).</p></div>
+      <div class="step"><h4>4. Optimise</h4><p>SROA promotes the register slots and the three stack slots to SSA values. The
+      shift pair folds into a <code>sext</code>, the empty blocks vanish, and the loop is rotated so the bound check runs once before entry.
+      The call-stack machinery is never used and disappears. The result is the 20-line function in the "Optimised IR" tab.</p></div>
+      <div class="step"><h4>5. Emit</h4><p>The x86-64 backend emits 11 instructions, 31 bytes. The loop body is
+      <code>addl (%rdi,%rdx,4), %eax</code>: the eBPF stack, the address arithmetic and the register file have been compiled away.</p></div>
+    </div>
+
+    <div class="tabs">
+      <div class="tab-panel" data-label="eBPF bytecode"><p><code>llvm-objdump -d .github/assets/sum.bpf.o</code> (program <code>test</code>):</p><pre><code class="language-plaintext">0000000000000000 &lt;test&gt;:
+       0:	*(u64 *)(r10 - 8) = r1
+       1:	r1 = 0
+       2:	*(u32 *)(r10 - 12) = r1
+       3:	r1 = 1
+       4:	*(u32 *)(r10 - 16) = r1
+       5:	goto +0 &lt;LBB0_1&gt;
+
+0000000000000030 &lt;LBB0_1&gt;:
+       6:	r1 = *(u32 *)(r10 - 16)
+       7:	r1 &lt;&lt;= 32
+       8:	r1 s&gt;&gt;= 32
+       9:	r2 = *(u64 *)(r10 - 8)
+      10:	r2 = *(u32 *)(r2 + 0)
+      11:	r2 &lt;&lt;= 32
+      12:	r2 s&gt;&gt;= 32
+      13:	if r1 s&gt; r2 goto +16 &lt;LBB0_4&gt;
+      14:	goto +0 &lt;LBB0_2&gt;
+
+0000000000000078 &lt;LBB0_2&gt;:
+      15:	r1 = *(u64 *)(r10 - 8)
+      16:	r2 = *(u32 *)(r10 - 16)
+      17:	r2 &lt;&lt;= 32
+      18:	r2 s&gt;&gt;= 32
+      19:	r2 &lt;&lt;= 2
+      20:	r1 += r2
+      21:	r2 = *(u32 *)(r1 + 0)
+      22:	r1 = *(u32 *)(r10 - 12)
+      23:	r1 += r2
+      24:	*(u32 *)(r10 - 12) = r1
+      25:	goto +0 &lt;LBB0_3&gt;
+
+00000000000000d0 &lt;LBB0_3&gt;:
+      26:	r1 = *(u32 *)(r10 - 16)
+      27:	r1 += 1
+      28:	*(u32 *)(r10 - 16) = r1
+      29:	goto -24 &lt;LBB0_1&gt;
+
+00000000000000f0 &lt;LBB0_4&gt;:
+      30:	r0 = *(u32 *)(r10 - 12)
+      31:	exit</code></pre></div>
+      <div class="tab-panel" data-label="Lifted IR (excerpt)"><p>Output of <code>bpftime-vm build sum.bpf.o -emit-llvm</code>, helper declarations removed:</p><pre><code class="language-llvm">define i64 @bpf_main(ptr %0, i64 %1) {
+setupBlock:
+  %r0 = alloca i64, align 8
+  %r1 = alloca i64, align 8
+  ; ... %r2 to %r9 ...
+  %r10 = alloca i64, align 8
+  %stackBegin = alloca i64, i32 2058, align 8
+  %stackEnd = getelementptr i64, ptr %stackBegin, i32 2048
+  store ptr %stackEnd, ptr %r10, align 8
+  %callStack = alloca ptr, i32 320, align 8
+  %callItemCnt = alloca i64, align 8
+  store i64 0, ptr %callItemCnt, align 4
+  store ptr %0, ptr %r1, align 8
+  store i64 %1, ptr %r2, align 4
+  br label %bb_inst_0
+
+bb_inst_0:                                        ; preds = %setupBlock
+  ; pc 0: *(u64 *)(r10 - 8) = r1
+  %2 = load i64, ptr %r1, align 4
+  %3 = load ptr, ptr %r10, align 8
+  %4 = getelementptr i8, ptr %3, i64 -8
+  store i64 %2, ptr %4, align 4
+  ; pc 1: r1 = 0
+  store i64 0, ptr %r1, align 4
+  ; pc 2: *(u32 *)(r10 - 12) = r1
+  %5 = load i64, ptr %r1, align 4
+  %6 = trunc i64 %5 to i32
+  %7 = load ptr, ptr %r10, align 8
+  %8 = getelementptr i8, ptr %7, i64 -12
+  store i32 %6, ptr %8, align 4
+  ; ... pc 3-4 ...
+  br label %bb_inst_6
+
+bb_inst_6:                                        ; preds = %bb_inst_26, %bb_inst_0
+  ; pc 6-8: r1 = *(u32 *)(r10 - 16); r1 &lt;&lt;= 32; r1 s&gt;&gt;= 32
+  %13 = load ptr, ptr %r10, align 8
+  %14 = getelementptr i8, ptr %13, i64 -16
+  %15 = load i32, ptr %14, align 4
+  %16 = zext i32 %15 to i64
+  store i64 %16, ptr %r1, align 4
+  %17 = load i64, ptr %r1, align 4
+  %18 = shl i64 %17, 32
+  store i64 %18, ptr %r1, align 4
+  %19 = load i64, ptr %r1, align 4
+  %20 = ashr i64 %19, 32
+  store i64 %20, ptr %r1, align 4
+  ; ... pc 9-12 compute r2 = (s32)a[0] ...
+  ; pc 13: if r1 s&gt; r2 goto +16
+  %32 = load i64, ptr %r2, align 4
+  %33 = load i64, ptr %r1, align 4
+  %34 = icmp sgt i64 %33, %32
+  br i1 %34, label %bb_inst_30, label %bb_inst_14
+  ; ...
+bb_inst_30:                                       ; preds = %bb_inst_6
+  %76 = load ptr, ptr %r10, align 8
+  %77 = getelementptr i8, ptr %76, i64 -12
+  %78 = load i32, ptr %77, align 4
+  %79 = zext i32 %78 to i64
+  store i64 %79, ptr %r0, align 4
+  ; pc 31: exit
+  %80 = load i64, ptr %callItemCnt, align 4
+  %81 = icmp eq i64 %80, 0
+  br i1 %81, label %exitBlock, label %localFuncReturnBlock
+
+exitBlock:                                        ; preds = %bb_inst_30
+  %82 = load i64, ptr %r0, align 4
+  ret i64 %82</code></pre>
+      <p>The <code>; pc …</code> comments were added by hand to line the IR up with the bytecode; everything else is verbatim output.</p></div>
+      <div class="tab-panel" data-label="Optimised IR"><p>Output of <code>opt -O3 -S sum.ll</code> (LLVM 15):</p><pre><code class="language-llvm">; Function Attrs: nofree norecurse nosync nounwind readonly
+define i64 @bpf_main(ptr %0, i64 %1) local_unnamed_addr #0 {
+setupBlock:
+  %2 = ptrtoint ptr %0 to i64
+  %3 = load i32, ptr %0, align 4
+  %4 = icmp slt i32 %3, 1
+  br i1 %4, label %bb_inst_30, label %bb_inst_15
+
+bb_inst_15:                                       ; preds = %setupBlock, %bb_inst_15
+  %storemerge32 = phi i32 [ %11, %bb_inst_15 ], [ 1, %setupBlock ]
+  %stackBegin29.sroa.2.031 = phi i32 [ %10, %bb_inst_15 ], [ 0, %setupBlock ]
+  %5 = sext i32 %storemerge32 to i64
+  %6 = shl nsw i64 %5, 2
+  %7 = add i64 %6, %2
+  %8 = inttoptr i64 %7 to ptr
+  %9 = load i32, ptr %8, align 4
+  %10 = add i32 %9, %stackBegin29.sroa.2.031
+  %11 = add i32 %storemerge32, 1
+  %12 = icmp sgt i32 %11, %3
+  br i1 %12, label %bb_inst_30, label %bb_inst_15
+
+bb_inst_30:                                       ; preds = %bb_inst_15, %setupBlock
+  %stackBegin29.sroa.2.0.lcssa = phi i32 [ 0, %setupBlock ], [ %10, %bb_inst_15 ]
+  %13 = zext i32 %stackBegin29.sroa.2.0.lcssa to i64
+  ret i64 %13
+}</code></pre>
+      <p>The name <code>%stackBegin29.sroa.2…</code> shows where the sum came from: SROA split a slice out of the eBPF stack allocation
+      and turned it into a <code>phi</code>. The same output appears in the project README.</p></div>
+      <div class="tab-panel" data-label="x86-64 (AOT object)"><p>Output of <code>llvm-objdump -d test.o</code> after <code>bpftime-vm build</code>:</p><pre><code class="language-x86asm">test.o:	file format elf64-x86-64
+
+Disassembly of section .text:
+
+0000000000000000 &lt;bpf_main&gt;:
+       0:      	movl	(%rdi), %ecx
+       2:      	xorl	%eax, %eax
+       4:      	testl	%ecx, %ecx
+       6:      	jle	0x1c &lt;bpf_main+0x1c&gt;
+       8:      	movl	$1, %edx
+       d:      	nopl	(%rax)
+      10:      	movslq	%edx, %rdx
+      13:      	addl	(%rdi,%rdx,4), %eax
+      16:      	incl	%edx
+      18:      	cmpl	%ecx, %edx
+      1a:      	jle	0x10 &lt;bpf_main+0x10&gt;
+      1c:      	movl	%eax, %eax
+      1e:      	retq</code></pre>
+      <p>32 eBPF instructions, 13 of them stack loads or stores, become 11 x86 instructions with no memory traffic except the
+      reads of <code>a[]</code>. A per-instruction JIT would keep those 13 stack accesses as real memory operations.</p></div>
+      <div class="tab-panel" data-label="PTX (sm_60)"><p>Output of <code>generate_ptx("sm_60")</code> on the same bytecode, from a scratch driver:</p><pre><code class="language-plaintext">//
+// Generated by LLVM NVPTX Back-End
+//
+
+.version 5.0
+.target sm_60
+.address_size 64
+
+	// .globl	bpf_main
+
+.visible .func bpf_main(
+	.param .b64 bpf_main_param_0,
+	.param .b64 bpf_main_param_1
+)
+{
+	.reg .pred 	%p&lt;2&gt;;
+	.reg .b32 	%r&lt;6&gt;;
+	.reg .b64 	%rd&lt;2&gt;;
+
+	ld.param.u64 	%rd1, [bpf_main_param_0];
+	ld.u32 	%r1, [%rd1];
+	mov.u32 	%r5, 0;
+$L__BB0_1:
+	add.s32 	%r5, %r5, 1;
+	setp.le.s32 	%p1, %r5, %r1;
+	@%p1 bra 	$L__BB0_1;
+	ret;
+
+}</code></pre>
+      <p>Look closely: the summation is <em>gone</em>. In GPU mode <code>bpf_main</code> returns <code>void</code>, because a kernel entry
+      cannot return a value. <code>r0</code> is therefore dead and LLVM deletes everything that computes it, leaving only the loop counter. A GPU-side
+      eBPF program must publish results through memory: a map, the context, or a helper. The section on GPU targets below explains how.</p></div>
+    </div>
+
+    <h2>From IR to machine code</h2>
+
+    <h3>The optimisation pipeline</h3>
+    <p><code>optimizeModule()</code> builds LLVM's standard per-module pipeline at the requested level (default 3). On LLVM 17 and newer
+    it uses the new pass manager (<code>PassBuilder::buildPerModuleDefaultPipeline</code>); on 15 and 16 it uses the legacy
+    <code>PassManagerBuilder</code>. Since March 2026 the embedder can tune this. <code>set_optimization_level(0..3)</code>,
+    <code>set_disabled_passes({...})</code> (skips any pass whose name contains one of the given strings, through a
+    <code>PassInstrumentationCallbacks</code> hook) and <code>set_log_passes(true)</code> were added "for ablation study", according to the
+    commit messages. <code>set_target_cpu()</code> and <code>set_target_features()</code> let a deployment pick, say, a CPU model for the
+    JIT target machine instead of the host's.</p>
+
+    <h3>JIT: ORC LLJIT and symbol binding</h3>
+    <p>The JIT path uses LLVM's ORC <code>LLJIT</code>, the current recommended in-process JIT API
+    (<a href="https://llvm.org/docs/ORCv2.html">LLVM ORC v2 docs</a>). <code>do_jit_compile()</code> is short:</p>
+    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">llvm::Error llvm_bpf_jit_context::do_jit_compile()
+{
+	spin_lock_guard guard(compiling.get());
+	auto [jit, extFuncNames, definedLddwHelpers] =
+		create_and_initialize_lljit_instance();
+	if (!jit) {
+		return llvm::make_error&lt;llvm::StringError&gt;(
+			"jit initialization failed",
+			llvm::inconvertibleErrorCode());
+	}
+	// Handle the error from generateModule
+	auto bpfModuleOrErr =
+		generateModule(extFuncNames, definedLddwHelpers, true);
+	if (!bpfModuleOrErr) {
+		return bpfModuleOrErr.takeError();
+	}
+	// If successful, get the module
+	auto bpfModule = std::move(*bpfModuleOrErr);
+	// Optimize the module
+	bpfModule.withModuleDo([&amp;](auto &amp;M) {
+		optimizeModule(M, vm.optimization_level, vm.disabled_passes_,
+			       vm.log_passes_);
+		if (inline_array_map_lookup_helpers(M)) {
+			optimizeModule(M, vm.optimization_level,
+				       vm.disabled_passes_, vm.log_passes_);
+		}
+	});
+	// Handle the error from addIRModule
+	if (auto err = jit-&gt;addIRModule(std::move(bpfModule))) {
+		return err;
+	}
+	// If everything succeeds, move the JIT instance
+	this-&gt;jit = std::move(jit);
+	return llvm::Error::success();
+}</code></pre>
+    <p>The third argument to <code>generateModule</code>, <code>true</code>, is <code>patch_map_val_at_compile_time</code>: in the JIT, map value
+    addresses become constants. Binding helpers happens in <code>create_and_initialize_lljit_instance()</code>. For each registered helper
+    it defines an <em>absolute symbol</em> in the JIT's main dylib whose name is <code>_bpf_helper_ext_NNNN</code> and whose address is the
+    C function pointer the embedder registered:</p>
+    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">	auto &amp;mainDylib = jit-&gt;getMainJITDylib();
+	std::vector&lt;std::string&gt; extFuncNames;
+	// insert the helper functions
+	SymbolMap extSymbols;
+	for (uint32_t i = 0; i &lt; std::size(vm.ext_funcs); i++) {
+		if (vm.ext_funcs[i].has_value()) {
+			auto sym = JITEvaluatedSymbol::fromPointer(
+				vm.ext_funcs[i]-&gt;fn);
+			auto symName = jit-&gt;getExecutionSession().intern(
+				ext_func_sym(i));
+			sym.setFlags(JITSymbolFlags::Callable |
+				     JITSymbolFlags::Exported);
+			/* ... LLVM &lt; 17 and &gt;= 17 variants ... */
+			extSymbols.try_emplace(symName, symbol);
+			extFuncNames.emplace_back(ext_func_sym(i));
+		}
+	}
+	/* ... */
+	if (auto err = mainDylib.define(absoluteSymbols(extSymbols)); !err) {
+		SPDLOG_DEBUG("LLVM-JIT: failed to define external symbols");
+	}</code></pre>
+    <p>When ORC links the compiled module, the <code>call @_bpf_helper_ext_0001</code> is resolved to that absolute address, so a helper call
+    in JITed code is a direct native call into the host. (The <code>!err</code> in the condition logs on success rather than failure, but it only
+    affects a debug message.) Finally <code>get_entry_address()</code> calls <code>jit-&gt;lookup("bpf_main")</code> and casts the result to
+    <code>uint64_t (*)(void *mem, size_t mem_len)</code>, the type the embedder calls directly.</p>
+    <p>Several recent commits concern this setup rather than code generation. They pre-register ORC's EH-frame and GDB-loader wrapper
+    symbols before creating <code>LLJIT</code> (#49), so the JIT works when LLVM is statically linked into a shared library such as
+    <code>libbpftime-agent.so</code> with hidden symbols. A unit test checks this by loading the library with <code>dlopen</code>. Another change (#52)
+    links and initialises only the host backend plus NVPTX instead of every backend in the distro LLVM. Its commit message
+    reports <code>libbpftime-agent.so</code> shrinking from 140 MB to 79 MB on LLVM 17 (figures from the commit message, not reproduced here).</p>
+
+    <h3>AOT: a native ELF object</h3>
+    <p>The AOT path reuses the lifter with <code>patch_map_val_at_compile_time = false</code>, runs the same optimisation, and asks the host
+    <code>TargetMachine</code> to emit an object file into memory:</p>
+    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">	if (auto module = generateModule(extFuncNames, lddwHelpers, false);
+	    module) {
+		return module-&gt;withModuleDo([&amp;](auto &amp;module)
+						    -&gt; std::vector&lt;uint8_t&gt; {
+			if (print_ir) {
+				module.print(llvm::outs(), nullptr);
+			}
+			optimizeModule(module, vm.optimization_level,
+				       vm.disabled_passes_, vm.log_passes_);
+			auto targetMachine =
+				create_host_target_machine_or_throw(vm);
+			/* ... setTargetTriple / setDataLayout ... */
+			SmallVector&lt;char, 0&gt; objStream;
+			std::unique_ptr&lt;raw_svector_ostream&gt; BOS =
+				std::make_unique&lt;raw_svector_ostream&gt;(
+					objStream);
+
+			legacy::PassManager pass;
+			/* ... LLVM-version-specific addPassesToEmitFile(..., ObjectFile) ... */
+			pass.run(module);
+			std::vector&lt;uint8_t&gt; result(objStream.begin(),
+						    objStream.end());
+			return result;
+		});</code></pre>
+    <p>The result is an ordinary relocatable ELF. For <code>sum.bpf.o</code> it is 544 bytes, with one global symbol <code>T bpf_main</code> and
+    undefined references to any helpers it calls. You can use it in two ways:</p>
+    <ul>
+      <li><strong>Load it back</strong> with <code>load_aot_object()</code>. This creates a fresh <code>LLJIT</code>, binds the same helper
+      symbols, calls <code>addObjectFile()</code> and looks up <code>bpf_main</code>. The CLI's <code>run</code> command works this way. The point is
+      to compile once (for example at build time or on a powerful machine) and load quickly later, without running the optimiser
+      again. bpftime's <code>bpftime-aot</code> tool uses this to compile programs held in its shared memory and load the native code back.</li>
+      <li><strong>Link it</strong> into a C program like any other object. Define <code>_bpf_helper_ext_NNNN</code> and, if maps are used,
+      <code>__lddw_helper_map_val</code>, and you get a standalone binary that needs neither LLVM nor any eBPF runtime. The README pitches this
+      for deployment and for microcontrollers or systems without an OS.</li>
+    </ul>
+    <p>Because the AOT output (or its <code>-emit-llvm</code> IR) is just LLVM, you can also go further than the JIT does. The
+    <code>example/inline</code> recipe compiles the helper and map implementations to IR, merges them with <code>llvm-link</code>, runs
+    <code>opt -passes=always-inline</code>, and compiles the result. The helpers are then inlined into the eBPF program and constant-folded
+    with it. Since March 2026 the JIT can do a narrower version of this itself. If the embedder describes an array map with
+    <code>register_array_map()</code>, <code>inline_array_map_lookup_helpers()</code> replaces <code>_bpf_helper_ext_0001(const_handle, key)</code>
+    (<code>bpf_map_lookup_elem</code>) with a bounds check and address arithmetic, and the module is optimised a second time. The commit
+    calls this a proof of concept.</p>
+
+    <h3>GPU targets: PTX and SPIR-V</h3>
+    <p>PTX support was developed on a separate repository, <a href="https://github.com/eunomia-bpf/llvmbpf-nvptx">eunomia-bpf/llvmbpf-nvptx</a>,
+    whose description now reads "This branch has been merged into https://github.com/eunomia-bpf/llvmbpf". It landed on <code>main</code> as
+    <code>118919d</code> "feat: support generating PTX (#28)" on 21 May 2025: about 3,100 added lines, including a CUDA trampoline and a
+    demo program. The mechanism is the same lifter plus a different <code>TargetMachine</code>:</p>
+    <pre data-file="src/llvm_jit_context.cpp"><code class="language-cpp">static std::unique_ptr&lt;llvm::TargetMachine&gt;
+createNVPTXTargetMachine(const char *target_cpu)
+{
+#ifndef LLVMBPF_HAS_NVPTX
+	throw std::runtime_error("NVPTX backend is not available in this LLVM build");
+#endif
+	std::string error;
+	llvm::Triple triple("nvptx64-nvidia-cuda");
+	const llvm::Target *target =
+		llvm::TargetRegistry::lookupTarget("nvptx64", triple, error);
+	/* ... */
+	llvm::TargetOptions options;
+	auto result = std::unique_ptr&lt;llvm::TargetMachine&gt;(
+		target-&gt;createTargetMachine(
+			/* triple */, target_cpu, "", options, llvm::Reloc::Static));
+	return result;
+}
+/* ... in generate_ptx(): */
+	auto bpfModuleOrErr =
+		generateModule(extFuncNames, definedLddwHelpers, true,
+			       main_with_arguments, func_name, true);
+	/* ... optimise, then addPassesToEmitFile(..., AssemblyFile) ... */</code></pre>
+    <p>The last argument, <code>is_gpu = true</code>, changes three things in the lifter. The entry function returns <code>void</code>.
+    Its pointer parameter lives in address space 1 (global memory). The stack and call stack are fixed-size array <code>alloca</code>s
+    instead of variable-length ones, which GPU backends handle poorly. Everything else, including the instruction translation, is
+    shared. The PTX that comes out is a <code>.func</code> calling external <code>_bpf_helper_ext_NNNN</code> functions. That is not
+    runnable as is: there is no host to call into. The example (<code>example/ptx/ptx_test.cpp</code>) and bpftime's GPU attach code
+    post-process it as follows:</p>
+    <ul>
+      <li>they rename <code>.func bpf_main</code> to <code>.entry bpf_main</code> so it can be launched as a kernel (or, in bpftime, keep it as a
+      function and splice it into an existing CUDA kernel's PTX);</li>
+      <li>they rename helper references and prepend a <em>trampoline</em> PTX module, compiled from
+      <code>example/ptx/example_trampoline/default_trampoline.cu</code>, that implements the helpers;</li>
+      <li>the trampoline helpers place a request in host-mapped shared memory (<code>CommSharedMem</code> with
+      <code>flag1</code>/<code>flag2</code> handshake fields) and spin until a host thread services it. Map lookups, <code>trace_printk</code> and the
+      like therefore cross the PCIe bus;</li>
+      <li>the result is assembled with NVIDIA's PTX compiler API and launched through the CUDA driver API.</li>
+    </ul>
+    <p>bpftime's GPU support (<a href="15-bpftime-in-practice.html">Chapter 15</a>) and gpu_ext (<a href="20-gpu-ext.html">Chapter 20</a>) build on
+    this path. In <code>bpftime/attach/nv_attach_impl/pass/ptxpass_core/src/core.cpp</code>, <code>compile_ebpf_to_ptx_from_words()</code> constructs an
+    <code>llvmbpf_vm</code>, registers placeholder helpers including GPU-specific ones (501 <code>puts</code>, 503 <code>get_block_idx</code>, 505
+    <code>get_thread_idx</code>, 510 <code>get_warp_id</code>, …) and calls <code>generate_ptx()</code>. The placeholders only make the symbols exist; the real
+    implementations come from the trampoline.</p>
+    <p>SPIR-V output (added in <code>b8e4eea</code>, October 2025) uses the triple <code>spirv64-unknown-unknown</code> and LLVM's in-tree SPIR-V backend.
+    The README lists LLVM 18+ (20+ recommended) and OpenCL as requirements and shows an example run on an Intel GPU. I did not run either GPU
+    path on hardware. The orb has no GPU, and Debian's LLVM 15 has no SPIR-V backend. PTX <em>text generation</em> needs no GPU, and the output
+    in the tab above is real.</p>
+
+    <div class="callout tip"><span class="label">Tip</span><p>The PTX tab shows the kind of surprise to expect. Lifting to a <code>void</code> GPU entry
+    point makes <code>r0</code> dead, so a program that "returns" its result computes nothing. Programs written for GPU hooks must write to maps
+    or call helpers. The same applies to any target where the entry signature differs from the eBPF calling convention.</p></div>
+
+    <h2>Building and running it</h2>
+    <p>I built llvmbpf in the orb (Debian 12, x86-64) following the README, with two parallel jobs. Configuration plus build took a few minutes,
+    and memory stayed well within the orb's limits:</p>
+    <pre><code class="language-bash">sudo apt-get install -y llvm-15-dev libzstd-dev libelf-dev
+LLVM_DIR=/usr/lib/llvm-15/cmake cmake -S llvmbpf -B llvmbpf-build \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_LLVM_AOT_CLI=1
+cmake --build llvmbpf-build -j2</code></pre>
+    <p>LLVM is linked statically, so the binaries are large: <code>cli/bpftime-vm</code> is 49.9 MB and <code>vm-llvm-example</code> 48.6 MB. Two quirks
+    to know about. <code>libllvmbpf_vm.a</code> is written to the <em>parent</em> of the build directory (the CMake file sets
+    <code>ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/../"</code>). And <code>vm-llvm-example</code> prints nothing in a Release build,
+    because every call in its <code>main()</code> is wrapped in <code>assert()</code>, which <code>-DNDEBUG</code> removes. Rebuilt with assertions enabled it prints:</p>
+    <pre><code class="language-plaintext">running ebpf prog, code len: 56
+res = 3433728102
+running ebpf prog, code len: 80
+res = 2
+running ebpf prog, code len: 72
+hello
+res = 0</code></pre>
+
+    <h3>The library API</h3>
+    <p>That example shows the whole embedding API in a dozen lines. A helper is any C function taking five <code>uint64_t</code> arguments. Index 2
+    here is arbitrary: it just has to match the <code>call 2</code> instruction in the bytecode.</p>
+    <pre data-file="example/basic.cpp"><code class="language-cpp">uint64_t ffi_print_func(uint64_t a, uint64_t _b, uint64_t _c, uint64_t _d,
+			uint64_t _e)
+{
+	std::cout &lt;&lt; (const char *)a &lt;&lt; std::endl;
+	return 0;
+}
+/* ... */
+uint64_t run_ebpf_prog(const void *code, size_t code_len)
+{
+	uint64_t res = 0;
+	llvmbpf_vm vm;
+	printf("running ebpf prog, code len: %zd\n", code_len);
+
+	res = vm.load_code(code, code_len);
+	if (res) {
+		fprintf(stderr, "Failed to load: %s\n",
+			vm.get_error_message().c_str());
+		exit(1);
+	}
+	vm.register_external_function(2, "print", (void *)ffi_print_func);
+	auto func = vm.compile();
+	if (!func) {
+		fprintf(stderr, "Failed to compile: %s\n",
+			vm.get_error_message().c_str());
+		exit(1);
+	}
+	int err = vm.exec(&amp;bpf_mem, sizeof(bpf_mem), res);
+	if (err != 0) {
+		fprintf(stderr, "Failed to exec.");
+		exit(1);
+	}
+	printf("res = %" PRIu64 "\n", res);
+	return res;
+}</code></pre>
+    <p><code>compile()</code> returns <code>std::optional&lt;precompiled_ebpf_function&gt;</code>. You can call that pointer directly, which avoids even
+    the trivial indirection in <code>exec()</code>. bpftime does this on its hot path. The maps example adds
+    <code>set_lddw_helpers(map_by_fd, nullptr, map_val, nullptr, nullptr)</code> and helper 1 as <code>bpf_map_lookup_elem</code>. Its real output shows
+    the compile-time binding at work. <code>map_by_fd</code> and <code>map_val</code> run once, during <code>compile()</code>, and never again. Only the
+    lookup helper runs on each execution:</p>
+    <pre><code class="language-plaintext">running ebpf prog, code len: 296
+map_by_fd 5
+map_by_fd 6
+map_val 6
+cntrs_array[0] = 0
+bpf_map_lookup_elem 5
+
+return value = 1
+cntrs_array[0] = 1
+bpf_map_lookup_elem 5
+
+return value = 1
+cntrs_array[0] = 2
+bpf_map_lookup_elem 5
+
+return value = 2</code></pre>
+    <p>To exercise all three CPU and GPU paths on one program, I also wrote a 50-line scratch driver (not in the repo; deleted afterwards). It
+    loads the 256 bytes of <code>sum.bpf.o</code>'s <code>.text</code> section and runs JIT, AOT round trip and PTX in one process. For the input
+    <code>{3, 1, 2, 3}</code> it printed:</p>
+    <pre><code class="language-plaintext">JIT: 32 eBPF insns -&gt; 31 bytes native code
+JIT: direct call returns 6
+JIT: vm.exec returns 6
+AOT: object is 544 bytes
+[2026-11-06 00:11:13.808] [info] [llvm_jit_context.cpp:678] LLVM-JIT: Loading aot object
+AOT: loaded object returns 6
+PTX: 434 bytes written to sum.ptx</code></pre>
+
+    <h3>The CLI</h3>
+    <p><code>bpftime-vm</code> opens an eBPF ELF with libbpf, lifts every program in it, and either prints the IR or writes
+    <code>&lt;program&gt;.o</code>. It registers 1,000 placeholder helpers (indices 0–999) so that programs calling helpers can still be compiled.
+    Their addresses are null and only matter if you load the object with the CLI's own <code>run</code>, which binds just helper 6 to a
+    <code>printf</code>-based <code>bpf_trace_printk</code>. Real session in the orb:</p>
+    <pre><code class="language-console">$ bpftime-vm
+Usage: bpftime-vm &lt;command&gt; [options]
+Commands:
+  build &lt;EBPF_ELF&gt; [-o &lt;output_directory&gt;] [-emit-llvm]
+      Build native ELF(s) from eBPF ELF. Each program in the eBPF ELF will be built into a single native ELF.
+      If -emit-llvm is specified, the LLVM IR will be printed to stdout.
+  run &lt;PATH&gt; [MEMORY]
+      Run a native eBPF program.
+
+$ bpftime-vm build llvmbpf/.github/assets/sum.bpf.o -emit-llvm &gt; sum.ll
+$ bpftime-vm build llvmbpf/.github/assets/sum.bpf.o
+[2026-11-06 00:10:16.650] [info] [main.cpp:236] Processing program test
+[2026-11-06 00:10:16.664] [info] [main.cpp:282] Program test written to ./test.o
+$ file test.o
+test.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+$ echo "AwAAAAEAAAACAAAAAwAAAA==" | base64 -d &gt; test.bin    # int32 {3, 1, 2, 3}
+$ bpftime-vm run test.o test.bin
+[2026-11-06 00:10:16.679] [info] [llvm_jit_context.cpp:678] LLVM-JIT: Loading aot object
+[2026-11-06 00:10:16.680] [info] [main.cpp:358] Program executed successfully. Return value: 6</code></pre>
+    <p>Three runs of <code>bpftime-vm build</code> on this one-function file each took 0.02 s of wall time and about 36 MB peak RSS,
+    measured with <code>/usr/bin/time</code>. That includes process start-up and libbpf parsing, so it is an upper bound on compile time for a
+    small program, not a benchmark. Linking the AOT object into a C program also works. With the illustrative host below,
+    <code>cc host.c test.o -o standalone &amp;&amp; ./standalone</code> printed <code>bpf_main returned 100</code>, and the resulting binary is 16 KB with no LLVM inside.</p>
+    <pre><code class="language-c">/* Illustrative host program, not from the repo */
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+uint64_t bpf_main(void *mem, uint64_t len);
+int main(void)
+{
+	int32_t data[] = { 4, 10, 20, 30, 40 };
+	printf("bpf_main returned %lu\n", (unsigned long)bpf_main(data, sizeof(data)));
+	return 0;
+}</code></pre>
+    <p>For programs that use maps, the repo's <code>example/standalone/main.c</code> shows the other half of the contract. It defines
+    <code>_bpf_helper_ext_0001</code> (the lookup helper) and <code>__lddw_helper_map_val</code>, which return pointers into ordinary C arrays.
+    It then compiles with <code>clang -g main.c xdp-counter.ll -o standalone</code> against IR that bpftime exported from a running XDP program. I did not run
+    that example, because it needs a bpftime build to produce the IR. The <code>.ll</code> file is checked in, though.</p>
+
+    <h2>Newer features</h2>
+    <p>Most of the code paths above are a year old or more. Several features added in 2026 extend what you can do with the lifted IR:</p>
+    <div class="grid">
+      <div class="card"><h4>BTF line info → DWARF</h4><p><code>load_line_info()</code> (#50, September 2026) attaches <code>DILocation</code>
+      metadata to every emitted IR instruction, using the <code>.BTF.ext</code> line records clang writes. The CLI parses <code>.BTF.ext</code>
+      itself because "libbpf only populates <code>bpf_program__line_info()</code> after <code>bpf_object__load()</code>". Native code can then be mapped
+      back to C source lines.</p></div>
+      <div class="card"><h4>Kernel-compatible lift</h4><p><code>set_kernel_compatible_mode(true)</code> (March 2026) changes the lift to
+      one that can be lowered back to valid kernel eBPF. Map references become external symbols such as
+      <code>__llvmbpf_pseudo_map_fd_XXXXXXXX</code>. Local calls become calls to <code>__llvmbpf_pseudo_call_pc_XXXXXXXX</code>. The stack is sized to
+      exactly what the program uses, and registers are zero-initialised. A branch named <code>codex/bpfopt-llvm-roundtrip-…</code> suggests
+      the purpose is a bytecode → IR → optimise → bytecode round trip (see <a href="19-bpf-benchmark.html">Chapter 19</a>); I have not verified this
+      beyond the code and the branch name.</p></div>
+      <div class="card"><h4>Inspection and ablation</h4><p><code>get_compiled_code()</code> returns the native code pointer and size. The size comes from the
+      symbol size of <code>bpf_main</code> in the object, which is how the driver above reported "31 bytes". Pass logging, disabling passes and target
+      CPU overrides make it possible to study which LLVM passes matter for eBPF code.</p></div>
+      <div class="card"><h4>LLVM version range</h4><p>LLVM ≥ 15 is required. The code carries <code>#if LLVM_VERSION_MAJOR</code> branches up to 24, and
+      #54 (October 2026) supports ROCm's LLVM 24 snapshot, which ships without NVPTX. In that case PTX generation reports an explicit
+      error instead of failing to link.</p></div>
+    </div>
+
+    <h2>Tests and conformance</h2>
+    <p>Three layers of tests exist:</p>
+    <ul>
+      <li><strong>Unit tests</strong> (Catch2, <code>test/unit-test/</code>): conditional jumps, helper registration, AOT compile/load, error paths for
+      bad code and missing helpers, sign-extending loads, atomics, array-map inlining, BTF line info and NVPTX availability. A separate module checks
+      JIT and AOT from a <code>dlopen</code>-ed shared library with private LLVM symbols. Built with <code>-DBPFTIME_ENABLE_UNIT_TESTING=1</code> in the orb,
+      <code>llvm_jit_tests</code> reported <code>All tests passed (92 assertions in 15 test cases)</code>.</li>
+      <li><strong>bpf_conformance</strong>: the CI job builds a plugin (<code>test/bpf_conformance_runner</code>) and runs Alan Jowett's
+      <a href="https://github.com/Alan-Jowett/bpf_conformance">bpf_conformance</a> suite with <code>--cpu_version v4</code>. The results file the README
+      links (<a href="https://eunomia-bpf.github.io/llvmbpf/bpf_conformance_results.txt">bpf_conformance_results.txt</a>, fetched 6 November 2026) ends
+      with <code>Passed 313 out of 313 tests</code>, including the <code>rfc9669_*</code> cases. That file shows no date or commit. An older snapshot checked
+      into <code>.github/assets/</code> (last changed August 2024) reports 168 of 172, failing <code>le16-high</code>, <code>le32-high</code> and
+      <code>lock_xchg</code>, which later commits fixed. I did not run the conformance suite myself.</li>
+      <li><strong>ubpf-style data tests</strong> (<code>test/test_framework</code>, pytest, 132 <code>.data</code> files with assembly and expected results), carried over
+      from uBPF.</li>
+    </ul>
+    <p>As the call-frame bug above shows, the suites test instruction semantics thoroughly but not every multi-frame stack layout. A test that writes deep
+    into a callee's stack would catch it.</p>
+
+    <h2>How bpftime uses llvmbpf</h2>
+    <p>In bpftime (<a href="14-bpftime-architecture.html">Chapter 14</a>), <code>vm/llvm-jit</code> is a git submodule pointing at llvmbpf. At bpftime commit
+    <code>25e250d</code> (3 November 2026) it is pinned to llvmbpf <code>87bac39</code> (21 September 2026), two commits behind llvmbpf's <code>main</code>. bpftime does not
+    call llvmbpf directly from its runtime. It goes through a small VM abstraction so that uBPF can be swapped in:</p>
+
+    <figure>
+      <svg viewBox="0 0 800 260" role="img" aria-label="Layering in bpftime: bpftime_prog calls the C VM API ebpf_create and ebpf_compile, which looks up a factory by name in the compat layer; the llvm factory creates bpftime_llvm_vm wrapping llvmbpf_vm; the ubpf factory wraps uBPF; GPU attach calls llvmbpf generate_ptx directly">
+        <defs>
+          <marker id="p16-arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/></marker>
+        </defs>
+        <g font-size="12" fill="var(--fg)">
+          <rect x="20" y="20" width="330" height="48" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="185" y="40" text-anchor="middle">bpftime_prog (runtime/src/bpftime_prog.cpp)</text>
+          <text x="185" y="57" text-anchor="middle" fill="var(--muted)" font-size="11">ebpf_create, ebpf_set_lddw_helpers, ebpf_compile</text>
+          <rect x="20" y="96" width="330" height="48" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="185" y="116" text-anchor="middle">VM core C API + compat factory map</text>
+          <text x="185" y="133" text-anchor="middle" fill="var(--muted)" font-size="11">vm/vm-core, vm/compat/include/bpftime_vm_compat.hpp</text>
+          <rect x="20" y="172" width="155" height="66" rx="6" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="97" y="194" text-anchor="middle">"llvm" (default)</text>
+          <text x="97" y="211" text-anchor="middle" fill="var(--muted)" font-size="11">bpftime_llvm_vm</text>
+          <text x="97" y="227" text-anchor="middle" fill="var(--muted)" font-size="11">: llvmbpf_vm</text>
+          <rect x="195" y="172" width="155" height="66" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="272" y="194" text-anchor="middle">"ubpf"</text>
+          <text x="272" y="211" text-anchor="middle" fill="var(--muted)" font-size="11">third_party/ubpf</text>
+          <text x="272" y="227" text-anchor="middle" fill="var(--muted)" font-size="11">BPFTIME_VM_NAME=ubpf</text>
+
+          <rect x="450" y="20" width="330" height="48" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="615" y="40" text-anchor="middle">bpftime-aot (tools/aot)</text>
+          <text x="615" y="57" text-anchor="middle" fill="var(--muted)" font-size="11">build | compile | load | run</text>
+          <rect x="450" y="96" width="330" height="48" rx="6" fill="var(--bg3)" stroke="var(--border)"/>
+          <text x="615" y="116" text-anchor="middle">GPU attach (attach/nv_attach_impl)</text>
+          <text x="615" y="133" text-anchor="middle" fill="var(--muted)" font-size="11">compile_ebpf_to_ptx_from_words → generate_ptx</text>
+          <rect x="450" y="172" width="330" height="66" rx="6" fill="var(--bg3)" stroke="var(--accent)" stroke-width="2"/>
+          <text x="615" y="196" text-anchor="middle">llvmbpf (vm/llvm-jit submodule)</text>
+          <text x="615" y="214" text-anchor="middle" fill="var(--muted)" font-size="11">JIT · AOT · PTX · SPIR-V</text>
+        </g>
+        <g stroke="var(--accent2)" stroke-width="2" fill="none">
+          <line x1="185" y1="68" x2="185" y2="94" marker-end="url(#p16-arrow3)"/>
+          <line x1="120" y1="144" x2="97" y2="170" marker-end="url(#p16-arrow3)"/>
+          <line x1="250" y1="144" x2="272" y2="170" marker-end="url(#p16-arrow3)"/>
+          <path d="M97,238 V252 H615 V240" marker-end="url(#p16-arrow3)"/>
+          <path d="M615,68 V80 H790 V190 H782" marker-end="url(#p16-arrow3)"/>
+          <line x1="615" y1="144" x2="615" y2="170" marker-end="url(#p16-arrow3)"/>
+        </g>
+      </svg>
+      <figcaption>Figure 16.3 — llvmbpf inside bpftime. The runtime reaches it through a named VM factory; the AOT tool and the GPU attach
+      code use it directly.</figcaption>
+    </figure>
+
+    <p>The adapter is under a hundred lines. It subclasses <code>llvmbpf_vm</code>, forwards each method, and registers itself under the name
+    <code>"llvm"</code> from a static constructor:</p>
+    <pre data-file="bpftime/vm/compat/llvm-vm/compat_llvm.cpp"><code class="language-cpp">std::unique_ptr&lt;bpftime_vm_impl&gt; create_llvm_vm_instance()
+{
+	SPDLOG_DEBUG("create llvm vm instance");
+	return std::make_unique&lt;llvm::bpftime_llvm_vm&gt;();
+}
+/* ... */
+std::optional&lt;compat::precompiled_ebpf_function&gt; bpftime_llvm_vm::compile()
+{
+	return bpftime::llvmbpf_vm::compile();
+}
+/* ... */
+std::optional&lt;std::string&gt; bpftime_llvm_vm::generate_ptx(const char *target_cpu)
+{
+	return bpftime::llvmbpf_vm::generate_ptx(target_cpu);
+}
+/* ... */
+__attribute__((constructor(0))) void register_llvm_vm_factory()
+{
+	register_vm_factory("llvm", create_llvm_vm_instance);
+	SPDLOG_DEBUG("llvm register vm factory\n");
+}</code></pre>
+    <p>In <code>runtime/include/bpftime_config.hpp</code>, <code>DEFAULT_VM_NAME</code> is <code>"llvm"</code>, and the environment variable
+    <code>BPFTIME_VM_NAME</code> overrides it (<code>runtime/src/bpftime_config.cpp</code>). Each <code>bpftime_prog</code> creates a VM by that name and
+    calls <code>ebpf_set_lddw_helpers(vm, map_ptr_by_fd, nullptr, map_val, nullptr, nullptr)</code>. This is how bpftime's shared-memory maps
+    (<a href="14-bpftime-architecture.html">Chapter 14</a>) get into the lifted code: <code>map_ptr_by_fd</code> turns a map fd into bpftime's internal handle
+    at compile time, and <code>map_val</code> returns the address of an array map's value area. Loading then calls <code>ebpf_compile</code>. If JIT
+    compilation fails, the runtime logs "falling back to interpreter", which only helps when the backend has one (uBPF does, llvmbpf does not). At
+    execution time a JITed program is a direct call: <code>val = fn(memory, memory_size)</code>.</p>
+    <p>Two other consumers bypass the abstraction. <code>bpftime-aot</code> (<code>tools/aot</code>, "For the underlying library, see llvmbpf") exposes
+    <code>build</code>, <code>compile</code> (programs already in bpftime shared memory), <code>load</code> and <code>run</code>. GPU attach constructs an
+    <code>llvmbpf_vm</code> and an <code>llvm_bpf_jit_context</code> to call <code>generate_ptx()</code> with a chosen function name and SM version, as described
+    above. <a href="15-bpftime-in-practice.html">Chapter 15</a> shows these from the user's side.</p>
+
+    <h2>Comparison with other eBPF JITs</h2>
+    <p>The table compares llvmbpf with the two established userspace VMs and with the kernel. Facts about uBPF and rbpf are from their READMEs; kernel facts are
+    from <a href="02-ebpf-isa-and-vm.html#running-the-bytecode-interpreter-and-jit">Chapter 02</a>.</p>
+    <table>
+      <thead><tr><th></th><th>llvmbpf</th><th>uBPF</th><th>rbpf</th><th>Linux kernel JIT</th></tr></thead>
+      <tbody>
+        <tr><td>Language / licence</td><td>C++20, MIT</td><td>C, Apache-2.0</td><td>Rust, Apache-2.0 / MIT</td><td>C, GPL-2.0</td></tr>
+        <tr><td>Where it runs</td><td>Any process (bpftime, your app)</td><td>Any process</td><td>Any process</td><td>Kernel only</td></tr>
+        <tr><td>Code generation</td><td>Lift to LLVM IR, LLVM <code>-O0</code>…<code>-O3</code>, LLVM backend</td><td>Direct per-instruction emitter</td><td>Direct per-instruction emitter</td><td>Direct per-instruction emitter per architecture</td></tr>
+        <tr><td>Targets</td><td>LLVM's native target (x86-64, arm64 and others), plus PTX and SPIR-V</td><td>JIT: x86-64, arm64; interpreter everywhere</td><td>JIT: x86_64; interpreter everywhere</td><td>x86_64, arm64, riscv, s390x, ppc, … (13 listed in sysctl docs)</td></tr>
+        <tr><td>Interpreter</td><td>None</td><td>Yes</td><td>Yes</td><td>Yes, unless <code>CONFIG_BPF_JIT_ALWAYS_ON</code></td></tr>
+        <tr><td>AOT to native object</td><td>Yes (ELF <code>.o</code>, linkable or loadable)</td><td>No</td><td>No</td><td>No</td></tr>
+        <tr><td>Verification</td><td>None (embedder's job)</td><td>Basic instruction validation at load; a new "Safe" profile adds pointer provenance tracking</td><td>"Very simple" verifier, replaceable</td><td>Full verifier before JIT (Ch. 03)</td></tr>
+        <tr><td>Run-time memory checks</td><td>None</td><td>In the interpreter; the Safe profile is interpreter-only, with "JIT compilation … intentionally unavailable"</td><td>Interpreter only; JIT "will crash" on bad accesses</td><td>None needed: verifier proved safety</td></tr>
+        <tr><td>Optimisation across instructions</td><td>Full (SROA, loops, inlining, constant folding of map addresses)</td><td>Minimal</td><td>Minimal</td><td>Peephole-level; verifier does dead-code and some rewrites</td></tr>
+        <tr><td>Compile cost</td><td>Full LLVM pipeline; ~50 MB static binary; 0.02 s for a whole CLI run on a small program (measured above)</td><td>One pass, no optimiser (not measured here)</td><td>One pass, no optimiser (not measured here)</td><td>One pass after verification (not measured here)</td></tr>
+        <tr><td>Main user</td><td>bpftime (default VM), gpu_ext, eGPU</td><td>bpftime (alternative VM), other C/C++ embedders</td><td>Rust embedders; forked by Solana as solana_rbpf</td><td>Everything in Part I</td></tr>
+      </tbody>
+    </table>
+    <p>Two rows deserve emphasis. First, llvmbpf is the only one of these that can produce an object file and the only one that targets GPUs. Both
+    follow from going through LLVM IR rather than being designed in. Second, llvmbpf gives up the interpreter and run-time checks that uBPF and rbpf
+    keep as a safety net. That trade is reasonable when a verifier is enforced first, as with bpftime in strict verifier mode. It is dangerous if you embed
+    llvmbpf alone, or run bpftime with its default warning-only verifier, and feed it untrusted bytecode.</p>
+
+    <h2>Benefits and limitations</h2>
+    <h3>Benefits</h3>
+    <ul>
+      <li><strong>Quality of code.</strong> The worked example shows the effect: an unoptimised 32-instruction loop with 13 stack accesses becomes an 11-instruction
+      register-only loop. A per-instruction JIT cannot recover that, because the information it needs, such as which stack slots never escape, spans instructions.</li>
+      <li><strong>Many targets from one lifter.</strong> x86-64 and arm64 come from LLVM, and GPUs need only a different <code>TargetMachine</code> and a few
+      signature changes. The PTX feature was a few hundred lines in the core library; most of its 3,100-line commit is trampoline and demo code.</li>
+      <li><strong>AOT and standalone deployment.</strong> Compile once, ship a <code>.o</code>, link it into a C program with your own helper implementations,
+      and run without any eBPF runtime or LLVM.</li>
+      <li><strong>Helper inlining.</strong> Because helpers are ordinary external functions in IR, they can be merged and inlined (manually via
+      <code>llvm-link</code>, or automatically for array maps).</li>
+      <li><strong>Inspectability.</strong> <code>-emit-llvm</code>, DWARF line info from BTF, <code>get_compiled_code()</code> and pass logging make the
+      compilation transparent.</li>
+    </ul>
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>No safety of its own.</strong> No verifier, no bounds checks, no interpreter fallback. Anything the bytecode does, the native code does.</li>
+      <li><strong>LLVM is heavy.</strong> Binaries embedding it are tens of megabytes, even after #52 trimmed unused backends. Compilation runs the full
+      LLVM pipeline at run time, which costs far more than a direct emitter. The cost amortises when a program runs many times, and AOT removes it.</li>
+      <li><strong>Semantic gaps from LLVM's assumptions.</strong> The lifter must add guards (division, shifts) wherever eBPF defines behaviour that LLVM leaves undefined.
+      Alignment and data-race assumptions on plain loads and stores remain.</li>
+      <li><strong>Hand-rolled calls in one function.</strong> BPF-to-BPF calls go through an IR-level call stack and <code>indirectbr</code>, with a 32-frame limit.
+      As shown above, the frame offset is wrong at the studied commit.</li>
+      <li><strong>Userspace calling convention.</strong> <code>bpf_main(mem, mem_len)</code> puts the length in <code>r2</code>. Kernel programs expect only a context
+      pointer, though for most programs the extra register is harmless. Tail calls are approximated as "call helper 12, then exit".</li>
+      <li><strong>GPU paths need external pieces.</strong> The PTX is not self-contained. It needs the trampoline, PTX patching and a host thread servicing helper
+      requests over shared memory. Results must go through memory, not <code>r0</code>.</li>
+      <li><strong>65,535-instruction limit</strong> from the <code>uint16_t</code> program counter.</li>
+    </ul>
+
+    <h2>Project history and activity</h2>
+    <p>The standalone repository has 56 commits on <code>main</code>, from 10 August 2024 ("Init project from bpftime") to 25 October 2026 ("Support LLVM 24 and ROCm builds
+    without NVPTX (#54)"). It had 149 GitHub stars when I checked. Milestones visible in <code>git log</code>:</p>
+    <ul>
+      <li>August 2024: extraction from bpftime, CI, codecov, bpf_conformance integration, uBPF instruction definitions, map examples.</li>
+      <li>March 2025: support for the newer instructions in the eBPF standard (#23: sign-extending moves and loads, signed div/mod, <code>bswap</code>, <code>ja32</code>).</li>
+      <li>May 2025: PTX generation merged from the llvmbpf-nvptx line (#28–#33).</li>
+      <li>July 2025: citations updated to the OSDI '25 bpftime paper.</li>
+      <li>October 2025: SPIR-V generation (#35).</li>
+      <li>February–March 2026: atomic fixes (#40, #41), the inspection and ablation APIs, array-map inlining, target CPU overrides, kernel-compatible lift.</li>
+      <li>September–October 2026: ORC symbol registration for DSOs (#49), BTF line info (#50), smaller binaries (#52), LLVM 24 / ROCm (#54).</li>
+    </ul>
+    <p>In 2026, commits landed in February, March, May, September and October, under eight author names, including bpftime's maintainers and GitHub
+    Copilot. Across the whole history there are 13 author names, several of which are the same person. The project is actively maintained.</p>
+
+    <h2>Related work and papers</h2>
+    <p>No paper is devoted to llvmbpf itself; I searched and found none. It appears in the papers of the systems that use it:</p>
+    <ul>
+      <li><strong>bpftime</strong>: Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn, "Extending Applications Safely and Efficiently", OSDI '25. This paper introduces
+      the Extension Interface Model and bpftime, which compiles eBPF with LLVM. An earlier preprint is "bpftime: userspace eBPF Runtime for Uprobe, Syscall and Kernel-User
+      Interactions" (arXiv:2311.07923, 2023). The architecture is the subject of <a href="14-bpftime-architecture.html">Chapter 14</a>.</li>
+      <li><strong>eGPU</strong>: Y. Yang et al., "eGPU: Extending eBPF Programmability and Observability to GPUs", HCDS '25 (ACM). It "compiles eBPF bytecode into NVIDIA's
+      Parallel Thread Execution (PTX) intermediate representation at runtime" and injects it into running kernels. This is the use case that drove the PTX backend. Its repository
+      is now merged into bpftime.</li>
+      <li><strong>gpu_ext</strong>: "gpu_ext: Extensible OS Policies for GPUs via eBPF" (arXiv:2512.12615) describes "an LLVM-based backend (~1 KLOC)" translating a restricted
+      eBPF subset into PTX on top of bpftime (<a href="20-gpu-ext.html">Chapter 20</a>).</li>
+      <li><strong>Userspace VMs</strong>: <a href="https://github.com/iovisor/ubpf">uBPF</a>, which supplied llvmbpf's instruction definitions and test cases, and <a href="https://github.com/qmonnet/rbpf">rbpf</a>.</li>
+      <li><strong>Verified JITs</strong>: Jitk and Jitterbug verify per-instruction kernel JITs (<a href="02-ebpf-isa-and-vm.html#related-work">Chapter 02</a>). An LLVM-based
+      design trades that kind of verifiability for optimisation. Translation validation of eBPF transformations is the topic of <a href="18-ebpf-correctness-verifier.html">Chapter 18</a>.</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> How does the lifter represent eBPF register <code>r3</code> in LLVM IR?</p>
+        <button class="opt">As a fixed physical register chosen by llvmbpf</button>
+        <button class="opt" data-right>As an <code>alloca i64</code> slot that every instruction loads and stores; LLVM's SROA/mem2reg later turns it into SSA values</button>
+        <button class="opt">As a global variable shared by all programs</button>
+        <button class="opt">As a function argument of <code>bpf_main</code></button>
+        <div class="why"><code>setupBlock</code> creates <code>%r0</code>…<code>%r10</code> with <code>CreateAlloca</code>. That makes lifting a mutable register machine easy,
+        and costs nothing after optimisation, as the optimised IR in the worked example shows.</div></div>
+      <div class="q"><p><strong>Q2.</strong> Why does an <code>lddw</code> map-value reference (<code>src_reg = 2</code>) become a constant in JIT mode but a call to
+      <code>__lddw_helper_map_val</code> in AOT mode?</p>
+        <button class="opt">AOT objects cannot contain 64-bit constants</button>
+        <button class="opt">The verifier requires it</button>
+        <button class="opt" data-right>A JIT compiles in the process that will run the code, so the address is known; an AOT object may be linked or loaded elsewhere, so the address must be resolved later</button>
+        <button class="opt">PTX does not support absolute addresses</button>
+        <div class="why"><code>do_jit_compile</code> passes <code>patch_map_val_at_compile_time = true</code>; <code>do_aot_compile</code> passes <code>false</code>. The standalone
+        example therefore has to define <code>__lddw_helper_map_val</code> itself.</div></div>
+      <div class="q"><p><strong>Q3.</strong> You AOT-compile a program that calls helper 6 and link the object into a C program. Which symbol must you define?</p>
+        <button class="opt"><code>bpf_trace_printk</code></button>
+        <button class="opt" data-right><code>_bpf_helper_ext_0006</code></button>
+        <button class="opt"><code>helper_6</code></button>
+        <button class="opt"><code>__lddw_helper_6</code></button>
+        <div class="why"><code>ext_func_sym()</code> formats <code>_bpf_helper_ext_%04d</code>. The name passed to <code>register_external_function</code> is only a label;
+        the index determines the symbol.</div></div>
+      <div class="q"><p><strong>Q4.</strong> The PTX for <code>sum.bpf.o</code> contains a loop counter but no addition. Why?</p>
+        <button class="opt">NVPTX does not support 32-bit adds</button>
+        <button class="opt">The lifter skips ALU instructions on GPUs</button>
+        <button class="opt" data-right>In GPU mode <code>bpf_main</code> returns <code>void</code>, so <code>r0</code> is dead and LLVM removes the code that computes it</button>
+        <button class="opt">The sum is computed by the trampoline</button>
+        <div class="why">With <code>is_gpu</code> the entry function type is <code>void(ptr addrspace(1), i64)</code> and <code>exitBlock</code> is <code>ret void</code>. GPU eBPF
+        programs must communicate through memory or helpers.</div></div>
+      <div class="q"><p><strong>Q5.</strong> An llvmbpf-JITed program executes <code>r0 = *(u64 *)(r1 + 100000)</code> on an 8-byte buffer. What happens?</p>
+        <button class="opt">llvmbpf's run-time bounds check returns an error from <code>exec()</code></button>
+        <button class="opt">The lifter rejects the program at compile time</button>
+        <button class="opt">It falls back to the interpreter</button>
+        <button class="opt" data-right>The native code reads that host address; the result is whatever is there or a crash. Only an enforced verifier run beforehand prevents it</button>
+        <div class="why"><code>emitLoadX</code> is a GEP plus a load with no checks, and llvmbpf has no interpreter. Safety is the embedder's job; bpftime's
+        verifier only rejects programs when it runs in strict mode.</div></div>
+      <div class="q"><p><strong>Q6.</strong> How do you make bpftime use uBPF instead of llvmbpf for a run?</p>
+        <button class="opt">Rebuild bpftime without LLVM</button>
+        <button class="opt" data-right>Set <code>BPFTIME_VM_NAME=ubpf</code>; the runtime looks up the VM factory by that name (default <code>"llvm"</code>)</button>
+        <button class="opt">Pass <code>-O0</code> to <code>bpftime-aot</code></button>
+        <button class="opt">Call <code>set_kernel_compatible_mode(true)</code></button>
+        <div class="why"><code>bpftime_config.cpp</code> reads <code>BPFTIME_VM_NAME</code>; <code>DEFAULT_VM_NAME</code> is <code>"llvm"</code>; <code>compat_llvm.cpp</code> registers the
+        <code>"llvm"</code> factory from a constructor.</div></div>
+    </div>
+
+    <h2>References</h2>
+    <ol class="refs">
+      <li>eunomia-bpf. <a href="https://github.com/eunomia-bpf/llvmbpf">llvmbpf: Userspace/GPU eBPF VM with llvm JIT/AOT compiler</a>. GitHub, MIT. Studied at
+      <a href="https://github.com/eunomia-bpf/llvmbpf/tree/7e384dbb1c8af0b78e8ae58d2bfb304580ff1e27">7e384db</a> (2026-10-25); key files:
+      <a href="https://github.com/eunomia-bpf/llvmbpf/blob/7e384dbb1c8af0b78e8ae58d2bfb304580ff1e27/src/compiler.cpp#L586">src/compiler.cpp (translation loop, L586)</a>,
+      <a href="https://github.com/eunomia-bpf/llvmbpf/blob/7e384dbb1c8af0b78e8ae58d2bfb304580ff1e27/src/compiler_utils.cpp">src/compiler_utils.cpp</a>,
+      <a href="https://github.com/eunomia-bpf/llvmbpf/blob/7e384dbb1c8af0b78e8ae58d2bfb304580ff1e27/src/llvm_jit_context.cpp#L533">src/llvm_jit_context.cpp (do_jit_compile, L533)</a>,
+      <a href="https://github.com/eunomia-bpf/llvmbpf/blob/7e384dbb1c8af0b78e8ae58d2bfb304580ff1e27/include/llvmbpf.hpp">include/llvmbpf.hpp</a>,
+      <a href="https://github.com/eunomia-bpf/llvmbpf/blob/7e384dbb1c8af0b78e8ae58d2bfb304580ff1e27/cli/main.cpp">cli/main.cpp</a>.</li>
+      <li>eunomia-bpf. <a href="https://github.com/eunomia-bpf/llvmbpf-nvptx">llvmbpf-nvptx</a> (merged into llvmbpf; PTX commit
+      <a href="https://github.com/eunomia-bpf/llvmbpf/commit/118919d57c1a97db974cae512ae2e8f26ee148a4">118919d</a>).</li>
+      <li>eunomia-bpf. <a href="https://github.com/eunomia-bpf/bpftime">bpftime</a>; <a href="https://github.com/eunomia-bpf/bpftime/blob/25e250d651ad1d2a2608bbbaeaf7b9ee90cca401/vm/compat/llvm-vm/compat_llvm.cpp">vm/compat/llvm-vm/compat_llvm.cpp</a>,
+      <a href="https://github.com/eunomia-bpf/bpftime/blob/25e250d651ad1d2a2608bbbaeaf7b9ee90cca401/runtime/src/bpftime_prog.cpp">runtime/src/bpftime_prog.cpp</a>,
+      <a href="https://github.com/eunomia-bpf/bpftime/tree/25e250d651ad1d2a2608bbbaeaf7b9ee90cca401/tools/aot">tools/aot</a> at 25e250d.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, D. Williams, A. Quinn. <a href="https://www.usenix.org/conference/osdi25/presentation/zheng-yusheng">Extending Applications Safely and Efficiently</a>.
+      19th USENIX Symposium on Operating Systems Design and Implementation (OSDI '25), 2025. <a href="https://www.usenix.org/system/files/osdi25-zheng-yusheng.pdf">PDF</a>.</li>
+      <li>Y. Zheng, T. Yu, Y. Yang, Y. Hu, X. Lai, A. Quinn. <a href="https://arxiv.org/abs/2311.07923">bpftime: userspace eBPF Runtime for Uprobe, Syscall and Kernel-User Interactions</a>. arXiv:2311.07923, 2023.</li>
+      <li>Y. Yang et al. <a href="https://doi.org/10.1145/3723851.3726984">eGPU: Extending eBPF Programmability and Observability to GPUs</a>. Proceedings of the 4th Workshop on Heterogeneous Composable and Disaggregated Systems (HCDS '25), ACM, 2025.</li>
+      <li><a href="https://arxiv.org/abs/2512.12615">gpu_ext: Extensible OS Policies for GPUs via eBPF</a>. arXiv:2512.12615.</li>
+      <li>LLVM Project. <a href="https://llvm.org/docs/ORCv2.html">ORC Design and Implementation (ORCv2)</a>.</li>
+      <li>LLVM Project. <a href="https://llvm.org/docs/NVPTXUsage.html">User Guide for NVPTX Back-end</a>.</li>
+      <li>LLVM Project. <a href="https://llvm.org/docs/SPIRVUsage.html">User Guide for SPIR-V Target</a>.</li>
+      <li>LLVM Project. <a href="https://llvm.org/docs/LangRef.html">LLVM Language Reference Manual</a> (undefined behaviour of <code>udiv</code>, <code>shl</code>; <code>indirectbr</code>; <code>blockaddress</code>).</li>
+      <li>IO Visor. <a href="https://github.com/iovisor/ubpf">uBPF: Userspace eBPF VM</a>.</li>
+      <li>Q. Monnet. <a href="https://github.com/qmonnet/rbpf">rbpf: Rust virtual machine and JIT compiler for eBPF programs</a>.</li>
+      <li>A. Jowett. <a href="https://github.com/Alan-Jowett/bpf_conformance">bpf_conformance</a>; llvmbpf results: <a href="https://eunomia-bpf.github.io/llvmbpf/bpf_conformance_results.txt">bpf_conformance_results.txt</a>.</li>
+      <li>D. Thaler (Ed.). <a href="https://www.rfc-editor.org/rfc/rfc9669.html">RFC 9669: BPF Instruction Set Architecture (ISA)</a>. IETF, October 2024.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="15-bpftime-in-practice.html"><small>Previous</small>15 · bpftime in Practice</a>
+      <a class="next" href="17-bpfix.html"><small>Next</small>17 · bpfix</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

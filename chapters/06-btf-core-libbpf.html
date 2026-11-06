@@ -127,7 +127,9 @@
     <p>The kinds are <code>INT</code>, <code>PTR</code>, <code>ARRAY</code>, <code>STRUCT</code>, <code>UNION</code>,
       <code>ENUM</code>, <code>FWD</code>, <code>TYPEDEF</code>, <code>VOLATILE</code>, <code>CONST</code>,
       <code>RESTRICT</code>, <code>FUNC</code>, <code>FUNC_PROTO</code>, <code>VAR</code>, <code>DATASEC</code>,
-      <code>FLOAT</code>, <code>DECL_TAG</code>, <code>TYPE_TAG</code> and <code>ENUM64</code> (kinds 1–19). Most map
+      <code>FLOAT</code>, <code>DECL_TAG</code>, <code>TYPE_TAG</code> and <code>ENUM64</code> (kinds 1–19 in every
+      released kernel up to v7.3; mainline for 7.4 adds three location kinds, <code>LOC_PARAM</code>,
+      <code>LOC_PROTO</code> and <code>LOCSEC</code>, as 20–22). Most map
       directly to C. Three are BPF-specific. <code>FUNC</code> describes a function (a subprogram), not a type.
       <code>VAR</code> describes a global variable. <code>DATASEC</code> describes an ELF data section, such as
       <code>.bss</code> or <code>.rodata</code>, and lists the variables inside it. These last two are what make the
@@ -401,8 +403,9 @@ libbpf: prog 'read_state': relo #2: substituting insn #12 w/ invalid insn</code>
 		insn[i].imm = 195896080; /* =&gt; 0xbad2310 =&gt; "bad relo" */</code></pre>
 
     <h2>How libbpf applies relocations at load time</h2>
-    <p>The relocation work happens inside libbpf's load step, before any program reaches the kernel. In libbpf v1.9
-      (commit <code>872299d</code>), <code>bpf_object_prepare()</code> runs these stages in order:</p>
+    <p>The relocation work happens inside libbpf's load step, before any program reaches the kernel. In libbpf's master
+      branch (commit <code>872299d</code>, version 1.9 in development; the latest release is v1.8.0),
+      <code>bpf_object_prepare()</code> runs these stages in order:</p>
     <pre data-file="libbpf/src/libbpf.c"><code class="language-c">	err = bpf_object_check_gen_loader(obj);
 	err = err ? : bpf_object_prepare_token(obj);
 	err = err ? : bpf_object__probe_loading(obj);
@@ -997,7 +1000,7 @@ cleanup:
       <li><strong>Tear down.</strong> Links are destroyed (programs detach), and the program, map and BTF file descriptors
         are closed, which frees the kernel objects unless something else holds a reference.</li>
     </ol>
-    <p>libbpf v1.9 also has <code>bpf_object__prepare()</code>, which does everything in the load phase except loading the
+    <p>Since v1.6, libbpf also has <code>bpf_object__prepare()</code>, which does everything in the load phase except loading the
       programs. You can inspect or change the final instructions before the verifier sees them.</p>
 
     <div class="tabs">
@@ -1390,7 +1393,7 @@ bpf_link__destroy(link);      /* the pin keeps the attachment alive; rm the file
         <code>minimal.bpf.c</code>, <code>minimal.c</code>, <code>bootstrap.bpf.c</code>, <code>bootstrap.c</code>,
         <code>tools/gen_vmlinux_h.sh</code>, <code>README.md</code>).</li>
       <li><a href="https://github.com/libbpf/libbpf">libbpf/libbpf</a>, commit
-        <code>872299d94e27d2fa9f119667c7e52268698dc760</code> (v1.9; <code>src/libbpf.c</code>, <code>src/btf.c</code>,
+        <code>872299d94e27d2fa9f119667c7e52268698dc760</code> (master after v1.8.0, version 1.9 in development; <code>src/libbpf.c</code>, <code>src/btf.c</code>,
         <code>src/relo_core.c</code>, <code>src/bpf_core_read.h</code>, <code>src/bpf_helpers.h</code>,
         <code>include/uapi/linux/bpf.h</code>).</li>
       <li><a href="https://github.com/libbpf/bpftool">libbpf/bpftool</a>, commit <code>1f6bbb7</code>, and its

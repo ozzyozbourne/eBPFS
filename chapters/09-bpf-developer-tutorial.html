@@ -1,0 +1,1490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · bpf-developer-tutorial · eBPF Curriculum</title>
+<!-- Metadata read by tools/build_index.py -->
+<meta name="chapter-number" content="09">
+<meta name="chapter-part" content="Part II · Learning and tooling">
+<meta name="chapter-summary" content="A guided tour of eunomia-bpf's bpf-developer-tutorial: how its 60-plus lessons are organized and built (ecc/ecli versus libbpf skeletons), how CI and the eunomia.dev site keep them current, six lessons read line by line, and a learning path mapped to this curriculum.">
+<meta name="chapter-repo" content="https://github.com/eunomia-bpf/bpf-developer-tutorial">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js" defer></script>
+<script src="../assets/app.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <a class="brand" href="../index.html">eBPF Curriculum</a>
+  <span class="crumb">Part II · Learning and tooling › 09 · bpf-developer-tutorial</span>
+  <button id="theme-toggle" type="button">theme</button>
+</header>
+<div class="layout">
+  <nav class="toc"></nav>
+  <main>
+    <section class="chapter-hero">
+      <div class="kicker">Chapter 09</div>
+      <h1>bpf-developer-tutorial: learning eBPF one small tool at a time</h1>
+      <p class="lede">Part I explained the eBPF machine: the instruction set, the verifier, maps,
+      hooks, CO-RE and the networking datapath. This chapter looks at the eunomia-bpf
+      organization's most widely used repository, a set of short, runnable lessons that turn
+      those ideas into working tools. We cover what the project contains, how it builds,
+      how it is tested, and the order in which to read it.</p>
+      <div class="meta"><span>Prerequisites: <a href="01-what-is-bpf.html">01</a>, <a href="05-program-types-and-hooks.html">05</a>, <a href="06-btf-core-libbpf.html">06</a></span><span>Repo: eunomia-bpf/bpf-developer-tutorial @ <code>110b91f8</code></span><span>~45 min</span></div>
+    </section>
+
+    <h2>What this project is</h2>
+    <p><a href="https://github.com/eunomia-bpf/bpf-developer-tutorial">bpf-developer-tutorial</a>
+    describes itself as <em>"eBPF Developer Tutorial: Learning eBPF Step by Step with
+    Examples"</em>. It is a single Git repository of self-contained lessons. Each lesson is a
+    directory under <code>src/</code> with a README in English and Chinese, the eBPF kernel
+    code, and usually a user-space loader and a Makefile. The README sets the scope plainly:
+    the tutorial "does not cover complex concepts and scenario introductions". Its goal is
+    to provide examples of eBPF tools that are "very short, starting with twenty lines of
+    code", so that developers pick up the development method by running and changing real
+    programs.</p>
+    <p>The project was created in December 2022. It is MIT-licensed and is mainly written by
+    GitHub user <code>yunwei37</code>, by far the largest committer (lesson 36 is signed by Yusheng Zheng), with a number of
+    other regular contributors. When surveyed on 2026-11-06 it had about 4,300 GitHub stars
+    and 600 forks, which makes it one of the most visible eunomia-bpf repositories. The same
+    lessons are published as a website at <a href="https://eunomia.dev/tutorials/">eunomia.dev/tutorials</a>
+    and mirrored on <a href="https://gitee.com/yunwei37/bpf-developer-tutorial">Gitee</a>.</p>
+
+    <h3>Who it is for</h3>
+    <p>The introductory lesson (<code>src/0-introduce/README.md</code>) names three audiences:
+    developers building custom kernel solutions, system administrators who want better
+    performance and security, and people exploring kernel technology. The stated
+    prerequisites are a Linux kernel of 4.8 or newer (the README recommends 5.15+ or 6.9+ for
+    features such as arena and tokens), basic C, familiarity with processes and system calls,
+    root access, and clang, llvm and libelf-dev. That matches the audience of this
+    curriculum: a C programmer who knows Linux but not eBPF.</p>
+    <p>The lessons favor modern toolchains. The README explains that the project was inspired
+    by the <a href="https://github.com/iovisor/bcc/blob/master/docs/tutorial_bcc_python_developer.md">bcc
+    Python developer tutorial</a>, but that "using <code>libbpf</code> to develop eBPF
+    applications is a relatively better choice". Examples therefore use CO-RE with libbpf,
+    libbpf-rs, cilium/ebpf and eunomia-bpf, not BCC's runtime compilation. (Chapter
+    <a href="08-ecosystem.html">08</a> compares those frameworks.)</p>
+
+    <div class="callout key"><span class="label">Key idea</span><p>Treat the repository as a
+    workbook, not a textbook. Each directory answers one question ("which files does this
+    process open?", "how do I schedule tasks in BPF?") with the smallest program that answers
+    it. Theory is kept short in the README and lives in references such as the chapters of
+    this curriculum. For each lesson, read the code first, run it, change one thing, and run
+    it again.</p></div>
+
+    <h2>Why it exists: the gap between the docs and a working tool</h2>
+    <p>Kernel documentation explains every program type and helper but rarely gives a
+    complete program, with a loader, that runs on a stock distribution kernel. The kernel's
+    own <code>samples/bpf/</code> and selftests are complete but written to test the kernel,
+    not to teach. BCC's tools are good teaching material, but they compile at run time and
+    need kernel headers on the target. The bpf-developer-tutorial sits between these. It
+    shows the libbpf-bootstrap style of development (chapter <a href="06-btf-core-libbpf.html">06</a>)
+    applied to many domains, and each lesson's README explains the code line by line.</p>
+    <p>The project solves three practical problems for a beginner:</p>
+    <ul>
+      <li><strong>Setting up a build environment.</strong> The early lessons need only the
+      <code>.bpf.c</code> file and two downloaded binaries (<code>ecc</code> and
+      <code>ecli</code>). The later lessons ship libbpf, bpftool, blazesym and a
+      <code>vmlinux.h</code> for each architecture in <code>src/third_party</code>, so
+      <code>make</code> works without system-wide libbpf.</li>
+      <li><strong>Finding a lesson-sized example for a hook.</strong> Every common hook
+      family has at least one lesson: tracepoints, kprobes, fentry, uprobes, USDT, perf
+      events, LSM, tc, TCX, XDP, sockops, struct_ops, sched_ext, HID-BPF and BPF qdisc.</li>
+      <li><strong>Knowing whether a lesson will run on your kernel.</strong> Each lesson
+      declares its minimum kernel, required config options, hardware and CI status. A
+      generated compatibility matrix collects all of these.</li>
+    </ul>
+
+    <h2>How the repository is organized</h2>
+    <p>Figure 9.1 is a directory map at commit <code>110b91f8</code>. The top level holds
+    documentation and automation. All lessons are under <code>src/</code>.</p>
+
+    <figure>
+      <svg viewBox="0 0 1000 620" role="img" aria-label="Directory map of bpf-developer-tutorial">
+        <style>
+          .bx{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .hl{fill:none;stroke:var(--accent);stroke-width:2}
+          .h2l{fill:none;stroke:var(--accent2);stroke-width:2}
+          .t{fill:var(--fg);font:600 14px monospace}
+          .s{fill:var(--fg);font:12.5px monospace}
+          .m{fill:var(--muted);font:12px sans-serif}
+          .ln{stroke:var(--muted);stroke-width:1.3;fill:none}
+        </style>
+        <rect class="bx" x="20" y="20" width="270" height="40" rx="8"/>
+        <text class="t" x="35" y="46">bpf-developer-tutorial/</text>
+        <path class="ln" d="M40 60 V560"/>
+        <!-- top-level files -->
+        <path class="ln" d="M40 95 H70"/>
+        <rect class="bx" x="70" y="75" width="300" height="130" rx="8"/>
+        <text class="s" x="82" y="97">README.md · README.zh.md</text>
+        <text class="m" x="82" y="114">generated index of all lessons</text>
+        <text class="s" x="82" y="136">TUTORIAL_IDEAS.md</text>
+        <text class="m" x="82" y="153">ranked registry of future lessons</text>
+        <text class="s" x="82" y="175">CLAUDE.md · .agents/skills/</text>
+        <text class="m" x="82" y="192">guidance for AI coding agents</text>
+        <path class="ln" d="M40 250 H70"/>
+        <rect class="bx" x="70" y="225" width="300" height="100" rx="8"/>
+        <text class="s" x="82" y="247">scripts/</text>
+        <text class="m" x="82" y="264">generate_toc.py, generate_compatibility.py,</text>
+        <text class="m" x="82" y="280">check_internal_links.py + unit tests</text>
+        <text class="s" x="82" y="302">.github/workflows/</text>
+        <text class="m" x="82" y="318">6 workflows: build, run, docs, site sync</text>
+        <path class="ln" d="M40 380 H70"/>
+        <rect class="hl" x="70" y="345" width="300" height="215" rx="8"/>
+        <text class="t" x="82" y="368">src/</text>
+        <text class="s" x="82" y="390">SUMMARY.md · compatibility.md</text>
+        <text class="s" x="82" y="410">Makefile</text>
+        <text class="m" x="160" y="410">builds every lesson dir</text>
+        <text class="m" x="82" y="436">Each lesson directory:</text>
+        <text class="s" x="92" y="456">.config</text>
+        <text class="m" x="170" y="456">level, type, kernel_min…</text>
+        <text class="s" x="92" y="476">README.md / README.zh.md</text>
+        <text class="s" x="92" y="496">*.bpf.c  *.h</text>
+        <text class="m" x="200" y="496">kernel side</text>
+        <text class="s" x="92" y="516">*.c  Makefile</text>
+        <text class="m" x="200" y="516">loader (libbpf)</text>
+        <text class="s" x="92" y="536">tests/</text>
+        <text class="m" x="200" y="536">newer lessons</text>
+        <!-- src children -->
+        <path class="ln" d="M370 450 H410"/>
+        <path class="ln" d="M410 60 V590"/>
+        <path class="ln" d="M410 80 H440"/>
+        <rect class="h2l" x="440" y="40" width="540" height="80" rx="8"/>
+        <text class="s" x="452" y="62">0-introduce … 10-hardirqs</text>
+        <text class="m" x="700" y="62">Basic · mostly ecc/ecli, one .bpf.c</text>
+        <text class="s" x="452" y="84">11-bootstrap … 21-xdp</text>
+        <text class="m" x="700" y="84">Advance · libbpf + Makefile</text>
+        <text class="s" x="452" y="106">22-android … 54-exec-image-inspector</text>
+        <text class="m" x="770" y="106">Depth · by type</text>
+        <path class="ln" d="M410 170 H440"/>
+        <rect class="h2l" x="440" y="140" width="540" height="60" rx="8"/>
+        <text class="s" x="452" y="162">features/</text>
+        <text class="m" x="550" y="162">bpf_arena bpf_iters bpf_token bpf_wq dynptr struct_ops</text>
+        <text class="s" x="452" y="186">xpu/</text>
+        <text class="m" x="550" y="186">flamegraph (CUPTI) · gpu-kernel-driver · npu-kernel-driver</text>
+        <path class="ln" d="M410 245 H440"/>
+        <rect class="h2l" x="440" y="220" width="540" height="50" rx="8"/>
+        <text class="s" x="452" y="242">cgroup/</text>
+        <text class="m" x="550" y="242">socket, device and sysctl policy (unnumbered)</text>
+        <text class="s" x="452" y="262">bpftrace-tutorial/</text>
+        <text class="m" x="610" y="262">Brendan Gregg's one-liner tutorial</text>
+        <path class="ln" d="M410 340 H440"/>
+        <rect class="hl" x="440" y="290" width="540" height="160" rx="8"/>
+        <text class="t" x="452" y="312">third_party/</text>
+        <text class="s" x="452" y="336">bpftool/</text>
+        <text class="m" x="600" y="336">git submodule (libbpf/bpftool)</text>
+        <text class="s" x="452" y="358">bpftool/libbpf/</text>
+        <text class="m" x="600" y="358">nested submodule (libbpf/libbpf)</text>
+        <text class="s" x="452" y="380">libbpf → bpftool/libbpf</text>
+        <text class="m" x="660" y="380">symlink</text>
+        <text class="s" x="452" y="402">blazesym/</text>
+        <text class="m" x="600" y="402">git submodule, symbolizer (Rust)</text>
+        <text class="s" x="452" y="424">vmlinux/{x86,arm,arm64,riscv,</text>
+        <text class="s" x="452" y="442">         powerpc,loongarch}/vmlinux.h</text>
+        <path class="ln" d="M410 520 H440"/>
+        <rect class="bx" x="440" y="470" width="540" height="120" rx="8"/>
+        <text class="m" x="452" y="494">Every lesson Makefile points at:</text>
+        <text class="s" x="452" y="516">LIBBPF_SRC  := ../third_party/libbpf/src</text>
+        <text class="s" x="452" y="536">BPFTOOL_SRC := ../third_party/bpftool/src</text>
+        <text class="s" x="452" y="556">VMLINUX     := ../third_party/vmlinux/$(ARCH)/vmlinux.h</text>
+        <text class="m" x="452" y="578">so a lesson builds with no system libbpf installed</text>
+      </svg>
+      <figcaption>Figure 9.1 — Directory map at <code>110b91f8</code>. Orange boxes are the
+      parts a reader touches on every lesson; blue boxes are the lesson groups.</figcaption>
+    </figure>
+
+    <p>Some numbers, from <code>git ls-files</code> at the studied commit: <code>src/</code>
+    holds 673 tracked files, 67 English READMEs and 71 <code>*.bpf.c</code> files. There are
+    55 numbered directories (<code>0-introduce</code> to <code>54-exec-image-inspector</code>)
+    and 12 unnumbered lesson directories under <code>features/</code>, <code>xpu/</code>,
+    <code>cgroup/</code> and <code>bpftrace-tutorial/</code>. The generated index lists 64
+    lessons.</p>
+
+    <h3>Lesson metadata: the <code>.config</code> file</h3>
+    <p>The index is generated, not written by hand. Each lesson has a small key-value file
+    named <code>.config</code>. Here are two real ones:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="44-scx-simple/.config">
+        <pre data-file="bpf-developer-tutorial/src/44-scx-simple/.config"><code class="language-ini">level=Depth
+type=Scheduler
+kernel_min=6.12
+kernel_min_basis=documented
+architectures=x86_64,arm64
+btf=required
+kernel_config=CONFIG_BPF=y,CONFIG_BPF_SYSCALL=y,CONFIG_DEBUG_INFO_BTF=y,CONFIG_SCHED_CLASS_EXT=y
+hardware=none
+root=required
+test_status=ci-build</code></pre>
+      </div>
+      <div class="tab-panel" data-label="47-cuda-events/.config">
+        <pre data-file="bpf-developer-tutorial/src/47-cuda-events/.config"><code class="language-ini">level=Depth
+type=GPU
+kernel_min=5.8
+kernel_min_basis=required-feature
+architectures=x86_64
+btf=required
+kernel_config=CONFIG_BPF=y,CONFIG_BPF_SYSCALL=y,CONFIG_BPF_EVENTS=y,CONFIG_DEBUG_INFO_BTF=y,CONFIG_UPROBE_EVENTS=y
+hardware=nvidia-cuda-gpu
+root=required
+test_status=ci-build</code></pre>
+      </div>
+    </div>
+    <p><code>level</code> is one of <code>Basic</code>, <code>Advance</code> or
+    <code>Depth</code>. Depth lessons also carry a <code>type</code>. In
+    <code>scripts/generate_toc.py</code> the Depth subsections are printed in a fixed order:
+    GPU, Scheduler, Networking, Tracing, Security, Features, Other, Android. The script reads
+    the first Markdown heading of each README as the lesson title, or uses <code>desc=</code>
+    if present. <code>scripts/generate_compatibility.py</code> turns the remaining keys into
+    <code>src/compatibility.md</code>. That page warns that "<code>Not in CI</code> does not
+    imply that a manual test was performed". <code>test_status</code> is one of
+    <code>ci-runtime</code> (CI loads and runs it), <code>ci-build</code> (CI only compiles
+    it), <code>not-in-ci</code> or <code>docs-only</code>.</p>
+    <div class="callout tip"><span class="label">Tip</span><p>Before you start a Depth lesson,
+    open <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/blob/main/src/compatibility.md"><code>src/compatibility.md</code></a>
+    and check the lesson's minimum kernel and config options against <code>uname -r</code>
+    and <code>/boot/config-$(uname -r)</code>. The range is wide: lesson 1 declares 4.8,
+    lesson 52 (fsession) declares 7.0 and lesson 54 declares 6.19.</p></div>
+    <p>A side effect of generating the index: a lesson whose <code>.config</code> lacks a
+    <code>type</code> drops out of it. At <code>110b91f8</code>,
+    <code>32-wallclock-profiler</code> has <code>level=Depth</code> and no <code>type</code>,
+    so it does not appear in the README or SUMMARY. <code>bpftrace-tutorial</code> has no
+    <code>.config</code> at all. Both directories still exist and are worth reading.</p>
+
+    <h2>The lesson groups</h2>
+    <p>Figure 9.2 shows the three levels and the eight Depth categories. The table that
+    follows lists every group at the studied commit.</p>
+
+    <figure>
+      <svg viewBox="0 0 1000 470" role="img" aria-label="Lesson categories: Basic, Advance, and eight Depth subgroups">
+        <style>
+          .lv{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .ca{fill:none;stroke:var(--accent2);stroke-width:2}
+          .cb{fill:none;stroke:var(--accent);stroke-width:2}
+          .t{fill:var(--fg);font:600 15px sans-serif}
+          .s{fill:var(--fg);font:12px monospace}
+          .m{fill:var(--muted);font:12px sans-serif}
+          .ar{stroke:var(--muted);stroke-width:2;fill:none;marker-end:url(#a9)}
+        </style>
+        <defs><marker id="a9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+        <rect class="lv" x="15" y="20" width="220" height="200" rx="10"/>
+        <text class="t" x="30" y="46">Basic · 0–10</text>
+        <text class="m" x="30" y="66">eunomia-bpf (ecc / ecli)</text>
+        <text class="s" x="30" y="92">tracepoint · kprobe</text>
+        <text class="s" x="30" y="110">fentry · uprobe</text>
+        <text class="s" x="30" y="128">globals · hash map</text>
+        <text class="s" x="30" y="146">perf array · ringbuf</text>
+        <text class="s" x="30" y="164">histograms · irqs</text>
+        <text class="m" x="30" y="196">11 lessons, kernel ≥ 4.8–5.8</text>
+        <path class="ar" d="M235 120 H270"/>
+        <rect class="lv" x="275" y="20" width="220" height="200" rx="10"/>
+        <text class="t" x="290" y="46">Advance · 11–21</text>
+        <text class="m" x="290" y="66">libbpf + skeleton + Makefile</text>
+        <text class="s" x="290" y="92">bootstrap loader</text>
+        <text class="s" x="290" y="110">profile (Rust)</text>
+        <text class="s" x="290" y="128">TCP · USDT · memleak</text>
+        <text class="s" x="290" y="146">block I/O</text>
+        <text class="s" x="290" y="164">LSM · tc · XDP</text>
+        <text class="m" x="290" y="196">11 lessons, kernel ≥ 5.2–5.8</text>
+        <path class="ar" d="M495 120 H530"/>
+        <rect class="lv" x="535" y="20" width="450" height="430" rx="10"/>
+        <text class="t" x="550" y="46">Depth · grouped by type</text>
+        <rect class="cb" x="550" y="60" width="200" height="80" rx="8"/>
+        <text class="t" x="562" y="82">GPU (4)</text>
+        <text class="s" x="562" y="102">47 · xpu/flamegraph</text>
+        <text class="s" x="562" y="120">xpu/gpu- npu-driver</text>
+        <rect class="cb" x="770" y="60" width="200" height="80" rx="8"/>
+        <text class="t" x="782" y="82">Scheduler (2)</text>
+        <text class="s" x="782" y="102">44 scx_simple</text>
+        <text class="s" x="782" y="120">45 scx_nest</text>
+        <rect class="ca" x="550" y="155" width="200" height="90" rx="8"/>
+        <text class="t" x="562" y="177">Networking (7)</text>
+        <text class="s" x="562" y="197">23 29 41 42</text>
+        <text class="s" x="562" y="215">46 50 53</text>
+        <text class="m" x="562" y="235">XDP, TCX, sockops, qdisc</text>
+        <rect class="ca" x="770" y="155" width="200" height="90" rx="8"/>
+        <text class="t" x="782" y="177">Tracing (8)</text>
+        <text class="s" x="782" y="197">30 31 33 37</text>
+        <text class="s" x="782" y="215">39 40 48 52</text>
+        <text class="m" x="782" y="235">TLS, Go, Rust, nginx…</text>
+        <rect class="cb" x="550" y="260" width="200" height="90" rx="8"/>
+        <text class="t" x="562" y="282">Security (8)</text>
+        <text class="s" x="562" y="302">24 25 26 27</text>
+        <text class="s" x="562" y="320">28 34 51 54</text>
+        <text class="m" x="562" y="340">attack and defense</text>
+        <rect class="ca" x="770" y="260" width="200" height="90" rx="8"/>
+        <text class="t" x="782" y="282">Features (10)</text>
+        <text class="s" x="782" y="302">35 36 38 43</text>
+        <text class="s" x="782" y="320">features/* (6)</text>
+        <text class="m" x="782" y="340">arena, token, wq, dynptr…</text>
+        <rect class="ca" x="550" y="365" width="200" height="70" rx="8"/>
+        <text class="t" x="562" y="387">Other (2)</text>
+        <text class="s" x="562" y="407">49 HID-BPF · cgroup</text>
+        <rect class="ca" x="770" y="365" width="200" height="70" rx="8"/>
+        <text class="t" x="782" y="387">Android (1)</text>
+        <text class="s" x="782" y="407">22-android</text>
+        <rect class="lv" x="15" y="250" width="480" height="200" rx="10"/>
+        <text class="t" x="30" y="276">How a reader moves through it</text>
+        <text class="m" x="30" y="300">1. Basic teaches one hook or one map per lesson, with</text>
+        <text class="m" x="30" y="318">   no loader to write: ecli runs the object directly.</text>
+        <text class="m" x="30" y="342">2. Advance replaces ecli with a libbpf C loader</text>
+        <text class="m" x="30" y="360">   (skeleton, ring buffer polling, CLI flags).</text>
+        <text class="m" x="30" y="384">3. Depth is a menu, not a sequence: pick the domain you</text>
+        <text class="m" x="30" y="402">   need. Newer lessons (50–54) add CLIs and tests/.</text>
+        <text class="m" x="30" y="430">Orange: hooks that change kernel behavior · blue: observe</text>
+      </svg>
+      <figcaption>Figure 9.2 — Lesson categories as generated by
+      <code>scripts/generate_toc.py</code>. The counts are entries in the generated index at
+      <code>110b91f8</code>. Orange groups contain programs that change kernel behavior
+      (scheduling, policy, packet rewriting); blue groups mainly observe.</figcaption>
+    </figure>
+
+    <table>
+      <thead><tr><th>Group</th><th>Lessons</th><th>Main framework</th><th>Declared min. kernel</th><th>What you learn</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Basic</strong></td><td>0-introduce, 1-helloworld, 2-kprobe-unlink, 3-fentry-unlink, 4-opensnoop, 5-uprobe-bashreadline, 6-sigsnoop, 7-execsnoop, 8-exitsnoop, 9-runqlat, 10-hardirqs</td><td>eunomia-bpf (<code>ecc</code>/<code>ecli</code>)</td><td>4.8 (1, 4) to 5.8 (8)</td><td>One hook or one data path per lesson: tracepoints, kprobe/kretprobe, fentry/fexit, uprobe, global variables as parameters, hash maps, perf event array, ring buffer, log2 histograms, hard and soft IRQs</td></tr>
+        <tr><td><strong>Advance</strong></td><td>11-bootstrap, 12-profile, 13-tcpconnlat, 14-tcpstates, 15-javagc, 16-memleak, 17-biopattern, 18-further-reading, 19-lsm-connect, 20-tc, 21-xdp</td><td>libbpf C (12 is Rust/libbpf-rs; 19–21 still use ecc)</td><td>5.2 to 5.8</td><td>Writing a user-space loader, CPU profiling with stack symbolization, TCP latency and state, USDT probes in the JVM, allocation tracking, disk I/O patterns, an LSM policy, first tc and XDP programs</td></tr>
+        <tr><td>Depth · <strong>GPU</strong></td><td>47-cuda-events, xpu/flamegraph, xpu/gpu-kernel-driver, xpu/npu-kernel-driver</td><td>libbpf + uprobes; CUPTI; bpftrace</td><td>4.8 to 6.2</td><td>Uprobes on the CUDA runtime, a CPU-to-GPU flame graph, DRM scheduler and vendor driver tracepoints, the Intel NPU driver</td></tr>
+        <tr><td>Depth · <strong>Scheduler</strong></td><td>44-scx-simple, 45-scx-nest</td><td>libbpf + sched_ext headers</td><td>6.12</td><td>Writing a CPU scheduler as <code>struct_ops</code> with dispatch queues</td></tr>
+        <tr><td>Depth · <strong>Networking</strong></td><td>23-http, 29-sockops, 41-xdp-tcpdump, 42-xdp-loadbalancer, 46-xdp-test, 50-tcx, 53-egress-pacer</td><td>libbpf</td><td>4.8 (42) to 6.16 (53)</td><td>L7 tracing with socket filters, sockmap redirection, XDP capture, load balancing and packet generation, TCX links, a BPF qdisc</td></tr>
+        <tr><td>Depth · <strong>Tracing</strong></td><td>30-sslsniff, 31-goroutine, 33-funclatency, 37-uprobe-rust, 39-nginx, 40-mysql, 48-energy, 52-fsession-latency</td><td>libbpf, ecc, bpftrace, Rust</td><td>4.8 to 7.0</td><td>TLS plaintext capture through uprobes, Go and Rust runtimes, function latency, nginx and MySQL request tracing, energy estimation, <code>fsession</code></td></tr>
+        <tr><td>Depth · <strong>Security</strong></td><td>24-hide, 25-signal, 26-sudo, 27-replace, 28-detach, 34-syscall, 51-tcp-quarantine, 54-exec-image-inspector</td><td>libbpf, ecc</td><td>5.8 to 6.19</td><td>Offensive techniques (hiding PIDs, rewriting reads, editing syscall arguments), <code>bpf_send_signal</code>, pinning programs past the loader's exit, socket iterators for quarantine, task work and file dynptrs</td></tr>
+        <tr><td>Depth · <strong>Features</strong></td><td>35-user-ringbuf, 36-userspace-ebpf, 38-btf-uprobe, 43-kfuncs, features/bpf_arena, bpf_iters, bpf_token, bpf_wq, dynptr, struct_ops</td><td>libbpf, kernel modules</td><td>5.2 to 6.11 (arena/token 6.9, wq 6.10)</td><td>One newer kernel feature per lesson: user ring buffer, userspace runtimes, CO-RE for user space, custom kfuncs in a module, arena, iterators, tokens, workqueues, dynptrs, custom struct_ops</td></tr>
+        <tr><td>Depth · <strong>Other</strong></td><td>49-hid, cgroup</td><td>libbpf</td><td>6.3 / 5.8</td><td>HID-BPF input fixups; cgroup socket, device and sysctl policy</td></tr>
+        <tr><td>Depth · <strong>Android</strong></td><td>22-android</td><td>(docs)</td><td>5.15</td><td>Running eBPF on Android</td></tr>
+        <tr><td><em>Not indexed</em></td><td>32-wallclock-profiler, bpftrace-tutorial</td><td>libbpf + Python; bpftrace</td><td>5.2 / –</td><td>Combined on-CPU and off-CPU profiling; twelve bpftrace one-liners</td></tr>
+      </tbody>
+    </table>
+    <p>Two things stand out in the table. First, numbering reflects the order in which
+    lessons were written, not difficulty. Lessons 22–54 are grouped by <code>type</code>, and
+    within a group you can read in any order. Second, lesson 18 is a reading list
+    (papers and projects) and lesson 36 is an essay on userspace eBPF runtimes, with no code
+    to build. Lesson 36 is the tutorial's link to bpftime (chapters
+    <a href="14-bpftime-architecture.html">14</a>–<a href="15-bpftime-in-practice.html">15</a>).</p>
+
+    <h2>How lessons are built: two toolchains</h2>
+    <p>The README sends readers to two lessons for setup. For eunomia-bpf lessons, see
+    <code>src/1-helloworld</code>. For libbpf lessons, see <code>src/11-bootstrap</code>.
+    The two paths differ in who writes the user-space half (Figure 9.3).</p>
+
+    <figure>
+      <svg viewBox="0 0 1000 330" role="img" aria-label="Two build pipelines: ecc/ecli and libbpf Makefile with bpftool skeleton">
+        <style>
+          .bx{fill:var(--bg3);stroke:var(--border);stroke-width:1.5}
+          .e{fill:none;stroke:var(--accent2);stroke-width:2}
+          .l{fill:none;stroke:var(--accent);stroke-width:2}
+          .t{fill:var(--fg);font:600 14px sans-serif}
+          .s{fill:var(--fg);font:12px monospace}
+          .m{fill:var(--muted);font:11.5px sans-serif}
+          .ar{stroke:var(--muted);stroke-width:2;fill:none;marker-end:url(#b9)}
+        </style>
+        <defs><marker id="b9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+        <text class="t" x="20" y="30">eunomia-bpf path (lessons 1–10, 19–21, 25, 31, 34…)</text>
+        <rect class="e" x="20" y="45" width="170" height="70" rx="8"/>
+        <text class="s" x="32" y="70">x.bpf.c [x.h]</text>
+        <text class="m" x="32" y="90">+ /// @ comments</text>
+        <path class="ar" d="M190 80 H230"/>
+        <rect class="e" x="235" y="45" width="210" height="70" rx="8"/>
+        <text class="s" x="247" y="70">./ecc x.bpf.c x.h</text>
+        <text class="m" x="247" y="90">clang → BPF object, export</text>
+        <text class="m" x="247" y="105">types from header, pack</text>
+        <path class="ar" d="M445 80 H485"/>
+        <rect class="e" x="490" y="45" width="180" height="70" rx="8"/>
+        <text class="s" x="502" y="70">package.json</text>
+        <text class="m" x="502" y="90">object + JSON config</text>
+        <path class="ar" d="M670 80 H710"/>
+        <rect class="e" x="715" y="45" width="265" height="70" rx="8"/>
+        <text class="s" x="727" y="70">sudo ./ecli run package.json</text>
+        <text class="m" x="727" y="90">generic loader: CLI flags from globals,</text>
+        <text class="m" x="727" y="105">prints ringbuf/perf events as columns</text>
+        <text class="t" x="20" y="170">libbpf path (lessons 11–17, 23, 24, 26–30, 32–35, 38, 41–54…)</text>
+        <rect class="l" x="20" y="185" width="150" height="70" rx="8"/>
+        <text class="s" x="32" y="210">x.bpf.c</text>
+        <text class="m" x="32" y="230">vmlinux.h from</text>
+        <text class="m" x="32" y="245">third_party</text>
+        <path class="ar" d="M170 220 H200"/>
+        <rect class="l" x="205" y="185" width="190" height="70" rx="8"/>
+        <text class="s" x="217" y="210">clang -target bpf</text>
+        <text class="s" x="217" y="228">bpftool gen object</text>
+        <text class="m" x="217" y="245">→ .output/x.bpf.o</text>
+        <path class="ar" d="M395 220 H425"/>
+        <rect class="l" x="430" y="185" width="190" height="70" rx="8"/>
+        <text class="s" x="442" y="210">bpftool gen skeleton</text>
+        <text class="m" x="442" y="230">→ .output/x.skel.h</text>
+        <text class="m" x="442" y="245">(object embedded as bytes)</text>
+        <path class="ar" d="M620 220 H650"/>
+        <rect class="l" x="655" y="185" width="150" height="70" rx="8"/>
+        <text class="s" x="667" y="210">cc x.c</text>
+        <text class="m" x="667" y="230">+ libbpf.a -lelf -lz</text>
+        <path class="ar" d="M805 220 H835"/>
+        <rect class="l" x="840" y="185" width="140" height="70" rx="8"/>
+        <text class="s" x="852" y="210">sudo ./x</text>
+        <text class="m" x="852" y="230">your own loader</text>
+        <rect class="bx" x="20" y="275" width="960" height="42" rx="8"/>
+        <text class="m" x="32" y="300">libbpf.a and bpftool are built once per lesson from src/third_party submodules (git submodule update --init --recursive), so the host needs only clang, libelf and zlib.</text>
+      </svg>
+      <figcaption>Figure 9.3 — The two build pipelines. With eunomia-bpf you write only the
+      kernel half, and <code>ecli</code> acts as a generic loader. With libbpf you write both
+      halves and the Makefile produces a static binary.</figcaption>
+    </figure>
+
+    <h3>Path 1: eunomia-bpf, <code>ecc</code> and <code>ecli</code></h3>
+    <p>The Basic lessons use the eunomia-bpf toolchain, which chapter
+    <a href="10-eunomia-bpf-ecc-ecli.html">10</a> covers in depth. <code>ecc</code> compiles
+    the <code>.bpf.c</code> file and packs the object with a JSON description into
+    <code>package.json</code>. <code>ecli</code> loads that package, attaches every program,
+    turns <code>const volatile</code> globals into command-line flags, and prints the events
+    the program emits. A lesson in this style is just the kernel file, the README and a
+    <code>.config</code>. The setup commands, copied from <code>src/1-helloworld/README.md</code>:</p>
+    <pre data-file="bpf-developer-tutorial/src/1-helloworld/README.md"><code class="language-bash">$ wget https://aka.pw/bpf-ecli -O ecli &amp;&amp; chmod +x ./ecli
+$ ./ecli -h
+Usage: ecli [--help] [--version] [--json] [--no-cache] url-and-args
+
+$ wget https://github.com/eunomia-bpf/eunomia-bpf/releases/latest/download/ecc &amp;&amp; chmod +x ./ecc
+
+# or compile in a container; `pwd` must contain the *.bpf.c and *.h files
+$ docker run -it -v `pwd`/:/src/ ghcr.io/eunomia-bpf/ecc-`uname -m`:latest
+
+$ sudo apt install clang llvm
+$ ./ecc minimal.bpf.c
+Compiling bpf object...
+Packing ebpf object and config into package.json...
+$ sudo ./ecli run package.json
+Running eBPF program...</code></pre>
+    <p>On aarch64 the README points to <code>ecc-aarch64</code> and <code>ecli-aarch64</code>
+    from the same release page. Lessons that print with <code>bpf_printk</code> are read
+    through <code>sudo cat /sys/kernel/debug/tracing/trace_pipe</code>.</p>
+
+    <h3>Path 2: libbpf, bpftool and a skeleton</h3>
+    <p>From lesson 11 onward most lessons have a Makefile derived from
+    <a href="https://github.com/libbpf/libbpf-bootstrap">libbpf-bootstrap</a>. The important
+    rules, copied from <code>src/11-bootstrap/Makefile</code>:</p>
+    <pre data-file="bpf-developer-tutorial/src/11-bootstrap/Makefile"><code class="language-makefile">LIBBPF_SRC := $(abspath ../third_party/libbpf/src)
+BPFTOOL_SRC := $(abspath ../third_party/bpftool/src)
+/* ... */
+VMLINUX := ../third_party/vmlinux/$(ARCH)/vmlinux.h
+INCLUDES := -I$(OUTPUT) -I../third_party/libbpf/include/uapi -I$(dir $(VMLINUX))
+/* ... */
+# Build BPF code
+$(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
+	$(call msg,BPF,$@)
+	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)		      \
+		     $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES)		      \
+		     -c $(filter %.c,$^) -o $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
+	$(Q)$(BPFTOOL) gen object $@ $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
+
+# Generate BPF skeletons
+$(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
+	$(call msg,GEN-SKEL,$@)
+	$(Q)$(BPFTOOL) gen skeleton $&lt; &gt; $@
+/* ... */
+# Build application binary
+$(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
+	$(call msg,BINARY,$@)
+	$(Q)$(CC) $(CFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@</code></pre>
+    <p>Each lesson's Makefile builds a static <code>libbpf.a</code> and a "bootstrap"
+    <code>bpftool</code> from the submodules on first use, so a fresh clone needs
+    <code>git submodule update --init --recursive</code>. The <code>vmlinux.h</code> comes
+    from the repository and is not generated from the running kernel's BTF. This works
+    because of CO-RE (chapter <a href="06-btf-core-libbpf.html">06</a>): the header only has
+    to be close enough to compile, and libbpf relocates field offsets at load time. It also
+    has a cost, which shows up in lesson 52 below. The master <code>src/Makefile</code>
+    finds every directory with a Makefile and runs <code>make -C</code> on each.</p>
+    <p>A few lessons use other toolchains: lesson 12 and <code>xpu/flamegraph/profiler</code>
+    are Rust crates (lesson 12 uses <code>libbpf-rs = "0.24"</code> and
+    <code>blazesym</code>). Lesson 37 builds Rust targets with <code>cargo build</code>.
+    Lessons 39, 40, parts of 47 and <code>xpu/gpu-kernel-driver</code> are bpftrace
+    <code>.bt</code> scripts. Lesson 47 also contains CUDA <code>.cu</code> programs.</p>
+
+    <div class="callout warn"><span class="label">Warning</span><p>Neither path is safe to
+    try on a laptop you care about without reading the lesson first. Security lessons such
+    as 24-hide, 26-sudo, 27-replace and 34-syscall show attacker techniques: they hide
+    processes, rewrite what <code>read()</code> returns, and change syscall arguments.
+    Lesson 28 pins a program so that it outlives its loader. Run these in a VM. The
+    repository's own agent skill <code>test-bpf-tutorial-kvm</code> runs every
+    BPF-loading step inside a short-lived KVM guest for the same reason.</p></div>
+
+    <h3>Building one lesson end to end</h3>
+    <p>The stepper below follows lesson 11 through a build. I ran these steps in this
+    curriculum's orb (kernel 6.1, Debian clang 14.0.6) at commit <code>110b91f8</code>.</p>
+    <div class="stepper">
+      <div class="step"><h4>1. Clone with submodules</h4><p>From the README:
+      <code>git clone https://github.com/eunomia-bpf/bpf-developer-tutorial.git</code>, then
+      <code>git submodule update --init --recursive</code>. This fetches
+      <code>third_party/bpftool</code> (which contains libbpf as a nested submodule) and
+      <code>third_party/blazesym</code>. <code>third_party/libbpf</code> is a symlink to
+      <code>bpftool/libbpf</code>.</p></div>
+      <div class="step"><h4>2. Install the host packages</h4><p>Lesson 11 lists
+      <code>sudo apt install clang libelf1 libelf-dev zlib1g-dev</code> for Debian/Ubuntu and
+      <code>sudo dnf install clang elfutils-libelf elfutils-libelf-devel zlib-devel</code>
+      for Fedora/CentOS.</p></div>
+      <div class="step"><h4>3. <code>make</code></h4><p>The first run builds bpftool and
+      libbpf (dozens of <code>CC</code> lines), then the four lesson steps:
+      <code>BPF .output/bootstrap.bpf.o</code>, <code>GEN-SKEL .output/bootstrap.skel.h</code>,
+      <code>CC .output/bootstrap.o</code>, <code>BINARY bootstrap</code>. In my build the
+      generated skeleton header was 116,660 bytes. It embeds the whole BPF object as a byte
+      array.</p></div>
+      <div class="step"><h4>4. Run it</h4><p><code>sudo ./bootstrap</code> prints a header
+      and one line per <code>exec</code> and <code>exit</code>. On the orb I saw lines such
+      as <code>EXEC git … /opt/git/bin/git</code> followed by
+      <code>EXIT git … [128] (1ms)</code>. CI runs the same binary as
+      <code>sudo timeout -s 2 3 src/11-bootstrap/bootstrap</code> and treats exit code 124
+      (timeout) as success.</p></div>
+      <div class="step"><h4>5. Clean up</h4><p><code>make clean</code> removes
+      <code>.output/</code> and the binary. Generated artifacts are no longer tracked in Git
+      (PR #215, July 2026).</p></div>
+    </div>
+
+    <h2>Lesson walkthroughs</h2>
+    <p>The six walkthroughs below cover the main shapes of a lesson: a tracepoint with a
+    parameter (4), a kprobe next to fentry (2 and 3), the move from ring buffer events to a
+    real loader (8 and 11), packet programs (20 and 21), an LSM policy (19), a sched_ext
+    scheduler (44), and CUDA tracing (47). All code is copied from the repository at
+    <code>110b91f8</code>, and the commands come from each lesson's README.</p>
+
+    <h3>Lesson 1 and 4: a tracepoint, a filter, and a flag for free</h3>
+    <p>Lesson 1 is the smallest complete program in the repository: one tracepoint handler
+    that prints the PID of every process that calls <code>write()</code>.</p>
+    <pre data-file="bpf-developer-tutorial/src/1-helloworld/minimal.bpf.c"><code class="language-c">/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+#define BPF_NO_GLOBAL_DATA
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+
+typedef unsigned int u32;
+typedef int pid_t;
+const pid_t pid_filter = 0;
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+SEC("tp/syscalls/sys_enter_write")
+int handle_tp(void *ctx)
+{
+	pid_t pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	if (pid_filter &amp;&amp; pid != pid_filter)
+		return 0;
+	bpf_printk("BPF triggered sys_enter_write from PID %d.\n", pid);
+	return 0;
+}</code></pre>
+    <p>Everything that chapter <a href="05-program-types-and-hooks.html">05</a> calls a
+    "hook contract" is visible here. <code>SEC("tp/syscalls/sys_enter_write")</code> picks
+    the program type and the attach point. The context is ignored (<code>void *ctx</code>).
+    The return value means nothing for a tracepoint. <code>bpf_printk</code> writes to the
+    shared trace pipe. The README notes that it accepts at most three arguments, that the
+    pipe is shared by every program, and that production tools should use ring buffers or
+    perf arrays instead. <code>BPF_NO_GLOBAL_DATA</code> is there for kernels older than 5.2,
+    which lack global variable support.</p>
+    <p>Lesson 4 (opensnoop) adds one idea: a global that user space sets before load.</p>
+    <pre data-file="bpf-developer-tutorial/src/4-opensnoop/opensnoop.bpf.c"><code class="language-c">#define BPF_NO_GLOBAL_DATA
+#include &lt;vmlinux.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+/// @description "Process ID to trace"
+const volatile int pid_target = 0;
+
+SEC("tracepoint/syscalls/sys_enter_openat")
+int tracepoint__syscalls__sys_enter_openat(struct trace_event_raw_sys_enter* ctx)
+{
+	u64 id = bpf_get_current_pid_tgid();
+	u32 pid = id &gt;&gt; 32;
+
+	if (pid_target &amp;&amp; pid_target != pid)
+		return false;
+	// Use bpf_printk to print the process information
+	bpf_printk("Process ID: %d enter sys openat\n", pid);
+	return 0;
+}
+
+/// "Trace open family syscalls."
+char LICENSE[] SEC("license") = "GPL";</code></pre>
+    <p><code>const volatile</code> places <code>pid_target</code> in the read-only data
+    section. The BPF program cannot write it, the compiler cannot constant-fold it, and the
+    loader can patch it before load. Because the value is fixed at load time, the verifier
+    sees a known constant and can prune the dead branch. The filter runs in the kernel, so
+    events you do not want never cross into user space. The <code>/// @description</code>
+    comment is eunomia-bpf specific: <code>ecc</code> records it, and <code>ecli</code> turns
+    the global into a documented flag. From the lesson README:</p>
+    <pre data-file="bpf-developer-tutorial/src/4-opensnoop/README.md"><code class="language-bash">$ ecc opensnoop.bpf.c
+Compiling bpf object...
+Packing ebpf object and config into package.json...
+$ ecli package.json -h
+Usage: opensnoop_bpf [--help] [--version] [--verbose] [--pid_target VAR]
+
+Trace open family syscalls.
+
+Optional arguments:
+  -h, --help    shows help message and exits 
+  -v, --version prints version information and exits 
+  --verbose     prints libbpf debug information 
+  --pid_target  Process ID to trace 
+/* ... */
+$ sudo ./ecli run package.json  --pid_target 618
+Running eBPF program...</code></pre>
+    <p>The eunomia CI workflow runs this lesson both ways:
+    <code>ecli run src/4-opensnoop/package.json</code> and the same command with
+    <code>--pid_target 1</code>.</p>
+
+    <h3>Lessons 2 and 3: the same probe as kprobe and as fentry</h3>
+    <p>Lessons 2 and 3 trace the same kernel function, <code>do_unlinkat</code>, with two
+    hook families. Reading them side by side is the fastest way to see what BTF-typed hooks
+    give you.</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="kprobe (lesson 2)">
+        <pre data-file="bpf-developer-tutorial/src/2-kprobe-unlink/kprobe-link.bpf.c"><code class="language-c">SEC("kprobe/do_unlinkat")
+int BPF_KPROBE(do_unlinkat, int dfd, struct filename *name)
+{
+	pid_t pid;
+	const char *filename;
+
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	filename = BPF_CORE_READ(name, name);
+	bpf_printk("KPROBE ENTRY pid = %d, filename = %s\n", pid, filename);
+	return 0;
+}
+
+SEC("kretprobe/do_unlinkat")
+int BPF_KRETPROBE(do_unlinkat_exit, long ret)
+{
+	pid_t pid;
+
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	bpf_printk("KPROBE EXIT: pid = %d, ret = %ld\n", pid, ret);
+	return 0;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="fentry (lesson 3)">
+        <pre data-file="bpf-developer-tutorial/src/3-fentry-unlink/fentry-link.bpf.c"><code class="language-c">SEC("fentry/do_unlinkat")
+int BPF_PROG(do_unlinkat, int dfd, struct filename *name)
+{
+	pid_t pid;
+
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	bpf_printk("fentry: pid = %d, filename = %s\n", pid, name-&gt;name);
+	return 0;
+}
+
+SEC("fexit/do_unlinkat")
+int BPF_PROG(do_unlinkat_exit, int dfd, struct filename *name, long ret)
+{
+	pid_t pid;
+
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	bpf_printk("fexit: pid = %d, filename = %s, ret = %ld\n", pid, name-&gt;name, ret);
+	return 0;
+}</code></pre>
+      </div>
+    </div>
+    <p>Three differences matter. In the kprobe, <code>BPF_KPROBE</code> unpacks the
+    arguments from <code>struct pt_regs</code>, and the pointer must be read with
+    <code>BPF_CORE_READ</code> because the verifier treats it as an untrusted kernel address.
+    In fentry, the BTF-typed argument can be dereferenced directly (<code>name-&gt;name</code>).
+    The kretprobe sees only the return value, while fexit sees the arguments <em>and</em>
+    the return value. The lesson 3 README claims fentry/fexit "run about 10x faster than
+    kprobes". That figure is the repository's claim and is not measured here; chapter
+    <a href="05-program-types-and-hooks.html">05</a> explains why the trampoline is cheaper.
+    The README also has a troubleshooting section for
+    <code>failed to attach: ERROR: strerror_r(-524)=22</code> (ENOTSUPP). The usual causes are
+    a kernel older than 5.5 on x86 or 6.0 on arm64, or a kernel without
+    <code>CONFIG_DEBUG_INFO_BTF</code>.</p>
+    <p>Build and test commands for lesson 2, from the README:</p>
+    <pre data-file="bpf-developer-tutorial/src/2-kprobe-unlink/README.md"><code class="language-bash">$ ecc kprobe-link.bpf.c
+Compiling bpf object...
+Packing ebpf object and config into package.json...
+$ sudo ecli run package.json
+
+# in another window
+touch test1
+rm test1
+
+$ sudo cat /sys/kernel/debug/tracing/trace_pipe
+              rm-9346    [005] d..3  4710.951696: bpf_trace_printk: KPROBE ENTRY pid = 9346, filename = test1
+              rm-9346    [005] d..4  4710.951819: bpf_trace_printk: KPROBE EXIT: ret = 0</code></pre>
+
+    <h3>Lessons 8 and 11: from ring buffer events to your own loader</h3>
+    <p>Lessons 7 and 8 replace <code>bpf_printk</code> with structured events. Lesson 7 uses
+    a <code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code> and <code>bpf_perf_event_output</code>.
+    Lesson 8 uses the BPF ring buffer (chapter <a href="04-maps-helpers-kfuncs.html">04</a>),
+    which declares its minimum kernel as 5.8:</p>
+    <pre data-file="bpf-developer-tutorial/src/8-exitsnoop/exitsnoop.bpf.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+
+SEC("tp/sched/sched_process_exit")
+int handle_exit(struct trace_event_raw_sched_process_template* ctx)
+{
+	struct task_struct *task;
+	struct event *e;
+	pid_t pid, tid;
+	u64 id, ts, *start_ts, start_time = 0;
+	
+	/* get PID and TID of exiting thread/process */
+	id = bpf_get_current_pid_tgid();
+	pid = id &gt;&gt; 32;
+	tid = (u32)id;
+
+	/* ignore thread exits */
+	if (pid != tid)
+		return 0;
+
+	/* reserve sample from BPF ringbuf */
+	e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	/* fill out the sample with data */
+	task = (struct task_struct *)bpf_get_current_task();
+	start_time = BPF_CORE_READ(task, start_time);
+
+	e-&gt;duration_ns = bpf_ktime_get_ns() - start_time;
+	e-&gt;pid = pid;
+	e-&gt;ppid = BPF_CORE_READ(task, real_parent, tgid);
+	e-&gt;exit_code = (BPF_CORE_READ(task, exit_code) &gt;&gt; 8) &amp; 0xff;
+	bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+
+	/* send data to user-space for post-processing */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}</code></pre>
+    <p>The verifier forces the <code>if (!e) return 0;</code> check: reserve may fail when
+    the buffer is full, and every path must either submit or discard the record.
+    <code>BPF_CORE_READ(task, real_parent, tgid)</code> follows two pointers with CO-RE
+    relocations. With eunomia-bpf you pass the header to <code>ecc</code>, which exports
+    the <code>struct event</code> layout, and <code>ecli</code> prints each field as a
+    column:</p>
+    <pre data-file="bpf-developer-tutorial/src/8-exitsnoop/README.md"><code class="language-bash">$ ecc exitsnoop.bpf.c exitsnoop.h
+Compiling bpf object...
+Generating export types...
+Packing ebpf object and config into package.json...
+$ sudo ./ecli run package.json 
+TIME     PID     PPID    EXIT_CODE  DURATION_NS  COMM
+21:40:09  42050  42049   0          0            which
+21:40:09  42049  3517    0          0            sh</code></pre>
+    <p>Lesson 11 (bootstrap, from libbpf-bootstrap) is the turning point. The kernel side
+    joins <code>exec</code> and <code>exit</code> through a hash map and adds a
+    <code>min_duration_ns</code> parameter. The new part is that you write the loader
+    yourself:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Kernel side (bootstrap.bpf.c)">
+        <pre data-file="bpf-developer-tutorial/src/11-bootstrap/bootstrap.bpf.c"><code class="language-c">struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, pid_t);
+	__type(value, u64);
+} exec_start SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+
+const volatile unsigned long long min_duration_ns = 0;
+
+SEC("tp/sched/sched_process_exec")
+int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
+{
+	/* ... */
+	/* remember time exec() was executed for this PID */
+	pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+	ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&amp;exec_start, &amp;pid, &amp;ts, BPF_ANY);
+
+	/* don't emit exec events when minimum duration is specified */
+	if (min_duration_ns)
+		return 0;
+	/* ... */
+	fname_off = ctx-&gt;__data_loc_filename &amp; 0xFFFF;
+	bpf_probe_read_str(&amp;e-&gt;filename, sizeof(e-&gt;filename), (void *)ctx + fname_off);
+
+	/* successfully submit it to user-space for post-processing */
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="User side (bootstrap.c)">
+        <pre data-file="bpf-developer-tutorial/src/11-bootstrap/bootstrap.c"><code class="language-c">	/* Load and verify BPF application */
+	skel = bootstrap_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+		return 1;
+	}
+
+	/* Parameterize BPF code with minimum duration parameter */
+	skel-&gt;rodata-&gt;min_duration_ns = env.min_duration_ms * 1000000ULL;
+
+	/* Load &amp; verify BPF programs */
+	err = bootstrap_bpf__load(skel);
+	/* ... */
+	/* Attach tracepoints */
+	err = bootstrap_bpf__attach(skel);
+	/* ... */
+	/* Set up ring buffer polling */
+	rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.rb), handle_event, NULL, NULL);
+	/* ... */
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		/* Ctrl-C will cause -EINTR */
+		if (err == -EINTR) {
+			err = 0;
+			break;
+		}
+		/* ... */
+	}
+
+cleanup:
+	/* Clean up */
+	ring_buffer__free(rb);
+	bootstrap_bpf__destroy(skel);</code></pre>
+      </div>
+    </div>
+    <p>The skeleton functions <code>__open</code>, <code>__load</code>, <code>__attach</code>
+    and <code>__destroy</code> are the libbpf object lifecycle from chapter
+    <a href="06-btf-core-libbpf.html">06</a>. Writing <code>skel-&gt;rodata-&gt;min_duration_ns</code>
+    between open and load is how a libbpf program does what <code>ecli</code> did with
+    <code>--pid_target</code>. The <code>__data_loc_filename &amp; 0xFFFF</code> line decodes a
+    tracepoint's variable-length field: the low 16 bits are the offset from the start of the
+    record. Build and run, from the README:</p>
+    <pre data-file="bpf-developer-tutorial/src/11-bootstrap/README.md"><code class="language-bash">$ git submodule update --init --recursive
+$ make
+  BPF      .output/bootstrap.bpf.o
+  GEN-SKEL .output/bootstrap.skel.h
+  CC       .output/bootstrap.o
+  BINARY   bootstrap
+$ sudo ./bootstrap 
+TIME     EVENT COMM             PID     PPID    FILENAME/EXIT CODE
+03:16:41 EXEC  sh               110688  80168   /bin/sh
+03:16:41 EXEC  which            110689  110688  /usr/bin/which
+03:16:41 EXIT  which            110689  110688  [0] (0ms)</code></pre>
+
+    <h3>Lessons 20 and 21: tc and XDP</h3>
+    <p>The first two packet lessons are deliberately tiny and still use <code>ecc</code>.
+    They show the one verifier rule every packet program must follow: prove that each header
+    lies inside <code>[data, data_end)</code> before reading it (chapters
+    <a href="03-verifier.html">03</a> and <a href="07-networking-xdp-tc.html">07</a>).</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="tc ingress (lesson 20)">
+        <pre data-file="bpf-developer-tutorial/src/20-tc/tc.bpf.c"><code class="language-c">#define TC_ACT_OK 0
+#define ETH_P_IP 0x0800 /* Internet Protocol packet	*/
+
+/// @tchook {"ifindex":1, "attach_point":"BPF_TC_INGRESS"}
+/// @tcopts {"handle":1, "priority":1}
+SEC("tc")
+int tc_ingress(struct __sk_buff *ctx)
+{
+    void *data_end = (void *)(__u64)ctx-&gt;data_end;
+    void *data = (void *)(__u64)ctx-&gt;data;
+    struct ethhdr *l2;
+    struct iphdr *l3;
+
+    if (ctx-&gt;protocol != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;
+
+    l2 = data;
+    if ((void *)(l2 + 1) &gt; data_end)
+        return TC_ACT_OK;
+
+    l3 = (struct iphdr *)(l2 + 1);
+    if ((void *)(l3 + 1) &gt; data_end)
+        return TC_ACT_OK;
+
+    bpf_printk("Got IP packet: tot_len: %d, ttl: %d", bpf_ntohs(l3-&gt;tot_len), l3-&gt;ttl);
+    return TC_ACT_OK;
+}
+
+char __license[] SEC("license") = "GPL";</code></pre>
+      </div>
+      <div class="tab-panel" data-label="XDP (lesson 21)">
+        <pre data-file="bpf-developer-tutorial/src/21-xdp/xdp.bpf.c"><code class="language-c">#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+
+/// @ifindex 1
+/// @flags 0
+/// @xdpopts {"old_prog_fd":0}
+SEC("xdp")
+int xdp_pass(struct xdp_md* ctx) {
+    void* data = (void*)(long)ctx-&gt;data;
+    void* data_end = (void*)(long)ctx-&gt;data_end;
+    int pkt_sz = data_end - data;
+
+    bpf_printk("packet size is %d", pkt_sz);
+    return XDP_PASS;
+}
+
+char __license[] SEC("license") = "GPL";</code></pre>
+      </div>
+    </div>
+    <p>The <code>///</code> comments again carry attach options for <code>ecli</code>:
+    interface index 1 (usually <code>lo</code>), tc ingress with handle and priority 1, and
+    XDP flags. With a libbpf loader you would make the same choices in C, for example with
+    <code>bpf_tc_hook_create</code> or <code>bpf_program__attach_xdp</code>. The commands,
+    from the READMEs:</p>
+    <pre data-file="bpf-developer-tutorial/src/21-xdp/README.md"><code class="language-bash">$ ecc xdp.bpf.c
+Compiling bpf object...
+Packing ebpf object and config into package.json...
+$ sudo ecli run package.json
+$ sudo cat /sys/kernel/tracing/trace_pipe
+            node-1939    [000] d.s11  1601.190413: bpf_trace_printk: packet size is 177
+            node-1939    [000] d.s11  1601.190479: bpf_trace_printk: packet size is 66</code></pre>
+    <p>The networking track then builds up in steps: 41 parses TCP headers in XDP, 42 is a
+    load balancer with a setup script that creates network namespaces, 46 generates packets
+    from XDP, 50 replaces <code>SEC("tc")</code> with link-based TCX attachment, and 53
+    implements a qdisc in BPF.</p>
+
+    <h3>Lesson 19: an LSM hook that says no</h3>
+    <p>Lesson 19 is the first lesson whose return value the kernel obeys. It attaches to the
+    <code>socket_connect</code> LSM hook and refuses IPv4 connections to 1.1.1.1:</p>
+    <pre data-file="bpf-developer-tutorial/src/19-lsm-connect/lsm-connect.bpf.c"><code class="language-c">#define EPERM 1
+#define AF_INET 2
+
+const __u32 blockme = 16843009; // 1.1.1.1 -&gt; int
+
+SEC("lsm/socket_connect")
+int BPF_PROG(restrict_connect, struct socket *sock, struct sockaddr *address, int addrlen, int ret)
+{
+    // Satisfying "cannot override a denial" rule
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    // Only IPv4 in this example
+    if (address-&gt;sa_family != AF_INET)
+    {
+        return 0;
+    }
+
+    // Cast the address to an IPv4 socket address
+    struct sockaddr_in *addr = (struct sockaddr_in *)address;
+
+    // Where do you want to go?
+    __u32 dest = addr-&gt;sin_addr.s_addr;
+    bpf_printk("lsm: found connect to %d", dest);
+
+    if (dest == blockme)
+    {
+        bpf_printk("lsm: blocking %d", dest);
+        return -EPERM;
+    }
+    return 0;
+}</code></pre>
+    <p>The extra <code>int ret</code> argument is the decision of earlier LSM programs on the
+    same hook. Returning it unchanged when it is non-zero respects the rule that a BPF LSM
+    program cannot turn a denial into an allow. 16843009 is <code>0x01010101</code>, which
+    reads the same in either byte order, so the comparison works without
+    <code>bpf_htonl</code>. This shortcut only works for that address. For any other address
+    you need the byte-order conversion.</p>
+    <p>The README first checks that the kernel has BPF LSM compiled in <em>and</em> enabled.
+    This is the most common reason the lesson fails, and it is why <code>.config</code>
+    marks it <code>not-in-ci</code>:</p>
+    <pre data-file="bpf-developer-tutorial/src/19-lsm-connect/README.md"><code class="language-bash">$ cat /boot/config-$(uname -r) | grep BPF_LSM
+CONFIG_BPF_LSM=y
+$ cat /sys/kernel/security/lsm
+ndlock,lockdown,yama,integrity,apparmor
+# if "bpf" is missing, add it to GRUB_CMDLINE_LINUX in /etc/default/grub:
+#   GRUB_CMDLINE_LINUX="lsm=ndlock,lockdown,yama,integrity,apparmor,bpf"
+# then update-grub2 and reboot
+
+$ ecc lsm-connect.bpf.c
+Compiling bpf object...
+Packing ebpf object and config into package.json...
+$ sudo ecli run package.json
+
+# another terminal
+$ ping 1.1.1.1
+ping: connect: Operation not permitted
+$ curl 1.1.1.1
+curl: (7) Couldn't connect to server</code></pre>
+    <p>(The <code>ndlock</code> in the README's sample output is copied as written; the kernel
+    lists the Landlock LSM as <code>landlock</code>.) Chapter
+    <a href="05-program-types-and-hooks.html">05</a> covers the LSM hook family. In the
+    repository, the security track continues with <code>bpf_send_signal</code> (25), cgroup
+    policy (<code>src/cgroup</code>) and TCP quarantine with socket iterators (51).</p>
+
+    <h3>Lesson 44: a CPU scheduler in BPF</h3>
+    <p>Lesson 44 brings in sched_ext, the struct_ops-based scheduler class merged in Linux
+    6.12 (chapter <a href="05-program-types-and-hooks.html">05</a>). The program is the
+    kernel's <code>scx_simple</code> example, copied into the lesson with its own copy of the
+    <code>scx</code> headers under <code>include/</code>. It implements a global weighted
+    virtual-time scheduler that can switch to FIFO:</p>
+    <pre data-file="bpf-developer-tutorial/src/44-scx-simple/scx_simple.bpf.c"><code class="language-c">#include &lt;scx/common.bpf.h&gt;
+
+char _license[] SEC("license") = "GPL";
+
+const volatile bool fifo_sched;
+
+static u64 vtime_now;
+UEI_DEFINE(uei);
+/* ... */
+#define SHARED_DSQ 0
+/* ... */
+s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+	bool is_idle = false;
+	s32 cpu;
+
+	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &amp;is_idle);
+	if (is_idle) {
+		stat_inc(0);	/* count local queueing */
+		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	}
+
+	return cpu;
+}
+
+void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	stat_inc(1);	/* count global queueing */
+
+	if (fifo_sched) {
+		scx_bpf_dispatch(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+	} else {
+		u64 vtime = p-&gt;scx.dsq_vtime;
+
+		/*
+		 * Limit the amount of budget that an idling task can accumulate
+		 * to one slice.
+		 */
+		if (vtime_before(vtime, vtime_now - SCX_SLICE_DFL))
+			vtime = vtime_now - SCX_SLICE_DFL;
+
+		scx_bpf_dispatch_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
+				       enq_flags);
+	}
+}
+
+void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev)
+{
+	scx_bpf_consume(SHARED_DSQ);
+}
+/* ... */
+void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable)
+{
+	if (fifo_sched)
+		return;
+	/* ... */
+	p-&gt;scx.dsq_vtime += (SCX_SLICE_DFL - p-&gt;scx.slice) * 100 / p-&gt;scx.weight;
+}
+/* ... */
+s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
+{
+	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+}
+
+SCX_OPS_DEFINE(simple_ops,
+	       .select_cpu		= (void *)simple_select_cpu,
+	       .enqueue			= (void *)simple_enqueue,
+	       .dispatch		= (void *)simple_dispatch,
+	       .running			= (void *)simple_running,
+	       .stopping		= (void *)simple_stopping,
+	       .enable			= (void *)simple_enable,
+	       .init			= (void *)simple_init,
+	       .exit			= (void *)simple_exit,
+	       .name			= "simple");</code></pre>
+    <p>The flow: on wakeup, <code>select_cpu</code> picks a CPU and, if it is idle, places
+    the task directly in that CPU's local dispatch queue (DSQ). Otherwise
+    <code>enqueue</code> puts the task in one shared DSQ, ordered by virtual time unless FIFO
+    mode is on. When a CPU runs out of work, <code>dispatch</code> pulls the next task from
+    the shared DSQ. <code>stopping</code> charges the task for the slice it used, scaled by
+    the inverse of its weight, which is what makes the scheduler fair. <code>SCX_OPS_DEFINE</code>
+    builds the <code>struct sched_ext_ops</code> that the loader registers as a struct_ops
+    map. A per-CPU array counts local and global queueing, and the loader prints the counts
+    every second.</p>
+    <p>From the README: the toolchain needs clang ≥ 16.0.0, pahole ≥ 1.25 and (for Rust
+    schedulers) rust ≥ 1.70.0. The kernel needs <code>CONFIG_SCHED_CLASS_EXT=y</code>,
+    <code>CONFIG_DEBUG_INFO_BTF=y</code>, <code>CONFIG_BPF_JIT=y</code> and related options.
+    Then:</p>
+    <pre data-file="bpf-developer-tutorial/src/44-scx-simple/README.md"><code class="language-bash">make
+./scx_simple -f      # -f: FIFO mode; -v verbose; -h help
+local=123 global=456
+local=124 global=457</code></pre>
+    <div class="callout warn"><span class="label">Version drift</span><p>This lesson uses the
+    original kfunc names <code>scx_bpf_dispatch</code>, <code>scx_bpf_dispatch_vtime</code>
+    and <code>scx_bpf_consume</code>, declared in its bundled
+    <code>include/scx/common.bpf.h</code>. Linux 6.13 renamed them to
+    <code>scx_bpf_dsq_insert</code>, <code>scx_bpf_dsq_insert_vtime</code> and
+    <code>scx_bpf_dsq_move_to_local</code> (see the kernel's
+    <code>tools/sched_ext/include/scx/compat.bpf.h</code>). According to
+    <a href="https://docs.ebpf.io/linux/kfuncs/scx_bpf_consume/">docs.ebpf.io</a>, the old
+    <code>scx_bpf_consume</code> alias was removed in 6.17. I have not tested the unmodified
+    lesson on 6.17 or later. Expect to port it to the new names, or copy the current
+    <code>scx_simple</code> from the kernel tree. CI only builds this lesson; it does not
+    load it. The README's build section also says to "navigate to the kernel's
+    <code>tools/sched_ext/</code> directory and run make", although the lesson ships its own
+    Makefile, and CI uses that Makefile (<code>make -C src/44-scx-simple</code>).</p></div>
+
+    <h3>Lesson 47: tracing CUDA from the host</h3>
+    <p>eBPF cannot run on the GPU in the mainline kernel. It can, however, watch the host
+    side of a GPU program, the calls into the CUDA runtime library, with ordinary uprobes.
+    Lesson 47 puts an entry uprobe and a return uprobe on eleven functions in
+    <code>libcudart.so</code>. The kernel side is a set of tiny handlers that write tagged
+    events to one ring buffer:</p>
+    <div class="tabs">
+      <div class="tab-panel" data-label="Kernel side (cuda_events.bpf.c)">
+        <pre data-file="bpf-developer-tutorial/src/47-cuda-events/cuda_events.bpf.c"><code class="language-c">struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
+/* ... */
+/* Helper function for malloc event */
+static inline int submit_malloc_event(size_t size, bool is_return, int ret_val)
+{
+    struct event *e;
+    
+    e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+    if (!e)
+        return 0;
+    
+    e-&gt;pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+    e-&gt;type = CUDA_EVENT_MALLOC;
+    e-&gt;is_return = is_return;
+    
+    if (is_return) {
+        e-&gt;ret_val = ret_val;
+    } else {
+        e-&gt;mem.size = size;
+    }
+    
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+/* ... */
+/* Memory allocation/free operations */
+SEC("uprobe")
+int BPF_KPROBE(cuda_malloc_enter, void **ptr, size_t size)
+{
+    return submit_malloc_event(size, false, 0);
+}
+
+SEC("uretprobe")
+int BPF_KRETPROBE(cuda_malloc_exit, int ret)
+{
+    return submit_malloc_event(0, true, ret);
+}</code></pre>
+      </div>
+      <div class="tab-panel" data-label="User side (cuda_events.c)">
+        <pre data-file="bpf-developer-tutorial/src/47-cuda-events/cuda_events.c"><code class="language-c">/* Attach a uprobe to a CUDA API function */
+static int attach_cuda_func(struct cuda_events_bpf *skel, const char *lib_path, 
+                           const char *func_name, struct bpf_program *prog_entry,
+                           struct bpf_program *prog_exit)
+{
+    int err;
+    LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts);
+    /* ... */
+    /* Attach entry uprobe */
+    if (prog_entry) {
+        uprobe_opts.func_name = func_name;
+        struct bpf_link *link = bpf_program__attach_uprobe_opts(prog_entry, env.target_pid  , lib_path, 0, &amp;uprobe_opts);
+        /* ... */
+    }
+
+    /* Attach exit uprobe */
+    if (prog_exit) {
+        uprobe_opts.func_name = func_name;
+        uprobe_opts.retprobe = true;  /* This is a return probe */
+        struct bpf_link *link = bpf_program__attach_uprobe_opts(prog_exit, env.target_pid, lib_path, 0, &amp;uprobe_opts);
+        /* ... */
+    }
+
+    return 0;
+}
+/* ... in main(): */
+    struct cuda_api_func cuda_funcs[] = {
+        {"cudaMalloc", skel-&gt;progs.cuda_malloc_enter, skel-&gt;progs.cuda_malloc_exit},
+        {"cudaFree", skel-&gt;progs.cuda_free_enter, skel-&gt;progs.cuda_free_exit},
+        {"cudaMemcpy", skel-&gt;progs.cuda_memcpy_enter, skel-&gt;progs.cuda_memcpy_exit},
+        {"cudaLaunchKernel", skel-&gt;progs.cuda_launch_kernel_enter, skel-&gt;progs.cuda_launch_kernel_exit},
+        /* ... cudaStreamCreate, cudaStreamSynchronize, cudaGetDevice, cudaSetDevice,
+               cudaEventCreate, cudaEventRecord, cudaEventSynchronize ... */
+    };</code></pre>
+      </div>
+    </div>
+    <p>The design point is the bare <code>SEC("uprobe")</code>. The section name carries no
+    binary or symbol, so the skeleton does not auto-attach, and the loader attaches each
+    program by symbol name with <code>bpf_uprobe_opts.func_name</code>. This lets one binary
+    trace whichever library or application you name with <code>-p</code> (the default is
+    <code>/usr/local/cuda/lib64/libcudart.so</code>), which matters because CUDA applications
+    often link the runtime statically. Commands from the README:</p>
+    <pre data-file="bpf-developer-tutorial/src/47-cuda-events/README.md"><code class="language-bash"># Build both the tracer and the example
+make
+
+# Start the tracing tool
+sudo ./cuda_events -p ./basic02
+
+# In another terminal, run the CUDA example
+./basic02
+
+# or filter by PID
+./basic02 &amp;
+PID=$!
+sudo ./cuda_events -p ./basic02 -d $PID</code></pre>
+    <p>The tool's options are <code>-v</code> (verbose), <code>-t</code> (no timestamps),
+    <code>-r</code> (entries only), <code>-p PATH</code> and <code>-d PID</code>. The README
+    includes a benchmark (<code>bench.cu</code>) and reports that the tracer "adds about 2us
+    overhead to each CUDA API call". That number is the repository's, measured on its
+    authors' hardware. I could not reproduce it here because the orb has no GPU. CI builds
+    the tracer on every push and builds the CUDA samples only when <code>nvcc</code> is
+    present.</p>
+    <p>The GPU track goes further in <code>src/xpu/</code>. <code>xpu/flamegraph</code>
+    combines CPU stacks captured at <code>cudaLaunchKernel</code> with CUPTI kernel timing to
+    draw a merged CPU-to-GPU flame graph (its example profiles a Qwen3 0.6B inference).
+    <code>xpu/gpu-kernel-driver</code> ships bpftrace scripts for the DRM scheduler, i915,
+    amdgpu, NVIDIA driver and vblank events (<code>drm_scheduler.bt</code>, <code>intel_i915.bt</code>, <code>amd_amdgpu.bt</code>, <code>nvidia_driver.bt</code>, <code>drm_vblank.bt</code>). For eBPF that changes GPU behavior,
+    lesson 47 points to gpu_ext (chapter <a href="20-gpu-ext.html">20</a>); continuous
+    CPU+GPU profiling is covered by xpu-perf (chapter <a href="22-xpu-perf.html">22</a>).</p>
+
+    <h3>Coda: lesson 52 and the newest kernel features</h3>
+    <p>The lessons added in 2026 (50–54) follow a stricter template: a real CLI, a
+    <code>tests/</code> directory with a Python integration test, and explicit operational
+    limits. Lesson 52 uses <code>fsession</code>, new in Linux 7.0, where one program runs at
+    both entry and exit of <code>vfs_read</code> and keeps a per-call cookie. Its opening
+    lines show the cost of shipping a frozen <code>vmlinux.h</code>:</p>
+    <pre data-file="bpf-developer-tutorial/src/52-fsession-latency/fsession_latency.bpf.c"><code class="language-c">#define bpf_session_is_return bpf_session_is_return_vmlinux_snapshot
+#define bpf_session_cookie bpf_session_cookie_vmlinux_snapshot
+#include "vmlinux.h"
+#undef bpf_session_is_return
+#undef bpf_session_cookie
+/* ... */
+/*
+ * The repository vmlinux.h snapshot predates the ctx argument on these
+ * kfunc prototypes. Rename those stale declarations while including the
+ * snapshot, then provide the Linux 7.0 signatures below.
+ */
+extern bool bpf_session_is_return(void *ctx) __ksym;
+extern __u64 *bpf_session_cookie(void *ctx) __ksym;
+
+SEC("fsession/vfs_read")
+int BPF_PROG(measure_vfs_read, struct file *file, char *buf, size_t count,
+	     loff_t *pos, ssize_t ret)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 *started = bpf_session_cookie(ctx);
+	/* ... */
+	if (!bpf_session_is_return(ctx)) {
+		/* ... */
+		*started = bpf_ktime_get_ns();
+		return 0;
+	}
+	/* ... */
+	latency = bpf_ktime_get_ns() - *started;</code></pre>
+    <p>CO-RE relocates struct fields, but kfunc prototypes in the header are only C
+    declarations. If the snapshot is older than the kernel API you target, you have to
+    override them yourself. The run command from the README is
+    <code>sudo ./fsession_latency --pid "$SERVICE_PID" --threshold-us 10000 --duration 30</code>.</p>
+
+    <h2>How the repository keeps itself working</h2>
+    <p>Six GitHub Actions workflows (<code>.github/workflows/</code>) cover builds, runtime
+    smoke tests and documentation:</p>
+    <table>
+      <thead><tr><th>Workflow</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>test-libbpf.yml</code></td><td>On <code>ubuntu-24.04</code>, installs clang, llvm, libelf, dwarves and HWE kernel headers, then runs <code>make -C</code> for every libbpf lesson (11–17, 23, 24, 26–30, 32–35, 38, 41–54, all of <code>features/</code>, <code>cgroup</code>). Smoke-runs 11, 13, 14, 16, 17, 23, 30 and 35 under <code>sudo timeout -s 2 3</code>, runs lesson 51's test target, and builds the kernel modules for 43 and <code>features/struct_ops</code> against the installed headers. Also runs weekly (<code>cron: '0 0 * * 0'</code>).</td></tr>
+        <tr><td><code>test-eunomia.yaml</code></td><td>Downloads the latest <code>ecc</code> and <code>ecli</code>, compiles lessons 1–10, 20, 23, 25, 31 and 34 with <code>ecc</code>, and runs each with <code>ecli run … package.json</code> for three seconds.</td></tr>
+        <tr><td><code>test-bpftrace.yml</code></td><td>Builds the Rust programs of lesson 37 with Rust 1.97, checks the <code>helloworld::hello</code> symbol, and attaches a bpftrace uprobe to it.</td></tr>
+        <tr><td><code>check-docs.yml</code></td><td>Unit-tests the doc scripts, regenerates the TOC and compatibility matrix and fails if they differ from what is committed, and checks relative Markdown links.</td></tr>
+        <tr><td><code>auto-generate-docs.yml</code></td><td>When a README or <code>.config</code> changes on <code>main</code>, regenerates the indexes and commits them as <code>github-actions[bot]</code> ("docs: auto-generate documentation").</td></tr>
+        <tr><td><code>trigger-sync.yml</code></td><td>Checks out <code>eunomia-bpf/eunomia.dev</code>, copies <code>src/*</code> into <code>website/docs/tutorials/</code> (SUMMARY becomes <code>index.md</code>), builds the Next.js static site, and on <code>main</code> sends a <code>trigger-tutorial-sync</code> dispatch to the website repository.</td></tr>
+      </tbody>
+    </table>
+    <p>So the docs site at eunomia.dev/tutorials is generated from the lesson READMEs, and a
+    broken site build fails the tutorial's own CI. The site is covered with the rest of the
+    organization's web presence in chapter <a href="31-org-meta.html">31</a>.</p>
+    <p>The repository also documents itself for AI coding agents. <code>CLAUDE.md</code>
+    gives build commands and a directory summary. <code>.agents/skills/</code> holds four
+    skills: a writing-style checklist for bilingual READMEs, a topic-selection workflow, a
+    KVM test harness, and a "write a production tutorial" workflow. CI runs a unit test for
+    one of the skill scripts (<code>test_sync_source_blocks.py</code>).</p>
+
+    <h2>What is being worked on</h2>
+    <p>From <code>gh api repos/eunomia-bpf/bpf-developer-tutorial/commits</code> and the
+    pull-request list on 2026-11-06:</p>
+    <ul>
+      <li><strong>Latest commit on <code>main</code></strong>: <code>110b91f8</code>
+      (2026-09-05), PR #227, which keeps GnuTLS and NSS probing enabled by default in
+      lesson 30's <code>sslsniff</code>.</li>
+      <li><strong>July 2026 burst.</strong> PR #220 added lessons 51–54 and the agent skills.
+      PR #223 turned lesson 54 into a persistent monitor. PR #225 made lessons 50–53 "safer
+      to operate". PR #222 added <code>TUTORIAL_IDEAS.md</code>. A series on 2026-07-14
+      fixed verified examples (#211), stopped tracking build artifacts (#215), added the
+      compatibility matrix (#212), extended CI to every libbpf Makefile (#213) and validated
+      the site sync (#214).</li>
+      <li><strong>Earlier in 2026</strong>: TCX and BPF token lessons (#203, March), a dynptr
+      TC demo, a cgroup policy guard lesson, a fix that removed incorrect cgroup filtering
+      from runqlat (#201), and fentry troubleshooting notes (#200). In late 2025: the
+      <code>features/struct_ops</code> lesson with its kernel module and the CUPTI flame
+      graph.</li>
+      <li><strong>Open PRs.</strong> #224 adds four lessons: <code>55-dns-egress</code>,
+      <code>56-tc-flow-index</code>, <code>57-oom-watch</code> and
+      <code>60-afxdp-dump</code>. Its description says they were validated on Linux
+      7.2.0-rc4. #236 (opened 2026-11-04) pins the eunomia CI job to Ubuntu 22.04 because
+      <code>ubuntu-latest</code> now lacks <code>llvm-14-dev</code>. Until it merges, the
+      ecc/ecli job fails before any lesson runs. #231 removes a repeated bpftime introduction
+      from lessons 5, 15, 16 and 30, and several PRs fix the Chinese translations.</li>
+      <li><strong>Roadmap.</strong> <code>TUTORIAL_IDEAS.md</code> (last audited 2026-07-20)
+      scores candidates out of 100. The top three are a container-aware service dependency
+      map (90), signed BPF program verification (88) and io_uring latency diagnosis (87).
+      Further down are an OOM pre-kill profile, an AI-agent runtime audit, and
+      <code>sk_lookup</code>. Its watchlist tracks Linux 7.2 features such as
+      <code>tracing_multi</code>, a BPF rhashtable map and sleepable tracepoints.</li>
+    </ul>
+
+    <h2>A learning path mapped to this curriculum</h2>
+    <p>The introductory lesson suggests a time budget: 5–7 hours to understand what eBPF is
+    (ebpf.io, docs.ebpf.io), then 10–15 hours on frameworks (the bpftrace tutorial, the BCC
+    Python tutorial, libbpf-bootstrap, and lessons 1–10). The path below orders the
+    repository against the chapters of this curriculum. Read the chapter for the theory,
+    then run the lessons.</p>
+    <table>
+      <thead><tr><th>Stage</th><th>Curriculum chapter</th><th>Lessons</th><th>Goal</th></tr></thead>
+      <tbody>
+        <tr><td>0 · Orientation</td><td><a href="01-what-is-bpf.html">01</a>, <a href="08-ecosystem.html">08</a></td><td>0-introduce, 18-further-reading, bpftrace-tutorial</td><td>Know what eBPF can do; try one-liners before writing C.</td></tr>
+        <tr><td>1 · First programs</td><td><a href="05-program-types-and-hooks.html">05</a>, <a href="10-eunomia-bpf-ecc-ecli.html">10</a></td><td>1, 2, 3, 4, 5</td><td>Tracepoint, kprobe, fentry and uprobe; global variables as parameters. Use <code>ecc</code>/<code>ecli</code>.</td></tr>
+        <tr><td>2 · Getting data out</td><td><a href="04-maps-helpers-kfuncs.html">04</a></td><td>6, 7, 8, 9, 10</td><td>Hash maps, perf array vs. ring buffer, in-kernel histograms (9 uses <code>raw_tp/sched_switch</code>).</td></tr>
+        <tr><td>3 · Real loaders</td><td><a href="06-btf-core-libbpf.html">06</a>, <a href="11-starter-templates.html">11</a></td><td>11, 13, 14, 16, 17; 12 for Rust</td><td>Skeleton lifecycle, rodata parameters, ring buffer polling. Then start your own project from a starter template.</td></tr>
+        <tr><td>4 · User-space tracing</td><td><a href="05-program-types-and-hooks.html">05</a></td><td>15 (USDT), 30, 31, 33, 37, 39, 40</td><td>Uprobes on TLS libraries, Go, Rust, nginx and MySQL; function latency.</td></tr>
+        <tr><td>5 · Networking</td><td><a href="07-networking-xdp-tc.html">07</a>, <a href="03-verifier.html">03</a></td><td>20, 21 → 41, 42, 46 → 50, 29, 23 → 53</td><td>Bounds checks, XDP actions, TCX links, sockmap, BPF qdisc.</td></tr>
+        <tr><td>6 · Security and policy</td><td><a href="05-program-types-and-hooks.html">05</a></td><td>19, cgroup, 25, 51; then 24, 26, 27, 28, 34, 54 in a VM</td><td>LSM and cgroup decisions, signals, pinning; know the attacks to defend against them.</td></tr>
+        <tr><td>7 · Kernel extension</td><td><a href="05-program-types-and-hooks.html">05</a>, <a href="04-maps-helpers-kfuncs.html">04</a></td><td>44, 45, features/struct_ops, 43, 49</td><td>struct_ops and sched_ext, custom kfuncs in a module, HID-BPF.</td></tr>
+        <tr><td>8 · New kernel features</td><td><a href="04-maps-helpers-kfuncs.html">04</a></td><td>35, features/{bpf_arena, bpf_iters, bpf_wq, dynptr, bpf_token}, 52</td><td>User ring buffer, arena, iterators, workqueues, dynptrs, tokens, fsession. Check <code>kernel_min</code> first.</td></tr>
+        <tr><td>9 · Beyond the kernel</td><td><a href="13-bpf-compatible.html">13</a>, <a href="14-bpftime-architecture.html">14</a>, <a href="15-bpftime-in-practice.html">15</a></td><td>36, 38</td><td>Userspace eBPF runtimes and CO-RE for user-space structs, as a bridge to bpftime and bpf-compatible.</td></tr>
+        <tr><td>10 · GPUs</td><td><a href="20-gpu-ext.html">20</a>, <a href="22-xpu-perf.html">22</a></td><td>47, xpu/flamegraph, xpu/gpu-kernel-driver, xpu/npu-kernel-driver</td><td>Host-side CUDA tracing and driver tracepoints, before eBPF that runs on or steers the GPU.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><span class="label">Tip</span><p>Stage 3 is where most readers
+    should stop using <code>ecli</code>. Once lesson 11 makes sense, go back to one Basic
+    lesson (8-exitsnoop is a good choice) and write a libbpf loader for it yourself, using
+    <code>bootstrap.c</code> as a template. That one exercise covers most of what chapter
+    <a href="06-btf-core-libbpf.html">06</a> describes.</p></div>
+
+    <h2>Benefits and limitations</h2>
+    <div class="grid">
+      <div class="card"><h4>Benefits</h4><p>Short, runnable lessons with line-by-line
+      READMEs in two languages. Broad coverage: almost every hook family, plus recent kernel
+      features (fsession, BPF qdisc, tokens, arena) soon after they are merged. Vendored
+      libbpf, bpftool and per-architecture <code>vmlinux.h</code> make builds reproducible.
+      Per-lesson <code>.config</code> metadata and a generated compatibility matrix tell you
+      what a lesson needs before you build it. CI builds every libbpf lesson and runs a
+      subset, weekly as well as on every push. MIT license.</p></div>
+      <div class="card"><h4>Limitations</h4><p>Numbering reflects when a lesson was written,
+      not difficulty, and some lessons fall out of the generated index (32, bpftrace).
+      Depth is uneven: Basic lessons are twenty lines, while 47 and xpu/flamegraph are
+      complete tools. Most "runtime" CI is a three-second smoke run on a GitHub runner
+      kernel, and LSM, XDP, sched_ext and GPU lessons are build-only or not in CI. The
+      frozen <code>vmlinux.h</code> and vendored headers lag behind kernel API changes (the
+      sched_ext kfunc renames, the fsession prototypes). The Basic lessons depend on
+      eunomia-bpf release binaries, and that CI job currently fails on Ubuntu 26.04 runners
+      (PR #236). Performance figures in READMEs, such as "10x faster" for fentry and "2 µs"
+      for CUDA tracing, come from the authors and are not independently
+      measured.</p></div>
+    </div>
+
+    <h2>Related work</h2>
+    <ul>
+      <li><a href="https://github.com/libbpf/libbpf-bootstrap">libbpf-bootstrap</a>: the
+      upstream scaffold that lessons 11 and later copy their Makefile and examples from.
+      Smaller, with no lesson text.</li>
+      <li><a href="https://github.com/iovisor/bcc/blob/master/docs/tutorial_bcc_python_developer.md">bcc
+      Python developer tutorial</a> and <code>libbpf-tools</code> in the bcc repository: the
+      README names the bcc tutorial as its inspiration, and many lessons (opensnoop,
+      execsnoop, runqlat, tcpconnlat, memleak, biopattern, funclatency) are versions of bcc
+      tools.</li>
+      <li><a href="https://docs.ebpf.io/">docs.ebpf.io</a> and the
+      <a href="https://docs.kernel.org/bpf/">kernel BPF documentation</a>: reference
+      material for every helper, kfunc and program type the lessons use.</li>
+      <li>Within eunomia-bpf: the ecc/ecli toolchain (chapter
+      <a href="10-eunomia-bpf-ecc-ecli.html">10</a>), the starter templates the README
+      advertises for C, Go and Rust (chapter <a href="11-starter-templates.html">11</a>),
+      and GPTtrace, an LLM front end for writing eBPF that the README mentions (chapter
+      <a href="30-llm-kernel-tooling.html">30</a>).</li>
+    </ul>
+
+    <h2>Check your understanding</h2>
+    <div class="quiz">
+      <div class="q"><p><strong>Q1.</strong> You add a new lesson directory with a README and
+      code, but it does not appear in the generated README index. What is the most likely
+      cause?</p>
+        <button class="opt">The lesson has no Makefile</button>
+        <button class="opt" data-right>Its <code>.config</code> is missing, or for a Depth lesson lacks <code>type=</code></button>
+        <button class="opt">The directory name is not numbered</button>
+        <button class="opt">The README has no Chinese translation</button>
+        <div class="why"><code>scripts/generate_toc.py</code> indexes only directories with
+        both <code>.config</code> and <code>README.md</code>, and files Depth lessons under
+        their <code>type</code>. <code>32-wallclock-profiler</code> (no <code>type</code>)
+        and <code>bpftrace-tutorial</code> (no <code>.config</code>) are missing from the
+        index for exactly this reason. Unnumbered directories such as
+        <code>features/bpf_arena</code> are indexed.</div></div>
+      <div class="q"><p><strong>Q2.</strong> In lesson 4, what lets <code>ecli</code> offer a
+      <code>--pid_target</code> flag?</p>
+        <button class="opt">A user-space argp parser in <code>opensnoop.c</code></button>
+        <button class="opt">A BPF hash map keyed by PID</button>
+        <button class="opt" data-right>A <code>const volatile</code> global, which ecc records along with its <code>/// @description</code> comment</button>
+        <button class="opt">The tracepoint's format file</button>
+        <div class="why">Lesson 4 has no user-space C file. <code>const volatile</code> puts
+        the variable in rodata so a loader can set it before load, and eunomia-bpf turns
+        rodata globals into CLI flags, using the doc comment as help text.</div></div>
+      <div class="q"><p><strong>Q3.</strong> Why does lesson 2 use <code>BPF_CORE_READ(name, name)</code>
+      while lesson 3 writes <code>name-&gt;name</code>?</p>
+        <button class="opt">Lesson 3 targets an older kernel</button>
+        <button class="opt" data-right>fentry arguments are BTF-typed, so the verifier allows direct dereference; kprobe arguments come from raw registers</button>
+        <button class="opt">fentry programs run in user space</button>
+        <button class="opt">BPF_CORE_READ is only needed with ecc</button>
+        <div class="why">fentry/fexit programs get typed arguments through the BPF
+        trampoline, so pointer loads are checked as BTF-typed accesses. A kprobe gets
+        <code>pt_regs</code>, so any pointer it holds is an unknown kernel address and must
+        be read with a probe-read helper (here with CO-RE relocation).</div></div>
+      <div class="q"><p><strong>Q4.</strong> In lesson 19, why does the program return
+      <code>ret</code> early when it is non-zero?</p>
+        <button class="opt">To avoid a verifier loop error</button>
+        <button class="opt">Because <code>ret</code> holds the destination port</button>
+        <button class="opt" data-right>A BPF LSM program must not override an earlier denial on the same hook</button>
+        <button class="opt">To skip IPv6 sockets</button>
+        <div class="why">The last argument of an LSM BPF program is the return value so far.
+        The code comment says it is "satisfying 'cannot override a denial' rule": once
+        another program has denied the call, this one passes the denial on.</div></div>
+      <div class="q"><p><strong>Q5.</strong> Lesson 47 declares its uprobes as a bare
+      <code>SEC("uprobe")</code>. What follows from that?</p>
+        <button class="opt">The programs attach to every binary on the system</button>
+        <button class="opt" data-right>The skeleton cannot auto-attach them; the loader attaches each one by function name to the library or binary given with <code>-p</code></button>
+        <button class="opt">They run on the GPU</button>
+        <button class="opt">They need a kernel module</button>
+        <div class="why">Without a <code>binary:function</code> in the section name, libbpf
+        does not know the target. <code>cuda_events.c</code> calls
+        <code>bpf_program__attach_uprobe_opts</code> with <code>func_name</code> set, so the
+        same programs can trace <code>libcudart.so</code> or an application that links the
+        CUDA runtime statically.</div></div>
+      <div class="q"><p><strong>Q6.</strong> Lesson 44 builds in CI but fails to load on
+      your 6.18 kernel. Which explanation fits what you learned in this chapter?</p>
+        <button class="opt">sched_ext was removed after 6.12</button>
+        <button class="opt">struct_ops maps need a kernel module</button>
+        <button class="opt" data-right>It calls the pre-6.13 kfunc names (<code>scx_bpf_dispatch</code>, <code>scx_bpf_consume</code>) from its bundled headers, which newer kernels have renamed</button>
+        <button class="opt">CI uses a different <code>vmlinux.h</code></button>
+        <div class="why">CI only compiles lesson 44 (<code>test_status=ci-build</code>), and
+        compiling does not check whether a kfunc exists in the running kernel; that check
+        happens at load. The kfuncs were renamed in 6.13, and docs.ebpf.io reports the
+        <code>scx_bpf_consume</code> alias removed in 6.17. Porting to
+        <code>scx_bpf_dsq_insert</code>/<code>scx_bpf_dsq_move_to_local</code> is the likely
+        fix. Loading on 6.18 itself was not tested for this chapter.</div></div>
+    </div>
+
+    <h2 id="references">References</h2>
+    <ol class="refs">
+      <li><a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/tree/110b91f87320a952c4c55dba1d6e8e3f814a789c">eunomia-bpf/bpf-developer-tutorial</a> at commit <code>110b91f87320a952c4c55dba1d6e8e3f814a789c</code> (2026-09-05): <code>README.md</code>, <code>src/SUMMARY.md</code>, <code>src/compatibility.md</code>, <code>TUTORIAL_IDEAS.md</code>, <code>CLAUDE.md</code>, <code>scripts/generate_toc.py</code>, <code>.github/workflows/*</code>, and lessons 0, 1, 2, 3, 4, 8, 11, 19, 20, 21, 44, 47, 52.</li>
+      <li><a href="https://eunomia.dev/tutorials/">eunomia.dev/tutorials</a>: the website generated from the lesson READMEs (built by <code>trigger-sync.yml</code>).</li>
+      <li>Repository activity: <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/commits/main">commit history</a> and pull requests <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/pull/220">#220</a>, <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/pull/222">#222</a>, <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/pull/224">#224</a>, <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/pull/227">#227</a>, <a href="https://github.com/eunomia-bpf/bpf-developer-tutorial/pull/236">#236</a> (read via the GitHub API on 2026-11-06).</li>
+      <li><a href="https://github.com/eunomia-bpf/eunomia-bpf">eunomia-bpf/eunomia-bpf</a>: the <code>ecc</code> compiler and <code>ecli</code> runner used by the Basic lessons.</li>
+      <li><a href="https://github.com/libbpf/libbpf-bootstrap">libbpf/libbpf-bootstrap</a>, <a href="https://github.com/libbpf/libbpf">libbpf</a>, <a href="https://github.com/libbpf/bpftool">bpftool</a>, <a href="https://github.com/libbpf/blazesym">blazesym</a>: the scaffold and vendored submodules.</li>
+      <li><a href="https://github.com/iovisor/bcc/blob/master/docs/tutorial_bcc_python_developer.md">bcc Python Developer Tutorial</a>: named by the README as the project's inspiration.</li>
+      <li><a href="https://docs.kernel.org/bpf/libbpf/program_types.html">Program Types and ELF Sections</a>, libbpf kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/bpf/prog_lsm.html">LSM BPF Programs</a>, kernel documentation.</li>
+      <li><a href="https://docs.kernel.org/scheduler/sched-ext.html">Extensible Scheduler Class</a>, kernel documentation; <a href="https://github.com/torvalds/linux/blob/master/tools/sched_ext/include/scx/compat.bpf.h"><code>tools/sched_ext/include/scx/compat.bpf.h</code></a> (v6.13 kfunc renames); <a href="https://docs.ebpf.io/linux/kfuncs/scx_bpf_consume/">docs.ebpf.io: scx_bpf_consume</a> (alias removal in v6.17).</li>
+      <li><a href="https://docs.ebpf.io/">eBPF Docs (docs.ebpf.io)</a>: helper, kfunc and map reference recommended by lesson 0.</li>
+    </ol>
+
+    <div class="chapter-nav">
+      <a class="prev" href="08-ecosystem.html"><small>Previous</small>08 · The eBPF ecosystem map</a>
+      <a class="next" href="10-eunomia-bpf-ecc-ecli.html"><small>Next</small>10 · eunomia-bpf: ecc and ecli</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

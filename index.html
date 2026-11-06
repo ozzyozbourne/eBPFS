@@ -11,7 +11,7 @@
 <p class="lede">A chapter-wise guide: what the Berkeley Packet Filter and its extended form are, how they work
 inside the Linux kernel, and what every actively maintained <a href="https://github.com/eunomia-bpf">eunomia-bpf</a>
 project does, with diagrams, real code, papers and quizzes.</p>
-<div class="meta"><span>8 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
+<div class="meta"><span>16 chapters</span><span>Start with Chapter 01 if eBPF is new to you</span></div></section>
 <h2>Part I · Foundations</h2>
 <div class="grid">
 <a class="card" href="chapters/01-what-is-bpf.html"><h4>01 · What is BPF? From packet filter to in-kernel VM</h4><p>How a 1993 packet filter became Linux&#x27;s safe in-kernel execution engine: classic BPF, seccomp-bpf, the 2014 eBPF rewrite, and a first hello world.</p></a>
@@ -22,5 +22,19 @@ project does, with diagrams, real code, papers and quizzes.</p>
 <a class="card" href="chapters/06-btf-core-libbpf.html"><h4>06 · BTF, CO-RE and libbpf</h4><p>How BTF type information, compiler-emitted CO-RE relocations and the libbpf loader let one compiled eBPF object run on many kernels, and how skeletons, links and pinning manage its lifecycle.</p></a>
 <a class="card" href="chapters/07-networking-xdp-tc.html"><h4>07 · eBPF in the networking stack: XDP, AF_XDP, tc/TCX and socket programs</h4><p>Where eBPF hooks into the Linux packet path, from XDP in the NIC driver through AF_XDP, tc/TCX and socket-level programs, with real drop, redirect and tc programs and the commands to load them.</p></a>
 <a class="card" href="chapters/08-ecosystem.html"><h4>08 · The eBPF ecosystem map, and where eunomia-bpf fits</h4><p>One exec tracer written in bpftrace, BCC, libbpf, cilium/ebpf, aya, libbpf-rs and eunomia-bpf; the major eBPF projects and runtimes; and a map of the eunomia-bpf organization that the rest of the curriculum follows.</p></a>
+</div>
+<h2>Part II · Learning and tooling</h2>
+<div class="grid">
+<a class="card" href="chapters/09-bpf-developer-tutorial.html"><h4>09 · bpf-developer-tutorial: learning eBPF one small tool at a time</h4><p>A guided tour of eunomia-bpf&#x27;s bpf-developer-tutorial: how its 60-plus lessons are organized and built (ecc/ecli versus libbpf skeletons), how CI and the eunomia.dev site keep them current, six lessons read line by line, and a learning path mapped to this curriculum.</p></a>
+<a class="card" href="chapters/10-eunomia-bpf-ecc-ecli.html"><h4>10 · eunomia-bpf: ecc and ecli</h4><p>How eunomia-bpf&#x27;s ecc compiler turns kernel-only eBPF C into a self-describing JSON package, and how ecli and bpf-loader-rs load it, derive a command line and print ring-buffer, perf or map data with no hand-written userspace code, plus Wasm, OCI, the GitHub template, the in-browser compiler and the Homebrew tap.</p></a>
+<a class="card" href="chapters/11-starter-templates.html"><h4>11 · Starter templates for libbpf and libbpf-rs</h4><p>How eunomia-bpf&#x27;s libbpf-starter-template (C) and libbpf-rs-starter-template (Rust) package a single libbpf-bootstrap-style app with submodules, vendored vmlinux.h, Docker, Nix and GitHub Actions, and how to turn one into your own project.</p></a>
+<a class="card" href="chapters/12-wasm-bpf.html"><h4>12 · wasm-bpf: eBPF user space in WebAssembly</h4><p>How wasm-bpf moves the user-space half of an eBPF application into a WebAssembly sandbox: the seven host functions, how the Wasmtime and WAMR runtimes map them onto libbpf, how data crosses between linear memory, maps and ring buffers, and how the result is built, packaged as OCI images and run.</p></a>
+<a class="card" href="chapters/13-bpf-compatible.html"><h4>13 · bpf-compatible: CO-RE on kernels without BTF</h4><p>How bpf-compatible trims BTFHub&#x27;s kernel type files down to what one eBPF object needs, embeds them in the binary, and picks the right one at run time so CO-RE programs load on kernels without /sys/kernel/btf/vmlinux.</p></a>
+</div>
+<h2>Part III · Userspace eBPF runtimes</h2>
+<div class="grid">
+<a class="card" href="chapters/14-bpftime-architecture.html"><h4>14 · bpftime architecture: eBPF without the kernel round trip</h4><p>How bpftime runs unmodified eBPF tools in userspace: the LD_PRELOAD syscall server, shared-memory maps, the injected agent, inline-hook uprobes, zpoline-style syscall hooks, the VM and verifier options, kernel interop, and the OSDI &#x27;25 EIM paper.</p></a>
+<a class="card" href="chapters/15-bpftime-in-practice.html"><h4>15 · bpftime in practice: running eBPF tools in userspace</h4><p>How to install and drive bpftime: the load/start/attach/trace CLI, running unmodified libbpf tools (malloc, opensnoop, bashreadline, sslsniff, bpftrace) in userspace, bpftimetool, kernel-user mixed mode, CUDA kernel probes, XDP and nginx integrations, the repo&#x27;s own benchmark numbers, and the current limits.</p></a>
+<a class="card" href="chapters/16-llvmbpf.html"><h4>16 · llvmbpf: an LLVM JIT/AOT Compiler for eBPF</h4><p>How llvmbpf lifts eBPF bytecode to LLVM IR instruction by instruction, JIT-compiles it with ORC, AOT-compiles it to native ELF objects, emits PTX and SPIR-V for GPUs, and serves as bpftime&#x27;s default VM backend.</p></a>
 </div>
 </main></div></body></html>
