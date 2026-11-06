@@ -54,3 +54,9 @@ illustrative is labelled as such.
   - that the Previous/Next chain is continuous.
 
   It ends with a list of fixes per file.
+
+## Potential upstream bugs
+
+`reviews/potential-bugs.md` lists possible bugs found in eunomia-bpf repositories while writing this
+curriculum. It gives each one's status (reproduced or code reading only), the environment needed, and
+step-by-step commands to confirm or refute it, for agents or people with hardware this orb lacked.

@@ -94,3 +94,5 @@ The gaps found by `reviews/syllabus-audit.md` were filled afterwards: BPF tokens
 eBPF as an attack surface (chapter 03), BPF exceptions (chapter 04), debugging and measuring eBPF programs
 (chapter 06), and eBPF in Kubernetes (chapter 08). The orb used to write this has no BPF JIT, no GPU and no
 Kubernetes cluster, so JIT output, GPU runs and cluster deployments are quoted from sources and labelled so.
+
+Possible upstream bugs found along the way, with verification steps, are in `reviews/potential-bugs.md`.
